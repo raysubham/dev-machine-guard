@@ -11,7 +11,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/buildinfo"
 	"github.com/step-security/dev-machine-guard/internal/cli"
 	"github.com/step-security/dev-machine-guard/internal/config"
-	"github.com/step-security/dev-machine-guard/internal/detector"
+	"github.com/step-security/dev-machine-guard/internal/detector/configaudit"
 	"github.com/step-security/dev-machine-guard/internal/device"
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/launchd"
@@ -217,7 +217,7 @@ func runNPMRCOnly(exec executor.Executor, cfg *cli.Config) error {
 	loggedInUser, _ := exec.LoggedInUser()
 
 	searchDirs := resolveScanSearchDirs(exec, cfg.SearchDirs)
-	audit := detector.NewNPMRCDetector(exec).Detect(ctx, searchDirs, loggedInUser)
+	audit := configaudit.NewNPMRCDetector(exec).Detect(ctx, searchDirs, loggedInUser)
 
 	if cfg.OutputFormat == "json" {
 		return scanJSONEncoder(os.Stdout).Encode(audit)
@@ -233,7 +233,7 @@ func runPipConfigOnly(exec executor.Executor, cfg *cli.Config) error {
 	dev := device.Gather(ctx, exec)
 	loggedInUser, _ := exec.LoggedInUser()
 
-	audit := detector.NewPipConfigDetector(exec).Detect(ctx, loggedInUser)
+	audit := configaudit.NewPipConfigDetector(exec).Detect(ctx, loggedInUser)
 
 	if cfg.OutputFormat == "json" {
 		return scanJSONEncoder(os.Stdout).Encode(audit)

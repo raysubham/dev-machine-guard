@@ -18,6 +18,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/cli"
 	"github.com/step-security/dev-machine-guard/internal/config"
 	"github.com/step-security/dev-machine-guard/internal/detector"
+	"github.com/step-security/dev-machine-guard/internal/detector/configaudit"
 	"github.com/step-security/dev-machine-guard/internal/device"
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/lock"
@@ -517,12 +518,12 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	// pyenv / asdf / brew installs that root's PATH wouldn't see).
 	log.Progress("Auditing npm configuration...")
 	npmrcLoggedIn, _ := exec.LoggedInUser()
-	npmrcAudit := detector.NewNPMRCDetector(userExec).Detect(ctx, searchDirs, npmrcLoggedIn)
+	npmrcAudit := configaudit.NewNPMRCDetector(userExec).Detect(ctx, searchDirs, npmrcLoggedIn)
 	log.Progress("  npm available: %v, files discovered: %d", npmrcAudit.Available, len(npmrcAudit.Files))
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Auditing pip configuration...")
-	pipAudit := detector.NewPipConfigDetector(userExec).Detect(ctx, npmrcLoggedIn)
+	pipAudit := configaudit.NewPipConfigDetector(userExec).Detect(ctx, npmrcLoggedIn)
 	log.Progress("  pip available: %v, files discovered: %d, findings: %d", pipAudit.Available, len(pipAudit.Files), len(pipAudit.Findings))
 	fmt.Fprintln(os.Stderr)
 

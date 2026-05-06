@@ -1,4 +1,4 @@
-package detector
+package configaudit
 
 import (
 	"strings"

@@ -1,6 +1,6 @@
 //go:build windows
 
-package detector
+package configaudit
 
 // pipStatOwner is a no-op on Windows: SID-to-username resolution is
 // non-trivial and not actionable for v1 of this audit. The detector

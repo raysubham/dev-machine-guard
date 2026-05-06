@@ -1,6 +1,6 @@
 //go:build !windows
 
-package detector
+package configaudit
 
 import (
 	"os"
