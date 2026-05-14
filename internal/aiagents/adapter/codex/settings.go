@@ -30,14 +30,14 @@ const (
 
 // managedCmdRE is the uninstall match criterion. It matches an entry's
 // `command` field when the executable token is the DMG binary,
-// regardless of which absolute path it sits behind. The `(^|/)`
-// left-side accepts both bare invocations and absolute-path
-// invocations, while rejecting prefix collisions like
+// regardless of which absolute path it sits behind. The `(^|[/\\])`
+// left-side accepts bare invocations plus Unix and Windows absolute
+// paths, while rejecting prefix collisions like
 // `mystepsecurity-dev-machine-guard`.
 //
 // The regex is kept identical to the claudecode adapter's so a single
 // grep covers both.
-var managedCmdRE = regexp.MustCompile(`(^|/)stepsecurity-dev-machine-guard\s+_hook\s+`)
+var managedCmdRE = regexp.MustCompile(`(^|[/\\])stepsecurity-dev-machine-guard(?:\.exe)?\s+_hook\s+`)
 
 // hooksDoc holds raw bytes for ~/.codex/hooks.json. orig is the bytes
 // as read from disk (nil if the file did not exist); json is the

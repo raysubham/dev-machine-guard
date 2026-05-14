@@ -19,8 +19,7 @@ import (
 
 // testBinary is the absolute DMG binary path tests pass to New(). The
 // uninstall matcher (managedCmdRE) is path-token-agnostic, so the
-// specific value just needs to satisfy
-// `(^|/)stepsecurity-dev-machine-guard\s+_hook\s+`.
+// specific value just needs to satisfy the managed binary token pattern.
 const testBinary = "/usr/local/bin/stepsecurity-dev-machine-guard"
 
 // commandFor renders the canonical command string the adapter writes
@@ -91,6 +90,58 @@ func readTOML(t *testing.T, path string) map[string]any {
 		t.Fatalf("config.toml not valid TOML: %v: %s", err, b)
 	}
 	return m
+}
+
+func TestIsManagedCommandMatchesPlatformBinaryPaths(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  string
+		want bool
+	}{
+		{
+			name: "bare unix binary",
+			cmd:  "stepsecurity-dev-machine-guard _hook codex SessionStart",
+			want: true,
+		},
+		{
+			name: "absolute unix binary",
+			cmd:  "/usr/local/bin/stepsecurity-dev-machine-guard _hook codex SessionStart",
+			want: true,
+		},
+		{
+			name: "bare windows binary",
+			cmd:  "stepsecurity-dev-machine-guard.exe _hook codex SessionStart",
+			want: true,
+		},
+		{
+			name: "absolute windows binary",
+			cmd:  `C:\Users\runneradmin\.stepsecurity\bin\stepsecurity-dev-machine-guard.exe _hook codex SessionStart`,
+			want: true,
+		},
+		{
+			name: "prefixed lookalike",
+			cmd:  "mystepsecurity-dev-machine-guard.exe _hook codex SessionStart",
+			want: false,
+		},
+		{
+			name: "suffixed lookalike",
+			cmd:  "stepsecurity-dev-machine-guardctl status",
+			want: false,
+		},
+		{
+			name: "hyphenated lookalike",
+			cmd:  "/usr/local/bin/stepsecurity-dev-machine-guard-foo _hook codex SessionStart",
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isManagedCommand(tc.cmd); got != tc.want {
+				t.Fatalf("isManagedCommand(%q) = %v, want %v", tc.cmd, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestNameAndManagedFiles(t *testing.T) {

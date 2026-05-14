@@ -54,10 +54,10 @@ const settingsMode = os.FileMode(0o600)
 // managedCmdRE is the uninstall match criterion. It matches
 // an entry's `command` field when the executable token is the DMG
 // binary, regardless of which absolute path it sits behind. The
-// `(^|/)` left-side accepts both bare invocations and absolute-path
-// invocations, while rejecting prefix collisions like
+// `(^|[/\\])` left-side accepts bare invocations plus Unix and Windows
+// absolute paths, while rejecting prefix collisions like
 // `mystepsecurity-dev-machine-guard`.
-var managedCmdRE = regexp.MustCompile(`(^|/)stepsecurity-dev-machine-guard\s+_hook\s+`)
+var managedCmdRE = regexp.MustCompile(`(^|[/\\])stepsecurity-dev-machine-guard(?:\.exe)?\s+_hook\s+`)
 
 func loadSettings(path string) (*settingsDoc, error) {
 	b, err := os.ReadFile(path)
