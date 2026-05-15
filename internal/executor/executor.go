@@ -67,6 +67,9 @@ type Executor interface {
 	// every Run/RunWithTimeout on /usr/bin/-resolved binaries with this check
 	// to avoid disrupting end users on machines without CLT installed.
 	IsAppleCLTStub(ctx context.Context, binPath string) bool
+	// DiskCapacityBytes returns the total bytes on the filesystem containing
+	// path. Returns 0 on any error (lookup failures shouldn't block a scan).
+	DiskCapacityBytes(path string) uint64
 }
 
 // Real implements Executor using actual OS calls.

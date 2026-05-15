@@ -111,3 +111,6 @@ func (e *UserAwareExecutor) GOOS() string                      { return e.inner.
 func (e *UserAwareExecutor) IsAppleCLTStub(ctx context.Context, binPath string) bool {
 	return e.inner.IsAppleCLTStub(ctx, binPath)
 }
+func (e *UserAwareExecutor) DiskCapacityBytes(path string) uint64 {
+	return e.inner.DiskCapacityBytes(path)
+}

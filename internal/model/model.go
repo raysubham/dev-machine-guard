@@ -30,11 +30,24 @@ type ScanResult struct {
 }
 
 type Device struct {
-	Hostname     string `json:"hostname"`
-	SerialNumber string `json:"serial_number"`
-	OSVersion    string `json:"os_version"`
-	Platform     string `json:"platform"`
-	UserIdentity string `json:"user_identity"`
+	Hostname     string           `json:"hostname"`
+	SerialNumber string           `json:"serial_number"`
+	OSVersion    string           `json:"os_version"`
+	Platform     string           `json:"platform"`
+	UserIdentity string           `json:"user_identity"`
+	Resources    MachineResources `json:"resources"`
+}
+
+// MachineResources captures the static hardware capacity of the machine —
+// what's there, not what's currently in use. Answers "how much resource
+// does this machine have?".
+type MachineResources struct {
+	CPUModel        string `json:"cpu_model"`        // e.g. "Apple M3 Pro", "Intel(R) Core(TM) i9-13900K"
+	CPUArchitecture string `json:"cpu_architecture"` // "arm64", "amd64"
+	PhysicalCores   int    `json:"physical_cores"`   // 0 if undeterminable
+	LogicalCores    int    `json:"logical_cores"`    // includes SMT/hyperthreads
+	MemoryBytes     uint64 `json:"memory_bytes"`     // total installed RAM
+	DiskTotalBytes  uint64 `json:"disk_total_bytes"` // capacity of the system/root volume
 }
 
 // AITool represents a detected AI agent, CLI tool, framework, or general agent.

@@ -33,6 +33,7 @@ func Gather(ctx context.Context, exec executor.Executor) model.Device {
 		OSVersion:    osVersion,
 		Platform:     platform,
 		UserIdentity: userIdentity,
+		Resources:    gatherResources(ctx, exec),
 	}
 }
 

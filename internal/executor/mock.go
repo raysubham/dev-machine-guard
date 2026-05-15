@@ -44,6 +44,9 @@ type Mock struct {
 	// installed, where /usr/bin/python3 etc. are install-prompt shims).
 	appleCLTInstalled bool
 
+	// Disk capacity stubs: path -> total bytes
+	diskCapacities map[string]uint64
+
 	// LoggedInUser override — when set, LoggedInUser returns (nil, err)
 	// instead of falling through to CurrentUser. Used by tests covering
 	// the macOS+root "no console user" branch (issue #63).
@@ -59,19 +62,20 @@ type cmdResult struct {
 
 func NewMock() *Mock {
 	return &Mock{
-		commands:  make(map[string]cmdResult),
-		files:     make(map[string][]byte),
-		dirs:      make(map[string]bool),
-		dirEnts:   make(map[string][]os.DirEntry),
-		fileInfos: make(map[string]os.FileInfo),
-		paths:     make(map[string]string),
-		env:       make(map[string]string),
-		globs:     make(map[string][]string),
-		symlinks:  make(map[string]string),
-		hostname:  "test-host",
-		username:  "testuser",
-		homeDir:   "/Users/testuser",
-		goos:      "darwin",
+		commands:       make(map[string]cmdResult),
+		files:          make(map[string][]byte),
+		dirs:           make(map[string]bool),
+		dirEnts:        make(map[string][]os.DirEntry),
+		fileInfos:      make(map[string]os.FileInfo),
+		paths:          make(map[string]string),
+		env:            make(map[string]string),
+		globs:          make(map[string][]string),
+		symlinks:       make(map[string]string),
+		diskCapacities: make(map[string]uint64),
+		hostname:       "test-host",
+		username:       "testuser",
+		homeDir:        "/Users/testuser",
+		goos:           "darwin",
 	}
 }
 
@@ -180,6 +184,13 @@ func (m *Mock) SetAppleCLTInstalled(installed bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.appleCLTInstalled = installed
+}
+
+// SetDiskCapacityBytes stubs the result of DiskCapacityBytes(path).
+func (m *Mock) SetDiskCapacityBytes(path string, bytes uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.diskCapacities[path] = bytes
 }
 
 // SetLoggedInUserError makes LoggedInUser return (nil, err). Pass nil to
@@ -346,6 +357,12 @@ func (m *Mock) IsAppleCLTStub(_ context.Context, binPath string) bool {
 		return false
 	}
 	return !m.appleCLTInstalled
+}
+
+func (m *Mock) DiskCapacityBytes(path string) uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.diskCapacities[path]
 }
 
 // --- helpers ---

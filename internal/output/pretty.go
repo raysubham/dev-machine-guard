@@ -41,6 +41,15 @@ func Pretty(w io.Writer, result *model.ScanResult, colorMode string) error {
 	osLabel := model.PlatformDisplayName(result.Device.Platform)
 	fmt.Fprintf(w, "    %-16s %s\n", osLabel, result.Device.OSVersion)
 	fmt.Fprintf(w, "    %-16s %s\n", "User", result.Device.UserIdentity)
+	if cpu := formatCPU(result.Device.Resources); cpu != "" {
+		fmt.Fprintf(w, "    %-16s %s\n", "CPU", cpu)
+	}
+	if result.Device.Resources.MemoryBytes > 0 {
+		fmt.Fprintf(w, "    %-16s %s\n", "Memory", formatBytes(result.Device.Resources.MemoryBytes))
+	}
+	if result.Device.Resources.DiskTotalBytes > 0 {
+		fmt.Fprintf(w, "    %-16s %s\n", "Disk", formatBytes(result.Device.Resources.DiskTotalBytes))
+	}
 	fmt.Fprintln(w)
 
 	// SUMMARY
@@ -314,6 +323,81 @@ func truncate(s string, max int) string {
 		return s[:max-3] + "..."
 	}
 	return s
+}
+
+// formatCPU renders the CPU summary as
+//
+//	"Apple M3 Pro (12c / 16t, arm64)"
+//
+// Each piece is omitted gracefully when the underlying field is missing
+// (e.g. ARM Linux where /proc/cpuinfo has no "model name"). Returns "" when
+// nothing is known.
+func formatCPU(res model.MachineResources) string {
+	parts := []string{}
+	if res.CPUModel != "" {
+		parts = append(parts, res.CPUModel)
+	}
+	var detail []string
+	if res.PhysicalCores > 0 {
+		detail = append(detail, fmt.Sprintf("%dc", res.PhysicalCores))
+	}
+	if res.LogicalCores > 0 {
+		detail = append(detail, fmt.Sprintf("%dt", res.LogicalCores))
+	}
+	if res.CPUArchitecture != "" {
+		detail = append(detail, res.CPUArchitecture)
+	}
+	if len(detail) == 0 {
+		if len(parts) == 0 {
+			return ""
+		}
+		return parts[0]
+	}
+	if len(parts) == 0 {
+		return "(" + joinCPUDetail(detail) + ")"
+	}
+	return parts[0] + " (" + joinCPUDetail(detail) + ")"
+}
+
+func joinCPUDetail(detail []string) string {
+	// Cores joined with " / "; arch separated by ", " for readability.
+	switch len(detail) {
+	case 1:
+		return detail[0]
+	case 2:
+		return detail[0] + " / " + detail[1]
+	default:
+		return detail[0] + " / " + detail[1] + ", " + strings.Join(detail[2:], ", ")
+	}
+}
+
+// formatBytes renders a byte count as a human-readable size using binary
+// units (GiB), but labels them in the more familiar "GB" form. Examples:
+//
+//	17179869184 -> "16 GB"
+//	494384795648 -> "460 GB"
+func formatBytes(b uint64) string {
+	if b == 0 {
+		return "0 B"
+	}
+	const (
+		kib = 1024
+		mib = 1024 * kib
+		gib = 1024 * mib
+		tib = 1024 * gib
+	)
+	switch {
+	case b >= tib:
+		return fmt.Sprintf("%.1f TB", float64(b)/float64(tib))
+	case b >= gib:
+		return fmt.Sprintf("%d GB", b/gib)
+	case b >= mib:
+		return fmt.Sprintf("%d MB", b/mib)
+	case b >= kib:
+		return fmt.Sprintf("%d KB", b/kib)
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
 }
 
 func ideDisplayName(ideType string) string {

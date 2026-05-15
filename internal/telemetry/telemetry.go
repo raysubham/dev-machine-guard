@@ -27,16 +27,17 @@ import (
 
 // Payload is the enterprise telemetry JSON structure.
 type Payload struct {
-	CustomerID     string `json:"customer_id"`
-	DeviceID       string `json:"device_id"`
-	SerialNumber   string `json:"serial_number"`
-	UserIdentity   string `json:"user_identity"`
-	Hostname       string `json:"hostname"`
-	Platform       string `json:"platform"`
-	OSVersion      string `json:"os_version"`
-	AgentVersion   string `json:"agent_version"`
-	CollectedAt    int64  `json:"collected_at"`
-	NoUserLoggedIn bool   `json:"no_user_logged_in"`
+	CustomerID     string                 `json:"customer_id"`
+	DeviceID       string                 `json:"device_id"`
+	SerialNumber   string                 `json:"serial_number"`
+	UserIdentity   string                 `json:"user_identity"`
+	Hostname       string                 `json:"hostname"`
+	Platform       string                 `json:"platform"`
+	OSVersion      string                 `json:"os_version"`
+	Resources      model.MachineResources `json:"resources"`
+	AgentVersion   string                 `json:"agent_version"`
+	CollectedAt    int64                  `json:"collected_at"`
+	NoUserLoggedIn bool                   `json:"no_user_logged_in"`
 
 	IDEExtensions        []model.Extension               `json:"ide_extensions"`
 	IDEInstallations     []model.IDE                     `json:"ide_installations"`
@@ -531,6 +532,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		Hostname:       dev.Hostname,
 		Platform:       dev.Platform,
 		OSVersion:      dev.OSVersion,
+		Resources:      dev.Resources,
 		AgentVersion:   buildinfo.Version,
 		CollectedAt:    endTime.Unix(),
 		NoUserLoggedIn: noUserLoggedIn,

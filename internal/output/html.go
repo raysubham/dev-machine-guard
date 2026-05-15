@@ -76,6 +76,8 @@ func HTML(outputFile string, result *model.ScanResult) error {
 		"typeLabel":           typeLabel,
 		"platformDisplayName": model.PlatformDisplayName,
 		"add":                 func(a, b int) int { return a + b },
+		"formatBytes":         formatBytes,
+		"formatCPU":           formatCPU,
 	}
 
 	tmpl, err := template.New("report").Funcs(funcMap).Parse(htmlTemplate)
@@ -203,6 +205,9 @@ const htmlTemplate = `<!DOCTYPE html>
   <div class="field"><span class="field-label">Serial</span><span class="field-value">{{.Device.SerialNumber}}</span></div>
   <div class="field"><span class="field-label">{{platformDisplayName .Device.Platform}}</span><span class="field-value">{{.Device.OSVersion}}</span></div>
   <div class="field"><span class="field-label">User</span><span class="field-value">{{.Device.UserIdentity}}</span></div>
+  {{with formatCPU .Device.Resources}}<div class="field"><span class="field-label">CPU</span><span class="field-value">{{.}}</span></div>{{end}}
+  {{if .Device.Resources.MemoryBytes}}<div class="field"><span class="field-label">Memory</span><span class="field-value">{{formatBytes .Device.Resources.MemoryBytes}}</span></div>{{end}}
+  {{if .Device.Resources.DiskTotalBytes}}<div class="field"><span class="field-label">Disk</span><span class="field-value">{{formatBytes .Device.Resources.DiskTotalBytes}}</span></div>{{end}}
 </div>
 
 <div class="section">

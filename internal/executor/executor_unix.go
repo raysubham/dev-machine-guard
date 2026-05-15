@@ -8,10 +8,23 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"syscall"
 )
 
 func (r *Real) IsRoot() bool {
 	return os.Getuid() == 0
+}
+
+func (r *Real) DiskCapacityBytes(path string) uint64 {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0
+	}
+	// f_blocks is in units of f_frsize (fundamental block size) per POSIX.
+	// f_bsize is the preferred I/O size, which can differ from f_frsize on
+	// some Linux filesystems and would misreport capacity. Darwin's Statfs_t
+	// has no Frsize field — statfsFragmentSize falls back to Bsize there.
+	return uint64(stat.Blocks) * statfsFragmentSize(&stat)
 }
 
 // resolveUserShell returns the given user's configured login shell on macOS by
