@@ -25,7 +25,7 @@ import (
 // user can clean it up. Codex CLI accepts both keys today but warns on
 // the old one — see https://developers.openai.com/codex/config-basic#feature-flags.
 //
-// Multi-line strings (`"""..."""`, `'''...'''`) and comments are masked
+// Multi-line strings (`"""..."""`, `”'...”'`) and comments are masked
 // before pattern matching so that user content cannot trick the
 // scanner into treating the literal text `[features]` or `hooks =
 // true` inside a string as a real table header or key.
