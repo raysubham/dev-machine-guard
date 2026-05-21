@@ -113,9 +113,38 @@ func main() {
 
 	switch cfg.Command {
 	case "configure":
-		if err := config.RunConfigure(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+		// Non-interactive path: any explicit config flag, an explicit
+		// --non-interactive, OR the DMG_API_KEY env var route configure
+		// through the no-prompt code path. This is how MSI/SCCM/Intune
+		// custom actions drive configuration — they can't talk to stdin.
+		opts := config.NonInteractiveOptions{
+			FromFile:      cfg.ConfigFromFile,
+			CustomerID:    cfg.ConfigCustomerID,
+			APIEndpoint:   cfg.ConfigAPIEndpoint,
+			APIKey:        cfg.ConfigAPIKey,
+			ScanFrequency: cfg.ConfigScanFrequency,
+		}
+		if opts.APIKey == "" {
+			// Env-var fallback keeps the secret off the msiexec command
+			// line (which lands in AppEnforce.log on every endpoint).
+			opts.APIKey = os.Getenv("DMG_API_KEY")
+		}
+		// Only forward --search-dirs to configure when the user actually
+		// passed it on this invocation. (cli.Parse defaults SearchDirs to
+		// ["$HOME"] for the scan path, which we must not persist here.)
+		if len(cfg.SearchDirs) > 0 && !(len(cfg.SearchDirs) == 1 && cfg.SearchDirs[0] == "$HOME") {
+			opts.SearchDirs = cfg.SearchDirs
+		}
+		if cfg.NonInteractive || opts.HasAny() {
+			if err := config.RunConfigureNonInteractive(opts); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			if err := config.RunConfigure(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
 		}
 
 	case "configure show":
@@ -175,8 +204,18 @@ func main() {
 		}
 
 		if telemetryErr != nil {
-			log.Error("%v", telemetryErr)
-			os.Exit(1)
+			if cfg.IgnoreTelemetryError {
+				// Opt-in tolerance for MSI/SCCM/Intune deployments: the
+				// scheduled task is already registered and will retry
+				// telemetry on its next firing, so a transient first-run
+				// network hiccup shouldn't roll back the whole install.
+				// Default (dev-workflow) behavior remains exit non-zero
+				// to surface real misconfigurations during interactive use.
+				log.Warn("initial telemetry failed (%v) — the scheduled task will retry on its next firing", telemetryErr)
+			} else {
+				log.Error("%v", telemetryErr)
+				os.Exit(1)
+			}
 		}
 		runHookStateReconcile(exec, log)
 

@@ -9,7 +9,7 @@ LDFLAGS := -s -w \
 	-X $(MODULE)/internal/buildinfo.ReleaseTag=$(TAG) \
 	-X $(MODULE)/internal/buildinfo.ReleaseBranch=$(BRANCH)
 
-.PHONY: build build-windows build-linux deploy-windows test lint clean smoke
+.PHONY: build build-windows build-windows-arm64 build-linux deploy-windows test lint clean smoke build-msi-amd64 build-msi-arm64
 
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/stepsecurity-dev-machine-guard
@@ -17,8 +17,39 @@ build:
 build-windows:
 	GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY).exe ./cmd/stepsecurity-dev-machine-guard
 
+build-windows-arm64:
+	GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY)-arm64.exe ./cmd/stepsecurity-dev-machine-guard
+
 build-linux:
 	GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY)-linux ./cmd/stepsecurity-dev-machine-guard
+
+# MSI builds. Require WiX 4 on PATH: `dotnet tool install --global wix --version 4.0.5`.
+# Output: dist/stepsecurity-dev-machine-guard-<version>-{x64,arm64}.msi
+# Reads Version from internal/buildinfo so MajorUpgrade semantics line up
+# with whatever the binary reports as `--version`.
+build-msi-amd64: build-windows
+	mkdir -p dist
+	@wix extension list --global 2>/dev/null | grep -q "WixToolset.Util.wixext" || \
+		wix extension add --global WixToolset.Util.wixext/4.0.5
+	wix build packaging/windows/Product.wxs \
+		-arch x64 \
+		-ext WixToolset.Util.wixext \
+		-d Arch=x64 \
+		-d Version=$(VERSION) \
+		-d BinaryPath=$(CURDIR)/$(BINARY).exe \
+		-out dist/stepsecurity-dev-machine-guard-$(VERSION)-x64.msi
+
+build-msi-arm64: build-windows-arm64
+	mkdir -p dist
+	@wix extension list --global 2>/dev/null | grep -q "WixToolset.Util.wixext" || \
+		wix extension add --global WixToolset.Util.wixext/4.0.5
+	wix build packaging/windows/Product.wxs \
+		-arch arm64 \
+		-ext WixToolset.Util.wixext \
+		-d Arch=arm64 \
+		-d Version=$(VERSION) \
+		-d BinaryPath=$(CURDIR)/$(BINARY)-arm64.exe \
+		-out dist/stepsecurity-dev-machine-guard-$(VERSION)-arm64.msi
 
 deploy-windows:
 	@bash scripts/deploy-windows.sh $(DEPLOY_ARGS)
@@ -30,7 +61,8 @@ lint:
 	golangci-lint run ./...
 
 clean:
-	rm -f $(BINARY) $(BINARY).exe $(BINARY)-linux
+	rm -f $(BINARY) $(BINARY).exe $(BINARY)-arm64.exe $(BINARY)-linux
+	rm -rf dist/
 
 smoke: build
 	bash tests/test_smoke_go.sh

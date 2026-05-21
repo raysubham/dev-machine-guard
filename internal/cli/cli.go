@@ -35,6 +35,26 @@ type Config struct {
 	// HooksAgent is the --agent value on `hooks install` / `hooks uninstall`;
 	// "" means "every detected agent".
 	HooksAgent string
+
+	// Non-interactive `configure` inputs. Used by MSI/SCCM and other
+	// orchestrators that can't drive a stdin prompt loop. NonInteractive
+	// is implied when any of ConfigFromFile / ConfigCustomerID /
+	// ConfigAPIEndpoint / ConfigAPIKey / ConfigScanFrequency is set,
+	// and main.go routes accordingly.
+	NonInteractive      bool
+	ConfigFromFile      string // --from-file: read full config JSON from path
+	ConfigCustomerID    string // --customer-id
+	ConfigAPIEndpoint   string // --api-endpoint
+	ConfigAPIKey        string // --api-key (also accepts env var DMG_API_KEY)
+	ConfigScanFrequency string // --scan-frequency (hours)
+
+	// IgnoreTelemetryError opts the `install` subcommand into treating an
+	// initial-telemetry POST failure as a warning rather than a fatal exit.
+	// Default behavior (flag absent) preserves dev-workflow ergonomics —
+	// a failed first telemetry surfaces misconfigurations immediately. MSI
+	// custom actions and other unattended orchestrators set this so a
+	// transient network hiccup doesn't roll back the whole install.
+	IgnoreTelemetryError bool
 }
 
 // supportedHookAgents lists the agent names accepted by `hooks --agent <name>` and `_hook <agent> ...`.
@@ -143,6 +163,50 @@ func Parse(args []string) (*Config, error) {
 				i++
 			}
 			continue // skip the i++ at the bottom
+		case arg == "--non-interactive":
+			cfg.NonInteractive = true
+		case arg == "--ignore-telemetry-error":
+			cfg.IgnoreTelemetryError = true
+		case arg == "--from-file":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--from-file requires a file path argument")
+			}
+			cfg.ConfigFromFile = args[i]
+		case strings.HasPrefix(arg, "--from-file="):
+			cfg.ConfigFromFile = strings.TrimPrefix(arg, "--from-file=")
+		case arg == "--customer-id":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--customer-id requires a value")
+			}
+			cfg.ConfigCustomerID = args[i]
+		case strings.HasPrefix(arg, "--customer-id="):
+			cfg.ConfigCustomerID = strings.TrimPrefix(arg, "--customer-id=")
+		case arg == "--api-endpoint":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--api-endpoint requires a value")
+			}
+			cfg.ConfigAPIEndpoint = args[i]
+		case strings.HasPrefix(arg, "--api-endpoint="):
+			cfg.ConfigAPIEndpoint = strings.TrimPrefix(arg, "--api-endpoint=")
+		case arg == "--api-key":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--api-key requires a value")
+			}
+			cfg.ConfigAPIKey = args[i]
+		case strings.HasPrefix(arg, "--api-key="):
+			cfg.ConfigAPIKey = strings.TrimPrefix(arg, "--api-key=")
+		case arg == "--scan-frequency":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--scan-frequency requires a value (hours)")
+			}
+			cfg.ConfigScanFrequency = args[i]
+		case strings.HasPrefix(arg, "--scan-frequency="):
+			cfg.ConfigScanFrequency = strings.TrimPrefix(arg, "--scan-frequency=")
 		case arg == "--verbose":
 			cfg.Verbose = true
 		case strings.HasPrefix(arg, "--log-level="):
@@ -314,9 +378,21 @@ Examples:
   %s configure                          # Set up enterprise config and search dirs
   %s send-telemetry                   # Enterprise telemetry
 
+Non-interactive configure (for MSI / SCCM / Intune deployments):
+  --non-interactive             Skip prompts; require values via flags or --from-file
+  --from-file PATH              Read full config JSON from PATH (preferred for MSI)
+  --customer-id ID              Customer identifier
+  --api-endpoint URL            StepSecurity backend URL
+  --api-key KEY                 Authentication key (or set DMG_API_KEY env var)
+  --scan-frequency HOURS        Scheduled scan frequency
+  --ignore-telemetry-error      On 'install', treat a failed initial telemetry POST
+                                as a warning instead of a fatal exit (use in MSI
+                                custom actions to avoid rollback on transient network)
+
 Configuration:
-  Config file: ~/.stepsecurity/config.json
-  Run '%s configure' to set enterprise credentials and search directories interactively.
+  Per-user config:    ~/.stepsecurity/config.json
+  Machine-wide (Windows, admin): C:\ProgramData\StepSecurity\config.json
+  Run '%s configure' to set credentials and search directories interactively.
 
 %s
 `, buildinfo.Version, name, name,
