@@ -122,13 +122,13 @@ func TestBuildCreateArgs_Admin(t *testing.T) {
 	for i, a := range args {
 		if a == "/ru" && i+1 < len(args) {
 			foundRU = true
-			if args[i+1] != "SYSTEM" {
-				t.Errorf("expected /ru SYSTEM, got /ru %s", args[i+1])
+			if args[i+1] != "INTERACTIVE" {
+				t.Errorf("expected /ru INTERACTIVE, got /ru %s", args[i+1])
 			}
 		}
 	}
 	if !foundRU {
-		t.Error("expected /ru SYSTEM for admin install")
+		t.Error("expected /ru INTERACTIVE for admin install")
 	}
 }
 

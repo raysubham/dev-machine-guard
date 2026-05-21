@@ -42,6 +42,21 @@ func Install(exec executor.Executor, log *progress.Logger) error {
 		return fmt.Errorf("creating log directory: %w", err)
 	}
 
+	// For admin installs the log dir lives at C:\ProgramData\StepSecurity, which
+	// inherits ACLs from C:\ProgramData and only grants non-admin users
+	// Read & Execute on the files inside. The /ru INTERACTIVE task fires under
+	// whatever user is logged on — typically a non-admin developer — and
+	// cmd.exe's `>>` redirect to agent.log would fail with Access Denied, which
+	// aborts the whole task action. Grant BUILTIN\Users (SID 545) Modify rights
+	// on the log dir, propagated to files and subfolders, so any logged-in
+	// user can append to the log files.
+	if exec.IsRoot() {
+		_, _, _, icaclsErr := exec.Run(ctx, "icacls", logDir, "/grant", "*S-1-5-32-545:(OI)(CI)M", "/Q")
+		if icaclsErr != nil {
+			log.Warn("could not adjust log dir ACLs (%v) — non-admin users may not be able to write to %s", icaclsErr, logDir)
+		}
+	}
+
 	args := buildCreateArgs(binaryPath, logDir, hours, exec.IsRoot())
 	log.Debug("schtasks create: binary=%q log_dir=%q hours=%d is_admin=%v", binaryPath, logDir, hours, exec.IsRoot())
 
@@ -101,7 +116,13 @@ func buildCreateArgs(binaryPath, logDir string, hours int, isAdmin bool) []strin
 	args := []string{"/create", "/tn", taskName, "/tr", taskCmd,
 		"/sc", "HOURLY", "/mo", strconv.Itoa(hours), "/f"}
 	if isAdmin {
-		args = append(args, "/ru", "SYSTEM")
+		// /ru INTERACTIVE binds the task to the NT AUTHORITY\INTERACTIVE
+		// well-known group (SID S-1-5-4) so it fires under the security
+		// context of whoever is interactively logged on at trigger time —
+		// picking up their HKCU, %USERPROFILE%, and PATH. /ru SYSTEM would
+		// run as NT AUTHORITY\SYSTEM, which can't see any of the user-scoped
+		// data the scanner depends on.
+		args = append(args, "/ru", "INTERACTIVE")
 	}
 	return args
 }
