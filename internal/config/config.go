@@ -11,36 +11,38 @@ import (
 
 // Default placeholders (replaced by backend for enterprise installation scripts).
 var (
-	CustomerID         = "{{CUSTOMER_ID}}"
-	APIEndpoint        = "{{API_ENDPOINT}}"
-	APIKey             = "{{API_KEY}}"
-	ScanFrequencyHours = "{{SCAN_FREQUENCY_HOURS}}"
-	SearchDirs         []string
-	EnableNPMScan      *bool  // nil=auto
-	EnableBrewScan     *bool  // nil=auto
-	EnablePythonScan   *bool  // nil=auto
-	ColorMode          string // "" means auto
-	OutputFormat       string // "" means default (pretty)
-	HTMLOutputFile     string // "" means not set
-	LogLevel           string // "" means default (info); one of error/warn/info/debug
-	InstallDir         string // "" means default (~/.stepsecurity); non-empty makes the agent put all its files (logs, hook errors, future state) under this directory. Bootstrap config.json itself stays at the legacy location. Per-run opt-out is the CLI flag --install-dir=. Resolution: --install-dir flag > STEPSECURITY_HOME env > this field > default — see internal/paths.
+	CustomerID          = "{{CUSTOMER_ID}}"
+	APIEndpoint         = "{{API_ENDPOINT}}"
+	APIKey              = "{{API_KEY}}" //#nosec G101 -- build-time placeholder substituted by the backend installer; the literal is not a real credential.
+	ScanFrequencyHours  = "{{SCAN_FREQUENCY_HOURS}}"
+	SearchDirs          []string
+	EnableNPMScan       *bool  // nil=auto
+	EnableBrewScan      *bool  // nil=auto
+	EnablePythonScan    *bool  // nil=auto
+	IncludeTCCProtected *bool  // nil=auto (skip when running under macOS launchd, scan otherwise)
+	ColorMode           string // "" means auto
+	OutputFormat        string // "" means default (pretty)
+	HTMLOutputFile      string // "" means not set
+	LogLevel            string // "" means default (info); one of error/warn/info/debug
+	InstallDir          string // "" means default (~/.stepsecurity); non-empty makes the agent put all its files (logs, hook errors, future state) under this directory. Bootstrap config.json itself stays at the legacy location. Per-run opt-out is the CLI flag --install-dir=. Resolution: --install-dir flag > STEPSECURITY_HOME env > this field > default — see internal/paths.
 )
 
 // ConfigFile is the JSON structure persisted to ~/.stepsecurity/config.json.
 type ConfigFile struct {
-	CustomerID         string   `json:"customer_id,omitempty"`
-	APIEndpoint        string   `json:"api_endpoint,omitempty"`
-	APIKey             string   `json:"api_key,omitempty"`
-	ScanFrequencyHours string   `json:"scan_frequency_hours,omitempty"`
-	SearchDirs         []string `json:"search_dirs,omitempty"`
-	EnableNPMScan      *bool    `json:"enable_npm_scan,omitempty"`
-	EnableBrewScan     *bool    `json:"enable_brew_scan,omitempty"`
-	EnablePythonScan   *bool    `json:"enable_python_scan,omitempty"`
-	ColorMode          string   `json:"color_mode,omitempty"`
-	OutputFormat       string   `json:"output_format,omitempty"`
-	HTMLOutputFile     string   `json:"html_output_file,omitempty"`
-	LogLevel           string   `json:"log_level,omitempty"`
-	InstallDir         string   `json:"install_dir,omitempty"`
+	CustomerID          string   `json:"customer_id,omitempty"`
+	APIEndpoint         string   `json:"api_endpoint,omitempty"`
+	APIKey              string   `json:"api_key,omitempty"`
+	ScanFrequencyHours  string   `json:"scan_frequency_hours,omitempty"`
+	SearchDirs          []string `json:"search_dirs,omitempty"`
+	EnableNPMScan       *bool    `json:"enable_npm_scan,omitempty"`
+	EnableBrewScan      *bool    `json:"enable_brew_scan,omitempty"`
+	EnablePythonScan    *bool    `json:"enable_python_scan,omitempty"`
+	IncludeTCCProtected *bool    `json:"include_tcc_protected,omitempty"`
+	ColorMode           string   `json:"color_mode,omitempty"`
+	OutputFormat        string   `json:"output_format,omitempty"`
+	HTMLOutputFile      string   `json:"html_output_file,omitempty"`
+	LogLevel            string   `json:"log_level,omitempty"`
+	InstallDir          string   `json:"install_dir,omitempty"`
 }
 
 // userConfigDir returns ~/.stepsecurity — the per-user config location.
@@ -151,6 +153,9 @@ func Load() {
 	}
 	if cfg.EnablePythonScan != nil && EnablePythonScan == nil {
 		EnablePythonScan = cfg.EnablePythonScan
+	}
+	if cfg.IncludeTCCProtected != nil && IncludeTCCProtected == nil {
+		IncludeTCCProtected = cfg.IncludeTCCProtected
 	}
 	if cfg.ColorMode != "" && ColorMode == "" {
 		ColorMode = cfg.ColorMode

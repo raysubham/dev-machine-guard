@@ -17,22 +17,29 @@ import (
 // failure, so the hot path bypasses cli.Parse entirely — see main.go's
 // early-return and internal/aiagents/cli.RunHook.
 type Config struct {
-	Command               string   // "", "install", "uninstall", "send-telemetry", "configure", "configure show", "hooks install", "hooks uninstall"
-	OutputFormat          string   // "pretty", "json", "html"
-	OutputFormatSet       bool     // true if --pretty/--json/--html was explicitly passed (not persisted)
-	HTMLOutputFile        string   // set by --html (not persisted)
-	ColorMode             string   // "auto", "always", "never"
-	Verbose               bool     // --verbose (shortcut for --log-level=debug)
-	LogLevel              string   // "" = unset; one of "error", "warn", "info", "debug"
-	InstallDir            string   // --install-dir=DIR base install directory; all non-bootstrap files (logs, hook errors, binary placement) live under this dir. "" w/ InstallDirSet=true means "explicitly disabled" (no file logging).
-	InstallDirSet         bool     // true if --install-dir was passed (empty value = disable file logging for this run)
-	EnableNPMScan         *bool    // nil=auto, true/false=explicit
-	EnableBrewScan        *bool    // nil=auto, true/false=explicit
-	EnablePythonScan      *bool    // nil=auto, true/false=explicit
-	IncludeBundledPlugins bool     // --include-bundled-plugins: include bundled/platform plugins in output
-	NPMRCOnly             bool     // --npmrc: run only the npmrc audit and render verbose pretty output
-	PipConfigOnly         bool     // --pipconfig: run only the pip config audit and render verbose pretty output
-	SearchDirs            []string // defaults to ["$HOME"]
+	Command               string // "", "install", "uninstall", "send-telemetry", "configure", "configure show", "hooks install", "hooks uninstall"
+	OutputFormat          string // "pretty", "json", "html"
+	OutputFormatSet       bool   // true if --pretty/--json/--html was explicitly passed (not persisted)
+	HTMLOutputFile        string // set by --html (not persisted)
+	ColorMode             string // "auto", "always", "never"
+	Verbose               bool   // --verbose (shortcut for --log-level=debug)
+	LogLevel              string // "" = unset; one of "error", "warn", "info", "debug"
+	InstallDir            string // --install-dir=DIR base install directory; all non-bootstrap files (logs, hook errors, binary placement) live under this dir. "" w/ InstallDirSet=true means "explicitly disabled" (no file logging).
+	InstallDirSet         bool   // true if --install-dir was passed (empty value = disable file logging for this run)
+	EnableNPMScan         *bool  // nil=auto, true/false=explicit
+	EnableBrewScan        *bool  // nil=auto, true/false=explicit
+	EnablePythonScan      *bool  // nil=auto, true/false=explicit
+	IncludeBundledPlugins bool   // --include-bundled-plugins: include bundled/platform plugins in output
+	// IncludeTCCProtected is tristate: nil = use the runtime default
+	// (skip only when running under launchd, where TCC prompts actually
+	// fire), true = always include the protected dirs (skipper off),
+	// false = always exclude them (skipper on). Wired via
+	// --include-tcc-protected / --no-include-tcc-protected and the
+	// matching field in config.ConfigFile.
+	IncludeTCCProtected *bool
+	NPMRCOnly           bool     // --npmrc: run only the npmrc audit and render verbose pretty output
+	PipConfigOnly       bool     // --pipconfig: run only the pip config audit and render verbose pretty output
+	SearchDirs          []string // defaults to ["$HOME"]
 
 	// HooksAgent is the --agent value on `hooks install` / `hooks uninstall`;
 	// "" means "every detected agent".
@@ -146,6 +153,12 @@ func Parse(args []string) (*Config, error) {
 			cfg.EnablePythonScan = &v
 		case arg == "--include-bundled-plugins":
 			cfg.IncludeBundledPlugins = true
+		case arg == "--include-tcc-protected":
+			v := true
+			cfg.IncludeTCCProtected = &v
+		case arg == "--no-include-tcc-protected":
+			v := false
+			cfg.IncludeTCCProtected = &v
 		case arg == "--npmrc":
 			cfg.NPMRCOnly = true
 		case arg == "--pipconfig":
@@ -404,6 +417,12 @@ Options:
   --enable-python-scan          Enable Python package scanning
   --disable-python-scan         Disable Python package scanning
   --include-bundled-plugins     Include bundled/platform plugins in output (Windows)
+  --include-tcc-protected       Scan macOS TCC-protected dirs (Documents, Downloads,
+                                ~/Library/Mail, etc.). Default: skipped only when
+                                running under launchd (where permission prompts
+                                fire); direct CLI runs scan them.
+  --no-include-tcc-protected    Force-skip macOS TCC-protected dirs even on direct
+                                CLI runs.
   --npmrc                       Run ONLY the npm config audit (verbose pretty view; --json supported)
   --pipconfig                   Run ONLY the pip config audit (verbose pretty view; --json supported)
   --log-level=LEVEL      Log level: error | warn | info | debug (default: info)

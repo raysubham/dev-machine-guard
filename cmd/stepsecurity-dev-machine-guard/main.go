@@ -84,6 +84,9 @@ func main() {
 	if cfg.EnablePythonScan == nil && config.EnablePythonScan != nil {
 		cfg.EnablePythonScan = config.EnablePythonScan
 	}
+	if cfg.IncludeTCCProtected == nil && config.IncludeTCCProtected != nil {
+		cfg.IncludeTCCProtected = config.IncludeTCCProtected
+	}
 	if cfg.ColorMode == "auto" && config.ColorMode != "" {
 		cfg.ColorMode = config.ColorMode
 	}

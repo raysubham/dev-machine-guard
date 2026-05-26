@@ -25,6 +25,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/lock"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/progress"
+	"github.com/step-security/dev-machine-guard/internal/tcc"
 )
 
 // s3UploadBackoffUnit is multiplied by attempt-number to compute the
@@ -380,6 +381,18 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	log.Debug("search directories resolved: %v", searchDirs)
 	fmt.Fprintln(os.Stderr)
 
+	// Build a TCC skipper so directory walks avoid macOS-protected dirs and
+	// don't trigger system permission prompts when the agent runs without
+	// Full Disk Access. Nil when --include-tcc-protected is set; ShouldSkip
+	// is nil-safe.
+	var tccSkipper *tcc.Skipper
+	if tcc.Enabled(cfg.IncludeTCCProtected) {
+		tccSkipper = tcc.New(executor.ResolveHome(exec))
+		if cands := tccSkipper.Candidates(); len(cands) > 0 {
+			log.Debug("tcc skip list (%d): %v", len(cands), cands)
+		}
+	}
+
 	// Detect IDEs
 	tracker.Start("ide_scan")
 	log.Progress("Detecting IDE and AI desktop app installations...")
@@ -554,7 +567,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		log.Progress("  Found %d Python global package source(s)", len(pythonGlobalPkgs))
 
 		log.Progress("Searching for Python projects...")
-		pyProjectDetector := detector.NewPythonProjectDetector(exec)
+		pyProjectDetector := detector.NewPythonProjectDetector(exec).WithSkipper(tccSkipper)
 		pythonProjects = pyProjectDetector.ListProjects(searchDirs)
 		log.Progress("  Found %d Python projects", len(pythonProjects))
 		fmt.Fprintln(os.Stderr)
@@ -653,7 +666,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		fmt.Fprintln(os.Stderr)
 
 		log.Progress("Scanning globally installed packages...")
-		nodeScanner := detector.NewNodeScanner(exec, log, loggedInUsername)
+		nodeScanner := detector.NewNodeScanner(exec, log, loggedInUsername).WithSkipper(tccSkipper)
 		// Stream sub-progress so heartbeats show "project 12 of 47" /
 		// "global: yarn" during the long-running node phase. Both
 		// ScanGlobalPackages and ScanProjects share this hook.
@@ -705,7 +718,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	// pyenv / asdf / brew installs that root's PATH wouldn't see).
 	log.Progress("Auditing npm configuration...")
 	npmrcLoggedIn, _ := exec.LoggedInUser()
-	npmrcAudit := configaudit.NewNPMRCDetector(userExec).Detect(ctx, searchDirs, npmrcLoggedIn)
+	npmrcAudit := configaudit.NewNPMRCDetector(userExec).WithSkipper(tccSkipper).Detect(ctx, searchDirs, npmrcLoggedIn)
 	log.Progress("  npm available: %v, files discovered: %d", npmrcAudit.Available, len(npmrcAudit.Files))
 	fmt.Fprintln(os.Stderr)
 
@@ -795,6 +808,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 
 	fmt.Fprintln(os.Stderr)
 	log.Progress("Telemetry collection completed successfully")
+	tccSkipper.LogHits(log.Debug)
 	return nil
 }
 
