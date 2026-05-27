@@ -17,22 +17,29 @@ import (
 // failure, so the hot path bypasses cli.Parse entirely — see main.go's
 // early-return and internal/aiagents/cli.RunHook.
 type Config struct {
-	Command               string   // "", "install", "uninstall", "send-telemetry", "configure", "configure show", "hooks install", "hooks uninstall"
-	OutputFormat          string   // "pretty", "json", "html"
-	OutputFormatSet       bool     // true if --pretty/--json/--html was explicitly passed (not persisted)
-	HTMLOutputFile        string   // set by --html (not persisted)
-	ColorMode             string   // "auto", "always", "never"
-	Verbose               bool     // --verbose (shortcut for --log-level=debug)
-	LogLevel              string   // "" = unset; one of "error", "warn", "info", "debug"
-	InstallDir            string   // --install-dir=DIR base install directory; all non-bootstrap files (logs, hook errors, binary placement) live under this dir. "" w/ InstallDirSet=true means "explicitly disabled" (no file logging).
-	InstallDirSet         bool     // true if --install-dir was passed (empty value = disable file logging for this run)
-	EnableNPMScan         *bool    // nil=auto, true/false=explicit
-	EnableBrewScan        *bool    // nil=auto, true/false=explicit
-	EnablePythonScan      *bool    // nil=auto, true/false=explicit
-	IncludeBundledPlugins bool     // --include-bundled-plugins: include bundled/platform plugins in output
-	NPMRCOnly             bool     // --npmrc: run only the npmrc audit and render verbose pretty output
-	PipConfigOnly         bool     // --pipconfig: run only the pip config audit and render verbose pretty output
-	SearchDirs            []string // defaults to ["$HOME"]
+	Command               string // "", "install", "uninstall", "send-telemetry", "configure", "configure show", "hooks install", "hooks uninstall"
+	OutputFormat          string // "pretty", "json", "html"
+	OutputFormatSet       bool   // true if --pretty/--json/--html was explicitly passed (not persisted)
+	HTMLOutputFile        string // set by --html (not persisted)
+	ColorMode             string // "auto", "always", "never"
+	Verbose               bool   // --verbose (shortcut for --log-level=debug)
+	LogLevel              string // "" = unset; one of "error", "warn", "info", "debug"
+	InstallDir            string // --install-dir=DIR base install directory; all non-bootstrap files (logs, hook errors, binary placement) live under this dir. "" w/ InstallDirSet=true means "explicitly disabled" (no file logging).
+	InstallDirSet         bool   // true if --install-dir was passed (empty value = disable file logging for this run)
+	EnableNPMScan         *bool  // nil=auto, true/false=explicit
+	EnableBrewScan        *bool  // nil=auto, true/false=explicit
+	EnablePythonScan      *bool  // nil=auto, true/false=explicit
+	IncludeBundledPlugins bool   // --include-bundled-plugins: include bundled/platform plugins in output
+	// IncludeTCCProtected is tristate: nil or false = skip the macOS
+	// TCC-protected dirs (Documents, Downloads, ~/Library/Mail, ...)
+	// so the agent never triggers permission prompts; true = scan them.
+	// Customers who have granted the agent Full Disk Access (e.g., via
+	// an MDM-pushed PPPC profile) flip this to true to opt back into
+	// full scan coverage. See docs/macos-tcc-permissions.md.
+	IncludeTCCProtected *bool
+	NPMRCOnly           bool     // --npmrc: run only the npmrc audit and render verbose pretty output
+	PipConfigOnly       bool     // --pipconfig: run only the pip config audit and render verbose pretty output
+	SearchDirs          []string // defaults to ["$HOME"]
 
 	// HooksAgent is the --agent value on `hooks install` / `hooks uninstall`;
 	// "" means "every detected agent".
@@ -146,6 +153,12 @@ func Parse(args []string) (*Config, error) {
 			cfg.EnablePythonScan = &v
 		case arg == "--include-bundled-plugins":
 			cfg.IncludeBundledPlugins = true
+		case arg == "--include-tcc-protected":
+			v := true
+			cfg.IncludeTCCProtected = &v
+		case arg == "--no-include-tcc-protected":
+			v := false
+			cfg.IncludeTCCProtected = &v
 		case arg == "--npmrc":
 			cfg.NPMRCOnly = true
 		case arg == "--pipconfig":
@@ -254,6 +267,17 @@ func Parse(args []string) (*Config, error) {
 
 	if cfg.NPMRCOnly && cfg.PipConfigOnly {
 		return nil, fmt.Errorf("--npmrc and --pipconfig are mutually exclusive; pick one")
+	}
+
+	// --install-dir= (explicit empty) disables file logging by routing
+	// paths.Home() to "" globally. That conflicts with `install` /
+	// `uninstall`, whose platform installers (systemd / launchd) call
+	// os.MkdirAll(paths.Home()) and bake STEPSECURITY_HOME into the unit
+	// file — both break or write nonsense values when Home() is empty.
+	// Reject the combination here with a clear message rather than
+	// letting the installer fail opaquely on an empty path.
+	if cfg.InstallDirSet && cfg.InstallDir == "" && (cfg.Command == "install" || cfg.Command == "uninstall") {
+		return nil, fmt.Errorf("--install-dir= (empty) cannot be combined with %s — pass a directory or omit the flag", cfg.Command)
 	}
 
 	return cfg, nil
@@ -393,6 +417,13 @@ Options:
   --enable-python-scan          Enable Python package scanning
   --disable-python-scan         Disable Python package scanning
   --include-bundled-plugins     Include bundled/platform plugins in output (Windows)
+  --include-tcc-protected       Scan macOS TCC-protected dirs (Documents, Downloads,
+                                ~/Library/Mail, etc.). Default: skipped to avoid
+                                permission prompts. Pass after granting the agent
+                                Full Disk Access via PPPC profile or System
+                                Settings — see docs/macos-tcc-permissions.md.
+  --no-include-tcc-protected    Skip macOS TCC-protected dirs even if config has
+                                include_tcc_protected: true.
   --npmrc                       Run ONLY the npm config audit (verbose pretty view; --json supported)
   --pipconfig                   Run ONLY the pip config audit (verbose pretty view; --json supported)
   --log-level=LEVEL      Log level: error | warn | info | debug (default: info)

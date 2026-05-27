@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -360,6 +361,40 @@ func TestParse_InstallDir_AbsentLeavesUnset(t *testing.T) {
 	}
 	if cfg.InstallDir != "" || cfg.InstallDirSet {
 		t.Errorf("absent --install-dir should yield InstallDir=%q InstallDirSet=%v", cfg.InstallDir, cfg.InstallDirSet)
+	}
+}
+
+// TestParse_InstallDir_EmptyRejectedForInstall guards against the
+// combination that would make systemd/launchd Install mkdir an empty
+// path: --install-dir= disables paths.Home() globally, but the install
+// command unconditionally calls os.MkdirAll(paths.Home()). Rejecting at
+// parse time gives the operator a clear error instead of an opaque
+// installer failure.
+func TestParse_InstallDir_EmptyRejectedForInstall(t *testing.T) {
+	for _, cmd := range []string{"install", "uninstall"} {
+		_, err := Parse([]string{cmd, "--install-dir="})
+		if err == nil {
+			t.Errorf("Parse(%q --install-dir=) returned nil error, want rejection", cmd)
+			continue
+		}
+		if !strings.Contains(err.Error(), "--install-dir=") || !strings.Contains(err.Error(), cmd) {
+			t.Errorf("Parse(%q --install-dir=) error %q should reference the flag and the command", cmd, err)
+		}
+	}
+}
+
+// TestParse_InstallDir_EmptyAllowedWithoutInstallCommand confirms the
+// existing "disable file logging" use case for ad-hoc scans still
+// works — the rejection only fires when paired with install/uninstall.
+func TestParse_InstallDir_EmptyAllowedWithoutInstallCommand(t *testing.T) {
+	for _, args := range [][]string{
+		{"--install-dir="},
+		{"send-telemetry", "--install-dir="},
+		{"configure", "show", "--install-dir="},
+	} {
+		if _, err := Parse(args); err != nil {
+			t.Errorf("Parse(%v) returned error %v; --install-dir= should still be valid outside install/uninstall", args, err)
+		}
 	}
 }
 
