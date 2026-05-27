@@ -7,6 +7,7 @@ import (
 	osexec "os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/step-security/dev-machine-guard/internal/config"
 	"github.com/step-security/dev-machine-guard/internal/executor"
@@ -93,6 +94,20 @@ func Install(exec executor.Executor, log *progress.Logger) error {
 	}
 	if exitCode != 0 {
 		return fmt.Errorf("failed to create scheduled task (exit code %d): %s", exitCode, stderr)
+	}
+
+	// Kick off an immediate one-shot run so the first scan happens at install
+	// time, not N hours later. `schtasks /sc HOURLY /mo N` with no /st flag
+	// sets StartBoundary to the install minute; Windows treats that as
+	// already-elapsed and waits for the next interval boundary, so the first
+	// auto-fire is N hours away. Subsequent runs come from the HOURLY
+	// trigger. Non-fatal: under unattended deploys with no interactive user
+	// logged in, /ru INTERACTIVE has nothing to bind to and /run fails — the
+	// recurring trigger still fires once a user logs on.
+	_, runStderr, runExitCode, runErr := exec.Run(ctx, "schtasks", "/run", "/tn", taskName)
+	log.Debug("schtasks /run: exit_code=%d err=%v", runExitCode, runErr)
+	if runErr != nil || runExitCode != 0 {
+		log.Warn("immediate first-run dispatch failed (exit %d): %s — recurring trigger will fire normally", runExitCode, strings.TrimSpace(runStderr))
 	}
 
 	log.Progress("Windows Task Scheduler configuration completed successfully")
