@@ -63,7 +63,7 @@ command:
 ```cmd
 msiexec /i stepsecurity-dev-machine-guard-<version>-x64.msi /qn ^
   CUSTOMERID="acme-corp" ^
-  APIENDPOINT="https://api.stepsecurity.io" ^
+  APIENDPOINT="https://agent.api.stepsecurity.io" ^
   APIKEY="sk_..." ^
   SCANFREQUENCY=4 ^
   /l*v "%TEMP%\dmg-install.log"
@@ -80,7 +80,7 @@ Drop a JSON config via GPO / Intune File preferences first:
 ```json
 {
   "customer_id": "acme-corp",
-  "api_endpoint": "https://api.stepsecurity.io",
+  "api_endpoint": "https://agent.api.stepsecurity.io",
   "api_key": "sk_...",
   "scan_frequency_hours": "4"
 }

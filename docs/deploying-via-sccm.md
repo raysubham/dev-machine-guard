@@ -49,7 +49,7 @@ Use this in the SCCM Application's **Installation program** field:
 ```cmd
 msiexec /i "stepsecurity-dev-machine-guard-<version>-x64.msi" /qn ^
   CUSTOMERID="acme-corp" ^
-  APIENDPOINT="https://api.stepsecurity.io" ^
+  APIENDPOINT="https://agent.api.stepsecurity.io" ^
   APIKEY="sk_live_xxxxxxxxxxxxxxxx" ^
   SCANFREQUENCY=4 ^
   /l*v "C:\Windows\Temp\dmg-install.log"
@@ -58,7 +58,7 @@ msiexec /i "stepsecurity-dev-machine-guard-<version>-x64.msi" /qn ^
 | Property | Required | Description |
 |----------|----------|-------------|
 | `CUSTOMERID` | yes | Your StepSecurity tenant ID |
-| `APIENDPOINT` | yes | StepSecurity backend URL (typically `https://api.stepsecurity.io`) |
+| `APIENDPOINT` | yes | StepSecurity backend URL (typically `https://agent.api.stepsecurity.io`) |
 | `APIKEY` | yes | Tenant API key from your StepSecurity dashboard |
 | `SCANFREQUENCY` | no | Scheduled scan frequency in hours (default `4`) |
 
@@ -77,7 +77,7 @@ Contents:
 ```json
 {
   "customer_id": "acme-corp",
-  "api_endpoint": "https://api.stepsecurity.io",
+  "api_endpoint": "https://agent.api.stepsecurity.io",
   "api_key": "sk_live_xxxxxxxxxxxxxxxx",
   "scan_frequency_hours": "4"
 }

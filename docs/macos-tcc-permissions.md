@@ -88,7 +88,7 @@ stepsecurity-dev-machine-guard --pretty --enable-npm-scan --no-include-tcc-prote
 ```json
 {
   "customer_id": "your-customer-id",
-  "api_endpoint": "https://api.stepsecurity.io",
+  "api_endpoint": "https://agent.api.stepsecurity.io",
   "api_key": "step_…",
   "scan_frequency_hours": "4",
   "include_tcc_protected": true

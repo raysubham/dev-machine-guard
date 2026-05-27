@@ -238,7 +238,7 @@ View current settings:
 Configuration (~/.stepsecurity/config.json):
 
   Customer ID:             my-company
-  API Endpoint:            https://api.stepsecurity.io
+  API Endpoint:            https://agent.api.stepsecurity.io
   API Key:                 ***a1b2
   Scan Frequency:          4 hours
   Search Directories:      $HOME, /Volumes/code
