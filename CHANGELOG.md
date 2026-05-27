@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See [VERSIONING.md](VERSIONING.md) for why the version starts at 1.8.1.
 
+## [1.11.5] - 2026-05-27
+
+### Added
+
+- **macOS TCC-protected directory skipping**: scanners now skip TCC-protected paths (Photos, Media Library, App Management, etc.) by default when running under launchd, avoiding spurious permission prompts and noisy denials. Hits are logged so operators can see which paths were skipped.
+- **PPPC configuration guide**: new docs explain how to grant the agent the necessary TCC permissions via a PPPC profile for environments that want full coverage.
+- **`verify-msi.ps1` script**: client-side PowerShell script for verifying the integrity and Authenticode signature of distributed MSI artifacts.
+
+### Fixed
+
+- **Empty `--install-dir` rejected**: install/uninstall commands now reject an empty `--install-dir` value instead of silently falling back to a default, preventing accidental installs to the wrong location.
+- **`install_dir` config field is authoritative**: the configured `install_dir` is now treated as the source of truth across install/uninstall paths, resolving inconsistencies when the field disagreed with runtime defaults.
+
 ## [1.11.4] - 2026-05-26
 
 ### Added
@@ -202,6 +215,7 @@ First open-source release. The scanning engine was previously an internal enterp
 - Execution log capture and base64 encoding
 - Instance locking to prevent concurrent runs
 
+[1.11.5]: https://github.com/step-security/dev-machine-guard/compare/v1.11.4...v1.11.5
 [1.11.4]: https://github.com/step-security/dev-machine-guard/compare/v1.11.3...v1.11.4
 [1.11.3]: https://github.com/step-security/dev-machine-guard/compare/v1.11.1...v1.11.3
 [1.11.1]: https://github.com/step-security/dev-machine-guard/compare/v1.11.0...v1.11.1
