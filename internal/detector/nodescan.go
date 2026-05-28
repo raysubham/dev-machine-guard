@@ -14,6 +14,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/progress"
+	"github.com/step-security/dev-machine-guard/internal/tcc"
 )
 
 const defaultMaxProjectScanBytes = 500 * 1024 * 1024 // 500MB total limit
@@ -34,6 +35,7 @@ type NodeScanner struct {
 	exec         executor.Executor
 	log          *progress.Logger
 	loggedInUser string // when non-empty and running as root, commands run as this user
+	skipper      *tcc.Skipper
 	// ProgressHook, when non-nil, is invoked from inside ScanProjects /
 	// ScanGlobalPackages with a short human-readable detail string ("project
 	// 12 of 47", "scanning yarn", ...). Telemetry plumbs this into
@@ -43,6 +45,13 @@ type NodeScanner struct {
 
 func NewNodeScanner(exec executor.Executor, log *progress.Logger, loggedInUser string) *NodeScanner {
 	return &NodeScanner{exec: exec, log: log, loggedInUser: loggedInUser}
+}
+
+// WithSkipper attaches a TCC skipper so the discovery walk skips
+// macOS-protected directories. A nil skipper is a no-op.
+func (s *NodeScanner) WithSkipper(skipper *tcc.Skipper) *NodeScanner {
+	s.skipper = skipper
+	return s
 }
 
 func (s *NodeScanner) emitProgress(detail string) {
@@ -332,6 +341,9 @@ func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string) []m
 				return nil
 			}
 			if entry.IsDir() {
+				if s.skipper.ShouldSkip(path, dir) {
+					return filepath.SkipDir
+				}
 				name := entry.Name()
 				if name == "node_modules" || name == ".git" || name == ".cache" ||
 					strings.HasPrefix(name, ".") {
