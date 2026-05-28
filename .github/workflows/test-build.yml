@@ -212,9 +212,92 @@ jobs:
           path: dist/*.msi
           if-no-files-found: error
 
+  build-intunewin:
+    name: Build .intunewin packages
+    needs: [build, build-msi]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        with:
+          egress-policy: audit
+
+      - name: Checkout repository at requested commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.commit_id }}
+
+      - name: Download MSIs from build-msi job
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-msis
+          path: dist
+
+      - name: Download IntuneWinAppUtil.exe (pinned)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Pin commit + sha256 of Microsoft's Win32 Content Prep Tool. Bump
+          # both together via PR after verifying the new binary against the
+          # repo's release notes.
+          $commit      = '1d6cfcbdf8c28edc596337031f74df951f38f718'
+          $expectedSha = 'c1ba45b5cb939e84af064bb7ff4b38fb3dfe33c8dc1078fd9b157672eae671f6'
+          $url = "https://github.com/microsoft/Microsoft-Win32-Content-Prep-Tool/raw/$commit/IntuneWinAppUtil.exe"
+          New-Item -ItemType Directory -Force -Path tools | Out-Null
+          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile tools/IntuneWinAppUtil.exe
+          $actualSha = (Get-FileHash -Algorithm SHA256 tools/IntuneWinAppUtil.exe).Hash.ToLower()
+          if ($actualSha -ne $expectedSha) {
+            Write-Error "IntuneWinAppUtil.exe sha256 mismatch. expected=$expectedSha actual=$actualSha"
+            exit 1
+          }
+
+      - name: Build .intunewin per arch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = "${{ needs.build.outputs.version }}"
+          $tool    = (Resolve-Path tools/IntuneWinAppUtil.exe).Path
+          $out     = Join-Path (Get-Location) 'dist/intunewin'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          foreach ($arch in 'x64','arm64') {
+            $src = Join-Path (Get-Location) "stage/$arch"
+            New-Item -ItemType Directory -Force -Path $src | Out-Null
+            # MSI keeps its versioned filename - install.cmd matches it via
+            # wildcard so SCCM/manual-upgrade flows reading the MSI directly
+            # see the same filename customers know.
+            Copy-Item "dist/stepsecurity-dev-machine-guard-$version-$arch.msi" -Destination $src
+            Copy-Item "packaging/windows/intune/install.cmd"   -Destination $src
+            Copy-Item "packaging/windows/intune/uninstall.cmd" -Destination $src
+
+            & $tool -c $src -s install.cmd -o $out -q
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "IntuneWinAppUtil exited $LASTEXITCODE for arch $arch"
+              exit 1
+            }
+
+            # IntuneWinAppUtil names the output after the setup file, so we
+            # rename to a versioned, arch-tagged filename for the artifact.
+            $produced = Join-Path $out 'install.intunewin'
+            $final    = Join-Path $out "stepsecurity-dev-machine-guard-$version-$arch.intunewin"
+            if (Test-Path $final) { Remove-Item -Force $final }
+            Move-Item -Path $produced -Destination $final
+          }
+          Get-ChildItem $out | Format-Table Name, Length
+
+      - name: Upload .intunewin packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-intunewin
+          path: dist/intunewin/*.intunewin
+          if-no-files-found: error
+
   comment-on-pr:
     name: Comment on PR
-    needs: [build, build-msi]
+    needs: [build, build-msi, build-intunewin]
     if: ${{ inputs.pr_id != '' }}
     runs-on: ubuntu-latest
     permissions:
@@ -238,7 +321,7 @@ jobs:
           commit_url="https://github.com/${REPO}/commit/${COMMIT_ID}"
           run_url="https://github.com/${REPO}/actions/runs/${RUN_ID}"
           body=$(cat <<EOF
-          Test binaries and MSIs are ready.
+          Test binaries, MSIs, and .intunewin packages are ready.
 
           - Built from commit: [\`${short_sha}\`](${commit_url})
           - Workflow run (download artifacts here): [${RUN_ID}](${run_url})
