@@ -122,8 +122,8 @@ match the previous app entry. The MSI writes a stable
 (component `VersionRegistry`) set to the MSI's `ProductVersion` on
 every install. Intune detection rules read that value with
 `String Equals <version>`; the rule survives ProductCode regen and
-distinguishes versions across supersedence. See
-[`docs/deploying-via-intune.md`](../../docs/deploying-via-intune.md#page-4-detection-rules).
+distinguishes versions across supersedence. See the Intune deployment
+guide for the detection-rule walkthrough.
 
 ## GUIDs
 
