@@ -18,8 +18,7 @@ func TestSkipper_ShouldSkip(t *testing.T) {
 		{"documents trailing slash", "/Users/alice/Documents/", "/Users/alice", true},
 		{"downloads skipped", "/Users/alice/Downloads", "/Users/alice", true},
 		{"desktop skipped", "/Users/alice/Desktop", "/Users/alice", true},
-		{"library mail skipped", "/Users/alice/Library/Mail", "/Users/alice", true},
-		{"icloud drive skipped", "/Users/alice/Library/Mobile Documents", "/Users/alice", true},
+		{"library root skipped", "/Users/alice/Library", "/Users/alice", true},
 		{"trash skipped", "/Users/alice/.Trash", "/Users/alice", true},
 		{"random code dir not skipped", "/Users/alice/code", "/Users/alice", false},
 		{"vscode dotdir not skipped", "/Users/alice/.vscode", "/Users/alice", false},
@@ -85,6 +84,20 @@ func TestEnabled(t *testing.T) {
 				t.Errorf("Enabled(%v) = %v, want %v", tc.override, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestSkipper_RegressionAVFoundationMediaLibraryPrompt locks in the fix
+// for the macOS 26.x (Tahoe) "Apple Music, your music and video activity,
+// and your media library" prompt that fired when the project walker
+// descended into ~/Library/Application Support/com.apple.avfoundation/
+// looking for Python venvs / Node projects / .npmrc files. Without ~/Library
+// being skipped wholesale, the walker reaches that subtree and macOS pops
+// the kTCCServiceMediaLibrary prompt at the end user.
+func TestSkipper_RegressionAVFoundationMediaLibraryPrompt(t *testing.T) {
+	s := New("/Users/alice")
+	if !s.ShouldSkip("/Users/alice/Library", "/Users/alice") {
+		t.Fatal("~/Library must be skipped to prevent walker from descending into Apple-managed TCC subtrees (e.g. Library/Application Support/com.apple.avfoundation/ → kTCCServiceMediaLibrary)")
 	}
 }
 

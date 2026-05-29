@@ -33,33 +33,29 @@ The skip list is hard-coded against the well-known TCC categories on
 modern macOS (anchored at the logged-in user's `$HOME`):
 
 ```
-~/Desktop                  ~/Library/Mail
-~/Documents                ~/Library/Messages
-~/Downloads                ~/Library/Safari
-~/Pictures                 ~/Library/Calendars
-~/Movies                   ~/Library/Reminders
-~/Music                    ~/Library/HomeKit
-~/Public                   ~/Library/Suggestions
-~/.Trash                   ~/Library/IdentityServices
-~/Library/Mobile Documents ~/Library/Metadata/CoreSpotlight
-~/Library/CloudStorage     ~/Library/PersonalizationPortrait
-~/Library/Containers       ~/Library/Application Support/AddressBook
-~/Library/Group Containers ~/Library/Application Support/CallHistoryDB
-~/Library/Application      ~/Library/Application Support/CallHistoryTransactions
-  Scripts                  ~/Library/Application Support/com.apple.TCC
-
-/Volumes/.timemachine*     (Time Machine local snapshots, prefix match)
+~/Desktop                  ~/Library
+~/Documents                ~/.Trash
+~/Downloads
+~/Pictures                 /Volumes/.timemachine*  (Time Machine local
+~/Movies                                            snapshots, prefix match)
+~/Music
+~/Public
 ```
 
-The two parent skips that look broad (`~/Library/Containers` and
-`~/Library/Group Containers`) collapse per-app sandbox containers in
-one go. Apple gates many of those subtrees behind separate TCC
-services on modern macOS — Photos for `com.apple.Photos`, Media
-Library for `com.apple.Music`, and the Sonoma "App Management" /
-"Data from other apps" prompt for arbitrary `<app>/Data` subdirs. The
-contents (per-app sandbox state) aren't meaningful inventory data for
-the agent's purpose, so the broader skip avoids three distinct popup
-categories without losing useful coverage.
+`~/Library` is skipped wholesale rather than per-subpath. Every macOS
+release adds new Apple-managed subtrees behind new TCC services —
+Sonoma added "App Management" / "Data from other apps" for arbitrary
+`<app>/Data` containers, Sequoia hardened Photos / Media Library /
+Movies, Tahoe expanded Media Library to cover
+`~/Library/Application Support/com.apple.avfoundation/` — so a curated
+allowlist of `Library/X` entries goes stale on every upgrade and
+prompts start firing again at end users. `~/Library` is the wrong
+place for developer projects, lockfiles, or `.npmrc` files anyway. The
+detectors that DO need to read specific paths under `~/Library`
+(JetBrains plugins at `~/Library/Application Support/JetBrains/...`,
+Claude desktop MCP config, pip global config) use targeted
+`ReadDir`/`ReadFile` calls that don't consult the skipper, so they
+keep working unchanged.
 
 If a search dir is explicitly named (`--search-dirs ~/Documents`) the
 walk root itself is honored — the skip only applies to TCC paths

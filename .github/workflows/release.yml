@@ -478,3 +478,143 @@ jobs:
           subject-path: |
             ${{ steps.msi.outputs.x64 }}
             ${{ steps.msi.outputs.arm64 }}
+
+      - name: Download IntuneWinAppUtil.exe (pinned)
+        shell: pwsh
+        run: |
+          # Microsoft/Microsoft-Win32-Content-Prep-Tool v1.8.7 (FIPS-compliant
+          # SHA-256, added -q silent mode).
+          # https://github.com/microsoft/Microsoft-Win32-Content-Prep-Tool/releases/tag/v1.8.7
+          # Tag v1.8.7 -> commit 1d6cfcbdf8c28edc596337031f74df951f38f718.
+          # The binary is committed directly to the repo (no release-asset CDN),
+          # so we pull it via the commit-pinned raw URL (immutable). The pinned
+          # SHA-256 below is the canonical file hash; the next step double-
+          # checks Microsoft's Authenticode signature on top.
+          $ErrorActionPreference = 'Stop'
+          $url    = 'https://raw.githubusercontent.com/microsoft/Microsoft-Win32-Content-Prep-Tool/1d6cfcbdf8c28edc596337031f74df951f38f718/IntuneWinAppUtil.exe'
+          $sha256 = 'c1ba45b5cb939e84af064bb7ff4b38fb3dfe33c8dc1078fd9b157672eae671f6'
+          $dst    = 'dist/tools/IntuneWinAppUtil.exe'
+          New-Item -ItemType Directory -Path (Split-Path $dst) -Force | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+          $actual = (Get-FileHash -Path $dst -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $sha256) {
+            Write-Error "IntuneWinAppUtil.exe SHA-256 mismatch -- expected $sha256, got $actual"
+            exit 1
+          }
+          Write-Host "IntuneWinAppUtil.exe SHA-256 verified: $actual"
+
+      - name: Verify IntuneWinAppUtil.exe Microsoft Authenticode signature
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sig = Get-AuthenticodeSignature 'dist/tools/IntuneWinAppUtil.exe'
+          $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '<none>' }
+          Write-Host "IntuneWinAppUtil.exe: Status=$($sig.Status), Signer=$subject"
+          if ($sig.Status -ne 'Valid') {
+            Write-Error "IntuneWinAppUtil.exe signature status is $($sig.Status), expected Valid"
+            exit 1
+          }
+          if ($subject -notlike '*Microsoft Corporation*') {
+            Write-Error "IntuneWinAppUtil.exe not signed by Microsoft Corporation (subject: $subject)"
+            exit 1
+          }
+
+      - name: Pack .intunewin (x64 + arm64)
+        id: intunewin
+        shell: pwsh
+        run: |
+          # IntuneWinAppUtil takes a SOURCE FOLDER (-c) and a SETUP FILE within
+          # it (-s); it packs the folder's contents into the .intunewin and
+          # records the setup file as the install entry point.
+          #
+          # The setup file is install.cmd (NOT the MSI directly). The wrapper
+          # forces verbose logging to %ProgramData%\StepSecurity\install.log on
+          # every deploy, forwards Intune's install-command args (APIKEY etc.)
+          # to msiexec via %*, and matches the MSI by wildcard so the command
+          # stays version-agnostic. uninstall.cmd ships alongside so the Intune
+          # uninstall command is a single uniform string across every version in
+          # a supersedence chain. The signed MSI is bundled in the same folder.
+          #
+          # The MSI's Authenticode signature is preserved verbatim inside the
+          # encrypted payload -- IME extracts and runs the same signed bytes on
+          # the endpoint, so the trust chain (Azure Trusted Signing -> MSI ->
+          # MSI-inside-.intunewin -> MSI-extracted-on-device) holds end-to-end.
+          #
+          # The .intunewin format itself is an encrypted ZIP and cannot be
+          # Authenticode-signed (not a PE/MSI/CAB/CAT). Sigstore signing below
+          # provides outer-layer transparency-log attestation.
+          $ErrorActionPreference = 'Stop'
+          $version = "${{ needs.release.outputs.version }}"
+          $tool    = 'dist/tools/IntuneWinAppUtil.exe'
+
+          foreach ($arch in @('x64', 'arm64')) {
+            $msiName = "stepsecurity-dev-machine-guard-$version-$arch.msi"
+            $stage   = "dist/intunewin-staging-$arch"
+            New-Item -ItemType Directory -Path $stage -Force | Out-Null
+            Copy-Item -Path "dist/$msiName"                        -Destination $stage -Force
+            Copy-Item -Path "packaging/windows/intune/install.cmd"   -Destination $stage -Force
+            Copy-Item -Path "packaging/windows/intune/uninstall.cmd" -Destination $stage -Force
+
+            & $tool -c $stage -s install.cmd -o dist -q
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "IntuneWinAppUtil.exe failed for $arch (exit $LASTEXITCODE)"
+              exit 1
+            }
+            Remove-Item -Path $stage -Recurse -Force
+
+            # IntuneWinAppUtil names the output after the setup file
+            # (install.intunewin); rename to the versioned, arch-tagged filename.
+            $produced = "dist/install.intunewin"
+            if (-not (Test-Path $produced)) {
+              Write-Error "Expected output not found: $produced"
+              exit 1
+            }
+            $final = "dist/stepsecurity-dev-machine-guard-$version-$arch.intunewin"
+            if (Test-Path $final) { Remove-Item -Path $final -Force }
+            Move-Item -Path $produced -Destination $final
+            $full = (Get-Item $final).FullName
+            "$arch=$full" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+          Get-ChildItem dist -Filter "*.intunewin" | Format-Table Name, Length
+
+      - name: Sign .intunewin with Sigstore
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.release.outputs.version }}"
+          for arch in x64 arm64; do
+            blob="dist/stepsecurity-dev-machine-guard-${version}-${arch}.intunewin"
+            bundle="${blob}.bundle"
+            for attempt in 1 2 3; do
+              if cosign sign-blob "$blob" --bundle "$bundle" --yes; then
+                echo "Signed $blob"
+                break
+              fi
+              echo "::warning::Sign attempt $attempt failed for $blob, retrying in 10s..."
+              sleep 10
+            done
+            test -f "$bundle" || { echo "::error::Failed to sign $blob"; exit 1; }
+          done
+
+      - name: Upload .intunewin and bundles to draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.release.outputs.release_tag }}"
+          version="${{ needs.release.outputs.version }}"
+          gh release upload "$tag" \
+            "dist/stepsecurity-dev-machine-guard-${version}-x64.intunewin" \
+            "dist/stepsecurity-dev-machine-guard-${version}-arm64.intunewin" \
+            "dist/stepsecurity-dev-machine-guard-${version}-x64.intunewin.bundle" \
+            "dist/stepsecurity-dev-machine-guard-${version}-arm64.intunewin.bundle" \
+            --clobber
+
+      - name: Attest .intunewin build provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            ${{ steps.intunewin.outputs.x64 }}
+            ${{ steps.intunewin.outputs.arm64 }}

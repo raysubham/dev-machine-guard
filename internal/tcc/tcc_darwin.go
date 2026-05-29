@@ -9,8 +9,23 @@ import "path/filepath"
 //   - Files & Folders (Catalina+): Desktop, Documents, Downloads
 //   - Removable / Network (Catalina+): handled via opt-in search dirs
 //   - Photos / Music / Movies (Sequoia hardened): Pictures, Movies, Music
-//   - Full Disk Access subtrees: ~/Library/Mail, Messages, Safari, etc.
-//   - Cloud sync (Sonoma+): Mobile Documents, CloudStorage
+//   - Everything under ~/Library: Mail, Messages, Safari, Mobile Documents,
+//     CloudStorage, Containers, plus the long tail of Apple-private
+//     subtrees that gain new TCC services with each macOS release.
+//
+// ~/Library is skipped wholesale rather than per-subpath. Every macOS
+// release adds new Apple-managed subtrees behind new TCC services
+// (Sonoma's App Management, Sequoia's hardened Pictures/Music/Movies,
+// Tahoe's expanded Media Library scope into
+// ~/Library/Application Support/com.apple.avfoundation/, and so on),
+// so a curated allowlist of "Library/X" entries goes stale on every
+// upgrade — at which point a previously-silent walk into one of those
+// subtrees starts firing a prompt at end users. ~/Library is the wrong
+// place for developer projects / lockfiles / npmrc files anyway; the
+// detectors that DO need to read specific paths under ~/Library
+// (JetBrains plugins, Claude desktop MCP config, pip global config)
+// use targeted ReadDir/ReadFile calls that don't consult this skipper,
+// so they're unaffected.
 var protectedSuffixes = []string{
 	"Desktop",
 	"Documents",
@@ -20,34 +35,7 @@ var protectedSuffixes = []string{
 	"Music",
 	"Public",
 	".Trash",
-
-	"Library/Mail",
-	"Library/Messages",
-	"Library/Safari",
-	"Library/Calendars",
-	"Library/Reminders",
-	"Library/HomeKit",
-	"Library/Suggestions",
-	"Library/Application Support/AddressBook",
-	"Library/Application Support/CallHistoryDB",
-	"Library/Application Support/CallHistoryTransactions",
-	"Library/Application Support/com.apple.TCC",
-	"Library/IdentityServices",
-	"Library/Metadata/CoreSpotlight",
-	"Library/PersonalizationPortrait",
-
-	// App sandbox containers — skipped wholesale because any descent into
-	// these triggers per-service prompts (Photos for com.apple.Photos,
-	// Media Library for com.apple.Music, the macOS Sonoma "App Management"
-	// / "Data from other apps" prompt for arbitrary <app>/Data subdirs).
-	// Nothing inside an app's sandbox is meaningful inventory data for
-	// dev-machine-guard's purpose, so the broader skip is a clean win.
-	"Library/Containers",
-	"Library/Group Containers",
-	"Library/Application Scripts",
-
-	"Library/Mobile Documents",
-	"Library/CloudStorage",
+	"Library",
 }
 
 // protectedAbsolutePrefixes are matched with strings.HasPrefix. Time

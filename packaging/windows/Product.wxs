@@ -88,12 +88,29 @@
                 Name="stepsecurity-dev-machine-guard-task.exe"
                 KeyPath="yes"/>
         </Component>
+        <!-- Stable registry marker for Intune/SCCM detection rules.
+             HKLM\Software\StepSecurity\AgentVersion carries the installed
+             MSI's ProductVersion. The path is stable across releases —
+             unlike the per-build ProductCode under ARP — so detection
+             rules don't need updating when the MSI is rebuilt. Equals
+             comparisons let supersedence-driven upgrades distinguish
+             versions even when the binary is at the same path. -->
+        <Component Id="VersionRegistry" Bitness="always64">
+          <RegistryValue
+              Root="HKLM"
+              Key="Software\StepSecurity"
+              Name="AgentVersion"
+              Type="string"
+              Value="$(var.Version)"
+              KeyPath="yes"/>
+        </Component>
       </Directory>
     </StandardDirectory>
 
     <Feature Id="Main" Title="Dev Machine Guard" Level="1">
       <ComponentRef Id="MainBinary"/>
       <ComponentRef Id="LauncherBinary"/>
+      <ComponentRef Id="VersionRegistry"/>
     </Feature>
 
     <!--
