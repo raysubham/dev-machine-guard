@@ -9,11 +9,13 @@ import (
 	"time"
 )
 
-// UserAwareExecutor wraps an Executor and delegates LookPath and RunWithTimeout
-// to the logged-in user when the process is running as root. This ensures that
-// commands like "brew list", "pip3 list", "npm --version" etc. execute in the
-// correct user context, since many tools refuse to run as root or return
-// different results for different users.
+// UserAwareExecutor wraps an Executor and delegates LookPath/Run/RunWithTimeout/
+// RunInDir to the logged-in user's login shell (with rc files sourced for a full
+// PATH). This ensures commands like "brew list", "pip3 list", "npm --version"
+// execute in the user's context with their real PATH — whether the agent runs
+// as root (sudo to the user) or as the user itself under a LaunchAgent. launchd
+// strips PATH in both cases, so package managers installed via nvm/fnm/homebrew
+// aren't found by a bare exec.
 //
 // All other Executor methods are forwarded unchanged.
 type UserAwareExecutor struct {
@@ -21,11 +23,17 @@ type UserAwareExecutor struct {
 	username string // logged-in user to delegate to; empty = no delegation
 }
 
-// NewUserAwareExecutor returns a wrapped executor that delegates command execution
-// to the given user when running as root on Unix. If username is empty or the
-// process is not root, all calls pass through to the inner executor unchanged.
+// NewUserAwareExecutor returns a wrapped executor that runs commands through the
+// given user's login shell (rc files sourced for a full PATH) on Unix, in both
+// deployment modes:
+//   - root (LaunchDaemon / MDM "Run Script"): RunAsUser sudo's to the user.
+//   - non-root (LaunchAgent's periodic fire): RunAsUser runs as the current user.
+//
+// launchd hands both a stripped PATH, so package managers (brew/pip3/npm via
+// nvm/fnm/homebrew/npm-global) need the user's rc-sourced shell to be resolved.
+// Passes through to the inner executor unchanged when username is empty or on Windows.
 func NewUserAwareExecutor(inner Executor, username string) Executor {
-	if username == "" || !inner.IsRoot() || inner.GOOS() == "windows" {
+	if username == "" || inner.GOOS() == "windows" {
 		return inner // no wrapping needed
 	}
 	return &UserAwareExecutor{inner: inner, username: username}
