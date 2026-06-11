@@ -20,6 +20,7 @@ const (
 	FeatureAIAgentHooks   Feature = "ai-agent-hooks"
 	FeatureNPMRCAudit     Feature = "npmrc-audit"
 	FeaturePipConfigAudit Feature = "pipconfig-audit"
+	FeatureDevMDMPolicies Feature = "developer-mdm-policies"
 )
 
 // enabled lists features safe to ship today. Uncomment a line once its
@@ -28,6 +29,11 @@ var enabled = map[Feature]bool{
 	// FeatureAIAgentHooks:   true,
 	FeatureNPMRCAudit:     true,
 	FeaturePipConfigAudit: true,
+	// FeatureDevMDMPolicies stays gated until GA: the backend's
+	// MinEnforcementAgentVersion is still a placeholder (1.13.0) and the agent
+	// version floor has not been finalized. Enable via --override-gate /
+	// STEPSECURITY_OVERRIDE_GATE=1 for dogfooding.
+	// FeatureDevMDMPolicies: true,
 }
 
 var override bool
