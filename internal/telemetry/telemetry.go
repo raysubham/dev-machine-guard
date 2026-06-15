@@ -370,13 +370,16 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	}
 	endPhase(phaseCtx, phaseCancel, tracker, log, "device_info")
 
-	// Per-device scan state for the delta-upload protocol. STEPSEC_DISABLE_SCAN_STATE=1
-	// or an unresolvable Home() disables state tracking; in those cases scanState
-	// stays nil and the rest of the run behaves as today.
+	// Per-device scan state for the delta-upload protocol. Three opt-outs:
+	//   - config.UseLegacyPackageScan = true   (persistent, set in config.json)
+	//   - STEPSEC_DISABLE_SCAN_STATE=1         (env, incident response)
+	//   - paths.Home() unresolvable            (no place to write the file)
+	// Any of the three leaves scanState nil and the run behaves as pre-1.13.
 	var scanState *state.State
 	var scanStatePath string
 	var scanStateFullSync bool
-	if os.Getenv("STEPSEC_DISABLE_SCAN_STATE") != "1" {
+	scanStateDisabled := config.UseLegacyPackageScan || os.Getenv("STEPSEC_DISABLE_SCAN_STATE") == "1"
+	if !scanStateDisabled {
 		scanStatePath = paths.ScanStateFile()
 		if scanStatePath != "" {
 			loaded, loadErr := state.Load(scanStatePath, buildinfo.Version)
@@ -388,6 +391,8 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 			log.Debug("scan-state: loaded from %s (npm=%d python=%d full_sync=%v)",
 				scanStatePath, len(scanState.NPMProjects), len(scanState.PythonProjects), scanStateFullSync)
 		}
+	} else if config.UseLegacyPackageScan {
+		log.Debug("scan-state: disabled by config.use_legacy_package_scan; falling back to full-snapshot uploads")
 	}
 
 	// Report "started" now that we have a device_id. Fire-and-forget.
