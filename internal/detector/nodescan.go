@@ -388,10 +388,13 @@ type projectEntry struct {
 	modTime int64
 }
 
-// ScanProjects finds package.json files, sorts by most recently modified, then scans.
-// Respects the size limit (default 500MB, override via STEPSEC_MAX_NODE_SCAN_BYTES).
-func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string) []model.NodeScanResult {
-	// Phase 1: Discover all package.json files
+// ScanProjects finds package.json files and scans them within the size cap.
+//
+// Ordering: never-before-seen projects (paths absent from knownLastVerified)
+// come first, sorted by mtime descending. Already-known projects follow,
+// sorted by their LastVerifiedAt ascending so the stalest are re-checked
+// first. Pass a nil map for plain mtime-descending order.
+func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string, knownLastVerified map[string]time.Time) []model.NodeScanResult {
 	var projects []projectEntry
 	for _, dir := range searchDirs {
 		s.log.Progress("  Searching in: %s", dir)
@@ -417,7 +420,6 @@ func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string) []m
 			if isInsideNodeModules(projectDir) {
 				return nil
 			}
-			// Get modification time for sorting
 			modTime := int64(0)
 			if info, err := entry.Info(); err == nil {
 				modTime = info.ModTime().Unix()
@@ -429,10 +431,7 @@ func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string) []m
 
 	s.log.Debug("node project discovery: found %d package.json files across %d search dir(s)", len(projects), len(searchDirs))
 
-	// Phase 2: Sort by modification time descending (most recent first)
-	sort.Slice(projects, func(i, j int) bool {
-		return projects[i].modTime > projects[j].modTime
-	})
+	projects = orderScanProjects(projects, knownLastVerified)
 
 	// Phase 3: Scan in order, respecting limits
 	maxBytes := getMaxProjectScanBytes()
@@ -483,6 +482,36 @@ func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string) []m
 	}
 
 	return results
+}
+
+// orderScanProjects sorts discovered projects so that paths absent from
+// knownLastVerified (never-seen projects) come first by mtime descending,
+// then known paths by LastVerifiedAt ascending (stalest first). A nil map
+// degrades to the legacy mtime-descending order.
+func orderScanProjects(projects []projectEntry, knownLastVerified map[string]time.Time) []projectEntry {
+	if len(knownLastVerified) == 0 {
+		sort.Slice(projects, func(i, j int) bool {
+			return projects[i].modTime > projects[j].modTime
+		})
+		return projects
+	}
+
+	unknown := make([]projectEntry, 0, len(projects))
+	known := make([]projectEntry, 0, len(projects))
+	for _, p := range projects {
+		if _, ok := knownLastVerified[p.dir]; ok {
+			known = append(known, p)
+		} else {
+			unknown = append(unknown, p)
+		}
+	}
+	sort.Slice(unknown, func(i, j int) bool {
+		return unknown[i].modTime > unknown[j].modTime
+	})
+	sort.Slice(known, func(i, j int) bool {
+		return knownLastVerified[known[i].dir].Before(knownLastVerified[known[j].dir])
+	})
+	return append(unknown, known...)
 }
 
 // scanProject runs the project's detected package manager in the project

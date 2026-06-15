@@ -25,7 +25,9 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/lock"
 	"github.com/step-security/dev-machine-guard/internal/model"
+	"github.com/step-security/dev-machine-guard/internal/paths"
 	"github.com/step-security/dev-machine-guard/internal/progress"
+	"github.com/step-security/dev-machine-guard/internal/state"
 	"github.com/step-security/dev-machine-guard/internal/tcc"
 )
 
@@ -366,6 +368,26 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		log.Warn("no real developer identity (UserIdentity=%q, root=%v) — telemetry will be marked no_user_logged_in", dev.UserIdentity, exec.IsRoot())
 	}
 	endPhase(phaseCtx, phaseCancel, tracker, log, "device_info")
+
+	// Per-device scan state for the delta-upload protocol. STEPSEC_DISABLE_SCAN_STATE=1
+	// or an unresolvable Home() disables state tracking; in those cases scanState
+	// stays nil and the rest of the run behaves as today.
+	var scanState *state.State
+	var scanStatePath string
+	var scanStateFullSync bool
+	if os.Getenv("STEPSEC_DISABLE_SCAN_STATE") != "1" {
+		scanStatePath = paths.ScanStateFile()
+		if scanStatePath != "" {
+			loaded, loadErr := state.Load(scanStatePath, buildinfo.Version)
+			if loadErr != nil {
+				log.Debug("scan-state: load fallback (%v) — treating as empty", loadErr)
+			}
+			scanState = loaded
+			scanStateFullSync = scanState.IsFullSyncDue(time.Now(), buildinfo.Version, state.DefaultFullSyncHorizon)
+			log.Debug("scan-state: loaded from %s (npm=%d python=%d full_sync=%v)",
+				scanStatePath, len(scanState.NPMProjects), len(scanState.PythonProjects), scanStateFullSync)
+		}
+	}
 
 	// Report "started" now that we have a device_id. Fire-and-forget.
 	reportRunStatus(ctx, log, executionID, deviceID, runStatusStarted, "", invocationMethod)
@@ -782,7 +804,14 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 
 		log.Progress("Searching for Node.js projects...")
 		scanStart := time.Now()
-		nodeProjects = nodeScanner.ScanProjects(phaseCtx, searchDirs)
+		var knownNPM map[string]time.Time
+		if scanState != nil && !scanStateFullSync {
+			knownNPM = make(map[string]time.Time, len(scanState.NPMProjects))
+			for path, entry := range scanState.NPMProjects {
+				knownNPM[path] = entry.LastVerifiedAt
+			}
+		}
+		nodeProjects = nodeScanner.ScanProjects(phaseCtx, searchDirs, knownNPM)
 		nodeScanMs = time.Since(scanStart).Milliseconds()
 		log.Progress("  Found %d Node.js projects", len(nodeProjects))
 		log.Progress("  Scan duration: %dms", nodeScanMs)
@@ -958,6 +987,10 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	}
 	endPhase(phaseCtx, phaseCancel, tracker, log, "telemetry_upload")
 
+	if scanState != nil {
+		commitScanState(log, scanState, scanStatePath, executionID, nodeProjects, scanStateFullSync)
+	}
+
 	fmt.Fprintln(os.Stderr)
 	log.Progress("Telemetry collection completed successfully")
 	tccSkipper.LogHits(log.Debug)
@@ -984,6 +1017,32 @@ func writeTelemetryFile(path string, payload *Payload) error {
 		return fmt.Errorf("telemetry-out: write payload: %w", err)
 	}
 	return nil
+}
+
+// commitScanState records the scan outcome for npm projects in the per-device
+// state file. Called only after a successful S3 upload + backend notify, so
+// the file always reflects what the backend has been told about.
+func commitScanState(log *progress.Logger, s *state.State, path, executionID string, npmResults []model.NodeScanResult, fullSync bool) {
+	npmRecords := make([]state.ScanRecord, 0, len(npmResults))
+	for _, r := range npmResults {
+		if r.ProjectPath == "" {
+			continue
+		}
+		npmRecords = append(npmRecords, state.ScanRecordFromBase64(
+			r.ProjectPath, r.PackageManager, r.PMVersion, r.RawStdoutBase64, r.ExitCode,
+		))
+	}
+
+	changed, unchanged := s.Partition(state.EcosystemNPM, npmRecords, fullSync)
+	log.Debug("scan-state: npm partition changed=%d unchanged=%d full_sync=%v", len(changed), len(unchanged), fullSync)
+
+	s.CommitAfterUpload(time.Now(), executionID, buildinfo.Version, npmRecords, nil, nil, nil, fullSync)
+
+	if err := s.Save(path); err != nil {
+		log.Warn("scan-state: save failed (%v) — next run will full-sync", err)
+		return
+	}
+	log.Debug("scan-state: saved %s", path)
 }
 
 func brewFormulaeCount(scans []model.BrewScanResult) int {
