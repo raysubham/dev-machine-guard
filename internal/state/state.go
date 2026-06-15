@@ -85,7 +85,9 @@ func New(agentVersion string) *State {
 
 // Load reads scan-state.json. Missing file, parse error, or schema mismatch
 // returns a fresh empty state — the next run becomes a full sync naturally.
-// The error is non-nil only to surface why fallback happened, for logging.
+// The returned error is non-nil only for read or parse failures (to surface
+// the cause for logging); missing file and schema mismatch return a nil error
+// because those are expected fall-throughs.
 func Load(path, agentVersion string) (*State, error) {
 	cleanedPath := filepath.Clean(path)
 	data, err := os.ReadFile(cleanedPath)
@@ -122,7 +124,8 @@ func Load(path, agentVersion string) (*State, error) {
 // Save writes scan-state.json atomically: write tmp sibling, fsync, rename.
 // On any error before the rename the original file is untouched.
 func (s *State) Save(path string) error {
-	dir := filepath.Dir(path)
+	cleanedPath := filepath.Clean(path)
+	dir := filepath.Dir(cleanedPath)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
@@ -149,7 +152,7 @@ func (s *State) Save(path string) error {
 		_ = os.Remove(tmpPath)
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	return os.Rename(tmpPath, cleanedPath)
 }
 
 // IsFullSyncDue returns true when the next upload must include every
@@ -164,7 +167,7 @@ func (s *State) IsFullSyncDue(now time.Time, runningAgentVersion string, horizon
 	if s.LastFullSyncAt.IsZero() {
 		return true
 	}
-	return now.Sub(s.LastFullSyncAt) > horizon
+	return now.Sub(s.LastFullSyncAt) >= horizon
 }
 
 // Reconcile splits the discovered project set against per-ecosystem state.
@@ -425,7 +428,7 @@ func (s *State) projectMap(ecosystem string) map[string]ProjectEntry {
 	case EcosystemPython:
 		return s.PythonProjects
 	}
-	return nil
+	panic("state: unknown ecosystem " + ecosystem)
 }
 
 func (s *State) globalMap(ecosystem string) map[string]GlobalEntry {
@@ -435,5 +438,5 @@ func (s *State) globalMap(ecosystem string) map[string]GlobalEntry {
 	case EcosystemPython:
 		return s.PythonGlobal
 	}
-	return nil
+	panic("state: unknown ecosystem " + ecosystem)
 }
