@@ -1039,6 +1039,16 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 			return err
 		}
 		log.Progress("telemetry written to %s (upload skipped)", cfg.TelemetryOutFile)
+		// Treat a successful local dump as a successful upload for the
+		// purposes of scan-state persistence so dev/stress-test runs
+		// produce comparable second-run behavior to a real upload.
+		if snap != nil {
+			if err := commitDeltaSnapshot(scanState, snap, scanStatePath, executionID, buildinfo.Version); err != nil {
+				log.Warn("scan-state: save failed (%v) — next run will full-sync", err)
+			} else {
+				log.Debug("scan-state: saved %s (telemetry-out mode)", scanStatePath)
+			}
+		}
 		return nil
 	}
 
