@@ -11,7 +11,7 @@ import (
 
 	"github.com/tailscale/hujson"
 
-	"github.com/step-security/dev-machine-guard/internal/aiagents/atomicfile"
+	"github.com/step-security/dev-machine-guard/internal/atomicfile"
 )
 
 // Writer reads, upserts, and removes the `extensions.allowed` key in the

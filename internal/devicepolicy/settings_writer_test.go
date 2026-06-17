@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/step-security/dev-machine-guard/internal/aiagents/atomicfile"
+	"github.com/step-security/dev-machine-guard/internal/atomicfile"
 )
 
 const samplePolicyObject = `{"github.copilot":true,"ms-python.python":"1.2.3"}`
