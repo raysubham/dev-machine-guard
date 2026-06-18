@@ -68,10 +68,11 @@ func CachePath() string {
 }
 
 // ReadAppliedState returns (state, true) on a successful parse, else
-// (zero, false). It never surfaces an error: a missing/corrupt file simply
-// means "no recorded ownership", and the reconciler treats that as owning
-// nothing — safe, because it then refuses to clear a value it has no record of
-// writing.
+// (zero, false). It never surfaces an error: a missing/corrupt file — or one
+// written by a newer agent (schema_version beyond this build's
+// CacheSchemaVersion) — simply means "no recorded ownership", and the
+// reconciler treats that as owning nothing: safe, because it then refuses to
+// clear a value it has no record of writing and re-applies the policy.
 func ReadAppliedState() (AppliedState, bool) {
 	path := CachePath()
 	if path == "" {
@@ -85,6 +86,21 @@ func ReadAppliedState() (AppliedState, bool) {
 	}
 	var s AppliedState
 	if err := json.Unmarshal(b, &s); err != nil {
+		return AppliedState{}, false
+	}
+	// A 0 version predates the field (or was hand-written). WriteAppliedState
+	// always stamps the version, so a genuine file from this agent is never 0;
+	// treat 0 as the current schema rather than rejecting it.
+	if s.SchemaVersion == 0 {
+		s.SchemaVersion = CacheSchemaVersion
+	}
+	// Refuse a file from a newer agent. A schema beyond what this build knows may
+	// reuse written_value / applied_hash with changed meaning; acting on data we
+	// can't interpret risks a wrong ownership or drift decision. Reporting it
+	// unreadable falls back to "owns nothing" — the reconciler re-applies and
+	// never wrongly clears. Older/equal versions share today's shape, so they
+	// read normally (a future breaking bump owns its own migration here).
+	if s.SchemaVersion > CacheSchemaVersion {
 		return AppliedState{}, false
 	}
 	return s, true
