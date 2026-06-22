@@ -52,22 +52,35 @@ Developer machines are the new attack surface. They hold high-value assets — G
 
 ## Quick Start
 
-### Install from release (recommended)
+The steps below install the binary directly and are intended for **community users** evaluating Dev Machine Guard on a single machine.
 
-Download the latest binary for your platform from [GitHub Releases](https://github.com/step-security/dev-machine-guard/releases):
+**Enterprise customers should not install the binary manually.** Deploy Dev Machine Guard across your fleet using the loader script through your MDM or EDR tooling. See the [Installation Script documentation](https://docs.stepsecurity.io/developer-machines/installation-script) for the supported, auto-updating deployment flow.
+
+### Install from release (community)
+
+Release assets are named `stepsecurity-dev-machine-guard-<version>-<os>` (for example, `stepsecurity-dev-machine-guard-1.12.0-darwin`). Rather than hardcoding a version, discover the latest asset dynamically so the command keeps working across releases.
 
 **macOS:**
 
 ```bash
-# Apple Silicon (M1/M2/M3/M4)
-curl -sSL https://github.com/step-security/dev-machine-guard/releases/latest/download/stepsecurity-dev-machine-guard_darwin_arm64 -o stepsecurity-dev-machine-guard
-chmod +x stepsecurity-dev-machine-guard
+# Discover and download the latest macOS (darwin) release asset
+ASSET=$(curl -s https://api.github.com/repos/step-security/dev-machine-guard/releases/latest \
+  | jq -r '.assets[].name | select(test("^stepsecurity-dev-machine-guard-[0-9.]+-darwin$"))')
 
-# Intel Mac
-curl -sSL https://github.com/step-security/dev-machine-guard/releases/latest/download/stepsecurity-dev-machine-guard_darwin_amd64 -o stepsecurity-dev-machine-guard
+curl -fL "https://github.com/step-security/dev-machine-guard/releases/latest/download/$ASSET" \
+  -o stepsecurity-dev-machine-guard
 chmod +x stepsecurity-dev-machine-guard
 
 # Run the scan
+./stepsecurity-dev-machine-guard
+```
+
+To pin a specific version instead, download the matching asset directly:
+
+```bash
+curl -fL https://github.com/step-security/dev-machine-guard/releases/latest/download/stepsecurity-dev-machine-guard-1.12.0-darwin \
+  -o stepsecurity-dev-machine-guard
+chmod +x stepsecurity-dev-machine-guard
 ./stepsecurity-dev-machine-guard
 ```
 
