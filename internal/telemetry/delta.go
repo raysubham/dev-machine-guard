@@ -75,10 +75,32 @@ func buildDeltaSnapshot(
 	return snap
 }
 
+// isDiskScanResult reports whether a NodeScanResult came from the disk-parse
+// path rather than the legacy command path. Disk scans leave the raw body
+// empty AND omit PMVersion (resolving it would mean running the binary we
+// deliberately don't invoke), so requiring both avoids misclassifying a legacy
+// command scan whose stdout was legitimately empty.
+func isDiskScanResult(r model.NodeScanResult) bool {
+	return r.RawStdoutBase64 == "" && r.PMVersion == ""
+}
+
 func npmRecordsFromResults(results []model.NodeScanResult) []state.ScanRecord {
 	out := make([]state.ScanRecord, 0, len(results))
 	for _, r := range results {
 		if r.ProjectPath == "" {
+			continue
+		}
+		// Disk-parse results carry structured Packages and an empty raw body;
+		// hash the parsed packages so the delta change-detector reflects the
+		// actual inventory (hashing an empty raw body would collapse every
+		// project to the same hash). The command path keeps hashing raw stdout.
+		// Gate on PMVersion being omitted too — it's a disk-scan invariant, so a
+		// legacy command scan with legitimately empty stdout still hashes its raw
+		// payload rather than being misrouted into structured hashing.
+		if isDiskScanResult(r) {
+			out = append(out, state.ScanRecordFromValue(
+				r.ProjectPath, r.PackageManager, r.PMVersion, r.Packages, r.ExitCode,
+			))
 			continue
 		}
 		out = append(out, state.ScanRecordFromBase64(
@@ -111,7 +133,15 @@ func globalRecordsFromNode(results []model.NodeScanResult) []state.GlobalRecord 
 		if r.PackageManager == "" {
 			continue
 		}
-		hash, _ := state.CanonicalHashJSON(decodeBase64OrRaw(r.RawStdoutBase64))
+		var hash string
+		if isDiskScanResult(r) {
+			// Disk-parse globals: hash the parsed packages (see
+			// npmRecordsFromResults). ScanRecordFromValue gives the same
+			// canonical hash used everywhere else for structured values.
+			hash = state.ScanRecordFromValue("", r.PackageManager, "", r.Packages, r.ExitCode).Hash
+		} else {
+			hash, _ = state.CanonicalHashJSON(decodeBase64OrRaw(r.RawStdoutBase64))
+		}
 		out = append(out, state.GlobalRecord{PM: r.PackageManager, Hash: hash, ExitCode: r.ExitCode})
 	}
 	return out

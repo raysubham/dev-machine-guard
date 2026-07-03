@@ -123,6 +123,10 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 		log.StepStart("Scanning Node.js projects")
 		start = time.Now()
 		projectDetector := detector.NewNodeProjectDetector(exec).WithSkipper(tccSkipper)
+		if !config.UseLegacyNodeScan {
+			projectDetector = projectDetector.WithDiskScan(
+				detector.NewNodeDistDetector(exec).WithSkipper(tccSkipper).WithLogger(log))
+		}
 		nodeProjects = projectDetector.ListProjects(searchDirs)
 		log.StepDone(time.Since(start))
 	} else {
