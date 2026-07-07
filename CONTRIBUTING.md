@@ -50,7 +50,7 @@ Documentation lives in the `docs/` folder. Improvements, corrections, and new gu
 
 ## Code Style
 
-See **[docs/coding-guidelines.md](docs/coding-guidelines.md)** for the full coding guidelines — the conventions this codebase already follows (package layout, cross-platform build tags, the data-driven detector pattern, error/resilience handling, the JSON/wire contract, secret redaction, testing, and CI gates). New code (human- or agent-authored) should follow it.
+See **[AGENTS.md](AGENTS.md)** for the full coding guidelines — the conventions this codebase already follows (package layout, cross-platform build tags, the data-driven detector pattern, error/resilience handling, the JSON/wire contract, secret redaction, testing, and CI gates). New code (human- or agent-authored) should follow it.
 
 - Go source code in `internal/` must pass `golangci-lint` (our CI runs it on every PR)
 - Follow the existing code patterns (package structure, naming conventions, JSON struct tags)
