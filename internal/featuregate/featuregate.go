@@ -24,6 +24,7 @@ const (
 	FeatureBunConfigAudit  Feature = "bun-config-audit"
 	FeatureYarnConfigAudit Feature = "yarn-config-audit"
 	FeatureDevicePolicy    Feature = "device-policy"
+	FeatureAgentSkillsScan Feature = "agent-skills-scan"
 )
 
 // enabled lists features safe to ship today. Uncomment a line once its
@@ -35,6 +36,13 @@ var enabled = map[Feature]bool{
 	FeaturePnpmConfigAudit: true,
 	FeatureBunConfigAudit:  true,
 	FeatureYarnConfigAudit: true,
+	// Agent skills inventory ships on by default: metadata + content hashes only,
+	// never file content. To disable, comment out this line and rebuild — there
+	// is deliberately NO per-feature env kill-switch (the shared
+	// STEPSECURITY_OVERRIDE_GATE only force-ENABLES features). When disabled, no
+	// scan section is emitted, which is indistinguishable from "no information",
+	// so no skill state is affected.
+	FeatureAgentSkillsScan: true,
 	// FeatureDevicePolicy stays gated until GA: the backend's
 	// MinEnforcementAgentVersion is still a placeholder (1.13.0) and the agent
 	// version floor has not been finalized. Enable via --override-gate /

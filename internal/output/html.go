@@ -26,6 +26,7 @@ type htmlData struct {
 	PythonPkgManagers []model.PkgManager
 	PythonPackages    []model.PythonPackage
 	PythonProjects    []model.ProjectInfo
+	AgentSkills       []model.AgentSkill
 	Summary           model.Summary
 }
 
@@ -68,6 +69,7 @@ func HTML(outputFile string, result *model.ScanResult) error {
 		PythonPkgManagers: result.PythonPkgManagers,
 		PythonPackages:    result.PythonPackages,
 		PythonProjects:    result.PythonProjects,
+		AgentSkills:       result.AgentSkills,
 		Summary:           result.Summary,
 	}
 
@@ -195,6 +197,7 @@ const htmlTemplate = `<!DOCTYPE html>
   <div class="card"><div class="number">{{.Summary.IDEInstallationsCount}}</div><div class="label">IDEs & Apps</div></div>
   <div class="card"><div class="number">{{.Summary.IDEExtensionsCount}}</div><div class="label">IDE Extensions</div></div>
   <div class="card"><div class="number">{{.Summary.MCPConfigsCount}}</div><div class="label">MCP Servers</div></div>
+  <div class="card"><div class="number">{{.Summary.AgentSkillsCount}}</div><div class="label">Agent Skills</div></div>
   <div class="card"><div class="number">{{.Summary.NodeProjectsCount}}</div><div class="label">Node.js Projects</div></div>
   <div class="card"><div class="number">{{add .Summary.BrewFormulaeCount .Summary.BrewCasksCount}}</div><div class="label">Brew Packages</div></div>
   <div class="card"><div class="number">{{.Summary.PythonProjectsCount}}</div><div class="label">Python Venvs</div></div>
@@ -248,6 +251,20 @@ const htmlTemplate = `<!DOCTYPE html>
     <tr><th>Source</th><th>Vendor</th></tr>
     {{if .MCPConfigs}}{{range .MCPConfigs}}<tr><td>{{.ConfigSource}}</td><td>{{.Vendor}}</td></tr>
     {{end}}{{else}}<tr><td colspan="2" style="text-align:center;color:#8a94a6;">None detected</td></tr>{{end}}
+  </table>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-header" onclick="toggleSection(this)">
+    <h2>Agent Skills <span class="count">{{.Summary.AgentSkillsCount}}</span></h2>
+    <span class="toggle">&#9660;</span>
+  </div>
+  <div class="section-body">
+  <table>
+    <tr><th>Skill</th><th>Agent</th><th>Source</th><th>Scope</th><th>Managed By</th><th>On Disk</th></tr>
+    {{if .AgentSkills}}{{range .AgentSkills}}<tr><td>{{.SkillName}}</td><td>{{.Agent}}</td><td>{{.Source}}</td><td>{{.Scope}}</td><td>{{if .ManagedBy}}{{.ManagedBy}}{{else}}&mdash;{{end}}</td><td>{{if .PresentOnDisk}}yes{{else}}no{{end}}</td></tr>
+    {{end}}{{else}}<tr><td colspan="6" style="text-align:center;color:#8a94a6;">None detected</td></tr>{{end}}
   </table>
   </div>
 </div>

@@ -58,6 +58,7 @@ func Pretty(w io.Writer, result *model.ScanResult, colorMode string) error {
 	fmt.Fprintf(w, "    %-24s %s%d%s\n", "IDEs & Desktop Apps", c.green, result.Summary.IDEInstallationsCount, c.reset)
 	fmt.Fprintf(w, "    %-24s %s%d%s\n", "IDE Extensions", c.green, result.Summary.IDEExtensionsCount, c.reset)
 	fmt.Fprintf(w, "    %-24s %s%d%s\n", "MCP Servers", c.green, result.Summary.MCPConfigsCount, c.reset)
+	fmt.Fprintf(w, "    %-24s %s%d%s\n", "Agent Skills", c.green, result.Summary.AgentSkillsCount, c.reset)
 	if len(result.NodePkgManagers) > 0 {
 		fmt.Fprintf(w, "    %-24s %s%d%s\n", "Node.js Projects", c.green, result.Summary.NodeProjectsCount, c.reset)
 	}
@@ -118,6 +119,25 @@ func Pretty(w io.Writer, result *model.ScanResult, colorMode string) error {
 	if len(result.MCPConfigs) > 0 {
 		for _, cfg := range result.MCPConfigs {
 			fmt.Fprintf(w, "    %-24s %s%s%s\n", cfg.ConfigSource, c.dim, cfg.Vendor, c.reset)
+		}
+	} else {
+		fmt.Fprintf(w, "    %sNone detected%s\n", c.dim, c.reset)
+	}
+	fmt.Fprintln(w)
+
+	// AGENT SKILLS
+	printSectionHeader(w, c, "AGENT SKILLS", result.Summary.AgentSkillsCount)
+	if len(result.AgentSkills) > 0 {
+		for _, s := range result.AgentSkills {
+			tag := ""
+			if s.ManagedBy != "" {
+				tag = " [" + s.ManagedBy + "]"
+			}
+			if !s.PresentOnDisk {
+				tag += " [lock-only]"
+			}
+			fmt.Fprintf(w, "    %-24s %s%-18s %-11s %s%s%s\n",
+				truncate(s.SkillName, 24), c.dim, truncate(s.Source, 18), truncate(s.Agent, 11), s.Scope, tag, c.reset)
 		}
 	} else {
 		fmt.Fprintf(w, "    %sNone detected%s\n", c.dim, c.reset)

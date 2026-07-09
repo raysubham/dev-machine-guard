@@ -88,6 +88,14 @@ On Windows, `~` refers to the user's home directory (`%USERPROFILE%`). Claude De
 | Open Interpreter | `~/.config/open-interpreter/config.yaml`                         | _(same)_                                       | OpenSource|
 | Codex            | `~/.codex/config.toml`                                           | _(same)_                                       | OpenAI    |
 
+## AI Agent Skills
+
+Dev Machine Guard inventories every installed **agent skill** — a directory containing a `SKILL.md` manifest — across Claude Code, Codex, OpenCode, Cursor, the cross-agent `~/.agents` convention, and skills installed via [skills.sh](https://skills.sh). It probes each agent's global, system, project, and plugin skill directories; skills.sh lock files add upstream provenance (joined by symlink-resolved path). Detection is pure filesystem reads (no subprocesses), bounded by a 60-second budget and per-root caps.
+
+**Privacy: only metadata and a single SHA-256 hash of each `SKILL.md` are collected — no other file is ever read, and file contents are never transmitted.** The file census (counts, sizes, timestamps) comes entirely from directory listings and `stat`. For skills installed from a local path, the on-disk source path is never serialized — only the skill's alias.
+
+Per skill, the scan records identity and frontmatter (name, description, version, license, allowed tools), capability flags (load-time shell execution, hooks, plugin manifest, subagent context), a stat-only file census, the `SKILL.md` hash, and — when lock-managed — upstream provenance.
+
 ## IDE Extensions & Plugins
 
 ### VS Code-Family Extensions

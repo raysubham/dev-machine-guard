@@ -235,6 +235,22 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 		log.StepSkip("disabled (use --enable-python-scan to enable)")
 	}
 
+	// AI agent skills inventory — every installed SKILL.md across Claude Code,
+	// Codex, OpenCode, Cursor, and skills.sh-managed roots. Metadata + content
+	// hashes only, never file content. Pure filesystem reads bounded by an
+	// internal 60s budget and per-root caps. Project roots surfaced by the
+	// node/python scanners feed per-project discovery on top of the detector's
+	// own ~/.claude.json registry.
+	var agentSkills []model.AgentSkill
+	var agentSkillScan *model.AgentSkillScanInfo
+	if featuregate.IsEnabled(featuregate.FeatureAgentSkillsScan) {
+		log.StepStart("Collecting AI agent skills")
+		start = time.Now()
+		skillsDetector := detector.NewSkillsDetector(exec)
+		agentSkills, agentSkillScan = skillsDetector.Detect(ctx, detector.CollectProjectRoots(nodeProjects, pythonProjects))
+		log.StepDone(time.Since(start))
+	}
+
 	// npm config audit — surface-only inventory of every .npmrc on the host
 	// plus the merged effective view npm itself would resolve. The audit is
 	// cheap (a few stat calls and at most two npm invocations) but stays
@@ -362,6 +378,8 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 		PnpmAudit:         pnpmAudit,
 		BunAudit:          bunAudit,
 		YarnAudit:         yarnAudit,
+		AgentSkills:       agentSkills,
+		AgentSkillScan:    agentSkillScan,
 		Summary: model.Summary{
 			AIAgentsAndToolsCount: len(aiTools),
 			IDEInstallationsCount: len(ides),
@@ -374,11 +392,12 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 			SystemPackagesCount:   len(systemPackages),
 			SnapPackagesCount:     len(snapPackages),
 			FlatpakPackagesCount:  len(flatpakPackages),
+			AgentSkillsCount:      len(agentSkills),
 		},
 	}
 
-	log.Debug("scan complete: ais=%d ides=%d extensions=%d mcp=%d node_projects=%d brew_formulae=%d brew_casks=%d python_projects=%d",
-		len(aiTools), len(ides), len(extensions), len(mcpConfigs), len(nodeProjects), len(brewFormulae), len(brewCasks), len(pythonProjects))
+	log.Debug("scan complete: ais=%d ides=%d extensions=%d mcp=%d node_projects=%d brew_formulae=%d brew_casks=%d python_projects=%d agent_skills=%d",
+		len(aiTools), len(ides), len(extensions), len(mcpConfigs), len(nodeProjects), len(brewFormulae), len(brewCasks), len(pythonProjects), len(agentSkills))
 	tccSkipper.LogHits(log.Warn)
 
 	// Output
