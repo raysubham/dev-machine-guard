@@ -233,16 +233,24 @@ func (d *SkillsDetector) resolveProjectRoots(project string, info *model.AgentSk
 }
 
 // discoverProjects unions Claude Code's project registry with node/python
-// roots, dedupes on absolute symlink-resolved path, drops stale (missing) dirs,
-// and caps at maxProjects (sorted, deterministic).
+// roots, dedupes on absolute symlink-resolved path, drops stale (missing) dirs
+// and the home directory itself, and caps at maxProjects (sorted,
+// deterministic). Home is excluded because its dotfile skill dirs
+// (~/.claude/skills, ~/.agents/skills, …) are already the global roots; treating
+// home as a project would re-scan those same dirs and re-emit every global skill
+// as a project-scoped duplicate.
 func (d *SkillsDetector) discoverProjects(extra []string, info *model.AgentSkillScanInfo) []string {
 	seen := map[string]bool{}
+	home := d.resolvePath(getHomeDir(d.exec))
 	var out []string
 	consider := func(p string) {
 		if p == "" {
 			return
 		}
 		resolved := d.resolvePath(p)
+		if home != "" && resolved == home {
+			return // home is never a project — its skill dirs are the global roots
+		}
 		if seen[resolved] {
 			return
 		}

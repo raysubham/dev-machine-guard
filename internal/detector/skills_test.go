@@ -691,6 +691,49 @@ func TestDetect_HappyPath(t *testing.T) {
 	}
 }
 
+// TestDetect_HomeNotTreatedAsProject guards against re-emitting every global
+// skill as a project-scoped duplicate when the home directory itself appears in
+// the ~/.claude.json project registry (it does whenever Claude Code has been run
+// from $HOME). Home's dotfile skill dirs are the global roots, so home must be
+// excluded from project discovery — while a genuine project under home is still
+// scanned.
+func TestDetect_HomeNotTreatedAsProject(t *testing.T) {
+	m, fs := newSkillsMock()
+	// Global claude skill under ~/.claude/skills.
+	fs.addSkill(testHome+"/.claude/skills/glob", "SKILL.md", validFrontmatter("glob", "d"), nil)
+	// A genuine project (distinct from home) with its own skill.
+	fs.addSkill(testHome+"/proj/.claude/skills/pj", "SKILL.md", validFrontmatter("pj", "d"), nil)
+	// ~/.claude.json lists BOTH home itself and the real project.
+	fs.addFile(testHome+"/.claude.json",
+		`{"projects":{"`+testHome+`":{},"`+testHome+`/proj":{}}}`)
+	fs.commit()
+
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+
+	// Global skill is still found, as claude_user/global.
+	if findSkill(records, "claude_user", "glob") == nil {
+		t.Fatalf("global skill missing; records=%+v", records)
+	}
+	// No record may be attributed to home-as-project, and the global skill must
+	// not be duplicated under claude_project.
+	for i := range records {
+		if records[i].ProjectPath == testHome {
+			t.Errorf("record carries project_path == home (spurious home-as-project): %+v", records[i])
+		}
+	}
+	if rec := findSkill(records, "claude_project", "glob"); rec != nil {
+		t.Errorf("global skill re-emitted as project duplicate: %+v", rec)
+	}
+	// A genuine project under home is still discovered.
+	rec := findSkill(records, "claude_project", "pj")
+	if rec == nil {
+		t.Fatalf("real project skill missing; records=%+v", records)
+	}
+	if rec.ProjectPath != testHome+"/proj" {
+		t.Errorf("project skill project_path = %q, want %q", rec.ProjectPath, testHome+"/proj")
+	}
+}
+
 func TestDetect_NestedSkillRootRel(t *testing.T) {
 	m, fs := newSkillsMock()
 	// Skill nested two levels below the root; intermediate dirs are not skills.
