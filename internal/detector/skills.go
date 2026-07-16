@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -31,6 +32,15 @@ const (
 	maxScanErrors       = 50               // bounded error list
 	maxScanErrorLen     = 256              // per-error char cap
 	skillsPhaseBudget   = 60 * time.Second // overall phase deadline
+)
+
+// Home-walk caps. Package-level vars (not const) so the truncation paths can be
+// exercised in tests without materializing pathological directory trees; the
+// values are the production defaults.
+var (
+	maxHomeWalkDirs       = 100_000 // ReadDir calls across all search dirs before truncating
+	maxHomeWalkDepth      = 12      // recursion depth below each search-dir root
+	maxHomeWalkCandidates = 1_000   // project-root candidates emitted before truncating
 )
 
 // codeExtensions are files an agent or the OS executes directly — the script
@@ -129,8 +139,11 @@ type discoveredSkill struct {
 // also self-discovers projects from ~/.claude.json. It never returns a hard
 // error — every failure degrades to an AgentSkillScanInfo.Errors entry and the
 // phase keeps going. A non-nil scan info is always returned (the backend "scan
-// ran" sentinel), even on partial results.
-func (d *SkillsDetector) Detect(ctx context.Context, extraProjectRoots []string) (skills []model.AgentSkill, info *model.AgentSkillScanInfo) {
+// ran" sentinel), even on partial results. searchDirs (default $HOME) are swept
+// for project-convention marker dirs so projects the user never registered in
+// ~/.claude.json and that no node/python scanner surfaced are still inventoried;
+// passing nil disables the walk (the registry + extra roots still apply).
+func (d *SkillsDetector) Detect(ctx context.Context, extraProjectRoots []string, searchDirs []string) (skills []model.AgentSkill, info *model.AgentSkillScanInfo) {
 	start := time.Now()
 	info = &model.AgentSkillScanInfo{}
 
@@ -171,9 +184,14 @@ func (d *SkillsDetector) Detect(ctx context.Context, extraProjectRoots []string)
 		discovered = append(discovered, d.enumerateRoot(ctx, root, info, memo)...)
 	}
 
-	// Project roots: Claude Code registry ∪ node/python roots, deduped, capped,
-	// then the candidate skill dirs are probed on each.
-	projects := d.discoverProjects(extraProjectRoots, info)
+	// Project roots: Claude Code registry ∪ node/python roots ∪ home-walk
+	// discoveries, deduped, capped, then the candidate skill dirs are probed on
+	// each. The walk is the only source that finds a project the user never
+	// registered in ~/.claude.json and that no node/python scanner surfaced;
+	// every candidate still flows through discoverProjects' shared TCC / home /
+	// dedupe / cap choke point.
+	walkRoots := d.walkForProjectRoots(ctx, searchDirs, info)
+	projects := d.discoverProjects(extraProjectRoots, walkRoots, info)
 	info.ProjectsScanned = len(projects)
 	for _, proj := range projects {
 		for _, root := range d.resolveProjectRoots(proj, info) {
@@ -254,7 +272,9 @@ func (d *SkillsDetector) resolveGlobalRoots(info *model.AgentSkillScanInfo) []sk
 	}
 	add(filepath.Join(claudeBase, "skills"), "claude_user", "claude-code", "global", "")
 
-	// agents_user: ~/.agents/skills (skills.sh + cross-client convention).
+	// agents_user: ~/.agents/skills — the shared cross-client convention read by
+	// skills.sh, Zed, and the Gemini CLI (~/.agents is Gemini's alias for its own
+	// ~/.gemini root), hence the "shared" agent label.
 	add(filepath.Join(home, ".agents", "skills"), "agents_user", "shared", "global", "")
 
 	// codex_user: ~/.codex/skills, excluding the vendor .system subdir from
@@ -277,6 +297,10 @@ func (d *SkillsDetector) resolveGlobalRoots(info *model.AgentSkillScanInfo) []sk
 	// cursor_user: ~/.cursor/skills.
 	add(filepath.Join(home, ".cursor", "skills"), "cursor_user", "cursor", "global", "")
 
+	// gemini_user: ~/.gemini/skills (Gemini CLI workspace skills; the ~/.agents
+	// alias tier is already covered by agents_user above).
+	add(filepath.Join(home, ".gemini", "skills"), "gemini_user", "gemini-cli", "global", "")
+
 	// pi_user: ~/.pi/agent/skills (note the "agent" path segment).
 	add(filepath.Join(home, ".pi", "agent", "skills"), "pi_user", "pi", "global", "")
 
@@ -294,7 +318,9 @@ func (d *SkillsDetector) resolveGlobalRoots(info *model.AgentSkillScanInfo) []sk
 }
 
 // resolveProjectRoots expands the project-relative skill dirs for one project
-// root, filtering to existing dirs and appending them to info.RootsScanned.
+// root, filtering to existing dirs and appending them to info.RootsScanned. It
+// is the authority on which per-project skill dirs exist; projectMarkerDirs
+// mirrors this list for the home walk and MUST be kept in lockstep with it.
 func (d *SkillsDetector) resolveProjectRoots(project string, info *model.AgentSkillScanInfo) []skillsRoot {
 	var roots []skillsRoot
 	add := func(rel []string, source, agent string) {
@@ -311,7 +337,7 @@ func (d *SkillsDetector) resolveProjectRoots(project string, info *model.AgentSk
 		info.RootsScanned = append(info.RootsScanned, p)
 	}
 	add([]string{".claude", "skills"}, "claude_project", "claude-code")
-	add([]string{".agents", "skills"}, "agents_project", "shared")
+	add([]string{".agents", "skills"}, "agents_project", "shared") // shared convention: skills.sh, Zed, Gemini alias
 	add([]string{".opencode", "skills"}, "opencode_project", "opencode")
 	add([]string{".opencode", "skill"}, "opencode_project", "opencode")
 	add([]string{".cursor", "skills"}, "cursor_project", "cursor")
@@ -319,21 +345,326 @@ func (d *SkillsDetector) resolveProjectRoots(project string, info *model.AgentSk
 	add([]string{".factory", "skills"}, "factory_project", "factory")
 	add([]string{".agent", "skills"}, "factory_agent_project", "factory") // singular .agent — Factory legacy, distinct from .agents
 	add([]string{".github", "skills"}, "github_project", "copilot")       // only .github/skills, never the rest of .github
+	add([]string{".gemini", "skills"}, "gemini_project", "gemini-cli")
+	add([]string{".aider", "skills"}, "aider_project", "aider") // community convention: loaded manually, but on-disk state is inventoried
 	return roots
 }
 
-// discoverProjects unions Claude Code's project registry with node/python
-// roots, dedupes on absolute symlink-resolved path, drops stale (missing) dirs
-// and the home directory itself, and caps at maxProjects (sorted,
-// deterministic). Home is excluded because its dotfile skill dirs
-// (~/.claude/skills, ~/.agents/skills, …) are already the global roots; treating
-// home as a project would re-scan those same dirs and re-emit every global skill
-// as a project-scoped duplicate.
-func (d *SkillsDetector) discoverProjects(extra []string, info *model.AgentSkillScanInfo) []string {
+// projectMarkerDirs maps each project-convention dot-directory name to the child
+// directory name(s) whose presence marks the dot-dir's parent as a project root.
+// Keep in lockstep with resolveProjectRoots: that function is the authority on
+// which per-project skill dirs are probed once a project is known, and this
+// table is how walkForProjectRoots recognizes a project it was never told about.
+// A change to one MUST change the other.
+var projectMarkerDirs = map[string][]string{
+	".claude":   {"skills"},
+	".agents":   {"skills"},
+	".opencode": {"skills", "skill"}, // both spellings, same as resolveProjectRoots
+	".cursor":   {"skills"},
+	".pi":       {"skills"},
+	".factory":  {"skills"},
+	".agent":    {"skills"}, // singular — Factory legacy, distinct from .agents
+	".github":   {"skills"}, // only .github/skills, never the rest of .github
+	".gemini":   {"skills"}, // Gemini CLI workspace skills
+	".aider":    {"skills"}, // Aider community convention (skills loaded manually)
+}
+
+// walkForProjectRoots sweeps each search dir for projectMarkerDirs and returns
+// the marker dirs' parent directories as project-root candidates for
+// discoverProjects to union in. It exists because there is no "where does code
+// live" convention to exploit, so the only way to inventory a project the user
+// never registered in ~/.claude.json and that no node/python scanner surfaced is
+// to look for the marker conventions directly.
+//
+// The walk's only filesystem primitive is executor.ReadDir, invoked only on
+// directories proven to lie outside every TCC-protected tree. Each search root is
+// first normalized to an absolute path, rejected if it lies at or under a
+// protected tree (before any ReadDir — under the default skipper-on posture the
+// walk never enters one; --include-tcc-protected is the opt-in), deduped (a root
+// nested under an accepted one is skipped), and skipped if any component of its
+// path is a symlink or non-directory (classified by listing each ancestor
+// top-down, never following a link). While descending, a protected subtree is pruned by
+// ShouldSkip BEFORE its ReadDir, directory symlinks are recognized from the
+// parent listing and never followed, and every non-marker dot-dir plus
+// node_modules (and, on Windows, the big system trees) is pruned. No Stat /
+// DirExists / EvalSymlinks / ReadFile ever runs, so macOS serves the walk without
+// touching entries and no permission prompt can fire. Candidates are deduped on
+// the absolute path here; discoverProjects re-resolves, re-guards
+// (WithinProtected), home-excludes, dedupes, and caps them. Every cap trip flags
+// info.Truncated with a bounded error, matching the existing walks.
+func (d *SkillsDetector) walkForProjectRoots(ctx context.Context, searchDirs []string, info *model.AgentSkillScanInfo) []string {
+	var candidates []string
+	seen := map[string]bool{}
+	dirsVisited := 0
+	stopped := false
+	win := d.exec.GOOS() == model.PlatformWindows
+
+	// charge accounts for one ReadDir against the dir budget and trips truncation
+	// (once) when it is exhausted. Both the walk's own ReadDir and every marker
+	// probe charge, so a wide fan-out of marker dirs cannot evade the cap.
+	charge := func() bool {
+		// Check before incrementing so WalkDirsVisited counts ReadDir calls
+		// actually made and never overshoots the cap by one.
+		if dirsVisited >= maxHomeWalkDirs {
+			if !stopped {
+				stopped = true
+				info.Truncated = true
+				d.addError(info, fmt.Sprintf("home walk truncated at %d dirs", maxHomeWalkDirs))
+			}
+			return false
+		}
+		dirsVisited++
+		return true
+	}
+
+	// emit records one project-root candidate, deduping on the raw path and
+	// tripping truncation (once) at the candidate cap.
+	emit := func(dir string) {
+		if seen[dir] {
+			return
+		}
+		if len(candidates) >= maxHomeWalkCandidates {
+			if !stopped {
+				stopped = true
+				info.Truncated = true
+				d.addError(info, fmt.Sprintf("home walk candidates truncated at %d", maxHomeWalkCandidates))
+			}
+			return
+		}
+		seen[dir] = true
+		candidates = append(candidates, dir)
+	}
+
+	var walk func(dir, root string, depth int)
+	walk = func(dir, root string, depth int) {
+		if stopped || ctx.Err() != nil {
+			return
+		}
+		// TCC choke: the first filesystem op inside a protected tree is what fires
+		// the prompt, so ShouldSkip runs before the ReadDir. Nil-safe (opt-in mode).
+		if d.skipper.ShouldSkip(dir, root) {
+			return
+		}
+		if !charge() {
+			return
+		}
+		entries, err := d.exec.ReadDir(dir)
+		if err != nil {
+			// A search root that cannot be listed means an entire discovery source
+			// may be missing — mark the scan partial so the backend keeps it
+			// non-authoritative and suppresses deletions. Deeper per-dir failures
+			// are localized and deterministic, so they do NOT flip authority (doing
+			// so would strand deletion suppression on every scan of such a machine).
+			if depth == 0 {
+				info.Truncated = true
+			}
+			d.addError(info, fmt.Sprintf("home walk read dir %s: %v", dir, err))
+			return
+		}
+
+		entMap := make(map[string]os.DirEntry, len(entries))
+		for _, e := range entries {
+			entMap[e.Name()] = e
+		}
+		for _, name := range sortedEntryNames(entries) {
+			if stopped || ctx.Err() != nil {
+				return
+			}
+			ent := entMap[name]
+			// Directory symlinks are inert: recognized from the parent listing (no
+			// stat) and never followed, so the walk cannot be steered into a
+			// protected tree, another user's home, a network mount, or a cycle.
+			if ent.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			if !ent.IsDir() {
+				continue // a plain file never classifies a project
+			}
+			childDir := filepath.Join(dir, name)
+
+			if markerChildren, ok := projectMarkerDirs[name]; ok {
+				// A marker dot-dir (e.g. .claude): its parent `dir` is a project root
+				// iff the marker dir itself holds the expected skills child. Probe by
+				// listing the marker dir (charged to the budget); never descend past
+				// it — enumerating the skills inside is enumerateRoot's job, reached
+				// via the normal project pipeline once discoverProjects admits `dir`.
+				if !charge() {
+					return
+				}
+				mEntries, err := d.exec.ReadDir(childDir)
+				if err != nil {
+					d.addError(info, fmt.Sprintf("home walk read marker %s: %v", childDir, err))
+					continue
+				}
+				if hasMarkerChild(mEntries, markerChildren) {
+					emit(dir)
+				}
+				continue
+			}
+			if strings.HasPrefix(name, ".") {
+				continue // every other hidden tree (.git, .cache, .venv, …)
+			}
+			if name == "node_modules" || (win && isWindowsNoiseDir(name)) {
+				continue
+			}
+			if depth+1 <= maxHomeWalkDepth {
+				walk(childDir, root, depth+1)
+			}
+		}
+	}
+
+	// rootIsRealDir reports whether root is a real directory reachable WITHOUT
+	// following any symlink, verified by listing each ANCESTOR top-down (never the
+	// root itself — the walk does that). Resolving the path directly
+	// (EvalSymlinks/Stat) would dereference a symlinked component into its target;
+	// for ~/link/sub with link -> ~/Documents that means statting inside a
+	// protected tree — the very TCC prompt the walk exists to avoid. Each ancestor
+	// is confirmed unprotected BEFORE it is listed, and a symlink or non-directory
+	// anywhere on the path is rejected without being followed, so a symlinked
+	// COMPONENT (not just the final one) cannot steer a ReadDir into a protected
+	// tree. Every ancestor ReadDir is charged, so root validation counts against
+	// the dir budget and WalkDirsVisited. ReadDir stays the only filesystem
+	// primitive; this matches filepath.WalkDir, which never descends a root it
+	// cannot Lstat as a directory.
+	rootIsRealDir := func(root string) bool {
+		var chain []string // [root, parent, …, anchor]
+		for p := root; ; {
+			chain = append(chain, p)
+			parent := filepath.Dir(p)
+			if parent == p {
+				break // filesystem anchor ("/" or a volume root)
+			}
+			p = parent
+		}
+		// Descend anchor -> root, classifying each child from its parent's listing.
+		for i := len(chain) - 1; i > 0; i-- {
+			parent, child := chain[i], chain[i-1]
+			if d.skipper.WithinProtected(parent) {
+				return false // listing a protected ancestor would prompt; --include-tcc-protected opts in
+			}
+			if !charge() {
+				return false
+			}
+			entries, err := d.exec.ReadDir(parent)
+			if err != nil {
+				return false
+			}
+			base := filepath.Base(child)
+			var found os.DirEntry
+			for _, e := range entries {
+				if e.Name() == base {
+					found = e
+					break
+				}
+			}
+			if found == nil || !found.IsDir() || found.Type()&os.ModeSymlink != 0 {
+				return false
+			}
+		}
+		return true
+	}
+
+	// isUnder reports whether p is at or below any of roots (path-boundary match).
+	isUnder := func(p string, roots []string) bool {
+		for _, r := range roots {
+			if p == r || strings.HasPrefix(p, r+string(filepath.Separator)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Normalize each search root to an absolute, lexically-clean path (filepath.Abs
+	// consults only os.Getwd — no stat), drop any at or under a protected tree
+	// before any filesystem op (the default skipper-on posture never enters one;
+	// --include-tcc-protected is the opt-in), and dedupe. A relative root could
+	// never match an absolute TCC tree, and a bare "." would ReadDir the process
+	// CWD and later be admitted as the project ".", duplicating every global skill.
+	home := getHomeDir(d.exec)
+	seenRoots := map[string]bool{}
+	var roots []string
+	for _, sd := range searchDirs {
+		if sd == "" {
+			continue
+		}
+		root := canonicalNoStat(sd, home)
+		if d.skipper.WithinProtected(root) || seenRoots[root] {
+			continue
+		}
+		seenRoots[root] = true
+		roots = append(roots, root)
+	}
+	// Sort so a nested root is processed after the ancestor that already covers it,
+	// letting isUnder skip the overlap (e.g. $HOME then $HOME/work) instead of
+	// re-walking the same tree and double-charging the budget.
+	sort.Strings(roots)
+	var accepted []string
+	for _, root := range roots {
+		if stopped {
+			break
+		}
+		if isUnder(root, accepted) {
+			continue // an already-accepted ancestor root walks this subtree
+		}
+		if !rootIsRealDir(root) {
+			d.addError(info, fmt.Sprintf("home walk skipped non-directory or symlinked search root %s", root))
+			continue
+		}
+		accepted = append(accepted, root)
+		walk(root, root, 0)
+	}
+
+	info.WalkDirsVisited = dirsVisited
+	info.WalkRootsFound = len(candidates)
+	return candidates
+}
+
+// hasMarkerChild reports whether entries contains a real (non-symlink) directory
+// named one of want. A symlink-typed child is deliberately not a match: honoring
+// it would require resolving the link (a stat), reintroducing a TCC residual on a
+// new path. skills.sh farms symlinks at the skill level, not the container level,
+// and a registered project with a symlinked container still resolves via
+// resolveProjectRoots — pre-existing behavior, not widened here.
+func hasMarkerChild(entries []os.DirEntry, want []string) bool {
+	for _, e := range entries {
+		if e.Type()&os.ModeSymlink != 0 || !e.IsDir() {
+			continue
+		}
+		if slices.Contains(want, e.Name()) {
+			return true
+		}
+	}
+	return false
+}
+
+// isWindowsNoiseDir reports whether name is a Windows system directory that holds
+// no project roots but enormous, junction-heavy trees — pruned by name for cost.
+// (The junctions inside surface as symlink-typed entries and are skipped anyway.)
+func isWindowsNoiseDir(name string) bool {
+	switch name {
+	case "AppData", "Application Data", "$RECYCLE.BIN", "System Volume Information":
+		return true
+	}
+	return false
+}
+
+// discoverProjects unions Claude Code's project registry with node/python roots
+// (extra) and home-walk discoveries (walkRoots), dedupes on absolute
+// symlink-resolved path, drops stale (missing) dirs and the home directory
+// itself, and caps at maxProjects (deterministic). Home is excluded because its
+// dotfile skill dirs (~/.claude/skills, ~/.agents/skills, …) are already the
+// global roots; treating home as a project would re-scan those same dirs and
+// re-emit every global skill as a project-scoped duplicate.
+//
+// The registry and extra roots are an authoritative tier: a registered or
+// scanner-surfaced project must never be evicted from the cap by a walk
+// discovery, so they are admitted first (sorted) and the walk fills only the
+// capacity they leave (also sorted). With no walkRoots the result is identical
+// to registry∪extra alone — the walk can add projects but never displace one.
+func (d *SkillsDetector) discoverProjects(extra, walkRoots []string, info *model.AgentSkillScanInfo) []string {
 	seen := map[string]bool{}
 	home := d.resolvePath(getHomeDir(d.exec))
-	var out []string
-	consider := func(p string) {
+	consider := func(p string, out *[]string) {
 		if p == "" {
 			return
 		}
@@ -341,9 +672,9 @@ func (d *SkillsDetector) discoverProjects(extra []string, info *model.AgentSkill
 		// ~/Documents) BEFORE resolvePath — EvalSymlinks stats every path
 		// component, and statting inside the protected tree is itself what fires
 		// the permission prompt we are avoiding. Canonicalize lexically only (no
-		// EvalSymlinks/Stat) so the check touches nothing on disk. Both the
-		// ~/.claude.json and node/python `extra` roots flow through here, so this
-		// one choke point covers every self-discovered project root.
+		// EvalSymlinks/Stat) so the check touches nothing on disk. Registry,
+		// node/python `extra`, and walk roots all flow through here, so this one
+		// choke point covers every self-discovered project root.
 		if d.skipper.WithinProtected(canonicalNoStat(p, home)) {
 			return
 		}
@@ -358,15 +689,25 @@ func (d *SkillsDetector) discoverProjects(extra []string, info *model.AgentSkill
 		if !d.exec.DirExists(resolved) {
 			return // stale ~/.claude.json entry — skip silently
 		}
-		out = append(out, resolved)
+		*out = append(*out, resolved)
 	}
+	// Tier 1: registry ∪ node/python roots (authoritative, sorted).
+	var primary []string
 	for _, p := range discoverClaudeProjects(d.exec) {
-		consider(p)
+		consider(p, &primary)
 	}
 	for _, p := range extra {
-		consider(p)
+		consider(p, &primary)
 	}
-	sort.Strings(out)
+	sort.Strings(primary)
+	// Tier 2: home-walk candidates fill remaining capacity. The shared `seen` set
+	// means a project already in tier 1 is not re-added, so tier 1 wins dedupe.
+	var walk []string
+	for _, p := range walkRoots {
+		consider(p, &walk)
+	}
+	sort.Strings(walk)
+	out := append(primary, walk...)
 	if len(out) > maxProjects {
 		info.Truncated = true
 		d.addError(info, fmt.Sprintf("project roots truncated: %d discovered, capped at %d", len(out), maxProjects))

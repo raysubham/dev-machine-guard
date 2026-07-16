@@ -865,7 +865,7 @@ func TestDetect_HappyPath(t *testing.T) {
 	fs.addSkill(dir, "SKILL.md", "---\nname: My Skill\ndescription: Does a thing\nversion: 2.0\nallowed-tools: Read, Bash\n---\nBody.\n", nil)
 	fs.commit()
 
-	records, info := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, info := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	if info == nil {
 		t.Fatal("nil scan info")
 	}
@@ -910,7 +910,7 @@ func TestDetect_HomeNotTreatedAsProject(t *testing.T) {
 		`{"projects":{"`+testHome+`":{},"`+testHome+`/proj":{}}}`)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 
 	// Global skill is still found, as claude_user/global.
 	if findSkill(records, "claude_user", "glob") == nil {
@@ -943,7 +943,7 @@ func TestDetect_NestedSkillRootRel(t *testing.T) {
 	fs.addSkill(dir, "SKILL.md", validFrontmatter("nested", "d"), nil)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	rec := findSkill(records, "claude_user", "b")
 	if rec == nil {
 		t.Fatalf("nested skill not found; records=%+v", records)
@@ -962,7 +962,7 @@ func TestDetect_StopAtSkill(t *testing.T) {
 	fs.addSkill(filepath.Join(root, "inner"), "SKILL.md", validFrontmatter("inner", "d"), nil)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	if findSkill(records, "claude_user", "outer") == nil {
 		t.Error("outer skill missing")
 	}
@@ -984,7 +984,7 @@ func TestDetect_DepthCap(t *testing.T) {
 	fs.addSkill(deep, "SKILL.md", validFrontmatter("toodeep", "d"), nil)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	if findSkill(records, "claude_user", "d11") != nil {
 		t.Error("skill beyond depth cap must not be discovered")
 	}
@@ -1013,7 +1013,7 @@ func TestDetect_SymlinkDepthCap(t *testing.T) {
 	fs.addSymlink(testHome+"/.claude/skills/shallowlink", shallowTarget)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	if findSkill(records, "claude_user", "deeplink") != nil {
 		t.Error("symlinked skill beyond depth cap must not be discovered")
 	}
@@ -1030,7 +1030,7 @@ func TestDetect_SkipsGitAndNodeModules(t *testing.T) {
 	fs.addSkill(filepath.Join(root, "node_modules", "n"), "SKILL.md", validFrontmatter("nm", "d"), nil)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	if findSkill(records, "claude_user", "real") == nil {
 		t.Error("real skill missing")
 	}
@@ -1048,7 +1048,7 @@ func TestDetect_CaseVariantSkillMD(t *testing.T) {
 	fs.addSkill(dir, "Skill.md", validFrontmatter("cv", "d"), nil)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	if rec := findSkill(records, "claude_user", "cv"); rec != nil {
 		t.Errorf("case-variant Skill.md must not be detected, got %+v", rec)
 	}
@@ -1064,7 +1064,7 @@ func TestDetect_SymlinkedSkill(t *testing.T) {
 	fs.addSymlink(testHome+"/.claude/skills/linked", target)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	rec := findSkill(records, "claude_user", "linked")
 	if rec == nil {
 		t.Fatalf("symlinked skill not found; records=%+v", records)
@@ -1084,7 +1084,7 @@ func TestDetect_DanglingSymlink(t *testing.T) {
 	fs.commit()
 	m.SetSymlinkError(testHome+"/.claude/skills/broken", errors.New("no such file"))
 
-	records, info := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, info := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	if len(records) != 0 {
 		t.Errorf("dangling symlink must yield no skill, got %d", len(records))
 	}
@@ -1108,7 +1108,7 @@ func TestDetect_SkillsShSymlinkLayout(t *testing.T) {
 		`{"skills":{"foo":{"source":"acme/foo","sourceType":"github","sourceUrl":"https://github.com/acme/foo","ref":"main","skillFolderHash":"tree123"}}}`)
 	fs.commit()
 
-	records, info := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, info := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	if info.SkillsFound != 1 {
 		t.Fatalf("expected 1 collapsed record, got %d: %+v", info.SkillsFound, records)
 	}
@@ -1148,7 +1148,7 @@ func TestDetect_CrossScopeSymlinkCollapse(t *testing.T) {
 	fs.addFile(testHome+"/.claude.json", `{"projects":{"`+proj+`":{}}}`)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	agents := findSkill(records, "agents_user", "shared-skill")
 	if agents == nil {
 		t.Fatalf("global record missing; records=%+v", records)
@@ -1175,7 +1175,7 @@ func TestDetect_AllSymlinkGroupCollapses(t *testing.T) {
 	fs.addSymlink(testHome+"/.cursor/skills/ext-skill", external)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	var found []model.AgentSkill
 	for _, r := range records {
 		if r.SkillSlug == "ext-skill" {
@@ -1205,7 +1205,7 @@ func TestDetect_SameSlugTwoScopesStaySeparate(t *testing.T) {
 	fs.addFile(testHome+"/.claude.json", `{"projects":{"`+proj+`":{}}}`)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	g := findSkill(records, "claude_user", "dup")
 	p := findSkill(records, "claude_project", "dup")
 	if g == nil || p == nil {
@@ -1234,7 +1234,7 @@ func TestDetect_NewAgentGlobalSources(t *testing.T) {
 	}
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	for _, c := range cases {
 		slug := filepath.Base(c.dir)
 		rec := findSkill(records, c.source, slug)
@@ -1265,7 +1265,7 @@ func TestDetect_NewAgentProjectSources(t *testing.T) {
 	fs.addFile(testHome+"/.claude.json", `{"projects":{"`+proj+`":{}}}`)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	for _, c := range cases {
 		slug := filepath.Base(c.rel)
 		rec := findSkill(records, c.source, slug)
@@ -1287,7 +1287,7 @@ func TestDetect_NewAgentFormatsNotAdopted(t *testing.T) {
 	fs.addFile(testHome+"/.pi/agent/skills/loose.md", validFrontmatter("loose", "d"))
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	if len(records) != 0 {
 		t.Errorf("skill.mdx / loose .md must not be detected, got %+v", records)
 	}
@@ -1306,7 +1306,7 @@ func TestDetect_LockV3(t *testing.T) {
 	}}`)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 
 	gh := findSkill(records, "agents_user", "gh-skill")
 	if gh == nil || gh.ManagedBy != "skills.sh" || gh.SourceType != "github" {
@@ -1355,7 +1355,7 @@ func TestDetect_LockKeyTraversalNoEnrichment(t *testing.T) {
 	}}`)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 
 	legit := findSkill(records, "agents_user", "legit")
 	if legit == nil || legit.ManagedBy != "skills.sh" {
@@ -1379,7 +1379,7 @@ func TestDetect_LockMalformed(t *testing.T) {
 	fs.addFile(testHome+"/.agents/.skill-lock.json", "{ this is not json ]")
 	fs.commit()
 
-	records, info := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, info := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	if info.LockFilesParsed != 0 {
 		t.Errorf("malformed lock must not count as parsed, got %d", info.LockFilesParsed)
 	}
@@ -1397,7 +1397,7 @@ func TestDetect_EmptyRoot(t *testing.T) {
 	fs.mkdir(testHome + "/.claude/skills") // exists but contains no skills
 	fs.commit()
 
-	records, info := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, info := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	if len(records) != 0 || info.SkillsFound != 0 {
 		t.Errorf("expected 0 skills, got %d", info.SkillsFound)
 	}
@@ -1408,7 +1408,7 @@ func TestDetect_EmptyRoot(t *testing.T) {
 
 func TestDetect_Sentinel(t *testing.T) {
 	m, _ := newSkillsMock() // nothing registered at all
-	records, info := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, info := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	if info == nil {
 		t.Fatal("scan info must be non-nil even with zero skills (backend sentinel)")
 	}
@@ -1432,7 +1432,7 @@ func (p panicExec) GOOS() string { panic("injected boom") }
 // AgentSkillScan is returned so callers still see "scan ran".
 func TestDetect_PanicStillSetsScanInfo(t *testing.T) {
 	m, _ := newSkillsMock()
-	records, info := NewSkillsDetector(panicExec{m}).Detect(context.Background(), nil)
+	records, info := NewSkillsDetector(panicExec{m}).Detect(context.Background(), nil, nil)
 
 	if info == nil {
 		t.Fatal("panic must not leave AgentSkillScan nil — that is the backend 'no info' sentinel")
@@ -1458,7 +1458,7 @@ func TestDetect_DeadlineMarksTruncated(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, info := NewSkillsDetector(m).Detect(ctx, nil)
+	_, info := NewSkillsDetector(m).Detect(ctx, nil, nil)
 	if !info.Truncated {
 		t.Error("a cancelled/deadline-exceeded scan must set Truncated")
 	}
@@ -1489,7 +1489,7 @@ func TestDetect_GlobalCapTruncates(t *testing.T) {
 	m, fs := newSkillsMock()
 	extra := seedOverCapSkills(fs)
 
-	records, info := NewSkillsDetector(m).Detect(context.Background(), extra)
+	records, info := NewSkillsDetector(m).Detect(context.Background(), extra, nil)
 	if len(records) != maxSkillsTotal {
 		t.Errorf("len(records) = %d, want %d (global cap)", len(records), maxSkillsTotal)
 	}
@@ -1522,7 +1522,7 @@ func TestDetect_PanicRecoveryAppliesGlobalCap(t *testing.T) {
 	m, fs := newSkillsMock()
 	extra := seedOverCapSkills(fs)
 
-	records, info := NewSkillsDetector(xdgPanicExec{m}).Detect(context.Background(), extra)
+	records, info := NewSkillsDetector(xdgPanicExec{m}).Detect(context.Background(), extra, nil)
 	if !hasErrorContaining(info.Errors, "panic in skills detect") {
 		t.Fatalf("expected the recovered panic in Errors, got %v", info.Errors)
 	}
@@ -1546,7 +1546,7 @@ func TestDetect_CodexSystemCarveOut(t *testing.T) {
 	fs.addSkill(filepath.Join(codex, ".system", "sys"), "SKILL.md", validFrontmatter("sys", "d"), nil)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	if findSkill(records, "codex_user", "normal") == nil {
 		t.Error("codex_user normal skill missing")
 	}
@@ -1567,7 +1567,7 @@ func TestDetect_WindowsCodexAdmin(t *testing.T) {
 	fs.addSkill(filepath.Join(adminBase, "winskill"), "SKILL.md", validFrontmatter("win", "d"), nil)
 	fs.commit()
 
-	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	rec := findSkill(records, "codex_admin", "winskill")
 	if rec == nil {
 		t.Fatalf("windows codex_admin skill not found; records=%+v", records)
@@ -1585,7 +1585,7 @@ func TestDetect_ProjectRootFromClaudeRegistry(t *testing.T) {
 	fs.addFile(testHome+"/.claude.json", `{"projects":{"`+proj+`":{}}}`)
 	fs.commit()
 
-	records, info := NewSkillsDetector(m).Detect(context.Background(), nil)
+	records, info := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
 	rec := findSkill(records, "claude_project", "ps")
 	if rec == nil {
 		t.Fatalf("project skill not found; records=%+v", records)
@@ -1607,7 +1607,7 @@ func TestDiscoverProjects_Truncation(t *testing.T) {
 		extra = append(extra, p)
 	}
 	info := &model.AgentSkillScanInfo{}
-	got := NewSkillsDetector(m).discoverProjects(extra, info)
+	got := NewSkillsDetector(m).discoverProjects(extra, nil, info)
 	if len(got) != maxProjects {
 		t.Errorf("discoverProjects len = %d, want %d", len(got), maxProjects)
 	}

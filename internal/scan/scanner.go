@@ -247,7 +247,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 		log.StepStart("Collecting AI agent skills")
 		start = time.Now()
 		skillsDetector := detector.NewSkillsDetector(exec).WithSkipper(tccSkipper)
-		agentSkills, agentSkillScan = skillsDetector.Detect(ctx, detector.CollectProjectRoots(nodeProjects, pythonProjects))
+		agentSkills, agentSkillScan = skillsDetector.Detect(ctx, detector.CollectProjectRoots(nodeProjects, pythonProjects), searchDirs)
 		log.StepDone(time.Since(start))
 	}
 

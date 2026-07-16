@@ -709,12 +709,13 @@ type AgentSkill struct {
 	HasShellInjection      bool   `json:"has_shell_injection,omitempty"`     // body has !`cmd` / ```! load-time exec
 
 	// Attribution
-	Agent  string `json:"agent"`  // "claude-code"|"codex"|"opencode"|"cursor"|"pi"|"factory"|"amp"|"copilot"|"shared"
+	Agent  string `json:"agent"`  // "claude-code"|"codex"|"opencode"|"cursor"|"pi"|"factory"|"amp"|"copilot"|"gemini-cli"|"aider"|"shared"
 	Source string `json:"source"` // atomic attribution key. "claude_user"|"claude_project"|
 	//                              // "agents_user"|"agents_project"|"codex_user"|"codex_system"|"codex_admin"|
 	//                              // "opencode_user"|"opencode_project"|"cursor_user"|"cursor_project"|"pi_user"|
 	//                              // "pi_project"|"factory_user"|"factory_project"|"factory_agent_project"|
-	//                              // "amp_user"|"copilot_user"|"github_project"
+	//                              // "amp_user"|"copilot_user"|"github_project"|"gemini_user"|"gemini_project"|
+	//                              // "aider_project"
 	Scope       string `json:"scope"`                  // "global" | "project" | "system"
 	ProjectPath string `json:"project_path,omitempty"` // project root for project scope
 	PluginName  string `json:"plugin_name,omitempty"`  // owning plugin, from skills.sh lock pluginName
@@ -763,7 +764,9 @@ type AgentSkillScanInfo struct {
 	ProjectsScanned int      `json:"projects_scanned"`
 	LockFilesParsed int      `json:"lock_files_parsed"`
 	SkillsFound     int      `json:"skills_found"`
-	Truncated       bool     `json:"truncated,omitempty"` // any cap hit (roots/projects/skills)
-	Errors          []string `json:"errors,omitempty"`    // bounded: ≤50 entries, each ≤256 chars
+	Truncated       bool     `json:"truncated,omitempty"`         // any cap hit (roots/projects/skills/home-walk)
+	Errors          []string `json:"errors,omitempty"`            // bounded: ≤50 entries, each ≤256 chars
+	WalkDirsVisited int      `json:"walk_dirs_visited,omitempty"` // home-walk ReadDir count
+	WalkRootsFound  int      `json:"walk_roots_found,omitempty"`  // project-root candidates the home walk emitted (pre-union)
 	DurationMs      int64    `json:"duration_ms"`
 }
