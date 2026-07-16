@@ -24,6 +24,7 @@ const (
 	FeatureBunConfigAudit  Feature = "bun-config-audit"
 	FeatureYarnConfigAudit Feature = "yarn-config-audit"
 	FeatureDevicePolicy    Feature = "device-policy"
+	FeatureAgentSkillsScan Feature = "agent-skills-scan"
 )
 
 // enabled lists features safe to ship today. Uncomment a line once its
@@ -36,6 +37,7 @@ var enabled = map[Feature]bool{
 	FeatureBunConfigAudit:  true,
 	FeatureYarnConfigAudit: true,
 	FeatureDevicePolicy:    true,
+	FeatureAgentSkillsScan: true,
 }
 
 var override bool

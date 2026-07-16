@@ -17,7 +17,7 @@ func TestIsEnabled_DefaultDeny(t *testing.T) {
 func TestIsEnabled_OverrideEnablesEverything(t *testing.T) {
 	resetOverride(t)
 	EnableOverride()
-	for _, f := range []Feature{FeatureAIAgentHooks, FeatureNPMRCAudit, FeaturePipConfigAudit, FeaturePnpmConfigAudit, FeatureBunConfigAudit, FeatureYarnConfigAudit} {
+	for _, f := range []Feature{FeatureAIAgentHooks, FeatureNPMRCAudit, FeaturePipConfigAudit, FeaturePnpmConfigAudit, FeatureBunConfigAudit, FeatureYarnConfigAudit, FeatureAgentSkillsScan} {
 		if !IsEnabled(f) {
 			t.Errorf("%s should be enabled when override is set", f)
 		}

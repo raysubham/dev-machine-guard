@@ -83,6 +83,39 @@ func (s *Skipper) ShouldSkip(path, walkRoot string) bool {
 	return false
 }
 
+// WithinProtected reports whether path is a TCC-protected directory OR lies
+// beneath one (e.g. ~/Documents/my-project). It differs from ShouldSkip, which
+// matches only the protected directory itself as a walk descends into it and so
+// relies on the walk passing through the protected parent. Callers that resolve
+// a deep path directly — and would otherwise stat inside the protected tree,
+// firing the very prompt we avoid — must use this BEFORE any filesystem access.
+// Safe on a nil receiver (returns false), matching the --include-tcc-protected
+// opt-in. Records a hit against the matched protected root so LogHits surfaces
+// the skip.
+func (s *Skipper) WithinProtected(path string) bool {
+	if s == nil {
+		return false
+	}
+	cleaned := filepath.Clean(path)
+	for p := range s.paths {
+		// Home-anchored protected dirs match on equality or a "/" boundary only.
+		// hasPathPrefix (used for the prefixes below) also treats "." as a
+		// boundary, which is correct for Time Machine names but here would let
+		// ~/Documents swallow a sibling like ~/Documents.backup.
+		if hasDirPrefix(cleaned, p) {
+			s.recordHit(p)
+			return true
+		}
+	}
+	for _, p := range s.prefixes {
+		if hasPathPrefix(cleaned, p) {
+			s.recordHit(p)
+			return true
+		}
+	}
+	return false
+}
+
 // hasPathPrefix returns true when s starts with prefix AND the character
 // immediately after is a path separator, a dot, or end-of-string. This
 // keeps a sentinel like "/Volumes/.timemachine" from matching unrelated
@@ -97,6 +130,19 @@ func hasPathPrefix(s, prefix string) bool {
 	}
 	c := s[len(prefix)]
 	return c == '/' || c == '.'
+}
+
+// hasDirPrefix reports whether s equals dir or is nested under it at a "/"
+// boundary. Unlike hasPathPrefix it does NOT treat "." as a boundary: a
+// protected directory such as ~/Documents must match ~/Documents/x but never a
+// distinct sibling like ~/Documents.backup. (hasPathPrefix's "." boundary
+// exists only for the Time Machine prefix form
+// /Volumes/.timemachine.donottouch.<uuid>.)
+func hasDirPrefix(s, dir string) bool {
+	if !strings.HasPrefix(s, dir) {
+		return false
+	}
+	return len(s) == len(dir) || s[len(dir)] == '/'
 }
 
 func (s *Skipper) recordHit(path string) {

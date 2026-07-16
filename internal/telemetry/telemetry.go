@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -24,6 +25,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/detector/rules"
 	"github.com/step-security/dev-machine-guard/internal/device"
 	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/featuregate"
 	"github.com/step-security/dev-machine-guard/internal/lock"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/paths"
@@ -101,6 +103,8 @@ type Payload struct {
 	PnpmAudit               *model.PnpmAudit                `json:"pnpm_audit,omitempty"`
 	BunAudit                *model.BunAudit                 `json:"bun_audit,omitempty"`
 	YarnAudit               *model.YarnAudit                `json:"yarn_audit,omitempty"`
+	AgentSkills             []model.AgentSkill              `json:"agent_skills,omitempty"`
+	AgentSkillScan          *model.AgentSkillScanInfo       `json:"agent_skill_scan,omitempty"`
 
 	ExecutionLogs      *ExecutionLogs      `json:"execution_logs,omitempty"`
 	PerformanceMetrics *PerformanceMetrics `json:"performance_metrics,omitempty"`
@@ -124,6 +128,7 @@ type PerformanceMetrics struct {
 	PythonGlobalPkgsCount int   `json:"python_global_packages_count"`
 	PythonProjectsCount   int   `json:"python_projects_count"`
 	SystemPackagesCount   int   `json:"system_packages_count"`
+	AgentSkillsCount      int   `json:"agent_skills_count"`
 }
 
 // Run executes enterprise telemetry: scan, build payload, upload to S3.
@@ -945,6 +950,30 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		systemPackageScans = []model.SystemPackageScanResult{}
 	}
 
+	// AI agent skills inventory — every installed SKILL.md (metadata +
+	// content hashes only, never file content). A dedicated phase between MCP
+	// and the config audits. Pure filesystem reads bounded by an internal 60s
+	// budget and per-root caps. The node/python project roots discovered above
+	// feed per-project discovery on top of the detector's own ~/.claude.json
+	// registry. A non-nil scan info always ships (the backend "scan ran"
+	// sentinel), even when zero skills are found.
+	var agentSkills []model.AgentSkill
+	var agentSkillScan *model.AgentSkillScanInfo
+	if featuregate.IsEnabled(featuregate.FeatureAgentSkillsScan) {
+		phaseCtx, phaseCancel = startPhase(ctx, tracker, "agent_skills_scan")
+		log.Progress("Collecting AI agent skills...")
+		// userExec (not exec): match every other user-facing detector so home
+		// resolves to the logged-in user, not the SYSTEM/root profile, under an
+		// unattended enterprise deploy. The wrapper currently passes all read ops
+		// straight through, so this is convention + future-proofing, not a live fix.
+		skillsDetector := detector.NewSkillsDetector(userExec).WithSkipper(tccSkipper)
+		agentSkills, agentSkillScan = skillsDetector.Detect(phaseCtx, collectProjectRoots(nodeProjects, pythonProjects), searchDirs)
+		log.Progress("  Found %d agent skills across %d roots", len(agentSkills), len(agentSkillScan.RootsScanned))
+		fmt.Fprintln(os.Stderr)
+		endPhase(phaseCtx, phaseCancel, tracker, log, "agent_skills_scan")
+		postPhase()
+	}
+
 	// npm + pip configuration audits — surface-only inventory of every
 	// .npmrc and pip.conf on the host, plus the merged effective views
 	// each tool would resolve. We use the user-aware executor so npm and
@@ -1074,6 +1103,8 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		PnpmAudit:               &pnpmAudit,
 		BunAudit:                &bunAudit,
 		YarnAudit:               &yarnAudit,
+		AgentSkills:             agentSkills,
+		AgentSkillScan:          agentSkillScan,
 
 		ExecutionLogs: &ExecutionLogs{
 			OutputBase64: execLogsBase64,
@@ -1093,6 +1124,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 			PythonGlobalPkgsCount: len(pythonGlobalPkgs),
 			PythonProjectsCount:   len(pythonProjects),
 			SystemPackagesCount:   totalSystemPackagesCount(systemPackageScans),
+			AgentSkillsCount:      len(agentSkills),
 		},
 	}
 
@@ -1212,6 +1244,37 @@ func totalSystemPackagesCount(scans []model.SystemPackageScanResult) int {
 		total += s.PackagesCount
 	}
 	return total
+}
+
+// collectProjectRoots flattens the enterprise node and python project lists
+// into a deduplicated []string of project roots for the skills detector's
+// per-project discovery. NodeScanResult.ProjectPath is already a project root;
+// python ProjectInfo.Path is the venv directory, so it is mapped up to its
+// parent — skills live under <project>/.claude/skills, not <venv>/.claude/skills.
+// Empties are dropped and first occurrence wins. The skills detector re-resolves,
+// re-dedupes and sorts internally, so ordering here is immaterial.
+func collectProjectRoots(nodeProjects []model.NodeScanResult, pythonProjects []model.ProjectInfo) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(p string) {
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	for _, n := range nodeProjects {
+		add(n.ProjectPath)
+	}
+	for _, p := range pythonProjects {
+		// Guard the empty case: filepath.Dir("") == ".", which would inject a bogus
+		// "." root. Non-empty venv paths map up one level to the project root.
+		if p.Path == "" {
+			continue
+		}
+		add(filepath.Dir(p.Path))
+	}
+	return out
 }
 
 func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, executionID string, tracker *PhaseTracker) error {

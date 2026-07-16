@@ -31,7 +31,14 @@ type ScanResult struct {
 	PnpmAudit         *PnpmAudit      `json:"pnpm_audit,omitempty"`
 	BunAudit          *BunAudit       `json:"bun_audit,omitempty"`
 	YarnAudit         *YarnAudit      `json:"yarn_audit,omitempty"`
-	Summary           Summary         `json:"summary"`
+
+	// AgentSkills is the flat list of discovered AI agent skills. AgentSkillScan
+	// is the phase summary; its non-nil presence is the "scan ran" sentinel (a
+	// nil section must never cause the backend to delete skill state).
+	AgentSkills    []AgentSkill        `json:"agent_skills,omitempty"`
+	AgentSkillScan *AgentSkillScanInfo `json:"agent_skill_scan,omitempty"`
+
+	Summary Summary `json:"summary"`
 }
 
 type Device struct {
@@ -120,6 +127,7 @@ type Summary struct {
 	SystemPackagesCount   int `json:"system_packages_count"`
 	SnapPackagesCount     int `json:"snap_packages_count"`
 	FlatpakPackagesCount  int `json:"flatpak_packages_count"`
+	AgentSkillsCount      int `json:"agent_skills_count"`
 }
 
 // UnchangedProjectRef tells the backend a project is unchanged since the
@@ -676,4 +684,89 @@ type FileAttrs struct {
 	ModifiedAt int64 `json:"modified_at"` // mtime
 	CreatedAt  int64 `json:"created_at"`  // birth time (best-effort)
 	ChangedAt  int64 `json:"changed_at"`  // ctime
+}
+
+// AgentSkill represents one discovered agent skill: a physical SKILL.md
+// directory, optionally enriched with skills.sh lock provenance. Symlink shadows
+// of the same physical dir are collapsed into one record (the linked roots
+// listed in SymlinkSources). Never carries file content — identity, provenance,
+// hashes, and census counts only.
+type AgentSkill struct {
+	// Identity
+	SkillSlug    string   `json:"skill_slug"`              // directory basename
+	SkillName    string   `json:"skill_name"`              // frontmatter name, else slug
+	Description  string   `json:"description,omitempty"`   // frontmatter description, ≤1024 runes (standard max)
+	Version      string   `json:"version,omitempty"`       // frontmatter version (or metadata.version fallback)
+	License      string   `json:"license,omitempty"`       // standard frontmatter license, ≤128 runes
+	AllowedTools []string `json:"allowed_tools,omitempty"` // normalized from space/comma string or YAML list
+
+	// Behavior/risk flags (frontmatter + body scan)
+	DisableModelInvocation bool   `json:"disable_model_invocation,omitempty"`
+	UserInvocableDisabled  bool   `json:"user_invocable_disabled,omitempty"` // frontmatter user-invocable: false
+	ContextFork            bool   `json:"context_fork,omitempty"`            // context: fork (runs in subagent)
+	ModelOverride          string `json:"model_override,omitempty"`          // frontmatter model
+	HasHooks               bool   `json:"has_hooks,omitempty"`               // hooks key present in frontmatter
+	HasShellInjection      bool   `json:"has_shell_injection,omitempty"`     // body has !`cmd` / ```! load-time exec
+
+	// Attribution
+	Agent  string `json:"agent"`  // "claude-code"|"codex"|"opencode"|"cursor"|"pi"|"factory"|"amp"|"copilot"|"gemini-cli"|"aider"|"shared"
+	Source string `json:"source"` // atomic attribution key. "claude_user"|"claude_project"|
+	//                              // "agents_user"|"agents_project"|"codex_user"|"codex_system"|"codex_admin"|
+	//                              // "opencode_user"|"opencode_project"|"cursor_user"|"cursor_project"|"pi_user"|
+	//                              // "pi_project"|"factory_user"|"factory_project"|"factory_agent_project"|
+	//                              // "amp_user"|"copilot_user"|"github_project"|"gemini_user"|"gemini_project"|
+	//                              // "aider_project"
+	Scope       string `json:"scope"`                  // "global" | "project" | "system"
+	ProjectPath string `json:"project_path,omitempty"` // project root for project scope
+	PluginName  string `json:"plugin_name,omitempty"`  // owning plugin, from skills.sh lock pluginName
+
+	// Location
+	SkillDirPath   string   `json:"skill_dir_path,omitempty"` // absolute, symlink-resolved dir of the physical skill (the collapse group key)
+	RootRelPath    string   `json:"root_rel_path,omitempty"`  // skill dir relative to its root, forward-slash ("frontend-design", "apps/web/frontend-design")
+	SkillMDPath    string   `json:"skill_md_path,omitempty"`
+	SymlinkSources []string `json:"symlink_sources,omitempty"` // sorted, deduped source labels that symlink to this physical skill dir; every entry is a symlink by definition
+
+	// Content identity
+	SkillMDHash string `json:"skill_md_hash,omitempty"` // hex(sha256(SKILL.md)) — identity/drift key
+
+	// File census (all stat-derived — no file bytes read)
+	FileCount         int   `json:"file_count,omitempty"`
+	CodeFileCount     int   `json:"code_file_count,omitempty"`
+	SymlinkCount      int   `json:"symlink_count,omitempty"`
+	TotalSizeBytes    int64 `json:"total_size_bytes,omitempty"`
+	HasCode           bool  `json:"has_code,omitempty"`
+	HasPluginManifest bool  `json:"has_plugin_manifest,omitempty"` // .claude-plugin/plugin.json in skill dir
+	LastModified      int64 `json:"last_modified,omitempty"`       // unix, max mtime in dir
+
+	// Frontmatter health
+	HasFrontmatter   bool   `json:"has_frontmatter"`
+	FrontmatterError string `json:"frontmatter_error,omitempty"` // "" | "invalid_yaml" | "missing_name" | "missing_description" | "file_too_large" | "unreadable"
+
+	// skills.sh lock provenance (empty when unmanaged)
+	ManagedBy          string `json:"managed_by,omitempty"`  // "skills.sh" | ""
+	SourceSlug         string `json:"source_slug,omitempty"` // "vercel-labs/agent-skills" (alias only for sourceType=local)
+	SourceType         string `json:"source_type,omitempty"` // "github"|"mintlify"|"huggingface"|"local"|"well-known"
+	SourceURL          string `json:"source_url,omitempty"`
+	Ref                string `json:"ref,omitempty"`                  // branch|tag|sha as recorded
+	SkillPath          string `json:"skill_path,omitempty"`           // subdir within upstream repo
+	UpstreamFolderHash string `json:"upstream_folder_hash,omitempty"` // GitHub tree SHA from lock (NOT sha256)
+	InstalledAt        string `json:"installed_at,omitempty"`         // ISO8601 from lock
+	UpdatedAt          string `json:"updated_at,omitempty"`           // ISO8601 from lock
+	LockFilePath       string `json:"lock_file_path,omitempty"`
+}
+
+// AgentSkillScanInfo summarizes the skills phase. Its presence in the payload
+// is the "scan ran" sentinel: a nil section means the scan did not run (no
+// information), while a non-nil section with zero skills means "scan ran,
+// nothing installed".
+type AgentSkillScanInfo struct {
+	RootsScanned    []string `json:"roots_scanned"` // absolute root paths probed AND existing
+	ProjectsScanned int      `json:"projects_scanned"`
+	LockFilesParsed int      `json:"lock_files_parsed"`
+	SkillsFound     int      `json:"skills_found"`
+	Truncated       bool     `json:"truncated,omitempty"`         // any cap hit (roots/projects/skills/home-walk)
+	Errors          []string `json:"errors,omitempty"`            // bounded: ≤50 entries, each ≤256 chars
+	WalkDirsVisited int      `json:"walk_dirs_visited,omitempty"` // home-walk ReadDir count
+	WalkRootsFound  int      `json:"walk_roots_found,omitempty"`  // project-root candidates the home walk emitted (pre-union)
+	DurationMs      int64    `json:"duration_ms"`
 }

@@ -61,7 +61,7 @@ func (d *MCPDetector) Detect(_ context.Context, userIdentity string, enterprise 
 	}
 
 	// Discover project-level .mcp.json files from known project paths
-	for _, projectMCP := range d.discoverProjectMCPConfigs(homeDir) {
+	for _, projectMCP := range d.discoverProjectMCPConfigs() {
 		results = append(results, model.MCPConfig{
 			ConfigSource: projectMCP.SourceName,
 			ConfigPath:   projectMCP.ConfigPath,
@@ -106,7 +106,7 @@ func (d *MCPDetector) DetectEnterprise(_ context.Context) []model.MCPConfigEnter
 	}
 
 	// Discover project-level .mcp.json files from known project paths
-	for _, projectMCP := range d.discoverProjectMCPConfigs(homeDir) {
+	for _, projectMCP := range d.discoverProjectMCPConfigs() {
 		content, err := d.exec.ReadFile(projectMCP.ConfigPath)
 		if err != nil || len(content) == 0 {
 			continue
@@ -128,27 +128,14 @@ func (d *MCPDetector) DetectEnterprise(_ context.Context) []model.MCPConfigEnter
 	return results
 }
 
-// discoverProjectMCPConfigs finds project-level .mcp.json files by reading project paths
-// from ~/.claude.json's "projects" section.
-func (d *MCPDetector) discoverProjectMCPConfigs(homeDir string) []mcpConfigSpec {
-	claudeJSONPath := expandTilde("~/.claude.json", homeDir)
-
-	content, err := d.exec.ReadFile(claudeJSONPath)
-	if err != nil || len(content) == 0 {
-		return nil
-	}
-
-	var parsed struct {
-		Projects map[string]json.RawMessage `json:"projects"`
-	}
-	if err := json.Unmarshal(content, &parsed); err != nil || len(parsed.Projects) == 0 {
-		return nil
-	}
-
+// discoverProjectMCPConfigs finds project-level .mcp.json files in the roots
+// from Claude Code's project registry (~/.claude.json). Project-root discovery
+// is shared with the skills detector via discoverClaudeProjects.
+func (d *MCPDetector) discoverProjectMCPConfigs() []mcpConfigSpec {
 	var specs []mcpConfigSpec
 	seen := make(map[string]bool)
 
-	for projectPath := range parsed.Projects {
+	for _, projectPath := range discoverClaudeProjects(d.exec) {
 		mcpPath := filepath.Join(projectPath, ".mcp.json")
 		if seen[mcpPath] {
 			continue

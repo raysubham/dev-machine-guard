@@ -42,6 +42,52 @@ func TestSkipper_ShouldSkip(t *testing.T) {
 	}
 }
 
+func TestSkipper_WithinProtected(t *testing.T) {
+	home := "/Users/alice"
+	s := New(home)
+
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"protected dir itself", "/Users/alice/Documents", true},
+		{"nested under protected dir", "/Users/alice/Documents/proj", true},
+		{"deeply nested under protected dir", "/Users/alice/Documents/proj/.claude/skills", true},
+		{"nested with trailing slash", "/Users/alice/Downloads/x/", true},
+		{"library subtree", "/Users/alice/Library/Application Support/foo", true},
+		{"timemachine prefix", "/Volumes/.timemachine.donottouch/snap", true},
+		{"sibling of protected dir not matched", "/Users/alice/Documents-old", false},
+		{"dotted sibling of protected dir not matched", "/Users/alice/Documents.backup", false},
+		{"dotted sibling of library not matched", "/Users/alice/Library.old", false},
+		{"dotted sibling of trash not matched", "/Users/alice/.Trash.tmp", false},
+		{"safe dotdir not matched", "/Users/alice/.claude/skills", false},
+		{"home itself not matched", "/Users/alice", false},
+		{"unrelated path not matched", "/Users/alice/code/app", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := s.WithinProtected(tc.path); got != tc.want {
+				t.Errorf("WithinProtected(%q) = %v, want %v", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSkipper_WithinProtectedNilAndEmptyHome(t *testing.T) {
+	var nilS *Skipper
+	if nilS.WithinProtected("/Users/alice/Documents/proj") {
+		t.Error("nil Skipper WithinProtected should return false")
+	}
+	emptyHome := New("")
+	if emptyHome.WithinProtected("/Users/alice/Documents/proj") {
+		t.Error("empty-home Skipper should not match home-anchored paths")
+	}
+	if !emptyHome.WithinProtected("/Volumes/.timemachine.donottouch/snap") {
+		t.Error("empty-home Skipper should still match absolute-prefix entries")
+	}
+}
+
 func TestSkipper_NilSafe(t *testing.T) {
 	var s *Skipper
 	if s.ShouldSkip("/Users/alice/Documents", "/Users/alice") {
