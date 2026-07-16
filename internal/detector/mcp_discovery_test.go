@@ -59,6 +59,24 @@ func TestDiscoverWalkedMCPConfigs(t *testing.T) {
 	}
 }
 
+// TestMCPVendorForPath: the VS Code heuristic matches its real config shape
+// and dotfile roots, but does NOT mislabel arbitrary project roots like ~/code.
+func TestMCPVendorForPath(t *testing.T) {
+	sep := string(filepath.Separator)
+	cases := map[string]string{
+		filepath.Join(sep+"Users", "x", "Library", "Application Support", "Code", "User", "mcp.json"):     "Microsoft",
+		filepath.Join(sep+"Users", "x", ".vscode", "agent-plugins", "a", ".mcp.json"):                     "Microsoft",
+		filepath.Join(sep+"Users", "x", "code", "myproj", ".mcp.json"):                                    "Discovered", // NOT Microsoft
+		filepath.Join(sep+"Users", "x", ".cursor", "mcp.json"):                                            "Cursor",
+		filepath.Join(sep+"Users", "x", "Library", "Application Support", "VSCodium", "User", "mcp.json"): "VSCodium",
+	}
+	for p, want := range cases {
+		if got := mcpVendorForPath(p); got != want {
+			t.Errorf("mcpVendorForPath(%q) = %q, want %q", p, got, want)
+		}
+	}
+}
+
 // TestDiscoverWalkedMCPConfigs_TCCSkip: a config inside a TCC-protected subtree
 // (~/Library) is never walked, while one outside it is found. macOS-only,
 // since the TCC skipper is a no-op on other platforms.

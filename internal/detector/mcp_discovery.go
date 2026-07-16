@@ -4,14 +4,15 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
 // mcpConfigBasenames are the filenames recognized as MCP configs wherever they
 // appear in a walked tree. Recognizing by basename (rather than only at
 // hard-coded exact paths) is what lets discovery adapt to configs we didn't
-// anticipate — e.g. a VS Code agent-plugin's .mcp.json. Parity with the
-// filenames bumblebee recognizes.
+// anticipate — e.g. a VS Code agent-plugin's .mcp.json. The set covers the
+// well-known MCP config filenames used across editors and agents.
 var mcpConfigBasenames = map[string]bool{
 	"mcp.json":                   true,
 	".mcp.json":                  true,
@@ -74,10 +75,20 @@ func (d *MCPDetector) allConfigLocations(homeDir string, searchDirs []string) []
 	var out []mcpConfigSpec
 	add := func(source, path, vendor string) {
 		c := filepath.Clean(path)
-		if c == "" || c == "." || seen[c] {
+		if c == "" || c == "." {
 			return
 		}
-		seen[c] = true
+		// Windows paths are case-insensitive: dedupe case-folded so the same
+		// file discovered via different casings (e.g. %APPDATA%-resolved vs a
+		// walked path) is not reported twice. Original casing is kept for display.
+		key := c
+		if runtime.GOOS == "windows" {
+			key = strings.ToLower(c)
+		}
+		if seen[key] {
+			return
+		}
+		seen[key] = true
 		out = append(out, mcpConfigSpec{SourceName: source, ConfigPath: c, Vendor: vendor})
 	}
 
@@ -163,17 +174,22 @@ func (d *MCPDetector) discoverWalkedMCPConfigs(searchDirs []string, homeDir stri
 // path. Falls back to "Discovered" when nothing recognizable matches.
 func mcpVendorForPath(p string) string {
 	lp := strings.ToLower(p)
+	sep := string(filepath.Separator)
 	switch {
+	case strings.Contains(lp, "vscodium"):
+		return "VSCodium"
 	case strings.Contains(lp, "cursor"):
 		return "Cursor"
 	case strings.Contains(lp, "windsurf"), strings.Contains(lp, "codeium"):
 		return "Codeium"
-	case strings.Contains(lp, "vscodium"):
-		return "VSCodium"
 	case strings.Contains(lp, "claude"):
 		return "Anthropic"
-	case strings.Contains(lp, string(filepath.Separator)+".vscode"),
-		strings.Contains(lp, string(filepath.Separator)+"code"+string(filepath.Separator)):
+	// Match VS Code dotfile roots (~/.vscode*) and the actual user-config
+	// shape (.../Code/User/... or .../Code - Insiders/User/...) — not any path
+	// merely containing "code", which would mislabel project roots like ~/code.
+	case strings.Contains(lp, sep+".vscode"),
+		strings.Contains(lp, sep+"code"+sep+"user"+sep),
+		strings.Contains(lp, sep+"code - insiders"+sep+"user"+sep):
 		return "Microsoft"
 	default:
 		return "Discovered"

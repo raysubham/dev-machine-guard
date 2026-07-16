@@ -58,8 +58,10 @@ func (d *MCPDetector) WithSkipper(s *tcc.Skipper) *MCPDetector {
 	return d
 }
 
-// Detect finds MCP configs. If enterprise is true, includes base64-encoded content.
-// Returns community-mode MCPConfig structs (enterprise mode uses MCPConfigEnterprise separately).
+// Detect returns the MCP config locations found on the host as community-mode
+// MCPConfig structs (path, source, and vendor only). It does not read config
+// content — DetectEnterprise does that. The enterprise parameter is unused and
+// kept only for call-site compatibility.
 func (d *MCPDetector) Detect(_ context.Context, userIdentity string, searchDirs []string, enterprise bool) []model.MCPConfig {
 	homeDir := getHomeDir(d.exec)
 	var results []model.MCPConfig
