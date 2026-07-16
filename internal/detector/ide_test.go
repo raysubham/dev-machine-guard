@@ -68,9 +68,9 @@ func TestIDEDetector_MultipleIDEs(t *testing.T) {
 	mock.SetFile("/Applications/Visual Studio Code.app/Contents/Info.plist", []byte{})
 	mock.SetCommand("1.96.0", "", 0, "/usr/libexec/PlistBuddy", "-c", "Print :CFBundleShortVersionString", "/Applications/Visual Studio Code.app/Contents/Info.plist")
 
-	mock.SetDir("/Applications/Claude.app")
-	mock.SetFile("/Applications/Claude.app/Contents/Info.plist", []byte{})
-	mock.SetCommand("0.7.1", "", 0, "/usr/libexec/PlistBuddy", "-c", "Print :CFBundleShortVersionString", "/Applications/Claude.app/Contents/Info.plist")
+	mock.SetDir("/Applications/Copilot.app")
+	mock.SetFile("/Applications/Copilot.app/Contents/Info.plist", []byte{})
+	mock.SetCommand("1.0.0", "", 0, "/usr/libexec/PlistBuddy", "-c", "Print :CFBundleShortVersionString", "/Applications/Copilot.app/Contents/Info.plist")
 
 	det := NewIDEDetector(mock)
 	results := det.Detect(context.Background())
@@ -119,7 +119,7 @@ func TestIDEDetector_Windows_FindsVSCode(t *testing.T) {
 	}
 }
 
-func TestIDEDetector_Windows_FindsClaude(t *testing.T) {
+func TestIDEDetector_Windows_ClaudeNotAnIDE(t *testing.T) {
 	mock := executor.NewMock()
 	mock.SetGOOS("windows")
 	mock.SetEnv("LOCALAPPDATA", `C:\Users\testuser\AppData\Local`)
@@ -141,20 +141,10 @@ func TestIDEDetector_Windows_FindsClaude(t *testing.T) {
 	det := NewIDEDetector(mock)
 	results := det.Detect(context.Background())
 
-	if len(results) != 1 {
-		t.Fatalf("expected 1 IDE, got %d", len(results))
-	}
-	if results[0].IDEType != "claude_desktop" {
-		t.Errorf("expected claude_desktop, got %s", results[0].IDEType)
-	}
-	if results[0].Version != "0.8.2" {
-		t.Errorf("expected 0.8.2, got %s", results[0].Version)
-	}
-	if results[0].Vendor != "Anthropic" {
-		t.Errorf("expected Anthropic, got %s", results[0].Vendor)
-	}
-	if !results[0].IsInstalled {
-		t.Error("expected is_installed=true")
+	// Claude Desktop is intentionally NOT in the IDE catalog: it is reported
+	// once as the "claude-cowork" AI agent (see AgentDetector), never as an IDE.
+	if len(results) != 0 {
+		t.Errorf("expected Claude Desktop to NOT be detected as an IDE, got %d: %+v", len(results), results)
 	}
 }
 
