@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -24,6 +25,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/detector/rules"
 	"github.com/step-security/dev-machine-guard/internal/device"
 	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/featuregate"
 	"github.com/step-security/dev-machine-guard/internal/lock"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/paths"
@@ -101,6 +103,8 @@ type Payload struct {
 	PnpmAudit               *model.PnpmAudit                `json:"pnpm_audit,omitempty"`
 	BunAudit                *model.BunAudit                 `json:"bun_audit,omitempty"`
 	YarnAudit               *model.YarnAudit                `json:"yarn_audit,omitempty"`
+	AgentSkills             []model.AgentSkill              `json:"agent_skills,omitempty"`
+	AgentSkillScan          *model.AgentSkillScanInfo       `json:"agent_skill_scan,omitempty"`
 
 	ExecutionLogs      *ExecutionLogs      `json:"execution_logs,omitempty"`
 	PerformanceMetrics *PerformanceMetrics `json:"performance_metrics,omitempty"`
@@ -124,6 +128,7 @@ type PerformanceMetrics struct {
 	PythonGlobalPkgsCount int   `json:"python_global_packages_count"`
 	PythonProjectsCount   int   `json:"python_projects_count"`
 	SystemPackagesCount   int   `json:"system_packages_count"`
+	AgentSkillsCount      int   `json:"agent_skills_count"`
 }
 
 // Run executes enterprise telemetry: scan, build payload, upload to S3.
@@ -591,7 +596,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Detecting AI CLI tools...")
-	cliTools := detector.NewAICLIDetector(userExec).Detect(phaseCtx)
+	cliTools := detector.NewAICLIDetector(userExec).WithLogger(log).Detect(phaseCtx)
 	for _, t := range cliTools {
 		log.Progress("  Found: %s (%s) v%s at %s", t.Name, t.Vendor, t.Version, t.BinaryPath)
 	}
@@ -601,7 +606,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Detecting general-purpose AI agents...")
-	agents := detector.NewAgentDetector(userExec).Detect(phaseCtx, searchDirs)
+	agents := detector.NewAgentDetector(userExec).WithLogger(log).Detect(phaseCtx, searchDirs)
 	for _, a := range agents {
 		log.Progress("  Found: %s (%s) at %s", a.Name, a.Vendor, a.InstallPath)
 	}
@@ -611,7 +616,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Detecting AI frameworks and runtimes...")
-	frameworks := detector.NewFrameworkDetector(userExec).Detect(phaseCtx)
+	frameworks := detector.NewFrameworkDetector(userExec).WithLogger(log).Detect(phaseCtx)
 	for _, f := range frameworks {
 		running := "false"
 		if f.IsRunning != nil && *f.IsRunning {
@@ -745,7 +750,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	if pythonEnabled {
 		phaseCtx, phaseCancel = startPhase(ctx, tracker, "python_scan")
 		log.Progress("Detecting Python package managers...")
-		pyDetector := detector.NewPythonPMDetector(userExec)
+		pyDetector := detector.NewPythonPMDetector(userExec).WithLogger(log)
 		pythonPkgManagers = pyDetector.DetectManagers(phaseCtx)
 		for _, pm := range pythonPkgManagers {
 			log.Progress("  Found: %s v%s at %s", pm.Name, pm.Version, pm.Path)
@@ -871,7 +876,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		log.Progress("Node.js package scanning is ENABLED")
 
 		log.Progress("Detecting Node.js package managers...")
-		npmDetector := detector.NewNodePMDetector(userExec)
+		npmDetector := detector.NewNodePMDetector(userExec).WithLogger(log)
 		pkgManagers = npmDetector.DetectManagers(phaseCtx)
 		for _, pm := range pkgManagers {
 			log.Progress("  Found: %s v%s at %s", pm.Name, pm.Version, pm.Path)
@@ -945,6 +950,30 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		systemPackageScans = []model.SystemPackageScanResult{}
 	}
 
+	// AI agent skills inventory — every installed SKILL.md (metadata +
+	// content hashes only, never file content). A dedicated phase between MCP
+	// and the config audits. Pure filesystem reads bounded by an internal 60s
+	// budget and per-root caps. The node/python project roots discovered above
+	// feed per-project discovery on top of the detector's own ~/.claude.json
+	// registry. A non-nil scan info always ships (the backend "scan ran"
+	// sentinel), even when zero skills are found.
+	var agentSkills []model.AgentSkill
+	var agentSkillScan *model.AgentSkillScanInfo
+	if featuregate.IsEnabled(featuregate.FeatureAgentSkillsScan) {
+		phaseCtx, phaseCancel = startPhase(ctx, tracker, "agent_skills_scan")
+		log.Progress("Collecting AI agent skills...")
+		// userExec (not exec): match every other user-facing detector so home
+		// resolves to the logged-in user, not the SYSTEM/root profile, under an
+		// unattended enterprise deploy. The wrapper currently passes all read ops
+		// straight through, so this is convention + future-proofing, not a live fix.
+		skillsDetector := detector.NewSkillsDetector(userExec).WithSkipper(tccSkipper)
+		agentSkills, agentSkillScan = skillsDetector.Detect(phaseCtx, collectProjectRoots(nodeProjects, pythonProjects), searchDirs)
+		log.Progress("  Found %d agent skills across %d roots", len(agentSkills), len(agentSkillScan.RootsScanned))
+		fmt.Fprintln(os.Stderr)
+		endPhase(phaseCtx, phaseCancel, tracker, log, "agent_skills_scan")
+		postPhase()
+	}
+
 	// npm + pip configuration audits — surface-only inventory of every
 	// .npmrc and pip.conf on the host, plus the merged effective views
 	// each tool would resolve. We use the user-aware executor so npm and
@@ -967,12 +996,12 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Auditing bun configuration...")
-	bunAudit := configaudit.NewBunDetector(userExec).WithSkipper(tccSkipper).Detect(ctx, searchDirs, npmrcLoggedIn)
+	bunAudit := configaudit.NewBunDetector(userExec).WithSkipper(tccSkipper).WithLogger(log).Detect(ctx, searchDirs, npmrcLoggedIn)
 	log.Progress("  bun available: %v, files discovered: %d", bunAudit.Available, len(bunAudit.Files))
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Auditing yarn configuration...")
-	yarnAudit := configaudit.NewYarnDetector(userExec).WithSkipper(tccSkipper).Detect(ctx, searchDirs, npmrcLoggedIn)
+	yarnAudit := configaudit.NewYarnDetector(userExec).WithSkipper(tccSkipper).WithLogger(log).Detect(ctx, searchDirs, npmrcLoggedIn)
 	log.Progress("  yarn available: %v (flavor=%s), files discovered: %d", yarnAudit.Available, yarnAudit.Flavor, len(yarnAudit.Files))
 	fmt.Fprintln(os.Stderr)
 
@@ -982,6 +1011,13 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	// payload itself can't contain the log of its own upload, so this snapshot
 	// is "session so far" by design. The deferred capture.Finalize() does the
 	// real teardown (restores os.Stderr) on return.
+	//
+	// Sync() first so lines logged right before this snapshot (the config-audit
+	// block, ending at the yarn audit) are already in the ring — a fast run
+	// otherwise outruns the async capture tee and truncates this log. The upload
+	// path re-snapshots after the upload-intent lines (see uploadToS3); this drain
+	// also covers the --telemetry-out dev dump below, which skips that re-snapshot.
+	capture.Sync()
 	execLogsBase64 := capture.SnapshotBase64()
 	endTime := time.Now()
 
@@ -1074,6 +1110,8 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		PnpmAudit:               &pnpmAudit,
 		BunAudit:                &bunAudit,
 		YarnAudit:               &yarnAudit,
+		AgentSkills:             agentSkills,
+		AgentSkillScan:          agentSkillScan,
 
 		ExecutionLogs: &ExecutionLogs{
 			OutputBase64: execLogsBase64,
@@ -1093,6 +1131,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 			PythonGlobalPkgsCount: len(pythonGlobalPkgs),
 			PythonProjectsCount:   len(pythonProjects),
 			SystemPackagesCount:   totalSystemPackagesCount(systemPackageScans),
+			AgentSkillsCount:      len(agentSkills),
 		},
 	}
 
@@ -1131,7 +1170,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	// itself cannot wedge the agent indefinitely.
 	phaseCtx, phaseCancel = startPhase(runCtx, tracker, "telemetry_upload")
 	log.Progress("Requesting upload URL from backend...")
-	if err := uploadToS3(phaseCtx, log, payload, executionID, tracker); err != nil {
+	if err := uploadToS3(phaseCtx, log, payload, executionID, tracker, capture); err != nil {
 		endPhase(phaseCtx, phaseCancel, tracker, log, "telemetry_upload")
 		// Force-attach a final tail capturing the upload-failure output before
 		// returning. The deferred failure report carries no status_info (and so
@@ -1214,7 +1253,38 @@ func totalSystemPackagesCount(scans []model.SystemPackageScanResult) int {
 	return total
 }
 
-func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, executionID string, tracker *PhaseTracker) error {
+// collectProjectRoots flattens the enterprise node and python project lists
+// into a deduplicated []string of project roots for the skills detector's
+// per-project discovery. NodeScanResult.ProjectPath is already a project root;
+// python ProjectInfo.Path is the venv directory, so it is mapped up to its
+// parent — skills live under <project>/.claude/skills, not <venv>/.claude/skills.
+// Empties are dropped and first occurrence wins. The skills detector re-resolves,
+// re-dedupes and sorts internally, so ordering here is immaterial.
+func collectProjectRoots(nodeProjects []model.NodeScanResult, pythonProjects []model.ProjectInfo) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(p string) {
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	for _, n := range nodeProjects {
+		add(n.ProjectPath)
+	}
+	for _, p := range pythonProjects {
+		// Guard the empty case: filepath.Dir("") == ".", which would inject a bogus
+		// "." root. Non-empty venv paths map up one level to the project root.
+		if p.Path == "" {
+			continue
+		}
+		add(filepath.Dir(p.Path))
+	}
+	return out
+}
+
+func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, executionID string, tracker *PhaseTracker, capture *LogCapture) error {
 	// updateDetail forwards sub-progress to the heartbeat goroutine via the
 	// tracker. Tolerates nil so the function stays callable from tests that
 	// don't supply a tracker.
@@ -1280,6 +1350,32 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 	// Upload payload to S3 with retry. Content-Type stays application/json to
 	// match the presigned URL's signed headers — the body is gzipped JSON bytes.
 	log.Progress("Uploading telemetry to S3 (%d bytes)...", len(compressedPayload))
+
+	// Re-capture execution logs so the downloadable payload log includes the
+	// upload-intent lines just logged ("Requesting upload URL...", "Uploading
+	// telemetry to S3 (N bytes)..."). These are the last lines before the PUT;
+	// the payload can't record its own PUT result, so capture stops here. Sync()
+	// drains the async capture tee so those lines are already in the buffer when
+	// we snapshot — a fast (disk-scan) run otherwise outruns the tee and the log
+	// cuts off at the previous phase. Best-effort: a re-marshal error keeps the
+	// original body so log capture never blocks the upload. The re-marshalled
+	// body is a hair larger than the N just logged, which is cosmetic.
+	if capture != nil && payload.ExecutionLogs != nil {
+		capture.Sync()
+		payload.ExecutionLogs.OutputBase64 = capture.SnapshotBase64()
+		// The re-snapshot extends the log past the original end time (set at the
+		// pre-upload payload build), so bump EndTime to match the last captured
+		// byte — keeps execution_logs.end_time consistent with the embedded log
+		// instead of trailing it by the upload-prep window.
+		payload.ExecutionLogs.EndTime = time.Now().Unix()
+		if rebuilt, mErr := json.Marshal(payload); mErr == nil {
+			if regz, zErr := gzipBytes(rebuilt); zErr == nil {
+				payloadJSON = rebuilt
+				compressedPayload = regz
+			}
+		}
+	}
+
 	s3Client := &http.Client{Timeout: 10 * time.Minute}
 	const maxRetries = 3
 	backoffUnit := s3UploadBackoffUnit

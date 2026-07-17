@@ -39,6 +39,8 @@ type Mock struct {
 
 	// Symlink stubs: path -> resolved target
 	symlinks map[string]string
+	// Symlink resolution errors: path -> error (simulates a dangling link)
+	symlinkErrs map[string]error
 
 	// macOS Command Line Tools presence (false simulates a Mac without CLT
 	// installed, where /usr/bin/python3 etc. are install-prompt shims).
@@ -71,6 +73,7 @@ func NewMock() *Mock {
 		env:            make(map[string]string),
 		globs:          make(map[string][]string),
 		symlinks:       make(map[string]string),
+		symlinkErrs:    make(map[string]error),
 		diskCapacities: make(map[string]uint64),
 		hostname:       "test-host",
 		username:       "testuser",
@@ -185,6 +188,14 @@ func (m *Mock) SetSymlink(path, target string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.symlinks[path] = target
+}
+
+// SetSymlinkError makes EvalSymlinks(path) return (", err), simulating a
+// dangling or unresolvable symlink. Takes precedence over any SetSymlink stub.
+func (m *Mock) SetSymlinkError(path string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.symlinkErrs[path] = err
 }
 
 func (m *Mock) SetGOOS(goos string) {
@@ -350,6 +361,9 @@ func (m *Mock) LoggedInUser() (*user.User, error) {
 func (m *Mock) EvalSymlinks(path string) (string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if err, ok := m.symlinkErrs[path]; ok {
+		return "", err
+	}
 	if target, ok := m.symlinks[path]; ok {
 		return target, nil
 	}
@@ -407,14 +421,25 @@ func MockDirEntry(name string, isDir bool) os.DirEntry {
 	return &mockDirEntry{name: name, dir: isDir}
 }
 
+// MockSymlinkDirEntry creates an os.DirEntry whose Type() reports
+// os.ModeSymlink (IsDir() is false), for exercising symlinked directory
+// entries. Pair it with SetSymlink to stub the resolution target.
+func MockSymlinkDirEntry(name string) os.DirEntry {
+	return &mockDirEntry{name: name, symlink: true}
+}
+
 type mockDirEntry struct {
-	name string
-	dir  bool
+	name    string
+	dir     bool
+	symlink bool
 }
 
 func (e *mockDirEntry) Name() string { return e.name }
 func (e *mockDirEntry) IsDir() bool  { return e.dir }
 func (e *mockDirEntry) Type() os.FileMode {
+	if e.symlink {
+		return os.ModeSymlink
+	}
 	if e.dir {
 		return os.ModeDir
 	}

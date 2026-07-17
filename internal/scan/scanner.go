@@ -63,11 +63,11 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	// Detect AI agents and tools
 	log.StepStart("Detecting AI agents and tools")
 	start = time.Now()
-	cliDetector := detector.NewAICLIDetector(exec)
+	cliDetector := detector.NewAICLIDetector(exec).WithLogger(log)
 	cliTools := cliDetector.Detect(ctx)
-	agentDetector := detector.NewAgentDetector(exec)
+	agentDetector := detector.NewAgentDetector(exec).WithLogger(log)
 	agents := agentDetector.Detect(ctx, searchDirs)
-	fwDetector := detector.NewFrameworkDetector(exec)
+	fwDetector := detector.NewFrameworkDetector(exec).WithLogger(log)
 	frameworks := fwDetector.Detect(ctx)
 	aiTools := mergeAITools(cliTools, agents, frameworks)
 	log.StepDone(time.Since(start))
@@ -116,7 +116,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	if npmEnabled {
 		log.StepStart("Detecting package managers")
 		start = time.Now()
-		npmDetector := detector.NewNodePMDetector(exec)
+		npmDetector := detector.NewNodePMDetector(exec).WithLogger(log)
 		pkgManagers = npmDetector.DetectManagers(ctx)
 		log.StepDone(time.Since(start))
 
@@ -208,7 +208,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	if pythonEnabled {
 		log.StepStart("Detecting Python package managers")
 		start = time.Now()
-		pyDetector := detector.NewPythonPMDetector(exec)
+		pyDetector := detector.NewPythonPMDetector(exec).WithLogger(log)
 		pythonPkgManagers = pyDetector.DetectManagers(ctx)
 		log.StepDone(time.Since(start))
 
@@ -233,6 +233,22 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	} else {
 		log.StepStart("Python package scanning")
 		log.StepSkip("disabled (use --enable-python-scan to enable)")
+	}
+
+	// AI agent skills inventory — every installed SKILL.md across Claude Code,
+	// Codex, OpenCode, Cursor, and skills.sh-managed roots. Metadata + content
+	// hashes only, never file content. Pure filesystem reads bounded by an
+	// internal 60s budget and per-root caps. Project roots surfaced by the
+	// node/python scanners feed per-project discovery on top of the detector's
+	// own ~/.claude.json registry.
+	var agentSkills []model.AgentSkill
+	var agentSkillScan *model.AgentSkillScanInfo
+	if featuregate.IsEnabled(featuregate.FeatureAgentSkillsScan) {
+		log.StepStart("Collecting AI agent skills")
+		start = time.Now()
+		skillsDetector := detector.NewSkillsDetector(exec).WithSkipper(tccSkipper)
+		agentSkills, agentSkillScan = skillsDetector.Detect(ctx, detector.CollectProjectRoots(nodeProjects, pythonProjects), searchDirs)
+		log.StepDone(time.Since(start))
 	}
 
 	// npm config audit — surface-only inventory of every .npmrc on the host
@@ -275,7 +291,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	if featuregate.IsEnabled(featuregate.FeatureBunConfigAudit) {
 		log.StepStart("Auditing bun configuration")
 		start = time.Now()
-		a := configaudit.NewBunDetector(exec).WithSkipper(tccSkipper).Detect(ctx, searchDirs, loggedInUser)
+		a := configaudit.NewBunDetector(exec).WithSkipper(tccSkipper).WithLogger(log).Detect(ctx, searchDirs, loggedInUser)
 		bunAudit = &a
 		log.StepDone(time.Since(start))
 	}
@@ -284,7 +300,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	if featuregate.IsEnabled(featuregate.FeatureYarnConfigAudit) {
 		log.StepStart("Auditing yarn configuration")
 		start = time.Now()
-		a := configaudit.NewYarnDetector(exec).WithSkipper(tccSkipper).Detect(ctx, searchDirs, loggedInUser)
+		a := configaudit.NewYarnDetector(exec).WithSkipper(tccSkipper).WithLogger(log).Detect(ctx, searchDirs, loggedInUser)
 		yarnAudit = &a
 		log.StepDone(time.Since(start))
 	}
@@ -362,6 +378,8 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 		PnpmAudit:         pnpmAudit,
 		BunAudit:          bunAudit,
 		YarnAudit:         yarnAudit,
+		AgentSkills:       agentSkills,
+		AgentSkillScan:    agentSkillScan,
 		Summary: model.Summary{
 			AIAgentsAndToolsCount: len(aiTools),
 			IDEInstallationsCount: len(ides),
@@ -374,11 +392,12 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 			SystemPackagesCount:   len(systemPackages),
 			SnapPackagesCount:     len(snapPackages),
 			FlatpakPackagesCount:  len(flatpakPackages),
+			AgentSkillsCount:      len(agentSkills),
 		},
 	}
 
-	log.Debug("scan complete: ais=%d ides=%d extensions=%d mcp=%d node_projects=%d brew_formulae=%d brew_casks=%d python_projects=%d",
-		len(aiTools), len(ides), len(extensions), len(mcpConfigs), len(nodeProjects), len(brewFormulae), len(brewCasks), len(pythonProjects))
+	log.Debug("scan complete: ais=%d ides=%d extensions=%d mcp=%d node_projects=%d brew_formulae=%d brew_casks=%d python_projects=%d agent_skills=%d",
+		len(aiTools), len(ides), len(extensions), len(mcpConfigs), len(nodeProjects), len(brewFormulae), len(brewCasks), len(pythonProjects), len(agentSkills))
 	tccSkipper.LogHits(log.Warn)
 
 	// Output

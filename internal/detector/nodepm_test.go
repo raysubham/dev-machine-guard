@@ -12,7 +12,7 @@ import (
 func TestNodePMDetector_FindsNPM(t *testing.T) {
 	mock := executor.NewMock()
 	mock.SetPath("npm", "/usr/local/bin/npm")
-	mock.SetCommand("10.2.0\n", "", 0, "npm", "--version")
+	mock.SetCommand("10.2.0\n", "", 0, "/usr/local/bin/npm", "--version")
 
 	det := NewNodePMDetector(mock)
 	results := det.DetectManagers(context.Background())
@@ -31,9 +31,9 @@ func TestNodePMDetector_FindsNPM(t *testing.T) {
 func TestNodePMDetector_Multiple(t *testing.T) {
 	mock := executor.NewMock()
 	mock.SetPath("npm", "/usr/local/bin/npm")
-	mock.SetCommand("10.2.0\n", "", 0, "npm", "--version")
+	mock.SetCommand("10.2.0\n", "", 0, "/usr/local/bin/npm", "--version")
 	mock.SetPath("yarn", "/usr/local/bin/yarn")
-	mock.SetCommand("1.22.19\n", "", 0, "yarn", "--version")
+	mock.SetCommand("1.22.19\n", "", 0, "/usr/local/bin/yarn", "--version")
 
 	det := NewNodePMDetector(mock)
 	results := det.DetectManagers(context.Background())
@@ -57,7 +57,7 @@ func TestNodePMDetector_Windows_FindsNPM(t *testing.T) {
 	mock := executor.NewMock()
 	mock.SetGOOS("windows")
 	mock.SetPath("npm", `C:\Program Files\nodejs\npm.cmd`)
-	mock.SetCommand("10.2.0\n", "", 0, "npm", "--version")
+	mock.SetCommand("10.2.0\n", "", 0, `C:\Program Files\nodejs\npm.cmd`, "--version")
 
 	det := NewNodePMDetector(mock)
 	results := det.DetectManagers(context.Background())

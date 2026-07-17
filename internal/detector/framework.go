@@ -5,8 +5,11 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/step-security/dev-machine-guard/internal/execguard"
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
+	"github.com/step-security/dev-machine-guard/internal/progress"
+	"github.com/step-security/dev-machine-guard/internal/versionmeta"
 )
 
 type frameworkSpec struct {
@@ -25,10 +28,20 @@ var frameworkDefinitions = []frameworkSpec{
 // FrameworkDetector detects AI frameworks and runtimes.
 type FrameworkDetector struct {
 	exec executor.Executor
+	log  *progress.Logger
 }
 
 func NewFrameworkDetector(exec executor.Executor) *FrameworkDetector {
-	return &FrameworkDetector{exec: exec}
+	return &FrameworkDetector{exec: exec, log: progress.NewNoop()}
+}
+
+// WithLogger injects a logger (used to surface exec fallbacks when metadata
+// version resolution misses). Chainable, mirrors configaudit's WithSkipper.
+func (d *FrameworkDetector) WithLogger(log *progress.Logger) *FrameworkDetector {
+	if log != nil {
+		d.log = log
+	}
+	return d
 }
 
 func (d *FrameworkDetector) Detect(ctx context.Context) []model.AITool {
@@ -72,6 +85,17 @@ func (d *FrameworkDetector) Detect(ctx context.Context) []model.AITool {
 }
 
 func (d *FrameworkDetector) getVersion(ctx context.Context, binaryPath string) string {
+	// Static-first, exec-last (AGENTS.md §3.4). Bonus: skipping exec also
+	// avoids the daemon-warning-decorated output some frameworks (ollama)
+	// prepend to --version.
+	if v := versionmeta.FromBinary(ctx, d.exec, binaryPath); v != "" {
+		return v
+	}
+	if !execguard.SafeToExec(ctx, d.exec, binaryPath) {
+		d.log.Warn("skipping %s version probe: quarantined and rejected by Gatekeeper", binaryPath)
+		return "unknown"
+	}
+	d.log.Progress("exec fallback: running %s --version (no metadata version source)", binaryPath)
 	stdout, _, _, err := d.exec.RunWithTimeout(ctx, 10*time.Second, binaryPath, "--version")
 	if err != nil {
 		return "unknown"

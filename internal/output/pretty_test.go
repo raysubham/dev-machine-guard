@@ -116,6 +116,80 @@ func TestPretty_PlatformLabels(t *testing.T) {
 	}
 }
 
+// agentSkillsSection slices the AGENT SKILLS block out of the pretty output so
+// assertions cannot false-match the "None detected" lines of other sections.
+func agentSkillsSection(t *testing.T, output string) string {
+	t.Helper()
+	start := strings.Index(output, "AGENT SKILLS")
+	end := strings.Index(output, "IDE EXTENSIONS")
+	if start < 0 || end < start {
+		t.Fatal("output missing AGENT SKILLS / IDE EXTENSIONS headers")
+	}
+	return output[start:end]
+}
+
+func TestPretty_AgentSkillsNotScanned(t *testing.T) {
+	// Nil AgentSkillScan means the scan never ran (feature gate off) — rendered
+	// as "Not scanned", distinct from a completed scan that found nothing.
+	result := &model.ScanResult{
+		ScanTimestamp: 1700000000,
+		Device:        model.Device{Hostname: "test"},
+	}
+
+	var buf bytes.Buffer
+	_ = Pretty(&buf, result, "never")
+
+	section := agentSkillsSection(t, buf.String())
+	if !strings.Contains(section, "Not scanned") {
+		t.Errorf("nil AgentSkillScan must render 'Not scanned', got %q", section)
+	}
+}
+
+func TestPretty_AgentSkillsNoneDetected(t *testing.T) {
+	result := &model.ScanResult{
+		ScanTimestamp:  1700000000,
+		Device:         model.Device{Hostname: "test"},
+		AgentSkillScan: &model.AgentSkillScanInfo{},
+	}
+
+	var buf bytes.Buffer
+	_ = Pretty(&buf, result, "never")
+
+	section := agentSkillsSection(t, buf.String())
+	if !strings.Contains(section, "None detected") {
+		t.Errorf("completed empty scan must render 'None detected', got %q", section)
+	}
+	if strings.Contains(section, "Not scanned") {
+		t.Errorf("completed scan must not render 'Not scanned', got %q", section)
+	}
+}
+
+func TestPretty_AgentSkillsPopulated(t *testing.T) {
+	result := &model.ScanResult{
+		ScanTimestamp:  1700000000,
+		Device:         model.Device{Hostname: "test"},
+		AgentSkillScan: &model.AgentSkillScanInfo{SkillsFound: 1},
+		AgentSkills: []model.AgentSkill{
+			{SkillName: "pdf-tools", Source: "claude_user", Agent: "claude-code", Scope: "global", ManagedBy: "skills.sh"},
+		},
+	}
+
+	var buf bytes.Buffer
+	_ = Pretty(&buf, result, "never")
+
+	section := agentSkillsSection(t, buf.String())
+	for _, want := range []string{"pdf-tools", "claude_user", "[skills.sh]"} {
+		if !strings.Contains(section, want) {
+			t.Errorf("populated skills section missing %q: %q", want, section)
+		}
+	}
+	for _, absent := range []string{"Not scanned", "None detected"} {
+		if strings.Contains(section, absent) {
+			t.Errorf("populated skills section must not contain %q: %q", absent, section)
+		}
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	tests := []struct {
 		input string

@@ -49,7 +49,7 @@ frozenLockfile = true
 
 	mock := executor.NewMock()
 	mock.SetPath("bun", filepath.Join(tmp, "bin", "bun"))
-	mock.SetCommand("1.1.42\n", "", 0, "bun", "--version")
+	mock.SetCommand("1.1.42\n", "", 0, filepath.Join(tmp, "bin", "bun"), "--version")
 	mock.SetHomeDir(filepath.Join(tmp, "home"))
 
 	d := NewBunDetector(mock)
@@ -229,7 +229,7 @@ registry = "https://registry.npmjs.org/"
 	// so the npmrc effective view is skipped — we only need the discovered
 	// files.
 	mock.SetPath("bun", "/usr/local/bin/bun")
-	mock.SetCommand("1.1.42\n", "", 0, "bun", "--version")
+	mock.SetCommand("1.1.42\n", "", 0, "/usr/local/bin/bun", "--version")
 	mock.SetHomeDir(filepath.Join(tmp, "home"))
 
 	d := NewBunDetector(mock)

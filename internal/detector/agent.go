@@ -8,8 +8,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/step-security/dev-machine-guard/internal/execguard"
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
+	"github.com/step-security/dev-machine-guard/internal/progress"
+	"github.com/step-security/dev-machine-guard/internal/versionmeta"
 )
 
 type agentSpec struct {
@@ -30,10 +33,20 @@ var agentDefinitions = []agentSpec{
 // AgentDetector detects general-purpose AI agents.
 type AgentDetector struct {
 	exec executor.Executor
+	log  *progress.Logger
 }
 
 func NewAgentDetector(exec executor.Executor) *AgentDetector {
-	return &AgentDetector{exec: exec}
+	return &AgentDetector{exec: exec, log: progress.NewNoop()}
+}
+
+// WithLogger injects a logger (used to surface exec fallbacks when metadata
+// version resolution misses). Chainable, mirrors configaudit's WithSkipper.
+func (d *AgentDetector) WithLogger(log *progress.Logger) *AgentDetector {
+	if log != nil {
+		d.log = log
+	}
+	return d
 }
 
 func (d *AgentDetector) Detect(ctx context.Context, searchDirs []string) []model.AITool {
@@ -125,6 +138,16 @@ func (d *AgentDetector) findConfigDir(spec agentSpec, homeDir string) string {
 }
 
 func (d *AgentDetector) getVersion(ctx context.Context, binaryPath string) string {
+	// Static-first, exec-last (AGENTS.md §3.4): avoid launching third-party
+	// agents when on-disk metadata already carries the version.
+	if v := versionmeta.FromBinary(ctx, d.exec, binaryPath); v != "" {
+		return v
+	}
+	if !execguard.SafeToExec(ctx, d.exec, binaryPath) {
+		d.log.Warn("skipping %s version probe: quarantined and rejected by Gatekeeper", binaryPath)
+		return "unknown"
+	}
+	d.log.Progress("exec fallback: running %s --version (no metadata version source)", binaryPath)
 	stdout, _, _, err := d.exec.RunWithTimeout(ctx, 10*time.Second, binaryPath, "--version")
 	if err != nil {
 		return "unknown"

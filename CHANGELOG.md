@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See [VERSIONING.md](VERSIONING.md) for why the version starts at 1.8.1.
 
+## [Unreleased]
+
+### Added
+
+- **Gatekeeper pre-exec guard (macOS)**: before any version-probe exec fallback, the agent checks the resolved binary (and its containing directory) for the `com.apple.quarantine` attribute; quarantined binaries are then assessed silently with `spctl --assess --type execute`, and Gatekeeper-rejected ones are skipped (version reported as `unknown`) instead of executed. This removes the main scan-triggered path to the macOS "could not verify … free of malware" dialog for tools whose install layout carries no readable version metadata. It is not a blanket guarantee: the assessment covers the launched binary itself, so a Gatekeeper-accepted binary that loads a separately quarantined, un-notarized plugin at runtime could still prompt — metadata-first resolution (which avoids the exec entirely) remains the primary defense. Unquarantined binaries (e.g. Homebrew formulae) are unaffected.
+
+### Changed
+
+- **Metadata-first version detection**: tool version probes (AI CLIs, AI agents, AI frameworks, Node and Python package managers) now resolve versions from on-disk metadata — npm `package.json` manifests, `<tool>/versions/<v>` install layouts, Homebrew Cellar/Caskroom paths, and macOS app bundles — before falling back to executing `<tool> --version`. Executing third-party binaries could trigger macOS Gatekeeper "could not verify" popups when a tool ships un-notarized native code (e.g. cursor-agent's `merkle-tree-napi.darwin-arm64.node`); the exec fallback is unchanged, so tools without metadata are still detected exactly as before. Each remaining exec fallback is logged to stderr (`exec fallback: running <binary> ...`) so rollouts can track which tools still get executed.
+
 ## [1.13.0] - 2026-07-08
 
 ### Added

@@ -5,8 +5,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/step-security/dev-machine-guard/internal/execguard"
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
+	"github.com/step-security/dev-machine-guard/internal/progress"
+	"github.com/step-security/dev-machine-guard/internal/versionmeta"
 )
 
 type pmSpec struct {
@@ -25,10 +28,20 @@ var packageManagers = []pmSpec{
 // NodePMDetector detects installed Node.js package managers.
 type NodePMDetector struct {
 	exec executor.Executor
+	log  *progress.Logger
 }
 
 func NewNodePMDetector(exec executor.Executor) *NodePMDetector {
-	return &NodePMDetector{exec: exec}
+	return &NodePMDetector{exec: exec, log: progress.NewNoop()}
+}
+
+// WithLogger injects a logger (used to surface exec fallbacks when metadata
+// version resolution misses). Chainable, mirrors configaudit's WithSkipper.
+func (d *NodePMDetector) WithLogger(log *progress.Logger) *NodePMDetector {
+	if log != nil {
+		d.log = log
+	}
+	return d
 }
 
 func (d *NodePMDetector) DetectManagers(ctx context.Context) []model.PkgManager {
@@ -42,7 +55,19 @@ func (d *NodePMDetector) DetectManagers(ctx context.Context) []model.PkgManager 
 
 		version := ""
 		if path != "" {
-			stdout, _, _, err := d.exec.RunWithTimeout(ctx, 10*time.Second, pm.Binary, pm.VersionCmd)
+			// Static-first, exec-last (AGENTS.md §3.4): the manager's own
+			// package.json (npm/yarn/pnpm) or Homebrew layout (bun) carries
+			// the version without launching anything.
+			version = versionmeta.FromBinary(ctx, d.exec, path)
+		}
+		if path != "" && version == "" && !execguard.SafeToExec(ctx, d.exec, path) {
+			d.log.Warn("skipping %s version probe: quarantined and rejected by Gatekeeper", path)
+		} else if path != "" && version == "" {
+			// Run the exact absolute path the guard assessed, not the bare
+			// name — a PATH re-resolution at exec time could pick a
+			// different (unassessed) binary.
+			d.log.Progress("exec fallback: running %s %s (no metadata version source)", path, pm.VersionCmd)
+			stdout, _, _, err := d.exec.RunWithTimeout(ctx, 10*time.Second, path, pm.VersionCmd)
 			if err == nil {
 				version = strings.TrimSpace(stdout)
 			}
@@ -53,7 +78,7 @@ func (d *NodePMDetector) DetectManagers(ctx context.Context) []model.PkgManager 
 		// shell sourcing doesn't surface the manager. Probe the OS-specific
 		// default install dirs and run the binary by absolute path.
 		if path == "" || version == "" {
-			fbPath, fbVersion := resolveNodePMFromDefaults(ctx, d.exec, pm.Binary, pm.VersionCmd)
+			fbPath, fbVersion := resolveNodePMFromDefaults(ctx, d.exec, d.log, pm.Binary, pm.VersionCmd)
 			if path == "" {
 				path = fbPath
 			}

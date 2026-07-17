@@ -12,9 +12,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/step-security/dev-machine-guard/internal/execguard"
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
+	"github.com/step-security/dev-machine-guard/internal/progress"
 	"github.com/step-security/dev-machine-guard/internal/tcc"
+	"github.com/step-security/dev-machine-guard/internal/versionmeta"
 )
 
 // yarnEnvVars: classic and berry env names in one stable list. Berry's
@@ -46,6 +49,7 @@ const maxYarnFiles = 1000
 type YarnDetector struct {
 	exec    executor.Executor
 	skipper *tcc.Skipper
+	log     *progress.Logger
 
 	ownerLookup func(path string) ownerInfo
 	gitTracked  func(ctx context.Context, path string) bool
@@ -54,10 +58,19 @@ type YarnDetector struct {
 
 // NewYarnDetector returns a detector with platform-specific hooks wired in.
 func NewYarnDetector(exec executor.Executor) *YarnDetector {
-	d := &YarnDetector{exec: exec}
+	d := &YarnDetector{exec: exec, log: progress.NewNoop()}
 	d.ownerLookup = statOwner
 	d.gitTracked = func(ctx context.Context, p string) bool { return gitTrackedViaExec(ctx, exec, p) }
 	d.inGitRepo = defaultInGitRepo
+	return d
+}
+
+// WithLogger injects a logger (used to surface exec fallbacks when metadata
+// version resolution misses). Chainable, like WithSkipper.
+func (d *YarnDetector) WithLogger(log *progress.Logger) *YarnDetector {
+	if log != nil {
+		d.log = log
+	}
 	return d
 }
 
@@ -261,7 +274,25 @@ func (d *YarnDetector) collectFile(ctx context.Context, path, scope, flavor stri
 
 // yarnVersion returns the yarn CLI's version string, "unknown" on failure.
 func (d *YarnDetector) yarnVersion(ctx context.Context) string {
-	stdout, _, exit, _ := d.exec.RunWithTimeout(ctx, 5*time.Second, "yarn", "--version")
+	// Static-first, exec-last (AGENTS.md §3.4): classic yarn is an npm
+	// package whose manifest carries the version; a corepack shim's manifest
+	// won't match "yarn" and falls through to exec.
+	// Run the exact absolute path the guard assessed, not the bare name —
+	// a PATH re-resolution at exec time could pick a different (unassessed)
+	// binary. The name is only used when LookPath itself failed.
+	target := "yarn"
+	if path, err := d.exec.LookPath("yarn"); err == nil {
+		if v := versionmeta.FromBinary(ctx, d.exec, path); v != "" {
+			return v
+		}
+		if !execguard.SafeToExec(ctx, d.exec, path) {
+			d.log.Warn("skipping %s version probe: quarantined and rejected by Gatekeeper", path)
+			return "unknown"
+		}
+		target = path
+	}
+	d.log.Progress("exec fallback: running %s --version (no metadata version source)", target)
+	stdout, _, exit, _ := d.exec.RunWithTimeout(ctx, 5*time.Second, target, "--version")
 	if exit != 0 {
 		return "unknown"
 	}

@@ -1,11 +1,13 @@
 package telemetry
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
 	"sync"
+	"time"
 )
 
 // captureRingCapacity bounds the in-memory log buffer. Older bytes are
@@ -13,6 +15,17 @@ import (
 // stuck runs while still preserving enough recent context for diagnosis:
 // 1 MB ≈ several thousand lines of typical agent output.
 const captureRingCapacity = 1 << 20 // 1 MB
+
+// captureSyncMarker is a unique in-band sentinel that Sync() writes to the
+// capture pipe to learn the tee goroutine has drained every byte written before
+// it. The tee strips it, so it is never stored in the ring or echoed to stderr.
+// The NUL/RS control bytes make an accidental match in real log text effectively
+// impossible.
+const captureSyncMarker = "\x00\x1eSTEPSEC_LOGCAPTURE_SYNC\x1e\x00"
+
+// captureSyncTimeout bounds Sync() so a dead or absent tee goroutine can never
+// wedge the caller.
+const captureSyncTimeout = 2 * time.Second
 
 // LogCapture captures all stderr output during telemetry execution into a
 // bounded ring buffer. The buffer's contents are exposed two ways:
@@ -43,6 +56,7 @@ type LogCapture struct {
 	pipeRead  *os.File
 	pipeWrite *os.File
 	done      chan struct{}
+	syncCh    chan struct{} // tee signals here once a Sync() marker is drained
 }
 
 // ringBuffer is a fixed-capacity append-only byte sink. Once full, writes
@@ -117,6 +131,7 @@ func StartCapture() *LogCapture {
 		ring:    newRingBuffer(captureRingCapacity),
 		origErr: os.Stderr,
 		done:    make(chan struct{}),
+		syncCh:  make(chan struct{}, 1),
 	}
 
 	r, w, err := os.Pipe()
@@ -129,25 +144,62 @@ func StartCapture() *LogCapture {
 	// Redirect stderr to the pipe
 	os.Stderr = w
 
-	// Tee: read from pipe, write to both original stderr and ring buffer
+	// Tee: read from pipe, write to both original stderr and ring buffer.
+	// Sync() markers are detected here, stripped (never teed onward), and
+	// acknowledged via syncCh; a carry of marker-1 bytes handles a marker that
+	// straddles two reads.
 	go func() {
 		defer close(lc.done)
+		marker := []byte(captureSyncMarker)
 		buf := make([]byte, 4096)
+		var carry []byte
 		for {
 			n, err := r.Read(buf)
 			if n > 0 {
-				lc.mu.Lock()
-				lc.ring.Write(buf[:n])
-				lc.mu.Unlock()
-				_, _ = lc.origErr.Write(buf[:n])
+				data := buf[:n]
+				if len(carry) > 0 {
+					data = append(carry, data...)
+				}
+				for {
+					i := bytes.Index(data, marker)
+					if i < 0 {
+						break
+					}
+					lc.teeWrite(data[:i])
+					data = data[i+len(marker):]
+					select {
+					case lc.syncCh <- struct{}{}:
+					default:
+					}
+				}
+				// Hold back a possible partial marker at the tail for the next read.
+				if keep := len(marker) - 1; len(data) > keep {
+					lc.teeWrite(data[:len(data)-keep])
+					carry = append([]byte(nil), data[len(data)-keep:]...)
+				} else {
+					carry = append([]byte(nil), data...)
+				}
 			}
 			if err != nil {
+				lc.teeWrite(carry) // flush any held-back tail before exiting
 				break
 			}
 		}
 	}()
 
 	return lc
+}
+
+// teeWrite fans a slice out to the ring buffer and the original stderr. Empty
+// input is a no-op so the marker-stripping loop can call it unconditionally.
+func (lc *LogCapture) teeWrite(p []byte) {
+	if len(p) == 0 {
+		return
+	}
+	lc.mu.Lock()
+	lc.ring.Write(p)
+	lc.mu.Unlock()
+	_, _ = lc.origErr.Write(p)
 }
 
 // Finalize stops capture and returns the base64-encoded output.
@@ -184,6 +236,38 @@ func (lc *LogCapture) SnapshotBase64() string {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
 	return base64.StdEncoding.EncodeToString(lc.ringBytesLocked())
+}
+
+// Sync blocks until the tee goroutine has drained every byte written to the
+// capture pipe before this call — i.e. everything logged so far is now in the
+// ring and visible to a following SnapshotBase64/Tail. Unlike Finalize it does
+// NOT stop capture: the pipe stays open, so later output (the upload result, the
+// completion line) keeps being recorded for the run-status tail. It works by
+// writing a unique marker to the pipe and waiting for the tee to read past it,
+// which is the only reliable way to flush an asynchronous reader short of
+// closing the pipe. Bounded by captureSyncTimeout so an absent or stuck tee
+// cannot wedge the caller; on timeout the following snapshot simply reflects
+// whatever had drained. No-op before StartCapture or after Finalize.
+func (lc *LogCapture) Sync() {
+	lc.mu.Lock()
+	pw := lc.pipeWrite
+	ch := lc.syncCh
+	lc.mu.Unlock()
+	if pw == nil || ch == nil {
+		return
+	}
+	// Clear any stale ack from a previous Sync so we wait on our own marker.
+	select {
+	case <-ch:
+	default:
+	}
+	if _, err := pw.WriteString(captureSyncMarker); err != nil {
+		return // pipe closed concurrently (Finalize) — nothing left to drain
+	}
+	select {
+	case <-ch:
+	case <-time.After(captureSyncTimeout):
+	}
 }
 
 // Tail returns the last n captured bytes as a fresh slice. Safe to call

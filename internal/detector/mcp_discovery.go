@@ -100,7 +100,7 @@ func (d *MCPDetector) allConfigLocations(homeDir string, searchDirs []string) []
 		}
 	}
 	// (2) Claude-registered project .mcp.json files.
-	for _, s := range d.discoverProjectMCPConfigs(homeDir) {
+	for _, s := range d.discoverProjectMCPConfigs() {
 		add(s.SourceName, s.ConfigPath, s.Vendor)
 	}
 	// (3) Bounded walk of search dirs + IDE dotfile roots.
