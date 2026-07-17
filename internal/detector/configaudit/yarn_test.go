@@ -55,7 +55,7 @@ func TestYarnDetector_BothFlavors(t *testing.T) {
 
 	mock := executor.NewMock()
 	mock.SetPath("yarn", filepath.Join(tmp, "bin", "yarn"))
-	mock.SetCommand("4.5.0\n", "", 0, "yarn", "--version")
+	mock.SetCommand("4.5.0\n", "", 0, filepath.Join(tmp, "bin", "yarn"), "--version")
 	mock.SetHomeDir(homeDir)
 
 	d := NewYarnDetector(mock)
@@ -161,7 +161,7 @@ func TestYarnDetector_FlavorMismatch(t *testing.T) {
 
 	mock := executor.NewMock()
 	mock.SetPath("yarn", "/usr/local/bin/yarn")
-	mock.SetCommand("1.22.22\n", "", 0, "yarn", "--version")
+	mock.SetCommand("1.22.22\n", "", 0, "/usr/local/bin/yarn", "--version")
 	mock.SetHomeDir(homeDir)
 
 	d := NewYarnDetector(mock)

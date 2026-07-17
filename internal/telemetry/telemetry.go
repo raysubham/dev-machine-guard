@@ -596,7 +596,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Detecting AI CLI tools...")
-	cliTools := detector.NewAICLIDetector(userExec).Detect(phaseCtx)
+	cliTools := detector.NewAICLIDetector(userExec).WithLogger(log).Detect(phaseCtx)
 	for _, t := range cliTools {
 		log.Progress("  Found: %s (%s) v%s at %s", t.Name, t.Vendor, t.Version, t.BinaryPath)
 	}
@@ -606,7 +606,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Detecting general-purpose AI agents...")
-	agents := detector.NewAgentDetector(userExec).Detect(phaseCtx, searchDirs)
+	agents := detector.NewAgentDetector(userExec).WithLogger(log).Detect(phaseCtx, searchDirs)
 	for _, a := range agents {
 		log.Progress("  Found: %s (%s) at %s", a.Name, a.Vendor, a.InstallPath)
 	}
@@ -616,7 +616,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Detecting AI frameworks and runtimes...")
-	frameworks := detector.NewFrameworkDetector(userExec).Detect(phaseCtx)
+	frameworks := detector.NewFrameworkDetector(userExec).WithLogger(log).Detect(phaseCtx)
 	for _, f := range frameworks {
 		running := "false"
 		if f.IsRunning != nil && *f.IsRunning {
@@ -750,7 +750,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	if pythonEnabled {
 		phaseCtx, phaseCancel = startPhase(ctx, tracker, "python_scan")
 		log.Progress("Detecting Python package managers...")
-		pyDetector := detector.NewPythonPMDetector(userExec)
+		pyDetector := detector.NewPythonPMDetector(userExec).WithLogger(log)
 		pythonPkgManagers = pyDetector.DetectManagers(phaseCtx)
 		for _, pm := range pythonPkgManagers {
 			log.Progress("  Found: %s v%s at %s", pm.Name, pm.Version, pm.Path)
@@ -876,7 +876,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		log.Progress("Node.js package scanning is ENABLED")
 
 		log.Progress("Detecting Node.js package managers...")
-		npmDetector := detector.NewNodePMDetector(userExec)
+		npmDetector := detector.NewNodePMDetector(userExec).WithLogger(log)
 		pkgManagers = npmDetector.DetectManagers(phaseCtx)
 		for _, pm := range pkgManagers {
 			log.Progress("  Found: %s v%s at %s", pm.Name, pm.Version, pm.Path)
@@ -996,12 +996,12 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Auditing bun configuration...")
-	bunAudit := configaudit.NewBunDetector(userExec).WithSkipper(tccSkipper).Detect(ctx, searchDirs, npmrcLoggedIn)
+	bunAudit := configaudit.NewBunDetector(userExec).WithSkipper(tccSkipper).WithLogger(log).Detect(ctx, searchDirs, npmrcLoggedIn)
 	log.Progress("  bun available: %v, files discovered: %d", bunAudit.Available, len(bunAudit.Files))
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Auditing yarn configuration...")
-	yarnAudit := configaudit.NewYarnDetector(userExec).WithSkipper(tccSkipper).Detect(ctx, searchDirs, npmrcLoggedIn)
+	yarnAudit := configaudit.NewYarnDetector(userExec).WithSkipper(tccSkipper).WithLogger(log).Detect(ctx, searchDirs, npmrcLoggedIn)
 	log.Progress("  yarn available: %v (flavor=%s), files discovered: %d", yarnAudit.Available, yarnAudit.Flavor, len(yarnAudit.Files))
 	fmt.Fprintln(os.Stderr)
 

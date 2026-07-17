@@ -12,9 +12,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/step-security/dev-machine-guard/internal/execguard"
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
+	"github.com/step-security/dev-machine-guard/internal/progress"
 	"github.com/step-security/dev-machine-guard/internal/tcc"
+	"github.com/step-security/dev-machine-guard/internal/versionmeta"
 )
 
 // maxBunfigFiles bounds the payload on pathological monorepos.
@@ -40,6 +43,7 @@ var bunEnvVars = []string{
 type BunDetector struct {
 	exec    executor.Executor
 	skipper *tcc.Skipper
+	log     *progress.Logger
 
 	ownerLookup func(path string) ownerInfo
 	gitTracked  func(ctx context.Context, path string) bool
@@ -48,10 +52,19 @@ type BunDetector struct {
 
 // NewBunDetector returns a detector with platform-specific hooks wired in.
 func NewBunDetector(exec executor.Executor) *BunDetector {
-	d := &BunDetector{exec: exec}
+	d := &BunDetector{exec: exec, log: progress.NewNoop()}
 	d.ownerLookup = statOwner
 	d.gitTracked = func(ctx context.Context, p string) bool { return gitTrackedViaExec(ctx, exec, p) }
 	d.inGitRepo = defaultInGitRepo
+	return d
+}
+
+// WithLogger injects a logger (used to surface exec fallbacks when metadata
+// version resolution misses). Chainable, like WithSkipper.
+func (d *BunDetector) WithLogger(log *progress.Logger) *BunDetector {
+	if log != nil {
+		d.log = log
+	}
 	return d
 }
 
@@ -256,7 +269,24 @@ func (d *BunDetector) collectFile(ctx context.Context, path, scope string) model
 
 // bunVersion returns the bun CLI's version string, "unknown" on failure.
 func (d *BunDetector) bunVersion(ctx context.Context) string {
-	stdout, _, exit, _ := d.exec.RunWithTimeout(ctx, 5*time.Second, "bun", "--version")
+	// Static-first, exec-last (AGENTS.md §3.4): bun's Homebrew install path
+	// encodes the version; other installs fall through to exec.
+	// Run the exact absolute path the guard assessed, not the bare name —
+	// a PATH re-resolution at exec time could pick a different (unassessed)
+	// binary. The name is only used when LookPath itself failed.
+	target := "bun"
+	if path, err := d.exec.LookPath("bun"); err == nil {
+		if v := versionmeta.FromBinary(ctx, d.exec, path); v != "" {
+			return v
+		}
+		if !execguard.SafeToExec(ctx, d.exec, path) {
+			d.log.Warn("skipping %s version probe: quarantined and rejected by Gatekeeper", path)
+			return "unknown"
+		}
+		target = path
+	}
+	d.log.Progress("exec fallback: running %s --version (no metadata version source)", target)
+	stdout, _, exit, _ := d.exec.RunWithTimeout(ctx, 5*time.Second, target, "--version")
 	if exit != 0 {
 		return "unknown"
 	}

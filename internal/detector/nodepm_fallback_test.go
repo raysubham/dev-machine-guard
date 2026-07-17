@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/progress"
 )
 
 func TestPMBinaryCandidateDirs(t *testing.T) {
@@ -153,7 +154,7 @@ func TestResolveNodePMFromDefaults(t *testing.T) {
 		mock.SetFile("/opt/homebrew/bin/npm", []byte{})
 		stubFallbackVersion(mock, "/opt/homebrew/bin/npm", "--version", "10.2.0\n")
 
-		path, version := resolveNodePMFromDefaults(ctx, mock, "npm", "--version")
+		path, version := resolveNodePMFromDefaults(ctx, mock, progress.NewNoop(), "npm", "--version")
 		if path != "/opt/homebrew/bin/npm" {
 			t.Errorf("path = %q, want /opt/homebrew/bin/npm", path)
 		}
@@ -169,7 +170,7 @@ func TestResolveNodePMFromDefaults(t *testing.T) {
 		// File exists but no --version stub → RunWithTimeout errors.
 		mock.SetFile("/opt/homebrew/bin/pnpm", []byte{})
 
-		path, version := resolveNodePMFromDefaults(ctx, mock, "pnpm", "--version")
+		path, version := resolveNodePMFromDefaults(ctx, mock, progress.NewNoop(), "pnpm", "--version")
 		if path != "/opt/homebrew/bin/pnpm" {
 			t.Errorf("path = %q, want /opt/homebrew/bin/pnpm (first existing binary)", path)
 		}
@@ -183,7 +184,7 @@ func TestResolveNodePMFromDefaults(t *testing.T) {
 		mock.SetGOOS("darwin")
 		mock.SetHomeDir("/Users/foo")
 
-		path, version := resolveNodePMFromDefaults(ctx, mock, "npm", "--version")
+		path, version := resolveNodePMFromDefaults(ctx, mock, progress.NewNoop(), "npm", "--version")
 		if path != "" || version != "" {
 			t.Errorf("path=%q version=%q, want both empty", path, version)
 		}
@@ -199,7 +200,7 @@ func TestResolveNodePMFromDefaults(t *testing.T) {
 		mock.SetFile(npmGlobal, []byte{})
 		stubFallbackVersion(mock, npmGlobal, "--version", "9.8.1\n")
 
-		path, version := resolveNodePMFromDefaults(ctx, mock, "npm", "--version")
+		path, version := resolveNodePMFromDefaults(ctx, mock, progress.NewNoop(), "npm", "--version")
 		if path != npmGlobal {
 			t.Errorf("path = %q, want %q (binary that produced a version)", path, npmGlobal)
 		}
@@ -216,7 +217,7 @@ func TestResolveNodePMFromDefaults(t *testing.T) {
 		mock.SetFile(pnpmCmd, []byte{})
 		mock.SetCommand("9.1.0\n", "", 0, pnpmCmd, "--version")
 
-		path, version := resolveNodePMFromDefaults(ctx, mock, "pnpm", "--version")
+		path, version := resolveNodePMFromDefaults(ctx, mock, progress.NewNoop(), "pnpm", "--version")
 		if path != pnpmCmd {
 			t.Errorf("path = %q, want %q", path, pnpmCmd)
 		}

@@ -284,29 +284,6 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_
 	}
 }
 
-// TestNodeModulesPackageRoot exercises the npm package-root extractor
-// directly. The resolveInstallPath wrapper depends on this for both the AI
-// CLI detector and the general-agent detector.
-func TestNodeModulesPackageRoot(t *testing.T) {
-	tests := []struct {
-		path string
-		want string
-	}{
-		{"/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe", "/usr/local/lib/node_modules/@anthropic-ai/claude-code"},
-		{"/usr/local/lib/node_modules/@openai/codex/bin/codex.js", "/usr/local/lib/node_modules/@openai/codex"},
-		{"/home/u/.npm-global/lib/node_modules/opencode/bin/opencode", "/home/u/.npm-global/lib/node_modules/opencode"},
-		{"/usr/bin/ollama", ""},                   // not a node_modules path
-		{"/Users/u/Library/foo/node_modules", ""}, // node_modules with no package after
-		{"", ""},
-	}
-	for _, tt := range tests {
-		got := nodeModulesPackageRoot(tt.path)
-		if got != tt.want {
-			t.Errorf("nodeModulesPackageRoot(%q) = %q, want %q", tt.path, got, tt.want)
-		}
-	}
-}
-
 // TestExtractVersionFromOutput asserts that decorated `--version` output
 // (notably ollama warnings emitted before the version line) still yields the
 // real version. See bug 0001 F3.
@@ -380,4 +357,83 @@ func TestAICLIDetector_FindsCursorAgentInLocalBin(t *testing.T) {
 	if !found {
 		t.Error("cursor-agent not found via ~/.local/bin fallback")
 	}
+}
+
+// TestAICLIDetector_CursorAgentVersionFromMetadata is the regression test for
+// the customer-reported Gatekeeper popup: executing cursor-agent dlopens an
+// un-notarized native addon, so the version must come from the install
+// layout's versions/<v>/ directory without launching the binary. No command
+// stub is registered — if the detector exec'd anything, the mock would error
+// and the version would degrade to "unknown".
+func TestAICLIDetector_CursorAgentVersionFromMetadata(t *testing.T) {
+	binary := "/Users/testuser/.local/bin/cursor-agent"
+	mock := executor.NewMock()
+	mock.SetPath("cursor-agent", binary)
+	mock.SetSymlink(binary, "/Users/testuser/.local/share/cursor-agent/versions/2026.03.11-6dfa30c/cursor-agent")
+
+	det := NewAICLIDetector(mock)
+	results := det.Detect(context.Background())
+
+	var got *model.AITool
+	for i, r := range results {
+		if r.Name == "cursor-agent" {
+			got = &results[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("cursor-agent not found")
+	}
+	if got.Version != "2026.03.11-6dfa30c" {
+		t.Errorf("expected version 2026.03.11-6dfa30c from metadata (no exec), got %s", got.Version)
+	}
+}
+
+// TestAICLIDetector_VersionExecFallback pins the failsafe: when no metadata
+// source exists, the detector still execs `--version` exactly as before.
+func TestAICLIDetector_VersionExecFallback(t *testing.T) {
+	binary := "/usr/local/bin/aider"
+	mock := executor.NewMock()
+	mock.SetPath("aider", binary)
+	mock.SetCommand("aider 0.86.2\n", "", 0, binary, "--version")
+
+	det := NewAICLIDetector(mock)
+	results := det.Detect(context.Background())
+
+	for _, r := range results {
+		if r.Name == "aider" {
+			if r.Version != "0.86.2" {
+				t.Errorf("expected exec-fallback version 0.86.2, got %s", r.Version)
+			}
+			return
+		}
+	}
+	t.Fatal("aider not found")
+}
+
+// TestAICLIDetector_SkipsQuarantinedBinary pins the Gatekeeper pre-exec
+// guard: a quarantined, spctl-rejected binary with no metadata version must
+// NOT be executed for its version — executing it would pop the macOS "could
+// not verify" dialog. The `--version` stub answers 9.9.9, so a regression
+// that re-enables the exec would flip the asserted version off "unknown".
+func TestAICLIDetector_SkipsQuarantinedBinary(t *testing.T) {
+	binary := "/usr/local/bin/aider"
+	mock := executor.NewMock()
+	mock.SetPath("aider", binary)
+	mock.SetCommand("0083;65a1b2c3;Safari;", "", 0, "/usr/bin/xattr", "-p", "com.apple.quarantine", binary)
+	mock.SetCommand("", "rejected", 3, "/usr/sbin/spctl", "--assess", "--type", "execute", binary)
+	mock.SetCommand("aider 9.9.9\n", "", 0, binary, "--version")
+
+	det := NewAICLIDetector(mock)
+	results := det.Detect(context.Background())
+
+	for _, r := range results {
+		if r.Name == "aider" {
+			if r.Version != "unknown" {
+				t.Errorf("expected version unknown (exec skipped by Gatekeeper guard), got %s", r.Version)
+			}
+			return
+		}
+	}
+	t.Fatal("aider not found — the guard must skip the exec, not the tool")
 }

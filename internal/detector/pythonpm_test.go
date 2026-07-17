@@ -12,7 +12,7 @@ import (
 func TestPythonPMDetector_FindsPip(t *testing.T) {
 	mock := executor.NewMock()
 	mock.SetPath("pip3", "/usr/local/bin/pip3")
-	mock.SetCommand("pip 24.0 from /usr/lib/python3.12/site-packages/pip (python 3.12)\n", "", 0, "pip3", "--version")
+	mock.SetCommand("pip 24.0 from /usr/lib/python3.12/site-packages/pip (python 3.12)\n", "", 0, "/usr/local/bin/pip3", "--version")
 
 	det := NewPythonPMDetector(mock)
 	results := det.DetectManagers(context.Background())
@@ -34,11 +34,11 @@ func TestPythonPMDetector_FindsPip(t *testing.T) {
 func TestPythonPMDetector_FindsMultiple(t *testing.T) {
 	mock := executor.NewMock()
 	mock.SetPath("python3", "/usr/local/bin/python3")
-	mock.SetCommand("Python 3.12.0\n", "", 0, "python3", "--version")
+	mock.SetCommand("Python 3.12.0\n", "", 0, "/usr/local/bin/python3", "--version")
 	mock.SetPath("pip3", "/usr/local/bin/pip3")
-	mock.SetCommand("pip 24.0 from /usr/lib/python3.12/site-packages/pip (python 3.12)\n", "", 0, "pip3", "--version")
+	mock.SetCommand("pip 24.0 from /usr/lib/python3.12/site-packages/pip (python 3.12)\n", "", 0, "/usr/local/bin/pip3", "--version")
 	mock.SetPath("uv", "/usr/local/bin/uv")
-	mock.SetCommand("uv 0.4.0\n", "", 0, "uv", "--version")
+	mock.SetCommand("uv 0.4.0\n", "", 0, "/usr/local/bin/uv", "--version")
 
 	det := NewPythonPMDetector(mock)
 	results := det.DetectManagers(context.Background())
@@ -308,7 +308,7 @@ func TestPythonPMDetector_DetectsUsrBinWhenCLTInstalled(t *testing.T) {
 	mock.SetGOOS("darwin")
 	mock.SetAppleCLTInstalled(true)
 	mock.SetPath("python3", "/usr/bin/python3")
-	mock.SetCommand("Python 3.9.6\n", "", 0, "python3", "--version")
+	mock.SetCommand("Python 3.9.6\n", "", 0, "/usr/bin/python3", "--version")
 
 	det := NewPythonPMDetector(mock)
 	results := det.DetectManagers(context.Background())
@@ -324,7 +324,7 @@ func TestPythonPMDetector_DetectsUsrBinOnLinux(t *testing.T) {
 	mock.SetGOOS("linux")
 	mock.SetAppleCLTInstalled(false) // irrelevant on linux; verify it doesn't gate
 	mock.SetPath("python3", "/usr/bin/python3")
-	mock.SetCommand("Python 3.11.4\n", "", 0, "python3", "--version")
+	mock.SetCommand("Python 3.11.4\n", "", 0, "/usr/bin/python3", "--version")
 
 	det := NewPythonPMDetector(mock)
 	results := det.DetectManagers(context.Background())
