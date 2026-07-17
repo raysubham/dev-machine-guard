@@ -7,15 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See [VERSIONING.md](VERSIONING.md) for why the version starts at 1.8.1.
 
-## [Unreleased]
+## [1.14.0] - 2026-07-17
 
 ### Added
 
+- **AI agent skills inventory**: a new scanner discovers AI agent "skills" across the machine — walking home directories and both registered and unregistered project trees, recognizing a broader set of executable script types (`has_code`), collapsing symlink shadows, honoring macOS TCC-protected directories, and hardened against partial or hostile inputs. Claude Code plugin trees are intentionally excluded from skills discovery.
 - **Gatekeeper pre-exec guard (macOS)**: before any version-probe exec fallback, the agent checks the resolved binary (and its containing directory) for the `com.apple.quarantine` attribute; quarantined binaries are then assessed silently with `spctl --assess --type execute`, and Gatekeeper-rejected ones are skipped (version reported as `unknown`) instead of executed. This removes the main scan-triggered path to the macOS "could not verify … free of malware" dialog for tools whose install layout carries no readable version metadata. It is not a blanket guarantee: the assessment covers the launched binary itself, so a Gatekeeper-accepted binary that loads a separately quarantined, un-notarized plugin at runtime could still prompt — metadata-first resolution (which avoids the exec entirely) remains the primary defense. Unquarantined binaries (e.g. Homebrew formulae) are unaffected.
 
 ### Changed
 
 - **Metadata-first version detection**: tool version probes (AI CLIs, AI agents, AI frameworks, Node and Python package managers) now resolve versions from on-disk metadata — npm `package.json` manifests, `<tool>/versions/<v>` install layouts, Homebrew Cellar/Caskroom paths, and macOS app bundles — before falling back to executing `<tool> --version`. Executing third-party binaries could trigger macOS Gatekeeper "could not verify" popups when a tool ships un-notarized native code (e.g. cursor-agent's `merkle-tree-napi.darwin-arm64.node`); the exec fallback is unchanged, so tools without metadata are still detected exactly as before. Each remaining exec fallback is logged to stderr (`exec fallback: running <binary> ...`) so rollouts can track which tools still get executed.
+- **MCP configuration discovery broadened**: MCP server configs are now recognized by filename in addition to known locations, with VS Code support, a vendor heuristic for unrecognized clients, and de-duplication on Windows.
+- **Python package discovery via filesystem walk**: installed Python packages are now discovered by walking the filesystem and recognizing on-disk install layouts (complementing 1.13.0's `dist-info` reading); root-run scans resolve the console user's home directory instead of root's.
+- **Claude Desktop reclassification**: Claude Desktop is no longer reported as an IDE; it is captured as a cowork agent only.
+
+### Fixed
+
+- **Downloaded execution logs**: upload-intent log lines are now included in the execution logs available for download.
 
 ## [1.13.0] - 2026-07-08
 
@@ -297,6 +305,7 @@ First open-source release. The scanning engine was previously an internal enterp
 - Execution log capture and base64 encoding
 - Instance locking to prevent concurrent runs
 
+[1.14.0]: https://github.com/step-security/dev-machine-guard/compare/v1.13.0...v1.14.0
 [1.13.0]: https://github.com/step-security/dev-machine-guard/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/step-security/dev-machine-guard/compare/v1.11.7...v1.12.0
 [1.11.7]: https://github.com/step-security/dev-machine-guard/compare/v1.11.6...v1.11.7
