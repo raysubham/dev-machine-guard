@@ -5,7 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
+)
+
+// enforcementDMG and enforcementMDM are the enforcement channels carried in
+// ep.Enforcement. DMG (or empty) is the write-and-verify path; MDM is
+// verify-only — the agent probes the OS-managed policy and reports what it
+// observed, and never writes, patches, or clears settings.json.
+const (
+	enforcementDMG = "dmg"
+	enforcementMDM = "mdm"
 )
 
 // Reconciler converges the user-scope VS Code settings.json to the backend's
@@ -33,6 +44,24 @@ type Reconciler struct {
 	// ignore. nil → ProbeManagedPolicy (the per-OS implementation); tests
 	// inject a stub so results never depend on the host machine.
 	Probe func() (managed bool, detail string)
+
+	// ProbeContent reads the effective externally-managed configuration for the
+	// verify-only path and returns it as the observed bag. expected is this
+	// cycle's rendered desired value: the VS Code probe ignores it (the backend
+	// compares OS-managed values), while the ~/.npmrc probe needs it to decide
+	// auth_token_status on-device — the desired tenant key must never leave the
+	// machine, so only the verdict is reported. nil → the per-OS
+	// ProbeManagedContent for ide_extension, and an error (→ verification_failed)
+	// for any other category: falling back to the VS Code probe would report
+	// another category's policy. The DMG path never calls it.
+	ProbeContent func(expected string) (present bool, observed map[string]json.RawMessage, err error)
+
+	// OwnershipKey is the WrittenSettings key the single-value paths record
+	// ownership under (drift, adopt, persist, and the value-based clear all read
+	// the same one). The managed multi-key path keys by real setting id and
+	// ignores this. Empty → allowedExtensionsSettingKey, the only key a plain VS
+	// Code Writer manages; the npm lane sets NPMOwnedKey.
+	OwnershipKey string
 
 	// The seams below adapt the ladder to a target whose ownership and
 	// convergence model differs from the single-JSON-key settings.json writer
@@ -100,6 +129,12 @@ type Reconciler struct {
 	// They apply only to the shared store (State == nil).
 	writeState func(category, target string, s AppliedTargetState) error
 	clearState func(category, target string) error
+
+	// enforcement is the canonical channel the current cycle actually ran —
+	// always "dmg" or "mdm" (an empty or unrecognized ep.Enforcement resolves to
+	// "dmg"). Stamped onto every report as EvaluatedEnforcement so it matches the
+	// backend's exact-match gate. Per-cycle scratch.
+	enforcement string
 }
 
 // readState / persistState / dropState route through the injected StateStore
@@ -242,11 +277,43 @@ func (r *Reconciler) probe() (bool, string) {
 	return ProbeManagedPolicy()
 }
 
+// probeContent reads the effective externally-managed configuration for the
+// verify-only path. The fallback is CATEGORY-AWARE: only ide_extension may fall
+// back to the OS policy reader. Any other category with no seam (e.g. an npm
+// cycle whose writer could not be constructed, so ProbeContentNPM was never
+// bound) errors → verification_failed, an honest "could not verify". Falling
+// through to ProbeManagedContent there would report VS Code policy values as an
+// npm observation.
+func (r *Reconciler) probeContent(expected string) (bool, map[string]json.RawMessage, error) {
+	if r.ProbeContent != nil {
+		return r.ProbeContent(expected)
+	}
+	if r.category() == CategoryIDEExtension {
+		return ProbeManagedContent(expected)
+	}
+	return false, nil, fmt.Errorf("devicepolicy: no content probe for %s", r.category())
+}
+
+// ownershipKey is the WrittenSettings key the single-value paths record
+// ownership under. Empty OwnershipKey → the allowlist setting id, the only key a
+// plain VS Code Writer manages.
+func (r *Reconciler) ownershipKey() string {
+	if r.OwnershipKey != "" {
+		return r.OwnershipKey
+	}
+	return allowedExtensionsSettingKey
+}
+
 // Reconcile runs one enforcement cycle. It NEVER panics into the caller's hot
 // path; failures are returned for logging. The contract:
 //
 //   - fetch error (transport / non-200 / malformed) → NO-OP, error returned.
 //     Enforcement on disk is never wiped on a transient or malformed response.
+//   - MDM enforcement (ep.Enforcement=="mdm") → verify-only: probe the
+//     externally-managed configuration and report what was observed; never
+//     writes, patches, or clears. Checked right after fetch, before the gates
+//     below, so it runs even with a nil Writer, a WriterInitErr, or a clear
+//     directive.
 //   - platform not enforceable (nil Writer, nil WriterInitErr) → silent no-op.
 //   - writer could not be constructed (nil Writer, WriterInitErr set) →
 //     classified AFTER the fetch by what run-config asked for: absent → silent;
@@ -273,6 +340,22 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		// Malformed/transient: do nothing. The on-disk policy (if any) stands.
 		return fmt.Errorf("devicepolicy: fetch: %w", err)
 	}
+	// Resolve the requested channel to the canonical one this cycle actually
+	// runs, and stamp THAT on every report as EvaluatedEnforcement: the backend
+	// gates on an exact "mdm"/"dmg", so the report must name the channel that ran
+	// — never the raw request. An empty or unrecognized channel runs, and
+	// reports, the DMG path. MDM is verify-only and owns nothing on disk, so it
+	// routes before the Writer/clear checks below.
+	switch strings.ToLower(strings.TrimSpace(ep.Enforcement)) {
+	case enforcementMDM:
+		r.enforcement = enforcementMDM
+		return r.verifyMDM(ctx, cat, tgt, ep)
+	case enforcementDMG, "":
+		r.enforcement = enforcementDMG
+	default:
+		r.logf("devicepolicy: unknown enforcement %q; running DMG path", ep.Enforcement)
+		r.enforcement = enforcementDMG
+	}
 
 	if r.Writer == nil {
 		// No usable writer. Two shapes: an unsupported platform (no init error →
@@ -298,6 +381,54 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		return r.handleClear(cat, tgt)
 	}
 	return r.handleEnforce(ctx, cat, tgt, ep)
+}
+
+// verifyMDM is the verify-only path: it never opens the target file (an external
+// MDM owns the configuration), probes what is effective, and reports what it saw.
+// It does not compare observed against ep.Policy or decide drift — the backend
+// does that on read — and applied_hash is always empty.
+//
+// The desired value is rendered first and handed to the probe. The VS Code probe
+// ignores it; the ~/.npmrc probe needs it to decide auth_token_status on-device,
+// because the tenant key must never leave the machine. A render failure means the
+// backend payload is malformed, so nothing could be verified against it →
+// verification_failed.
+func (r *Reconciler) verifyMDM(ctx context.Context, cat, tgt string, ep EffectivePolicy) error {
+	if ep.Clear || !ep.present() {
+		r.logf("devicepolicy: mdm enforcement with no active policy for %s/%s; nothing to verify", cat, tgt)
+		return nil
+	}
+
+	expected, err := r.renderValue(ep.Policy)
+	if err != nil {
+		r.logf("devicepolicy: mdm render desired value failed: %v → verification_failed", err)
+		return r.sendReport(ctx, ComplianceReport{Category: cat, Target: tgt, State: StateVerificationFailed})
+	}
+
+	present, observed, err := r.probeContent(expected)
+	if err != nil {
+		r.logf("devicepolicy: mdm content probe failed: %v → verification_failed", err)
+		return r.sendReport(ctx, ComplianceReport{Category: cat, Target: tgt, State: StateVerificationFailed})
+	}
+
+	if !present {
+		r.logf("devicepolicy: mdm enforcement but no externally-managed policy present → policy_not_applied")
+		return r.sendReport(ctx, ComplianceReport{Category: cat, Target: tgt, State: StatePolicyNotApplied})
+	}
+
+	raw, err := json.Marshal(observed)
+	if err != nil {
+		// observed is built from our own parsers; a marshal failure is not expected.
+		r.logf("devicepolicy: mdm marshal observed failed: %v → verification_failed", err)
+		return r.sendReport(ctx, ComplianceReport{Category: cat, Target: tgt, State: StateVerificationFailed})
+	}
+	r.logf("devicepolicy: mdm managed policy present → mdm_managed (%d observed key(s))", len(observed))
+	return r.sendReport(ctx, ComplianceReport{
+		Category: cat,
+		Target:   tgt,
+		State:    StateMDMManaged,
+		Observed: raw,
+	})
 }
 
 // handleNoWriter classifies a cycle whose writer could not be constructed
@@ -341,18 +472,34 @@ func (r *Reconciler) handleNoWriter(ctx context.Context, cat, tgt string, ep Eff
 //     record was lost — is left intact, and the state record is dropped only
 //     when one existed.
 //   - marker-based (OwnsByMarker, ~/.npmrc): handleClearByMarker.
+//
+// Within the value-based model it dispatches on the Writer: a managed multi-key
+// writer clears each owned key independently (clearManaged); any other Writer
+// keeps the single-key path (clearSingle).
 func (r *Reconciler) handleClear(cat, tgt string) error {
 	if r.OwnsByMarker {
 		return r.handleClearByMarker(cat, tgt)
 	}
 
 	prev, hadPrev := r.readState(cat, tgt)
+	if mw, ok := r.Writer.(managedSettingsWriter); ok {
+		return r.clearManaged(cat, tgt, prev, hadPrev, mw)
+	}
+	return r.clearSingle(cat, tgt, prev, hadPrev)
+}
+
+// clearSingle is the single-value unassignment path. It clears the on-disk value
+// ONLY when it still equals what the agent last wrote (ownership); a value the
+// agent has no record of writing — the user's own extensions.allowed predates
+// enforcement, or the record was lost — is left intact.
+func (r *Reconciler) clearSingle(cat, tgt string, prev AppliedTargetState, hadPrev bool) error {
 	onDisk, present, err := r.Writer.Read()
 	if err != nil {
 		return fmt.Errorf("devicepolicy: clear: read %s: %w", r.Writer.Location(), err)
 	}
 
-	owns := present && prev.WrittenValue != "" && onDisk == prev.WrittenValue
+	prevWritten := prev.WrittenSettings[r.ownershipKey()]
+	owns := present && prevWritten != "" && onDisk == prevWritten
 	switch {
 	case owns:
 		if err := r.Writer.Clear(); err != nil {
@@ -364,10 +511,46 @@ func (r *Reconciler) handleClear(cat, tgt string) error {
 		r.logf("devicepolicy: clear requested but %s holds a value the agent did not write; leaving it", r.Writer.Location())
 	}
 
-	// Drop our ownership record whenever we hold an entry for this category.
-	// Beyond the obvious case (we owned a value), this also reclaims an empty
-	// record a preflight may have left after its settings write later failed.
-	// An absent entry → no-op (idempotent).
+	return r.dropClearedState(cat, tgt, hadPrev)
+}
+
+// clearManaged is the managed multi-key unassignment path. It removes each
+// agent-OWNED key INDEPENDENTLY, and only when its on-disk value still equals
+// what the agent wrote (per-key ownership); a foreign-valued or absent key is
+// preserved. The candidate set is exactly the recorded ownership (not a static
+// key list), so any key the agent ever wrote is cleared without code change.
+// One atomic write carries only the owned-key removes.
+func (r *Reconciler) clearManaged(cat, tgt string, prev AppliedTargetState, hadPrev bool, mw managedSettingsWriter) error {
+	owned := ownedKeys(prev, hadPrev)
+	keys := sortedKeys(owned) // only owned keys can be removed; sorted → deterministic
+	cur, err := mw.ReadManaged(keys)
+	if err != nil {
+		return fmt.Errorf("devicepolicy: clear: read %s: %w", r.Writer.Location(), err)
+	}
+	var ops []settingOp
+	for _, key := range keys {
+		ov := owned[key]
+		if ov != "" && cur[key].Present && cur[key].Raw == ov {
+			ops = append(ops, settingOp{Key: key, Remove: true})
+		}
+	}
+	if len(ops) > 0 {
+		if _, err := mw.ApplyManaged(ops); err != nil {
+			return fmt.Errorf("devicepolicy: clear %s: %w", r.Writer.Location(), err)
+		}
+		r.logf("devicepolicy: cleared %d agent-owned key(s) at %s", len(ops), r.Writer.Location())
+	} else {
+		r.logf("devicepolicy: clear requested but %s holds no agent-owned value; leaving it", r.Writer.Location())
+	}
+
+	return r.dropClearedState(cat, tgt, hadPrev)
+}
+
+// dropClearedState drops the ownership record whenever an entry exists for this
+// (category, target). Beyond the obvious case (we owned a value), this reclaims
+// an empty record a preflight may have left after its settings write later
+// failed. An absent entry → no-op (idempotent).
+func (r *Reconciler) dropClearedState(cat, tgt string, hadPrev bool) error {
 	if hadPrev {
 		if err := r.dropState(cat, tgt); err != nil {
 			return fmt.Errorf("devicepolicy: clear: update state: %w", err)
@@ -396,22 +579,27 @@ func (r *Reconciler) handleClearByMarker(cat, tgt string) error {
 	return nil
 }
 
-// handleEnforce converges settings.json to the compiled policy and reports.
-// The ladder, in order:
+// handleEnforce converges the target to the compiled policy and reports. It runs
+// the shared head of the ladder (render the desired value, then the
+// managed-policy probe), then dispatches on the Writer: a managed multi-key
+// writer converges the full SET of managed keys (enforceManaged); any other
+// Writer keeps the single-value path (enforceSingle — the VS Code degraded case
+// and the ~/.npmrc block writer). The ladder, in order:
 //
 //	probe (managed policy exists → mdm_managed, never write)
-//	→ read current value
-//	→ idempotency (hash unchanged ∧ on-disk converged → report, no write)
+//	→ read current value(s)
+//	→ idempotency (hash unchanged ∧ every managed key converged → report, no write)
 //	→ preflight ownership-store writability
-//	→ drift detection (on-disk diverged from the recorded written value)
+//	→ drift detection (an OWNED key diverged from its recorded written value)
 //	→ merge-write + readback
 //	→ persist ownership on every successful write (rollback if that fails)
 //	→ Verify → report (drift upgrades a would-be compliant to drift_detected)
 func (r *Reconciler) handleEnforce(ctx context.Context, cat, tgt string, ep EffectivePolicy) error {
-	// The value to enforce: the rendered block (Render seam) or the compacted
-	// policy JSON. Computed FIRST because the content-aware probe below needs it.
-	// (The backend's hash still travels verbatim; only the value bytes are
-	// normalized for comparison.)
+	// The value the probe reasons about, and — on the single-value path — the value
+	// to write: the rendered block (Render seam) or the compacted policy JSON.
+	// Computed FIRST because the content-aware probe below needs it. (The
+	// backend's hash still travels verbatim; only the value bytes are normalized
+	// for comparison.)
 	newValue, err := r.renderValue(ep.Policy)
 	if err != nil {
 		if r.Render != nil {
@@ -427,11 +615,58 @@ func (r *Reconciler) handleEnforce(ctx context.Context, cat, tgt string, ep Effe
 
 	// 1. Managed-policy probe. A real managed policy outranks the value the agent
 	// would write — writing would be ineffective at best and fight the MDM at
-	// worst. Yield and report.
+	// worst. Yield and report. (For VS Code, presence of EITHER managed policy key
+	// yields; see the probe.)
 	if managed, detail := r.probeExpected(newValue); managed {
 		r.logf("devicepolicy: managed policy present at %s → mdm_managed (yielding)", detail)
 		return r.report(ctx, cat, tgt, StateMDMManaged, "")
 	}
+
+	if mw, ok := r.Writer.(managedSettingsWriter); ok {
+		desired, derr := compactPolicySettings(ep.Policy)
+		if derr != nil {
+			// Defensive: the fetcher already validated object shape, so a value that
+			// will not decode/compact is a malformed-payload class failure → no-op,
+			// never write.
+			return fmt.Errorf("devicepolicy: enforce: compact policy: %w", derr)
+		}
+		return r.enforceManaged(ctx, cat, tgt, ep, desired, mw)
+	}
+
+	if r.Render == nil {
+		// Single-key fallback for a plain settings Writer: it manages only
+		// extensions.allowed, so the compacted whole-policy object newValue holds is
+		// not what to write — pick the allowlist value out of the settings map. The
+		// production settings writer is always managed, so this path is the
+		// fake/degraded case. A Writer WITH a Render seam (the ~/.npmrc block
+		// writer) writes its rendered value and never consults the map.
+		desired, derr := compactPolicySettings(ep.Policy)
+		if derr != nil {
+			return fmt.Errorf("devicepolicy: enforce: compact policy: %w", derr)
+		}
+		v, ok := desired[allowedExtensionsSettingKey]
+		if !ok {
+			_ = r.report(ctx, cat, tgt, StateVerificationFailed, "")
+			return fmt.Errorf("devicepolicy: enforce: settings missing %q for single-key writer", allowedExtensionsSettingKey)
+		}
+		if len(desired) > 1 {
+			// A multi-key policy on a single-key writer enforces only the allowlist;
+			// surface it so a partial-enforce is never invisible.
+			r.logf("devicepolicy: single-key writer at %s enforces only %s; %d other setting(s) dropped",
+				r.Writer.Location(), allowedExtensionsSettingKey, len(desired)-1)
+		}
+		newValue = v
+	}
+	return r.enforceSingle(ctx, cat, tgt, ep, newValue)
+}
+
+// enforceSingle is the single-VALUE convergence path (any Writer without the
+// managed multi-key API): the ~/.npmrc block writer, whose whole managed block is
+// one opaque value, and the degraded VS Code Writer, which manages exactly the
+// extensions.allowed key. Ownership is recorded under one WrittenSettings entry
+// keyed by r.ownershipKey().
+func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep EffectivePolicy, newValue string) error {
+	ownKey := r.ownershipKey()
 
 	// 2. Read the current value.
 	prev, hadPrev := r.readState(cat, tgt)
@@ -474,9 +709,9 @@ func (r *Reconciler) handleEnforce(ctx context.Context, cat, tgt string, ep Effe
 	// (body equality, shared store) is byte-identical to before.
 	if converged && r.Converged != nil {
 		if perr := r.persistState(cat, tgt, AppliedTargetState{
-			AppliedHash:  ep.Hash,
-			WrittenValue: newValue,
-			FetchedAt:    r.now(),
+			AppliedHash:     ep.Hash,
+			WrittenSettings: map[string]string{ownKey: newValue},
+			FetchedAt:       r.now(),
 		}); perr != nil {
 			r.logf("devicepolicy: could not adopt already-converged state at %s: %v", r.Writer.Location(), perr)
 		}
@@ -488,14 +723,15 @@ func (r *Reconciler) handleEnforce(ctx context.Context, cat, tgt string, ep Effe
 	// it (edited or removed — typically the user hand-editing settings.json).
 	// Enforcement means converging it back; the distinct state lets the
 	// backend surface that it happened.
-	drifted := hadPrev && prev.WrittenValue != "" && (!present || onDisk != prev.WrittenValue)
+	prevWritten := prev.WrittenSettings[ownKey]
+	drifted := hadPrev && prevWritten != "" && (!present || onDisk != prevWritten)
 	if drifted {
 		r.logf("devicepolicy: %s diverged from the recorded written value → re-applying (drift)", r.Writer.Location())
 	}
 
-	// 5. Preflight: prove the ownership store is writable BEFORE mutating the
-	// settings file. An enforced value with no ownership record is orphaned —
-	// a later clear refuses to remove it. Re-persisting the current state is a
+	// Preflight: prove the ownership store is writable BEFORE mutating the
+	// settings file. An enforced value with no ownership record is orphaned — a
+	// later clear refuses to remove it. Re-persisting the current state is a
 	// meaning-preserving writability probe.
 	probe := prev
 	if !hadPrev {
@@ -506,7 +742,7 @@ func (r *Reconciler) handleEnforce(ctx context.Context, cat, tgt string, ep Effe
 		return fmt.Errorf("devicepolicy: enforce: ownership state not writable, refusing to write policy: %w", perr)
 	}
 
-	// 6. Merge-write + readback.
+	// Merge-write + readback.
 	rb, werr := r.Writer.Write(newValue)
 	if werr != nil {
 		// write_failed by default; verification_failed only when the writer landed
@@ -516,16 +752,15 @@ func (r *Reconciler) handleEnforce(ctx context.Context, cat, tgt string, ep Effe
 	}
 	readbackMatch := rb == newValue
 
-	// 7. Ownership is recorded on EVERY successful write — it means "what the
-	// agent wrote", not "what it verified". On a readback mismatch the write
-	// may still have landed; without a record the next cycle would classify
-	// the agent's own value as drift forever. Value-based ownership
-	// self-corrects: the record only takes effect when the on-disk value
-	// actually equals it.
+	// Ownership is recorded on EVERY successful write — it means "what the agent
+	// wrote", not "what it verified". On a readback mismatch the write may still
+	// have landed; without a record the next cycle would classify the agent's
+	// own value as drift forever. Value-based ownership self-corrects: the
+	// record only takes effect when the on-disk value actually equals it.
 	if err := r.persistState(cat, tgt, AppliedTargetState{
-		AppliedHash:  ep.Hash,
-		WrittenValue: newValue,
-		FetchedAt:    r.now(),
+		AppliedHash:     ep.Hash,
+		WrittenSettings: map[string]string{ownKey: newValue},
+		FetchedAt:       r.now(),
 	}); err != nil {
 		// The write happened but ownership couldn't be recorded — undo it so no
 		// unrecorded value is left behind. The rollback outcome decides the state:
@@ -556,6 +791,246 @@ func (r *Reconciler) handleEnforce(ctx context.Context, cat, tgt string, ep Effe
 	return r.report(ctx, cat, tgt, state, appliedHash)
 }
 
+// enforceManaged is the managed multi-key convergence path. It is fully driven
+// by the settings map: every setting the backend sent is authoritatively Set,
+// and any key the agent previously owned that is NO LONGER in the map is an
+// ownership-gated Remove (only a value the agent itself wrote), else preserved
+// (a foreign or absent value is never deleted). No setting id is special-cased,
+// so a new managed key rides through with no change here.
+func (r *Reconciler) enforceManaged(ctx context.Context, cat, tgt string, ep EffectivePolicy, desired map[string]string, mw managedSettingsWriter) error {
+	prev, hadPrev := r.readState(cat, tgt)
+	owned := ownedKeys(prev, hadPrev)
+
+	// 1. Read every key this cycle may touch: the union of the settings map's keys
+	// (to Set) and the owned keys (Set again, or an ownership-gated Remove when a
+	// key has left the map). Sorted so reads, convergence, and writes are
+	// deterministic.
+	keys := sortedUnion(desired, owned)
+	cur, err := mw.ReadManaged(keys)
+	if err != nil {
+		_ = r.report(ctx, cat, tgt, StateVerificationFailed, "")
+		return fmt.Errorf("devicepolicy: enforce: read %s: %w", r.Writer.Location(), err)
+	}
+
+	// 2. Build the desired end-state ops, one per key in the union:
+	//   - present in the settings map          → Set to its compiled value;
+	//   - owned, gone from the map, and its
+	//     on-disk value still matches           → ownership-gated Remove;
+	//   - otherwise (foreign or absent value)   → preserve (never delete).
+	ops := make([]settingOp, 0, len(keys))
+	for _, key := range keys {
+		if v, ok := desired[key]; ok {
+			ops = append(ops, settingOp{Key: key, Set: true, Value: json.RawMessage(v)})
+			continue
+		}
+		if ov := owned[key]; ov != "" && cur[key].Present && cur[key].Raw == ov {
+			ops = append(ops, settingOp{Key: key, Remove: true})
+		} else {
+			ops = append(ops, settingOp{Key: key})
+		}
+	}
+
+	// 3. Convergence over the FULL desired end-state, computed BEFORE the
+	// idempotency short-circuit. It covers every managed key, so drift on any one
+	// key with an unchanged hash re-applies rather than short-circuiting to
+	// compliant.
+	converged := true
+	for _, op := range ops {
+		if !opConverged(op, cur) {
+			converged = false
+			break
+		}
+	}
+	if converged && prev.AppliedHash == ep.Hash {
+		r.logf("devicepolicy: policy already applied (hash unchanged) — no write")
+		return r.report(ctx, cat, tgt, StateCompliant, ep.Hash)
+	}
+
+	// 4. Drift: an OWNED key diverged from its recorded written value (edited or
+	// removed). Only owned keys count — a foreign value is not the agent's drift.
+	drifted := false
+	for key, ov := range owned {
+		if !cur[key].Present || cur[key].Raw != ov {
+			drifted = true
+			break
+		}
+	}
+	if drifted {
+		r.logf("devicepolicy: %s diverged from a recorded written value → re-applying (drift)", r.Writer.Location())
+	}
+
+	// 5. Snapshot the full pre-write state for an atomic multi-key rollback.
+	snapshot := make(map[string]settingValue, len(cur))
+	for k, sv := range cur {
+		snapshot[k] = sv
+	}
+
+	// 6. Preflight: prove the ownership store is writable BEFORE mutating the
+	// settings file (same rationale as the single-key path).
+	probe := prev
+	if !hadPrev {
+		probe = AppliedTargetState{FetchedAt: r.now()}
+	}
+	if perr := r.persistState(cat, tgt, probe); perr != nil {
+		_ = r.report(ctx, cat, tgt, StateWriteFailed, "")
+		return fmt.Errorf("devicepolicy: enforce: ownership state not writable, refusing to write policy: %w", perr)
+	}
+
+	// 7. Write the mutating ops in one atomic patch; a preserve contributes
+	// nothing.
+	writeOps := make([]settingOp, 0, len(ops))
+	for _, op := range ops {
+		if op.Set || op.Remove {
+			writeOps = append(writeOps, op)
+		}
+	}
+	readback, werr := mw.ApplyManaged(writeOps)
+	if werr != nil {
+		_ = r.report(ctx, cat, tgt, StateWriteFailed, "")
+		return fmt.Errorf("devicepolicy: enforce: write %s: %w", r.Writer.Location(), werr)
+	}
+
+	// 8. Readback over every mutating op — value + presence prove the requested
+	// mutation (a bare string cannot distinguish absent from present-empty).
+	readbackMatch := true
+	for _, op := range writeOps {
+		if !opConverged(op, readback) {
+			readbackMatch = false
+			break
+		}
+	}
+
+	// 9. Persist ownership: every key the agent Set this cycle (i.e. the whole
+	// settings map), keyed by setting id → the exact value written. A Remove or
+	// preserve key asserts no ownership this cycle (omitted).
+	ownedAfter := make(map[string]string, len(desired))
+	for key, v := range desired {
+		ownedAfter[key] = v
+	}
+	if err := r.persistState(cat, tgt, AppliedTargetState{
+		AppliedHash:     ep.Hash,
+		WrittenSettings: ownedAfter,
+		FetchedAt:       r.now(),
+	}); err != nil {
+		// The write happened but ownership couldn't be recorded — roll back ALL
+		// keys atomically so no unrecorded value is left behind. A clean undo →
+		// write_failed; a failed restore leaves the on-disk state uncertain →
+		// verification_failed.
+		if rerr := mw.RestoreManaged(snapshot); rerr != nil {
+			r.logf("devicepolicy: rollback at %s failed: %v", r.Writer.Location(), rerr)
+			_ = r.report(ctx, cat, tgt, StateVerificationFailed, "")
+			return fmt.Errorf("devicepolicy: enforce: update state (rollback failed: %v): %w", rerr, err)
+		}
+		_ = r.report(ctx, cat, tgt, StateWriteFailed, "")
+		return fmt.Errorf("devicepolicy: enforce: update state: %w", err)
+	}
+	r.logf("devicepolicy: wrote policy to %s (readback_match=%v)", r.Writer.Location(), readbackMatch)
+
+	state := Verify(VerifyInput{WriteOK: true, ReadbackMatch: readbackMatch})
+	if drifted && state == StateCompliant {
+		state = StateDriftDetected
+	}
+
+	// applied_hash is echoed only when readback-confirmed (compliant or
+	// drift_detected). It is the backend's hash verbatim — never recomputed — so
+	// the backend's byte-exact applied==desired check gates `compliant`.
+	appliedHash := ""
+	if state == StateCompliant || state == StateDriftDetected {
+		appliedHash = ep.Hash
+	}
+	return r.report(ctx, cat, tgt, state, appliedHash)
+}
+
+// compactPolicySettings decodes the raw policy object into the VS Code settings
+// map (setting id → compiled value) and compacts every value to its canonical
+// comparison form. Compaction normalizes whitespace so on-disk readback and
+// next-cycle ownership compare byte-exactly regardless of the backend's wire
+// formatting; member order within each value is preserved (it is the backend's
+// canonical, hashed order). The raw policy travels category-agnostically (npm's
+// object is not a settings map), so the decode lives here rather than in the
+// fetcher.
+func compactPolicySettings(policy json.RawMessage) (map[string]string, error) {
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(policy, &settings); err != nil {
+		return nil, fmt.Errorf("devicepolicy: decode settings map: %w", err)
+	}
+	out := make(map[string]string, len(settings))
+	for k, raw := range settings {
+		c, err := compactJSON(raw)
+		if err != nil {
+			return nil, fmt.Errorf("devicepolicy: compact policy key %q: %w", k, err)
+		}
+		out[k] = c
+	}
+	return out, nil
+}
+
+// sortedUnion returns the sorted union of two key sets — every settings key a
+// cycle may touch (a Set from the settings map, or an ownership-gated
+// Remove/preserve for an owned key no longer in it). The stable order makes
+// reads, convergence, writes, and logs deterministic.
+func sortedUnion(a, b map[string]string) []string {
+	set := make(map[string]struct{}, len(a)+len(b))
+	for k := range a {
+		set[k] = struct{}{}
+	}
+	for k := range b {
+		set[k] = struct{}{}
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// sortedKeys returns m's keys in sorted order, for a deterministic write.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// opConverged reports whether on-disk state m already satisfies op: a Set
+// converges when the key is present with the exact value; a Remove when the key
+// is absent; a preserve (neither Set nor Remove) is always satisfied.
+func opConverged(op settingOp, m map[string]settingValue) bool {
+	sv := m[op.Key]
+	switch {
+	case op.Set:
+		return sv.Present && sv.Raw == string(op.Value)
+	case op.Remove:
+		return !sv.Present
+	default:
+		return true
+	}
+}
+
+// ownedKeys folds an ownership record into a flat map of setting id → the exact
+// value the agent last wrote, skipping empty entries. WrittenSettings is the only
+// ownership field: every managed key — the allowlist included — and every
+// single-value lane's one entry live in it. Drift detection and ownership-gated
+// removal act only on keys the agent actually wrote. A pre-collapse state file
+// carrying only the retired written_value key decodes to an empty map, i.e.
+// "owns nothing", and the next enforce re-converges and re-records (pre-GA — no
+// shipped state to migrate).
+func ownedKeys(prev AppliedTargetState, hadPrev bool) map[string]string {
+	owned := map[string]string{}
+	if !hadPrev {
+		return owned
+	}
+	for k, v := range prev.WrittenSettings {
+		if v != "" {
+			owned[k] = v
+		}
+	}
+	return owned
+}
+
 // rollbackWrite restores the settings key to its pre-cycle condition after the
 // post-write ownership persist failed. WriteAppliedState is atomic
 // (temp+rename), so the failed persist left the previous state file intact —
@@ -574,21 +1049,29 @@ func (r *Reconciler) rollbackWrite(prevOnDisk string, prevPresent bool) {
 	}
 }
 
+// report submits a write-path compliance report.
 func (r *Reconciler) report(ctx context.Context, cat, tgt, state, appliedHash string) error {
-	r.logf("devicepolicy: reporting state=%s category=%s target=%s", state, cat, tgt)
+	return r.sendReport(ctx, ComplianceReport{
+		Category:    cat,
+		Target:      tgt,
+		State:       state,
+		AppliedHash: appliedHash,
+	})
+}
+
+// sendReport stamps the shared fields (agent version, platform,
+// EvaluatedEnforcement) and submits. Callers fill Category/Target/State and the
+// lane-specific field: AppliedHash for the write path, Observed for MDM.
+func (r *Reconciler) sendReport(ctx context.Context, rep ComplianceReport) error {
+	rep.AgentVersion = AgentVersion()
+	rep.Platform = r.Platform
+	rep.EvaluatedEnforcement = r.enforcement
+	r.logf("devicepolicy: reporting state=%s category=%s target=%s", rep.State, rep.Category, rep.Target)
 	if r.Reporter == nil {
 		return nil
 	}
-	rep := ComplianceReport{
-		Category:     cat,
-		Target:       tgt,
-		State:        state,
-		AppliedHash:  appliedHash,
-		AgentVersion: AgentVersion(),
-		Platform:     r.Platform,
-	}
 	if err := r.Reporter.Report(ctx, r.CustomerID, r.DeviceID, rep); err != nil {
-		return fmt.Errorf("devicepolicy: report %s: %w", state, err)
+		return fmt.Errorf("devicepolicy: report %s: %w", rep.State, err)
 	}
 	return nil
 }
