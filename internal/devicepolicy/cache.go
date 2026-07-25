@@ -58,18 +58,21 @@ type AppliedCategoryState struct {
 //
 //   - AppliedHash is the backend's content hash, stored VERBATIM (never
 //     recomputed). Compared against the freshly-fetched hash for idempotency.
-//   - WrittenSettings holds ownership for the managed multi-key path: setting id
-//     → the exact compacted value the agent wrote, for every managed key (the VS
-//     Code allowlist and the gallery service URL). A key absent from the map is
-//     one the agent does not own.
-//   - WrittenValue holds ownership for the single-key path (the npm writer, which
-//     owns one opaque value). The managed multi-key path does not use it.
+//   - WrittenSettings is the ONLY ownership field, for every lane: the managed
+//     multi-key path records setting id → the exact compacted value the agent
+//     wrote for each managed key (the VS Code allowlist and the gallery service
+//     URL), and a single-value path records exactly one entry under its own
+//     ownership key (npmOwnedKey for the ~/.npmrc block, the allowlist setting id
+//     for a degraded VS Code writer). A key absent from the map is one the agent
+//     does not own.
 //
 // A zero-value entry means "the agent owns nothing on disk" for that
-// category/target.
+// category/target. A pre-collapse file carrying the retired written_value key
+// decodes with an empty WrittenSettings — i.e. "owns nothing" — and the next
+// enforce re-converges and re-records it; there are no production devices, so no
+// migrator is owed.
 type AppliedTargetState struct {
 	AppliedHash     string            `json:"applied_hash"`
-	WrittenValue    string            `json:"written_value,omitempty"`
 	WrittenSettings map[string]string `json:"written_settings,omitempty"`
 	FetchedAt       time.Time         `json:"fetched_at"`
 }
