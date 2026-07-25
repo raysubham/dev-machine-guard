@@ -274,12 +274,17 @@ func TestRewrite_Idempotent(t *testing.T) { // edge 15 (content)
 }
 
 // ---------------------------------------------------------------------------
-// clearContent — the §3 clear algorithm (pure []byte -> []byte)
+// clearContent — the clear transform (pure bytes in, bytes out)
 // ---------------------------------------------------------------------------
 
-func clearOf(current string) string {
+func clearOf(t *testing.T, current string) string {
+	t.Helper()
 	w := &NPMRCWriter{}
-	return string(w.clearContent([]byte(current)))
+	out, err := w.clearContent([]byte(current))
+	if err != nil {
+		t.Fatalf("clearContent: %v", err)
+	}
+	return string(out)
 }
 
 func TestClear_RestoresAndPreserves(t *testing.T) { // edge 9
@@ -288,7 +293,7 @@ func TestClear_RestoresAndPreserves(t *testing.T) { // edge 9
 	current := "# [stepsecurity-dmg] registry=https://registry.npmjs.org/\n" +
 		"# [stepsecurity] registry=https://mdm/\n" +
 		block(stdBody)
-	got := clearOf(current)
+	got := clearOf(t, current)
 	want := "registry=https://registry.npmjs.org/\n# [stepsecurity] registry=https://mdm/\n"
 	if got != want {
 		t.Fatalf("clear mismatch:\n got: %q\nwant: %q", got, want)
@@ -297,14 +302,14 @@ func TestClear_RestoresAndPreserves(t *testing.T) { // edge 9
 
 func TestClear_ShellOnlyBlockRemoved(t *testing.T) { // edge 24
 	current := npmrcBeginMarker + "\n" + npmrcEndMarker + "\n"
-	if got := clearOf(current); got != "" {
+	if got := clearOf(t, current); got != "" {
 		t.Fatalf("shell-only block should clear to empty, got %q", got)
 	}
 }
 
 func TestClear_NeverUnprefixesMDM(t *testing.T) {
 	current := "# [stepsecurity] registry=https://mdm/\n" + block(stdBody)
-	got := clearOf(current)
+	got := clearOf(t, current)
 	if !strings.Contains(got, "# [stepsecurity] registry=https://mdm/\n") {
 		t.Fatalf("clear must not un-comment the MDM lane's prefix: %q", got)
 	}
@@ -314,7 +319,7 @@ func TestClear_MissingFinalNewlineNotRestored(t *testing.T) { // edge 34 (clear)
 	// Enforce turned "foo" (no trailing newline) into "foo\n<block>". Clearing
 	// keeps the "\n" enforce added — the one permitted byte deviation.
 	enforced := rewrite(t, "foo")
-	got := clearOf(enforced)
+	got := clearOf(t, enforced)
 	if got != "foo\n" {
 		t.Fatalf("clear should leave %q, got %q", "foo\n", got)
 	}
@@ -399,7 +404,7 @@ func TestSharedClassifier_SpacedForms(t *testing.T) {
 			t.Fatalf("spaced registry %q was not commented out:\n%s", spaced, out)
 		}
 		// clear restores it exactly (literal prefix strip, spacing intact).
-		if got := clearOf(out); got != spaced+"\n" {
+		if got := clearOf(t, out); got != spaced+"\n" {
 			t.Fatalf("clear did not restore spaced form: got %q want %q", got, spaced+"\n")
 		}
 		// probe precedence: the same spaced line below an MDM block defeats
@@ -484,6 +489,78 @@ func TestRewrite_CoercibleQuotedKeyFailsClosed(t *testing.T) {
 		if !strings.Contains(string(out), npmrcDMGPrefix) {
 			t.Fatalf("a single-quoted registry key should be commented out, got %q", string(out))
 		}
+	}
+}
+
+func TestRewrite_ArrayAppendOverrideFailsClosed(t *testing.T) {
+	// npm's ini reader folds `registry[]=` and our block's own `registry=` into ONE
+	// array, so the effective registry becomes a comma-joined list containing the
+	// injected value while a last-wins scalar scan still sees our line as the
+	// winner. Verified against npm 10.9.7: `registry=<ours>` + `registry[]=<theirs>`
+	// yields "<ours>,<theirs>", and the reverse order yields "<theirs>,<ours>".
+	// Commenting the line out is not enough (npm arrays are order-independent), so
+	// the transform refuses the file.
+	w := &NPMRCWriter{}
+	for _, in := range []string{
+		"registry[]=https://evil.example/\n",
+		`"registry[]"=https://evil.example/` + "\n",
+		"//registry-int.stepsecurity.io/javascript/:_authToken[]=ssevil\n",
+	} {
+		if _, err := w.rewriteContent([]byte(in), stdBody); !isTargetUnusable(err) {
+			t.Fatalf("rewriteContent(%q) must fail closed with ErrTargetUnusable, got %v", in, err)
+		}
+	}
+	// Array syntax on a key we do NOT manage is npm-legal config and must not make
+	// the file unusable — including another registry's token, which npm never
+	// consults for ours. Nor must the spaced form, which npm stores under the
+	// distinct key "registry " and which overrides nothing.
+	for _, in := range []string{
+		"omit[]=dev\n",
+		"//npm.pkg.github.com/:_authToken[]=ghtoken\n",
+		"registry [] = https://evil.example/\n",
+	} {
+		if _, err := w.rewriteContent([]byte(in), stdBody); err != nil {
+			t.Fatalf("rewriteContent(%q) must not fail closed, got %v", in, err)
+		}
+	}
+}
+
+func TestProbeContent_ArrayAppendOverrideNotManaged(t *testing.T) {
+	// The MDM probe shares the guard: a marker plus matching lines is not proof the
+	// MDM lane governs npm when an array-append line folds into the same key.
+	for _, in := range []string{
+		mdmBlock() + "registry[]=https://evil.example/\n",
+		"registry[]=https://evil.example/\n" + mdmBlock(),
+	} {
+		if managed, _ := probeNPMRCContent(in, stdBody); managed {
+			t.Fatalf("probe must fail closed on array-append syntax, got managed for %q", in)
+		}
+	}
+}
+
+func TestClear_LoneCRFailsClosed(t *testing.T) {
+	// A CR-delimited file collapses to one line under the '\n' split, so no marker
+	// matches and the block is never FOUND. Without this guard clearContent returned
+	// its input unchanged, Clear reported the nothing-to-do success, and the
+	// reconciler dropped ownership state while the token stayed on disk — an
+	// offboarding that silently revoked nothing.
+	w := &NPMRCWriter{}
+	crFile := strings.ReplaceAll("cache=x\n"+block(stdBody), "\n", "\r")
+	out, err := w.clearContent([]byte(crFile))
+	if !isTargetUnusable(err) {
+		t.Fatalf("clearContent on a CR-delimited block must fail closed with ErrTargetUnusable, got err=%v out=%q", err, string(out))
+	}
+	if out != nil {
+		t.Fatalf("a refused clear must return no bytes, got %q", string(out))
+	}
+	// CRLF is not a lone CR: a real block still clears.
+	crlf := strings.ReplaceAll(block(stdBody), "\n", "\r\n")
+	got, err := w.clearContent([]byte(crlf))
+	if err != nil {
+		t.Fatalf("CRLF must not be refused as a bare CR: %v", err)
+	}
+	if strings.Contains(string(got), stdTokenVal) {
+		t.Fatalf("the token must be gone after a CRLF clear, got %q", string(got))
 	}
 }
 

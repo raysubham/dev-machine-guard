@@ -92,3 +92,71 @@ func TestFetchPackageConfigTargetRoundTrips(t *testing.T) {
 		t.Fatalf("ep = %+v, want present with hash sha256:npm", ep)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Category-gated policy validation
+// ---------------------------------------------------------------------------
+
+func TestFetchAcceptsNPMPolicyWithoutIDEKeys(t *testing.T) {
+	// `policy` travels raw because its shape is per-category. The ide_extension
+	// structural check (extensions.allowed present and an object) must therefore be
+	// GATED on the category: a legitimate package_config object has no such key and
+	// must not be rejected by it. The npm structure is validated downstream by
+	// RenderNPMRCBlock.
+	body := `{"policy":{"category":"package_config","target":"npm","clear":false,` +
+		`"policy":{"ecosystem":"npm","registry_url":"https://t.registry.stepsecurity.io/javascript",` +
+		`"auth":{"scheme":"stepsecurity_device_token","api_key":"ssabc123"}},` +
+		`"hash":"sha256:n","enforcement":"mdm","generated_at":"2026-07-24T00:00:00Z"}}`
+	f := newPolicyFetchServer(t, CategoryPackageConfig, TargetNPM, body)
+	ep, err := f.Fetch(context.Background(), "cust", "dev-1", CategoryPackageConfig, TargetNPM)
+	if err != nil {
+		t.Fatalf("a valid npm policy must be accepted, got %v", err)
+	}
+	if !ep.present() || ep.Clear {
+		t.Fatalf("npm policy must be present and non-clear, got %+v", ep)
+	}
+	if ep.Enforcement != "mdm" {
+		t.Fatalf("enforcement = %q, want mdm", ep.Enforcement)
+	}
+	// The raw bytes reach the renderer untouched — never re-serialized.
+	if !strings.Contains(string(ep.Policy), `"ecosystem":"npm"`) {
+		t.Fatalf("policy bytes = %s, want the npm object verbatim", ep.Policy)
+	}
+}
+
+func TestFetchRejectsNonObjectPolicyForEveryCategory(t *testing.T) {
+	// The top-level object-shape check is category-AGNOSTIC: a string/array/scalar
+	// `policy` is malformed in every lane, and a non-object written verbatim could
+	// even read back "compliant".
+	for _, tc := range []struct{ category, target string }{
+		{CategoryIDEExtension, TargetVSCode},
+		{CategoryPackageConfig, TargetNPM},
+	} {
+		for _, raw := range []string{`"bad"`, `[]`, `42`, `true`} {
+			body := `{"policy":{"category":"` + tc.category + `","target":"` + tc.target + `","clear":false,` +
+				`"policy":` + raw + `,"hash":"sha256:x","generated_at":"x"}}`
+			f := newPolicyFetchServer(t, tc.category, tc.target, body)
+			if _, err := f.Fetch(context.Background(), "cust", "dev-1", tc.category, tc.target); err == nil {
+				t.Fatalf("%s/%s: policy %s must be an error", tc.category, tc.target, raw)
+			}
+		}
+	}
+}
+
+func TestFetchIDEStructuralCheckStillApplies(t *testing.T) {
+	// The mirror of the npm case: gating the check on the category must not weaken
+	// it for ide_extension. An allowlist-missing or non-object allowlist bag still
+	// errors, even though the same raw shape would be fine for npm.
+	for _, settings := range []string{
+		`{"extensions.gallery.serviceUrl":"https://mkt.example/api/v1"}`,
+		`{"extensions.allowed":"nope"}`,
+		`{"extensions.allowed":[]}`,
+	} {
+		body := `{"policy":{"category":"ide_extension","target":"vscode","clear":false,` +
+			`"policy":` + settings + `,"hash":"sha256:x","generated_at":"x"}}`
+		f := newPolicyFetchServer(t, CategoryIDEExtension, TargetVSCode, body)
+		if _, err := f.Fetch(context.Background(), "cust", "dev-1", CategoryIDEExtension, TargetVSCode); err == nil {
+			t.Fatalf("ide settings %s must be an error", settings)
+		}
+	}
+}

@@ -535,3 +535,207 @@ func TestRestoreSnapshot_ConsumedAfterUse(t *testing.T) {
 		t.Fatal("second RestoreSnapshot must error — the snapshot is consumed after one use")
 	}
 }
+
+func TestProbeContentNPM_OnDisk(t *testing.T) {
+	home := t.TempDir()
+	w := newDiskWriter(t, home)
+
+	// An absent file is the clean "nothing is managing this" signal, NOT an error:
+	// the reconciler must report policy_not_applied, not verification_failed.
+	present, observed, err := w.ProbeContentNPM(stdBody)
+	if err != nil || present || observed != nil {
+		t.Fatalf("absent ~/.npmrc = (%v, %v, %v), want (false, nil, nil)", present, observed, err)
+	}
+
+	if err := os.WriteFile(npmrcPath(home), []byte(mdmBlock()), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	before, err := os.ReadFile(npmrcPath(home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	present, observed, err = w.ProbeContentNPM(stdBody)
+	if err != nil || !present {
+		t.Fatalf("an effective MDM block = (%v, %v), want present with no error", present, err)
+	}
+	if len(observed) != 3 {
+		t.Fatalf("observed = %v, want exactly 3 keys", observed)
+	}
+	// Verify-only means verify-only: the file is never opened for writing, so not
+	// one byte moves — no write, no clear, no rollback, no backup.
+	after, err := os.ReadFile(npmrcPath(home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("ProbeContentNPM mutated the file:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	if entries, err := os.ReadDir(home); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 1 {
+		t.Fatalf("ProbeContentNPM left extra files behind: %v", entries)
+	}
+}
+
+func TestProbeContentNPM_LooseModeStillObserved(t *testing.T) {
+	// Deliberate divergence from ProbeExpected, which rejects loose metadata so the
+	// DMG lane enforces instead. In verify-only mode there is no write to fall back
+	// to, and perms are not part of the observed contract — so a
+	// correctly-deployed-but-0644 file must still report its real registry and auth
+	// status rather than be hidden behind a synthetic failure.
+	home := t.TempDir()
+	if err := os.WriteFile(npmrcPath(home), []byte(mdmBlock()), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	w := newDiskWriter(t, home)
+	present, observed, err := w.ProbeContentNPM(stdBody)
+	if err != nil || !present || len(observed) != 3 {
+		t.Fatalf("a 0644 MDM block = (%v, %v, %v), want it observed", present, observed, err)
+	}
+}
+
+func TestProbeContentNPM_UnreadableIsAnError(t *testing.T) {
+	// A file we cannot trust as the target user's own effective config must NOT read
+	// as the clean policy_not_applied: we could not establish what npm resolves, so
+	// the honest answer is verification_failed.
+	home := t.TempDir()
+	if err := os.WriteFile(npmrcPath(home), []byte(mdmBlock()), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	w := newDiskWriter(t, home)
+	w.owners = fakeOwner{uid: uint32(os.Getuid() + 1), enforced: true}
+	present, observed, err := w.ProbeContentNPM(stdBody)
+	if !isTargetUnusable(err) {
+		t.Fatalf("a foreign-owned leaf must error with ErrTargetUnusable, got %v", err)
+	}
+	if present || observed != nil {
+		t.Fatalf("a failed read must report nothing, got present=%v observed=%v", present, observed)
+	}
+}
+
+func TestClear_PurgesTokenBearingBackups(t *testing.T) {
+	// Offboarding must leave no readable copy of the token. Every backup after the
+	// first holds a previous managed block, and the one Clear itself takes holds the
+	// very block being revoked — so removing the block from the live file while
+	// leaving those siblings on disk would revoke nothing recoverable. Clear purges
+	// its own backups once the new bytes are committed.
+	home := t.TempDir()
+	if err := os.WriteFile(npmrcPath(home), []byte("registry=https://registry.npmjs.org/\n"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	w := newDiskWriter(t, home)
+	for i := 0; i < 3; i++ {
+		if _, err := w.Write(stdBody); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+	if backups := dmgBackups(t, home); len(backups) == 0 {
+		t.Fatal("expected the writes to leave backups to purge")
+	}
+	if err := w.Clear(); err != nil {
+		t.Fatalf("Clear: %v", err)
+	}
+	if backups := dmgBackups(t, home); len(backups) != 0 {
+		t.Fatalf("clear must purge our backups, got %v", backups)
+	}
+	// Nothing anywhere beside the leaf may still carry the token.
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if strings.Contains(readFile(t, filepath.Join(home, e.Name())), stdTokenVal) {
+			t.Fatalf("%q still contains the token after clear", e.Name())
+		}
+	}
+	// The user's own pre-policy line is restored in the live file — the purge
+	// removes our backups, not the user's content.
+	if got := readFile(t, npmrcPath(home)); !strings.Contains(got, "registry=https://registry.npmjs.org/") {
+		t.Fatalf("the user's original registry must be restored, got %q", got)
+	}
+}
+
+func TestClear_NoOpClearRetriesTheBackupPurge(t *testing.T) {
+	// The purge is best-effort, so an unlink that failed once must be retried rather
+	// than stranded: nothing else ever revisits a token-bearing sibling. Both paths
+	// that clear nothing — a file with no block of ours, and no file at all — reach
+	// the same residue, so both retry. Unassignment calls Clear on every cycle, which
+	// is what makes the retry fire.
+	cases := []struct {
+		name string
+		seed func(home string)
+	}{
+		{"a file we do not manage", func(home string) {
+			if err := os.WriteFile(npmrcPath(home), []byte("registry=https://registry.npmjs.org/\n"), 0o600); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+		}},
+		{"no live file at all", func(string) {}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			tc.seed(home)
+			// A backup an earlier purge could not remove, still holding the block.
+			stale := filepath.Join(home, ".npmrc.dmg-deadbeef.bak")
+			if err := os.WriteFile(stale, []byte(block(stdBody)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			w := newDiskWriter(t, home)
+			if err := w.Clear(); err != nil {
+				t.Fatalf("Clear: %v", err)
+			}
+			if _, err := os.Stat(stale); !os.IsNotExist(err) {
+				t.Fatalf("a later clear must retry the purge, stat err = %v", err)
+			}
+		})
+	}
+}
+
+func TestClear_LoneCRIsAnErrorAndKeepsTheBlock(t *testing.T) {
+	// On disk: a CR-delimited managed block cannot be located, so Clear reports an
+	// error instead of a false success. The reconciler maps that to a failure and
+	// keeps the ownership record, so a later run retries rather than forgetting a
+	// token that is still on disk.
+	home := t.TempDir()
+	crFile := strings.ReplaceAll("cache=x\n"+block(stdBody), "\n", "\r")
+	if err := os.WriteFile(npmrcPath(home), []byte(crFile), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// A refused clear leaves the block live, so the backup is still the recovery aid
+	// for it and must survive: only a clear that left nothing of ours purges.
+	stale := filepath.Join(home, ".npmrc.dmg-deadbeef.bak")
+	if err := os.WriteFile(stale, []byte(block(stdBody)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w := newDiskWriter(t, home)
+	err := w.Clear()
+	if !isTargetUnusable(err) {
+		t.Fatalf("Clear must fail closed with ErrTargetUnusable, got %v", err)
+	}
+	if got := readFile(t, npmrcPath(home)); got != crFile {
+		t.Fatalf("a refused clear must leave the file byte-identical, got %q", got)
+	}
+	if _, err := os.Stat(stale); err != nil {
+		t.Fatalf("a refused clear must keep the backup as a recovery aid, stat err = %v", err)
+	}
+}
+
+// dmgBackups lists the committed backups the writer maintains beside the leaf.
+func dmgBackups(t *testing.T, home string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".npmrc.dmg-") && strings.HasSuffix(e.Name(), ".bak") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}

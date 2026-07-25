@@ -25,15 +25,15 @@ func TestFileStateStoreRoundTrip(t *testing.T) {
 		t.Fatal("an empty store must read absent")
 	}
 	want := AppliedTargetState{
-		AppliedHash:  "sha256:N",
-		WrittenValue: "managed-block",
-		FetchedAt:    time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC),
+		AppliedHash:     "sha256:N",
+		WrittenSettings: npmOwnRec("managed-block"),
+		FetchedAt:       time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC),
 	}
 	if err := s.Write(CategoryPackageConfig, TargetNPM, want); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 	got, ok := s.Read(CategoryPackageConfig, TargetNPM)
-	if !ok || got.AppliedHash != want.AppliedHash || got.WrittenValue != want.WrittenValue || !got.FetchedAt.Equal(want.FetchedAt) {
+	if !ok || got.AppliedHash != want.AppliedHash || got.WrittenSettings[NPMOwnedKey] != want.WrittenSettings[NPMOwnedKey] || !got.FetchedAt.Equal(want.FetchedAt) {
 		t.Fatalf("Read = %+v ok=%v, want %+v", got, ok, want)
 	}
 	// The file is created 0600 (not group/other-accessible). POSIX-only: Windows
@@ -60,8 +60,8 @@ func TestFileStateStorePreservesSiblings(t *testing.T) {
 	// The read-modify-write must preserve every other category/target — the same
 	// guarantee the shared cache makes, applied to this category's own file.
 	s := newFileStore(t)
-	npm := AppliedTargetState{AppliedHash: "sha256:N", WrittenValue: "npm-block"}
-	ide := AppliedTargetState{AppliedHash: "sha256:V", WrittenValue: "vscode-value"}
+	npm := AppliedTargetState{AppliedHash: "sha256:N", WrittenSettings: npmOwnRec("npm-block")}
+	ide := AppliedTargetState{AppliedHash: "sha256:V", WrittenSettings: ownRec("vscode-value")}
 	if err := s.Write(CategoryPackageConfig, TargetNPM, npm); err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestFileStateStorePreservesSiblings(t *testing.T) {
 		t.Fatal("the dropped npm record must be gone")
 	}
 	got, ok := s.Read(CategoryIDEExtension, TargetVSCode)
-	if !ok || got.WrittenValue != "vscode-value" {
+	if !ok || got.WrittenSettings[allowedExtensionsSettingKey] != "vscode-value" {
 		t.Fatalf("the sibling record must survive, got %+v ok=%v", got, ok)
 	}
 }
@@ -96,7 +96,7 @@ func TestFileStateStoreRefusesFutureSchema(t *testing.T) {
 	if _, ok := s.Read(CategoryPackageConfig, TargetNPM); ok {
 		t.Fatal("a future-schema file must read as absent")
 	}
-	if err := s.Write(CategoryPackageConfig, TargetNPM, AppliedTargetState{WrittenValue: "x"}); err != errFutureSchema {
+	if err := s.Write(CategoryPackageConfig, TargetNPM, AppliedTargetState{WrittenSettings: npmOwnRec("x")}); err != errFutureSchema {
 		t.Fatalf("Write err = %v, want errFutureSchema", err)
 	}
 	if err := s.Drop(CategoryPackageConfig, TargetNPM); err != errFutureSchema {
@@ -123,11 +123,11 @@ func TestFileStateStoreRecreatesCorruptFile(t *testing.T) {
 	if _, ok := s.Read(CategoryPackageConfig, TargetNPM); ok {
 		t.Fatal("a corrupt file must read as absent")
 	}
-	if err := s.Write(CategoryPackageConfig, TargetNPM, AppliedTargetState{WrittenValue: "blk"}); err != nil {
+	if err := s.Write(CategoryPackageConfig, TargetNPM, AppliedTargetState{WrittenSettings: npmOwnRec("blk")}); err != nil {
 		t.Fatalf("Write over a corrupt file must recreate it, got %v", err)
 	}
 	got, ok := s.Read(CategoryPackageConfig, TargetNPM)
-	if !ok || got.WrittenValue != "blk" {
+	if !ok || got.WrittenSettings[NPMOwnedKey] != "blk" {
 		t.Fatalf("record after recreate = %+v ok=%v", got, ok)
 	}
 }
@@ -139,7 +139,7 @@ func TestFileStateStoreDropAbsentIsNoOp(t *testing.T) {
 		t.Fatalf("dropping from an absent store must be a no-op, got %v", err)
 	}
 	// A file that exists but holds no such record.
-	if err := s.Write(CategoryPackageConfig, TargetNPM, AppliedTargetState{WrittenValue: "x"}); err != nil {
+	if err := s.Write(CategoryPackageConfig, TargetNPM, AppliedTargetState{WrittenSettings: npmOwnRec("x")}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Drop(CategoryIDEExtension, TargetVSCode); err != nil {
@@ -151,13 +151,13 @@ func TestFileStateStoreDropAbsentIsNoOp(t *testing.T) {
 }
 
 func TestFileStateStoreDropRemovesCorruptFile(t *testing.T) {
-	// A corrupt state file can still carry token-bearing WrittenValue bytes. Drop
+	// A corrupt state file can still carry token-bearing ownership bytes. Drop
 	// (offboarding) must not report success while leaving those bytes on disk — it
 	// removes the file so no stale credential survives the clear. (Contrast an
 	// absent file, which stays a no-op — nothing to remove.)
 	dir := t.TempDir()
 	path := filepath.Join(dir, packageConfigStateBasename+".json")
-	corrupt := `{ broken "written_value": "ssabc123::dev:S1` // invalid JSON, token-shaped bytes
+	corrupt := `{ broken "written_settings": "ssabc123::dev:S1` // invalid JSON, token-shaped bytes
 	if err := os.WriteFile(path, []byte(corrupt), 0o600); err != nil {
 		t.Fatal(err)
 	}

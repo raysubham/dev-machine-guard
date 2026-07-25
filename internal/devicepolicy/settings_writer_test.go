@@ -626,7 +626,7 @@ func TestApplyManagedEscapesUnusualKeys(t *testing.T) {
 
 // TestGalleryValueRoundTrips pins the ownership invariant on the value path the
 // reconciler now uses: the gallery URL arrives as a JSON string in the settings
-// map, is compacted (compactSettings), written, and recorded as owned — and that
+// map, is compacted (compactPolicySettings), written, and recorded as owned — and that
 // value must equal what a write→read round-trip returns, or ownership /
 // convergence would churn forever. Includes a URL with &, =, <, > — the
 // HTML-escaping edge (canonical JSON must not HTML-escape; json.Compact and the

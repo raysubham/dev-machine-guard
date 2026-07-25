@@ -32,8 +32,10 @@ func probeLinuxPolicyFile(path string) (bool, string) {
 }
 
 // ProbeManagedContent reads the values of the Linux VS Code managed-policy file
-// for the verify-only path.
-func ProbeManagedContent() (bool, map[string]json.RawMessage, error) {
+// for the verify-only path. expected is unused — the backend compares observed
+// against desired, so reading the managed values needs nothing from the policy
+// (see ProbeContentNPM for a probe that does).
+func ProbeManagedContent(expected string) (bool, map[string]json.RawMessage, error) {
 	return probeLinuxPolicyContent(linuxPolicyFilePath)
 }
 

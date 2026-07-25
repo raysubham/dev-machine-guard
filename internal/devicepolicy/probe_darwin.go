@@ -51,7 +51,13 @@ func probeDarwinManagedPrefs(root string) (bool, string) {
 // user's VS Code would resolve on the com.microsoft.VSCode domain: the machine-
 // wide managed-prefs plist overlaid by that user's per-user plist (per-user
 // wins). It parses the plists (binary or XML) and never globs other users.
-func ProbeManagedContent() (bool, map[string]json.RawMessage, error) {
+//
+// expected (the reconciler's rendered desired value) is unused: the backend
+// compares observed VS Code values against desired, so nothing about the desired
+// policy is needed to READ the managed ones. It exists because the shared
+// ProbeContent seam carries it for probes that must decide part of the verdict
+// on-device (see ProbeContentNPM).
+func ProbeManagedContent(expected string) (bool, map[string]json.RawMessage, error) {
 	return probeDarwinManagedContent(darwinManagedPrefsDir, currentManagedPrefsUser())
 }
 

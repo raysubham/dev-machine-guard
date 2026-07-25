@@ -155,9 +155,9 @@ func (s *fileStateStore) Drop(category, target string) error {
 		return errFutureSchema
 	case stateAbsentOrCorrupt:
 		// Absent → nothing to drop. Corrupt (present but unparseable) → the bytes on
-		// disk can still carry a token-bearing WrittenValue; a Drop that left the file
-		// in place would strand that credential after offboarding. Remove it so no
-		// stale record — readable or not — survives the clear.
+		// disk can still carry a token-bearing WrittenSettings entry; a Drop that left
+		// the file in place would strand that credential after offboarding. Remove it
+		// so no stale record — readable or not — survives the clear.
 		return s.removeIfPresent()
 	}
 	cat, ok := f.Categories[category]

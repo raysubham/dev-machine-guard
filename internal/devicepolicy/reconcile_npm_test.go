@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -93,8 +94,10 @@ func npmPolicyEP(hash string) EffectivePolicy {
 }
 
 // newNPMRec builds a marker-owned, State-backed reconciler wired like the
-// ~/.npmrc path: OwnsByMarker, a Render seam that produces the managed block, a
-// content-aware ProbeExpected, and a Converged seam. Defaults: Render → the
+// ~/.npmrc path: OwnsByMarker, OwnershipKey, a Render seam that produces the
+// managed block, a content-aware ProbeExpected, and a Converged seam. It mirrors
+// runPackageConfigEnforce's wiring, so a seam the production path sets and this
+// one does not would show up as a behavior difference. Defaults: Render → the
 // fixed block, probe → not managed, Converged → false (proceed to write). Tests
 // override a single seam to exercise one rung. No withTempCache — State routes
 // every ownership access away from the shared file.
@@ -111,6 +114,7 @@ func newNPMRec(t *testing.T, ep EffectivePolicy, w *fakeWriter, st *memStateStor
 		Category:      CategoryPackageConfig,
 		Target:        TargetNPM,
 		OwnsByMarker:  true,
+		OwnershipKey:  NPMOwnedKey,
 		State:         st,
 		Render:        npmRenderOK,
 		ProbeExpected: func(string) (bool, string) { return false, "" },
@@ -145,7 +149,7 @@ func TestNPMEnforceRendersBlockAndWrites(t *testing.T) {
 		t.Fatal("ownership must be recorded through the State seam")
 	}
 	rec, ok := st.get(CategoryPackageConfig, TargetNPM)
-	if !ok || rec.WrittenValue != npmRendered || rec.AppliedHash != "sha256:N" {
+	if !ok || rec.WrittenSettings[NPMOwnedKey] != npmRendered || rec.AppliedHash != "sha256:N" {
 		t.Fatalf("state record = %+v ok=%v, want the rendered block + hash", rec, ok)
 	}
 }
@@ -207,7 +211,7 @@ func TestNPMConvergedSeamOverridesBodyEquality(t *testing.T) {
 	// reconciler still rewrites, where plain body-equality would have skipped.
 	w := &fakeWriter{value: npmRendered, present: true}
 	st := &memStateStore{m: map[string]AppliedTargetState{
-		msKey(CategoryPackageConfig, TargetNPM): {AppliedHash: "sha256:N", WrittenValue: npmRendered},
+		msKey(CategoryPackageConfig, TargetNPM): {AppliedHash: "sha256:N", WrittenSettings: npmOwnRec(npmRendered)},
 	}}
 	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
 	r.Converged = func(string) (bool, error) { return false, nil }
@@ -228,7 +232,7 @@ func TestNPMConvergedTrueIsIdempotent(t *testing.T) {
 	// evaluation.
 	w := &fakeWriter{value: npmRendered, present: true}
 	st := &memStateStore{m: map[string]AppliedTargetState{
-		msKey(CategoryPackageConfig, TargetNPM): {AppliedHash: "sha256:N", WrittenValue: npmRendered},
+		msKey(CategoryPackageConfig, TargetNPM): {AppliedHash: "sha256:N", WrittenSettings: npmOwnRec(npmRendered)},
 	}}
 	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
 	r.Converged = func(string) (bool, error) { return true, nil }
@@ -255,7 +259,7 @@ func TestNPMAdoptsAlreadyConvergedState(t *testing.T) {
 	}{
 		{"empty store (other mode applied)", &memStateStore{}},
 		{"stale hash in store", &memStateStore{m: map[string]AppliedTargetState{
-			msKey(CategoryPackageConfig, TargetNPM): {AppliedHash: "sha256:OLD", WrittenValue: npmRendered},
+			msKey(CategoryPackageConfig, TargetNPM): {AppliedHash: "sha256:OLD", WrittenSettings: npmOwnRec(npmRendered)},
 		}}},
 	}
 	for _, tc := range cases {
@@ -273,7 +277,7 @@ func TestNPMAdoptsAlreadyConvergedState(t *testing.T) {
 				t.Fatalf("report = %+v, want compliant + adopted hash", got)
 			}
 			rec, ok := tc.st.get(CategoryPackageConfig, TargetNPM)
-			if !ok || rec.AppliedHash != "sha256:NEW" || rec.WrittenValue != npmRendered {
+			if !ok || rec.AppliedHash != "sha256:NEW" || rec.WrittenSettings[NPMOwnedKey] != npmRendered {
 				t.Fatalf("state not adopted: rec=%+v ok=%v", rec, ok)
 			}
 		})
@@ -351,7 +355,7 @@ func TestNPMClearByMarkerAlwaysClearsAndDrops(t *testing.T) {
 	}{
 		{"no record", &memStateStore{}},
 		{"stale record", &memStateStore{m: map[string]AppliedTargetState{
-			msKey(CategoryPackageConfig, TargetNPM): {WrittenValue: "old-block"},
+			msKey(CategoryPackageConfig, TargetNPM): {WrittenSettings: npmOwnRec("old-block")},
 		}}},
 	}
 	for _, tc := range cases {
@@ -572,5 +576,438 @@ func TestSeamFallbacksMatchIDEBehavior(t *testing.T) {
 	}
 	if s := classifyWriteError(fmt.Errorf("x: %w", ErrWriteUnverified)); s != StateVerificationFailed {
 		t.Fatalf("classifyWriteError(unverified) = %q, want verification_failed", s)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// enforcement channel fork (npm): dmg writes, mdm verifies only
+// ---------------------------------------------------------------------------
+
+// npmObservedFake is the observed bag a wired ProbeContentNPM would return. Built
+// here rather than imported from the probe so a change to the real probe's shape
+// shows up as a wiring test failure, not silently.
+func npmObservedFake() map[string]json.RawMessage {
+	return map[string]json.RawMessage{
+		observedKeyEcosystem:       json.RawMessage(`"npm"`),
+		observedKeyRegistryURL:     json.RawMessage(`"https://npm.pkg.example/javascript"`),
+		observedKeyAuthTokenStatus: json.RawMessage(`"match"`),
+	}
+}
+
+// npmMDMEP is an npm policy directive on the verify-only channel.
+func npmMDMEP(hash string) EffectivePolicy {
+	ep := npmPolicyEP(hash)
+	ep.Enforcement = "mdm"
+	return ep
+}
+
+func TestNPMDMGChannelStillWrites(t *testing.T) {
+	// The explicit "dmg" channel and an absent one are the same write-and-verify
+	// path: the fork must not change the DMG lane the rest of this file covers.
+	for _, channel := range []string{"", "dmg", "DMG", "  dmg  ", "wat"} {
+		t.Run("channel="+channel, func(t *testing.T) {
+			w := &fakeWriter{}
+			st := &memStateStore{}
+			ep := npmPolicyEP("sha256:N")
+			ep.Enforcement = channel
+			r, rep := newNPMRec(t, ep, w, st)
+			if err := r.Reconcile(context.Background()); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if len(w.writes) != 1 || w.writes[0] != npmRendered {
+				t.Fatalf("the dmg lane must write the rendered block once, got %v", w.writes)
+			}
+			// An unrecognized channel resolves to dmg and REPORTS dmg, so the
+			// backend's exact-match gate sees the channel that actually ran.
+			if got := lastReport(t, rep).EvaluatedEnforcement; got != enforcementDMG {
+				t.Fatalf("evaluated_enforcement = %q, want %q", got, enforcementDMG)
+			}
+		})
+	}
+}
+
+func TestNPMMDMChannelVerifiesAndNeverWrites(t *testing.T) {
+	w := &fakeWriter{}
+	st := &memStateStore{}
+	r, rep := newNPMRec(t, npmMDMEP("sha256:N"), w, st)
+	r.ProbeContent = func(expected string) (bool, map[string]json.RawMessage, error) {
+		// verifyMDM renders the desired value FIRST and hands it over — the npm probe
+		// needs it to decide auth_token_status on-device.
+		if expected != npmRendered {
+			t.Fatalf("probe expected = %q, want the rendered block %q", expected, npmRendered)
+		}
+		return true, npmObservedFake(), nil
+	}
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	rec := lastReport(t, rep)
+	if rec.State != StateMDMManaged {
+		t.Fatalf("state = %q, want %q", rec.State, StateMDMManaged)
+	}
+	if rec.EvaluatedEnforcement != enforcementMDM {
+		t.Fatalf("evaluated_enforcement = %q, want %q", rec.EvaluatedEnforcement, enforcementMDM)
+	}
+	// The agent applied nothing, so it must claim nothing.
+	if rec.AppliedHash != "" {
+		t.Fatalf("applied_hash = %q, want empty in mdm mode", rec.AppliedHash)
+	}
+	var observed map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Observed, &observed); err != nil {
+		t.Fatalf("observed is not a JSON object: %v (%s)", err, rec.Observed)
+	}
+	if len(observed) != 3 || string(observed[observedKeyAuthTokenStatus]) != `"match"` {
+		t.Fatalf("observed = %s, want the three-key bag", rec.Observed)
+	}
+	// MDM owns nothing on disk: no write, no clear, no read, and the ownership
+	// store is never touched.
+	if len(w.writes) != 0 || w.clears != 0 || w.reads != 0 {
+		t.Fatalf("mdm mode touched the writer: writes=%v clears=%d reads=%d", w.writes, w.clears, w.reads)
+	}
+	if st.writes != 0 || st.drops != 0 || st.reads != 0 {
+		t.Fatalf("mdm mode touched the state store: writes=%d drops=%d reads=%d", st.writes, st.drops, st.reads)
+	}
+}
+
+func TestNPMMDMChannelStatesFromProbe(t *testing.T) {
+	cases := []struct {
+		name    string
+		probe   func(string) (bool, map[string]json.RawMessage, error)
+		state   string
+		wantObs bool
+	}{
+		{
+			name:    "marker present → mdm_managed with observed",
+			probe:   func(string) (bool, map[string]json.RawMessage, error) { return true, npmObservedFake(), nil },
+			state:   StateMDMManaged,
+			wantObs: true,
+		},
+		{
+			name:  "no marker → policy_not_applied, no observed",
+			probe: func(string) (bool, map[string]json.RawMessage, error) { return false, nil, nil },
+			state: StatePolicyNotApplied,
+		},
+		{
+			name: "unreadable/malformed → verification_failed, no observed",
+			probe: func(string) (bool, map[string]json.RawMessage, error) {
+				return false, nil, errors.New("npmrc: file contains an INI section header")
+			},
+			state: StateVerificationFailed,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &fakeWriter{}
+			r, rep := newNPMRec(t, npmMDMEP("sha256:N"), w, &memStateStore{})
+			r.ProbeContent = tc.probe
+			if err := r.Reconcile(context.Background()); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			rec := lastReport(t, rep)
+			if rec.State != tc.state {
+				t.Fatalf("state = %q, want %q", rec.State, tc.state)
+			}
+			if rec.EvaluatedEnforcement != enforcementMDM {
+				t.Fatalf("evaluated_enforcement = %q, want %q", rec.EvaluatedEnforcement, enforcementMDM)
+			}
+			if gotObs := len(rec.Observed) > 0; gotObs != tc.wantObs {
+				t.Fatalf("observed present = %v, want %v (%s)", gotObs, tc.wantObs, rec.Observed)
+			}
+			if len(w.writes) != 0 || w.clears != 0 {
+				t.Fatalf("mdm mode must not touch the writer, got writes=%v clears=%d", w.writes, w.clears)
+			}
+		})
+	}
+}
+
+func TestNPMMDMChannelRenderFailureIsVerificationFailed(t *testing.T) {
+	// In MDM mode a policy the renderer rejects means there is no desired value to
+	// verify against, so nothing could be checked — verification_failed, not the
+	// DMG lane's policy_not_applied (which asserts a failed APPLY).
+	w := &fakeWriter{}
+	r, rep := newNPMRec(t, npmMDMEP("sha256:N"), w, &memStateStore{})
+	r.Render = func(json.RawMessage) (string, error) { return "", errors.New("bad policy") }
+	probed := false
+	r.ProbeContent = func(string) (bool, map[string]json.RawMessage, error) {
+		probed = true
+		return true, npmObservedFake(), nil
+	}
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := lastReport(t, rep).State; got != StateVerificationFailed {
+		t.Fatalf("state = %q, want %q", got, StateVerificationFailed)
+	}
+	if probed {
+		t.Fatal("the probe must not run without a desired value to compare against")
+	}
+	if len(w.writes) != 0 {
+		t.Fatalf("mdm mode must never write, got %v", w.writes)
+	}
+}
+
+func TestNPMMDMChannelClearIsANoOp(t *testing.T) {
+	// enforcement=mdm + clear: the MDM lane owns nothing the agent could remove, and
+	// there is nothing to verify either. No write, no clear, no state change, and no
+	// report (an unassigned device is backend-derived).
+	w := &fakeWriter{}
+	st := &memStateStore{m: map[string]AppliedTargetState{
+		msKey(CategoryPackageConfig, TargetNPM): {AppliedHash: "sha256:OLD", WrittenSettings: npmOwnRec(npmRendered)},
+	}}
+	ep := npmMDMEP("")
+	ep.Clear = true
+	ep.Policy = nil
+	r, rep := newNPMRec(t, ep, w, st)
+	r.ProbeContent = func(string) (bool, map[string]json.RawMessage, error) {
+		t.Fatal("a clear directive must not reach the probe")
+		return false, nil, nil
+	}
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(rep.reports) != 0 {
+		t.Fatalf("mdm clear must not report, got %+v", rep.reports)
+	}
+	if len(w.writes) != 0 || w.clears != 0 {
+		t.Fatalf("mdm clear must not touch the writer, got writes=%v clears=%d", w.writes, w.clears)
+	}
+	if _, ok := st.get(CategoryPackageConfig, TargetNPM); !ok {
+		t.Fatal("mdm clear must leave the ownership record alone — it owns nothing to drop")
+	}
+}
+
+func TestNPMMDMChannelRunsWithNoWriter(t *testing.T) {
+	// The MDM fork sits ABOVE the writer gates, so a cycle with no constructible
+	// writer still verifies and reports — the DMG lane's handleNoWriter
+	// classification must not swallow it.
+	st := &memStateStore{}
+	r, rep := newNPMRec(t, npmMDMEP("sha256:N"), nil, st)
+	r.Writer = nil
+	r.Converged = nil
+	r.RestoreSnapshot = nil
+	r.WriterInitErr = fmt.Errorf("resolve target user: %w", ErrNoTargetUser)
+	r.ProbeContent = func(string) (bool, map[string]json.RawMessage, error) { return true, npmObservedFake(), nil }
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	rec := lastReport(t, rep)
+	if rec.State != StateMDMManaged || rec.EvaluatedEnforcement != enforcementMDM {
+		t.Fatalf("report = %+v, want mdm_managed on the mdm channel", rec)
+	}
+}
+
+func TestNPMMDMChannelNoProbeSeamIsVerificationFailed(t *testing.T) {
+	// The category-aware fallback. ProbeContent is nil whenever the writer could not
+	// be constructed (it is bound off the writer), and the generic default probes VS
+	// CODE policy locations — which for an npm category would report another
+	// category's policy. A non-ide category with no seam must error instead.
+	//
+	// verification_failed is the discriminating outcome: had it fallen through to
+	// ProbeManagedContent, a machine with no VS Code policy would have answered
+	// present=false and reported the clean policy_not_applied.
+	st := &memStateStore{}
+	r, rep := newNPMRec(t, npmMDMEP("sha256:N"), nil, st)
+	r.Writer = nil
+	r.Converged = nil
+	r.RestoreSnapshot = nil
+	r.WriterInitErr = fmt.Errorf("resolve target user: %w", ErrNoTargetUser)
+	r.ProbeContent = nil
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	rec := lastReport(t, rep)
+	if rec.State != StateVerificationFailed {
+		t.Fatalf("state = %q, want %q (never a VS Code probe for an npm category)", rec.State, StateVerificationFailed)
+	}
+	if len(rec.Observed) != 0 {
+		t.Fatalf("a failed verification must carry no observed bag, got %s", rec.Observed)
+	}
+}
+
+func TestIDEMDMChannelKeepsItsDefaultProbe(t *testing.T) {
+	// The mirror of the case above: for ide_extension the nil-seam fallback is still
+	// ProbeManagedContent, so making the fallback category-aware must not have
+	// changed the VS Code lane. probe_other/darwin/linux/windows all answer for a
+	// machine with no managed policy, so this asserts the clean not-applied outcome
+	// rather than the npm error.
+	withTempCache(t)
+	rep := &fakeReporter{}
+	r := &Reconciler{
+		Fetcher:    &fakeFetcher{ep: func() EffectivePolicy { ep := policyEP("sha256:H"); ep.Enforcement = "mdm"; return ep }()},
+		Reporter:   rep,
+		Writer:     &fakeWriter{},
+		CustomerID: "cust",
+		DeviceID:   "dev-1",
+		Platform:   "linux",
+		Now:        func() time.Time { return time.Date(2026, 7, 24, 0, 0, 0, 0, time.UTC) },
+	}
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := lastReport(t, rep).State; got != StatePolicyNotApplied && got != StateMDMManaged {
+		t.Fatalf("state = %q, want the OS probe's verdict (policy_not_applied or mdm_managed), not an error", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cache collapse: one WrittenSettings entry drives the whole npm DMG lifecycle
+// ---------------------------------------------------------------------------
+
+func TestNPMOwnershipLifecycleThroughWrittenSettings(t *testing.T) {
+	// The collapse of the retired single-value WrittenValue field into one
+	// WrittenSettings entry must leave the npm DMG lane behaving identically:
+	// enforce records ownership, a hand-edit is detected as drift and converged
+	// back, and clear removes the block by marker and drops the record. Every state
+	// access routes through the injected StateStore (r.readState), never the shared
+	// file.
+	w := &fakeWriter{}
+	st := &memStateStore{}
+	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
+	// Converged mirrors the writer: the block is in place iff the last write stands.
+	r.Converged = func(expected string) (bool, error) { return w.present && w.value == expected, nil }
+
+	// 1. Enforce → the block is written and ownership recorded under NPMOwnedKey.
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("enforce: %v", err)
+	}
+	rec, ok := st.get(CategoryPackageConfig, TargetNPM)
+	if !ok || len(rec.WrittenSettings) != 1 || rec.WrittenSettings[NPMOwnedKey] != npmRendered {
+		t.Fatalf("ownership = %+v, want exactly one %s entry", rec.WrittenSettings, NPMOwnedKey)
+	}
+	if got := lastReport(t, rep).State; got != StateCompliant {
+		t.Fatalf("first enforce state = %q, want compliant", got)
+	}
+
+	// 2. Hand-edit the file, then re-enforce with the SAME hash. The recorded entry
+	// no longer matches disk → drift, converged back in the same cycle.
+	w.value, w.present = "registry=https://hand-edited.example/", true
+	rep.reports = nil
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("re-enforce after hand-edit: %v", err)
+	}
+	if got := lastReport(t, rep).State; got != StateDriftDetected {
+		t.Fatalf("state after hand-edit = %q, want drift_detected", got)
+	}
+	if len(w.writes) != 2 || w.writes[1] != npmRendered {
+		t.Fatalf("drift must re-apply the rendered block, got %v", w.writes)
+	}
+	if rec, _ := st.get(CategoryPackageConfig, TargetNPM); rec.WrittenSettings[NPMOwnedKey] != npmRendered {
+		t.Fatalf("ownership after drift = %+v, want the re-applied block", rec.WrittenSettings)
+	}
+
+	// 3. A third cycle with the block intact is idempotent — no write, still
+	// compliant (not drift): the ownership entry now agrees with disk.
+	rep.reports = nil
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("idempotent cycle: %v", err)
+	}
+	if len(w.writes) != 2 {
+		t.Fatalf("a converged cycle must not write, got %v", w.writes)
+	}
+	if got := lastReport(t, rep).State; got != StateCompliant {
+		t.Fatalf("idempotent state = %q, want compliant", got)
+	}
+
+	// 4. Clear → marker-based, so the block goes and the record is dropped
+	// unconditionally (clear never consults the ownership entry).
+	clearEP := npmPolicyEP("")
+	clearEP.Clear = true
+	clearEP.Policy = nil
+	r.Fetcher = &fakeFetcher{ep: clearEP}
+	rep.reports = nil
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if w.clears != 1 {
+		t.Fatalf("clear must remove the block, clears=%d", w.clears)
+	}
+	if _, ok := st.get(CategoryPackageConfig, TargetNPM); ok {
+		t.Fatal("clear must drop the ownership record")
+	}
+	if len(rep.reports) != 0 {
+		t.Fatalf("clear must not report (backend-derived), got %+v", rep.reports)
+	}
+}
+
+func TestNPMEnforceIgnoresForeignOwnershipKeys(t *testing.T) {
+	// The npm lane reads and writes exactly its own WrittenSettings key. A record
+	// carrying only some other lane's key means "this lane owns nothing", so an
+	// unconverged file is a plain first enforce — NOT drift (drift asserts the agent's
+	// own value was changed) — and the post-write persist records the npm key alone,
+	// never inheriting the foreign one.
+	w := &fakeWriter{}
+	st := &memStateStore{m: map[string]AppliedTargetState{
+		msKey(CategoryPackageConfig, TargetNPM): {
+			AppliedHash:     "sha256:N",
+			WrittenSettings: map[string]string{allowedExtensionsSettingKey: "not-ours"},
+		},
+	}}
+	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := lastReport(t, rep).State; got != StateCompliant {
+		t.Fatalf("state = %q, want compliant (a foreign key is not npm drift)", got)
+	}
+	rec, _ := st.get(CategoryPackageConfig, TargetNPM)
+	if len(rec.WrittenSettings) != 1 || rec.WrittenSettings[NPMOwnedKey] != npmRendered {
+		t.Fatalf("ownership = %+v, want only the npm entry recorded", rec.WrittenSettings)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Secret hygiene
+// ---------------------------------------------------------------------------
+
+func TestNPMNeverLogsOrReportsTheToken(t *testing.T) {
+	// The rendered block carries the device token, and the reconciler handles it on
+	// every rung (render → probe → write → ownership → report). None of the api_key,
+	// the composed token, or the serial may reach a log line or any report field.
+	const apiKey = "ssSECRETKEY123"
+	const serial = "SERIAL-ABC"
+	const rendered = "registry=https://t.registry.stepsecurity.io/javascript\n" +
+		"//t.registry.stepsecurity.io/javascript/:_authToken=" + apiKey + "::dev:" + serial
+
+	var logged strings.Builder
+	run := func(channel string, probe func(string) (bool, map[string]json.RawMessage, error)) {
+		w := &fakeWriter{}
+		ep := npmPolicyEP("sha256:N")
+		ep.Enforcement = channel
+		r, rep := newNPMRec(t, ep, w, &memStateStore{})
+		r.Render = func(json.RawMessage) (string, error) { return rendered, nil }
+		r.Converged = func(expected string) (bool, error) { return w.present && w.value == expected, nil }
+		r.ProbeContent = probe
+		r.Logf = func(format string, args ...any) {
+			_, _ = fmt.Fprintf(&logged, format+"\n", args...)
+		}
+		if err := r.Reconcile(context.Background()); err != nil {
+			t.Fatalf("channel %q: %v", channel, err)
+		}
+		for _, got := range rep.reports {
+			raw, err := json.Marshal(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, secret := range []string{apiKey, apiKey + "::dev:" + serial, serial} {
+				if strings.Contains(string(raw), secret) {
+					t.Fatalf("channel %q report leaks %q: %s", channel, secret, raw)
+				}
+			}
+		}
+	}
+
+	// The DMG write lane handles the token most (render, write, ownership record)...
+	run("dmg", nil)
+	// ...and the MDM lane renders it to hand the tenant key to the probe.
+	run("mdm", func(string) (bool, map[string]json.RawMessage, error) { return true, npmObservedFake(), nil })
+
+	for _, secret := range []string{apiKey, apiKey + "::dev:" + serial, serial} {
+		if strings.Contains(logged.String(), secret) {
+			t.Fatalf("logs leak %q:\n%s", secret, logged.String())
+		}
+	}
+	if logged.Len() == 0 {
+		t.Fatal("the test proved nothing — no log lines were captured")
 	}
 }

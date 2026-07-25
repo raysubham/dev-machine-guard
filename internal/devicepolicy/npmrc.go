@@ -43,6 +43,36 @@ const (
 	npmrcMDMMarker = "# StepSecurity Secure Registry -- managed by mdm"
 )
 
+// NPMOwnedKey is the WrittenSettings key the npm lane records ownership under.
+// The managed block is ONE atomic unit (its BEGIN/END markers bound it), so the
+// lane owns exactly one entry — value = the rendered block body — where the VS
+// Code lane owns one entry per setting id. Wired as Reconciler.OwnershipKey so
+// drift, adoption, persistence, and the value-based clear all read the same key.
+const NPMOwnedKey = "npmrc"
+
+// The observed-bag keys and auth verdicts of the MDM verify-only report. They are
+// WIRE-PERMANENT: the backend validates exactly these three keys and rejects any
+// other (a secret-ingest guard), and maps auth_token_status to a redacted auth
+// change. auth_token_status is the ONLY axis decided on-device, because deciding
+// it backend-side would mean transmitting a token.
+const (
+	observedKeyEcosystem   = "ecosystem"
+	observedKeyRegistryURL = "registry_url"
+	// #nosec G101 -- a JSON field NAME, not a credential; the value it carries is
+	// one of the three verdicts below and never token material.
+	observedKeyAuthTokenStatus = "auth_token_status"
+
+	authTokenMatch    = "match"
+	authTokenMismatch = "mismatch"
+	authTokenAbsent   = "absent"
+)
+
+// npmrcMaxRegistryURLBytes caps the observed registry_url before transmission.
+// The value is read off a user-writable file and the backend rejects anything
+// longer, so an oversize value is refused on-device rather than sent to fail
+// there.
+const npmrcMaxRegistryURLBytes = 2048
+
 // npmrcDMGPrefix is prepended to a user's active bare `registry=` line when the
 // managed block is applied, so the original survives (commented) and can be
 // restored on clear. It is deliberately distinct from the MDM script's
@@ -563,14 +593,23 @@ func (w *NPMRCWriter) Clear() error {
 		return err
 	}
 	if !existed {
-		// Nothing to clear; leave the (absent) file alone.
+		// Nothing to clear; leave the (absent) file alone. A backup from an earlier
+		// cycle can still hold a managed block, and with the live file gone this is
+		// the only path that ever reaches it — so retry the purge here.
+		w.purgeBackups(rt)
 		return nil
 	}
 
-	next := w.clearContent(cur)
+	next, err := w.clearContent(cur)
+	if err != nil {
+		return err
+	}
 	if bytes.Equal(next, cur) {
-		// No managed block and no prefixed lines — a no-op that performs no
-		// write at all.
+		// No managed block and no prefixed lines — a no-op that performs no write at
+		// all. Nothing of ours is live, so a backup beside the leaf is residue: either
+		// an earlier purge that could not unlink it, or a block someone removed by
+		// hand. Retry the purge; the clear itself stays a no-op.
+		w.purgeBackups(rt)
 		return nil
 	}
 
@@ -583,13 +622,19 @@ func (w *NPMRCWriter) Clear() error {
 		if out.renamed {
 			// The cleared bytes landed but unverified — revert to the pre-clear state
 			// rather than leave an unverified file; a failed revert leaves disk
-			// indeterminate (ErrWriteUnverified).
+			// indeterminate (ErrWriteUnverified). The backup stays as a recovery aid.
 			return w.afterFailedRollback(rt, snap, err, "clear commit verification")
 		}
 		return err
 	}
 	snap.committed = out.committed
 	w.pending = snap
+	// The clear succeeded, so every backup beside the leaf is now stale — and the
+	// one taken moments ago holds the very token this clear exists to revoke.
+	// Removing the managed block while leaving a readable copy of it in a sibling
+	// would defeat offboarding, so drop our own backups here. Rollback is
+	// unaffected: RestoreSnapshot reverts from snap's in-memory bytes.
+	w.purgeBackups(rt)
 	return nil
 }
 
@@ -920,6 +965,60 @@ func (w *NPMRCWriter) rotateBackups(rt *resolvedTarget) {
 	}
 }
 
+// purgeBackups removes every committed backup beside the leaf. It runs on every
+// Clear that leaves nothing of ours live: the managed block is gone from the live
+// file, so a sibling still holding a copy of it would keep the revoked token
+// readable and defeat offboarding. Only files WE created are touched — the
+// "<base>.dmg-<rand>.bak" shape rotateBackups maintains — and in-flight temp files
+// are left to their own owners.
+//
+// Failures are logged, never returned, for two reasons. By the time we get here the
+// revocation itself has already happened, so reporting a failed unlink as a failed
+// Clear would call a completed revocation failed; and because the reconciler then
+// re-clears a file that has no block left, every later pass would take the no-op
+// path and fail again — a permanent synthetic failure over a sibling file. The no-op
+// paths call this instead, so an unlink that lost a race with a reader (a mapped or
+// open .bak on Windows) is retried on the next unassignment cycle.
+func (w *NPMRCWriter) purgeBackups(rt *resolvedTarget) {
+	d, err := rt.child.Open(".")
+	if err != nil {
+		w.log("npmrc: backup purge open dir failed: %v", err)
+		return
+	}
+	defer d.Close()
+
+	prefix := rt.base + ".dmg-"
+	tmpPrefix := rt.base + ".dmg-tmp-"
+	for {
+		entries, rerr := d.ReadDir(256)
+		for _, e := range entries {
+			name := e.Name()
+			if name == "" || strings.ContainsRune(name, filepath.Separator) {
+				continue
+			}
+			if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".bak") {
+				continue
+			}
+			if strings.HasPrefix(name, tmpPrefix) {
+				continue
+			}
+			li, lerr := rt.child.Lstat(name)
+			if lerr != nil || !li.Mode().IsRegular() {
+				continue
+			}
+			if err := rt.child.Remove(name); err != nil {
+				w.log("npmrc: purge backup %q failed: %v", name, err)
+			}
+		}
+		if rerr != nil {
+			if !errors.Is(rerr, io.EOF) {
+				w.log("npmrc: backup purge readdir failed: %v", rerr)
+			}
+			break
+		}
+	}
+}
+
 func randomSuffix() (string, error) {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -957,6 +1056,13 @@ func (w *NPMRCWriter) rewriteContent(current []byte, body string) ([]byte, error
 	if hasCoercibleQuotedKey(lines) {
 		return nil, fmt.Errorf("npmrc: file has a quoted key npm would coerce from non-string JSON; cannot safely transform: %w", ErrTargetUnusable)
 	}
+	if _, tokKey, _, _ := parseExpected(body); hasArrayAppendOverride(lines, tokKey) {
+		// npm folds `registry[]=` and our block's `registry=` into one array, so the
+		// block would be present and last-wins yet npm would not resolve to the
+		// tenant registry alone. Commenting the array line out is not enough (npm
+		// arrays are order-independent), so refuse the transform.
+		return nil, fmt.Errorf("npmrc: file uses npm array-append syntax on a managed key; cannot safely transform: %w", ErrTargetUnusable)
+	}
 	lines = commentBareRegistry(lines)
 
 	base := strings.Join(lines, "\n")
@@ -983,15 +1089,25 @@ func (w *NPMRCWriter) rewriteContent(current []byte, body string) ([]byte, error
 // deviation from "restore the world" is that a missing original final newline
 // is not restored — the remainder keeps the newline enforce added before the
 // block.
-func (w *NPMRCWriter) clearContent(current []byte) []byte {
+//
+// It fails closed on a bare CR for a reason specific to clearing: a CR-delimited
+// file collapses to a single line under the '\n' split, so no marker line matches
+// and the block is not FOUND — the transform would return the input unchanged,
+// Clear would report the nothing-to-do success, and the reconciler would drop
+// ownership state while the token stayed on disk. Refusing keeps the failure
+// visible and the ownership record intact, so a later run can retry.
+func (w *NPMRCWriter) clearContent(current []byte) ([]byte, error) {
 	rest, bom := stripBOM(current)
+	if hasLoneCR(string(rest)) {
+		return nil, fmt.Errorf("npmrc: file contains a bare CR npm treats as a line break; the managed block cannot be located to remove it: %w", ErrTargetUnusable)
+	}
 	lines := strings.Split(string(rest), "\n")
 	lines, _ = stripManagedBlock(lines)
 	lines = unprefixDMG(lines)
 	var buf bytes.Buffer
 	buf.Write(bom)
 	buf.WriteString(strings.Join(lines, "\n"))
-	return buf.Bytes()
+	return buf.Bytes(), nil
 }
 
 // stripBOM splits a leading UTF-8 BOM off the content. The BOM is removed for
@@ -1096,6 +1212,54 @@ func hasCoercibleQuotedKey(lines []string) bool {
 			continue
 		}
 		if quotedNonStringInner(strings.TrimSpace(l[:i])) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasArrayAppendOverride reports whether any active line uses npm's `key[]=`
+// array-append form on a key this writer's precedence model treats as a scalar.
+// npm's ini reader turns `registry[]=…` into an ARRAY and then folds the plain
+// `registry=` assignment into that same array, so BOTH orders leave the effective
+// registry a comma-joined list containing the injected value while a last-wins
+// scalar scan still sees the block's own `registry=` as the winner — i.e. we would
+// report converged (or observe a clean registry_url) on a file where npm no longer
+// resolves to the tenant registry alone. Verified against npm 10.9.7:
+//
+//	registry=<ours> + registry[]=<theirs> → "<ours>,<theirs>"
+//	registry[]=<theirs> + registry=<ours> → "<theirs>,<ours>"
+//
+// Only the keys we manage are judged, so an unrelated array config (`omit[]=dev`)
+// is left alone. tokenKey is the single `//host/path/:_authToken` this writer
+// manages: npm consults exactly that key for the tenant registry's credential, so
+// an array-append on any OTHER registry's token cannot perturb what we render or
+// read, and refusing the file over it would be a false unenforceable. When the
+// desired pair does not parse, which key is ours is unknown, so every token key is
+// judged rather than none.
+//
+// The `[]` suffix is tested AFTER npmUnsafe, matching npm's own order (it unquotes
+// before checking for `[]`), which is what catches the quoted `"registry[]"=…` form;
+// `registry [] = …` is NOT flagged because npm stores that under the distinct key
+// "registry " and it overrides nothing.
+func hasArrayAppendOverride(lines []string, tokenKey string) bool {
+	for _, l := range lines {
+		key, _, ok := activeKV(l)
+		if !ok {
+			continue
+		}
+		base, isAppend := strings.CutSuffix(key, "[]")
+		if !isAppend {
+			continue
+		}
+		if base == "registry" {
+			return true
+		}
+		if tokenKey != "" {
+			if base == tokenKey {
+				return true
+			}
+		} else if strings.HasSuffix(base, ":_authToken") {
 			return true
 		}
 	}
@@ -1361,6 +1525,13 @@ func (w *NPMRCWriter) Converged(expected string) (bool, error) {
 		// closed, the same refusal the rewrite path makes.
 		return false, fmt.Errorf("npmrc: file has a quoted key npm would coerce from non-string JSON; managed block cannot be verified: %w", ErrTargetUnusable)
 	}
+	if _, tokKey, _, _ := parseExpected(expected); hasArrayAppendOverride(lines, tokKey) {
+		// npm folds an array-append line into the same key as the block's scalar
+		// assignment, so last-wins would report converged while npm resolves to a
+		// list containing someone else's registry. Fail closed, as the rewrite path
+		// does.
+		return false, fmt.Errorf("npmrc: file uses npm array-append syntax on a managed key; managed block cannot be verified: %w", ErrTargetUnusable)
+	}
 
 	body, present := extractManagedBody(string(data))
 	if !present || body != expected {
@@ -1493,6 +1664,11 @@ func probeNPMRCContent(content, expected string) (bool, string) {
 		// marker plus matching lines is then not proof; fail closed (not managed).
 		return false, ""
 	}
+	if hasArrayAppendOverride(lines, expTokKey) {
+		// npm folds an array-append line into the MDM block's own key, so a marker
+		// plus matching lines is not proof the MDM lane governs npm. Fail closed.
+		return false, ""
+	}
 
 	// Our own block boundaries, so the MDM marker search can exclude it (a user
 	// planting the marker inside our block must not count).
@@ -1595,6 +1771,252 @@ func parseExpected(expected string) (registry, tokenKey, tokenVal string, ok boo
 		return "", "", "", false
 	}
 	return rv, tk, tv, true
+}
+
+// ProbeContentNPM is the MDM verify-only reader. It reports whether a
+// StepSecurity MDM-managed block is present in ~/.npmrc and, if so, the effective
+// (last-wins) configuration as the observed bag {ecosystem, registry_url,
+// auth_token_status}. It NEVER writes, patches, or clears — in MDM mode the agent
+// owns nothing on this file — and it never touches the ownership state store.
+//
+// expected is the rendered desired block. Only its tenant key (the api_key before
+// `::dev:<serial>`) is used, to decide auth_token_status here on the device; no
+// token, hash, or fingerprint is ever returned or logged.
+//
+// The three outcomes are deliberately distinct:
+//
+//   - genuinely absent file, or present with no MDM marker → (false, nil, nil) →
+//     policy_not_applied. Nothing is managing this file.
+//   - unreadable file — permission failure, a leaf that became a symlink or
+//     changed across the open, a non-regular leaf, an ownership mismatch, the size
+//     cap — or a construct we cannot reason about → error → verification_failed.
+//     We could not establish the effective config, so we must not report the clean
+//     policy_not_applied.
+//   - MDM marker present and the file parses → (true, bag, nil) → mdm_managed.
+//
+// Unlike the DMG-mode ProbeExpected this does NOT require 0600: perms are outside
+// the locked observed contract, so a correctly-deployed-but-lax file must still
+// report its real registry and auth status rather than be hidden behind a
+// synthetic failure. Ownership IS still enforced — readCurrent refuses a leaf the
+// target user does not own, because another user's file is not this user's
+// effective npm config.
+func (w *NPMRCWriter) ProbeContentNPM(expected string) (bool, map[string]json.RawMessage, error) {
+	rt, err := w.resolveLeaf()
+	if err != nil {
+		return false, nil, err
+	}
+	defer rt.close()
+
+	data, existed, mode, err := w.readCurrent(rt)
+	if err != nil {
+		return false, nil, err
+	}
+	if !existed {
+		return false, nil, nil
+	}
+	if enforcePOSIXMetadata && mode.Perm() != npmrcFileMode {
+		// Not a verification failure (see the doc comment), and not reportable — the
+		// observed bag has no perms field. Log it so support can spot a token file
+		// other local users can read; the mode only, never the content.
+		w.log("npmrc: mdm-managed file mode is %#o, not %#o (token may be readable by other local users)", mode.Perm(), npmrcFileMode)
+	}
+	return probeNPMRCObserved(string(data), expected)
+}
+
+// probeNPMRCObserved is the pure content logic behind ProbeContentNPM. It shares
+// the parse guards and the last-wins precedence scan with probeNPMRCContent, but
+// returns the observed VALUES instead of a yield/no-yield verdict: the backend
+// structurally compares registry_url and ecosystem against desired, so the agent
+// reports them raw and judges only the secret axis.
+func probeNPMRCObserved(content, expected string) (bool, map[string]json.RawMessage, error) {
+	// The desired registry is deliberately unused: the backend compares
+	// registry_url structurally. Only the token key (which _authToken line belongs
+	// to the tenant registry) and its value (the tenant key) are needed here.
+	_, expTokKey, expTokVal, ok := parseExpected(expected)
+	if !ok {
+		return false, nil, errors.New("npmrc: expected value is not a rendered registry/token pair")
+	}
+
+	rest, _ := stripBOM([]byte(content))
+	// Fail closed on the same constructs the DMG probe rejects. Each one hides a
+	// section or an override from the '\n'-split precedence scan below, so the
+	// values we would report are not provably the effective ones. An honest
+	// verification_failed beats a confident wrong observation.
+	if hasLoneCR(string(rest)) {
+		return false, nil, fmt.Errorf("npmrc: file contains a bare CR line break: %w", ErrTargetUnusable)
+	}
+	lines := strings.Split(string(rest), "\n")
+	if containsSection(lines) {
+		return false, nil, fmt.Errorf("npmrc: file contains an INI section header: %w", ErrTargetUnusable)
+	}
+	if hasCoercibleQuotedKey(lines) {
+		return false, nil, fmt.Errorf("npmrc: file contains a coercible quoted key: %w", ErrTargetUnusable)
+	}
+	if hasArrayAppendOverride(lines, expTokKey) {
+		// The registry we would report is not the one npm resolves: it folds the
+		// array-append line into the same key. Reporting the scalar last-wins value
+		// would be a confident wrong observation.
+		return false, nil, fmt.Errorf("npmrc: file uses npm array-append syntax on a managed key: %w", ErrTargetUnusable)
+	}
+
+	// Presence = an MDM marker OUTSIDE every DMG-owned block, so a marker planted
+	// inside one of our own blocks cannot pass as MDM management.
+	inDMGBlock, err := dmgBlockLines(lines)
+	if err != nil {
+		return false, nil, err
+	}
+	present := false
+	for i, l := range lines {
+		if inDMGBlock[i] {
+			continue
+		}
+		if isMarkerLine(l, npmrcMDMMarker) {
+			present = true
+			break
+		}
+	}
+	if !present {
+		return false, nil, nil
+	}
+
+	// Effective precedence over the WHOLE file: npm takes the LAST active
+	// assignment, so a line below the MDM block wins. Report what npm would
+	// actually use — an override surfaces as drift at the backend, which is the
+	// correct outcome, not something to hide.
+	lastReg, lastRegOK := "", false
+	lastTok, lastTokOK := "", false
+	for _, l := range lines {
+		key, val, ok := activeKV(l)
+		if !ok {
+			continue
+		}
+		switch key {
+		case "registry":
+			lastReg, lastRegOK = val, true
+		case expTokKey:
+			// The tenant registry's _authToken key. A block pointing at a DIFFERENT
+			// registry carries a different token key, so its token does not count as
+			// this policy's credential — it reports absent, alongside the registry drift.
+			lastTok, lastTokOK = val, true
+		}
+	}
+	if !lastRegOK {
+		// A managed marker with no effective registry line is not a credible read,
+		// and the backend requires registry_url to compare anything at all.
+		return false, nil, errors.New("npmrc: mdm marker present but no effective registry line")
+	}
+	if err := transmittableRegistryURL(lastReg); err != nil {
+		return false, nil, err
+	}
+
+	status := authTokenAbsent
+	if lastTokOK {
+		// Tenant-key PREFIX comparison on both sides: an admin-pushed shared token
+		// carrying no ::dev:<serial> suffix is still the tenant's key, so it reads
+		// match. The serial is device-specific and deliberately not part of the
+		// verdict.
+		status = authTokenMismatch
+		if tenantKeyPrefix(lastTok) == tenantKeyPrefix(expTokVal) {
+			status = authTokenMatch
+		}
+	}
+	return npmObservedBag(lastReg, status)
+}
+
+// dmgBlockLines marks every line that falls inside a DMG-owned block, so the MDM
+// marker search can exclude all of them. managedBlockBounds only locates the
+// FIRST block, so a second BEGIN/END pair would leave its interior unexcluded and
+// a marker planted there would read as MDM presence — refuse that file instead.
+// The writer never produces two blocks, so this is a tampered/hand-edited file.
+func dmgBlockLines(lines []string) ([]bool, error) {
+	if countMarker(lines, npmrcBeginMarker) > 1 || countMarker(lines, npmrcEndMarker) > 1 {
+		return nil, fmt.Errorf("npmrc: more than one dmg-managed block: %w", ErrTargetUnusable)
+	}
+	in := make([]bool, len(lines))
+	begin, end := managedBlockBounds(lines)
+	for i := begin; i <= end && i < len(lines); i++ {
+		in[i] = true
+	}
+	return in, nil
+}
+
+// transmittableRegistryURL rejects an effective registry_url that must not leave
+// the device. It is deliberately a SUBSET of validateRegistryURL's rules: the
+// value is read off a user-writable file, so credential-bearing or
+// parser-ambiguous forms (userinfo, a query, a fragment, control bytes) and
+// oversize values are refused before transmission — a token smuggled into the URL
+// must never reach the backend. The shape rules validateRegistryURL also enforces
+// (host grammar, no port, an exact /javascript path) are NOT applied: a merely
+// wrong registry is the drift the backend exists to detect, and erroring on it
+// would destroy that signal.
+//
+// The SCHEME is likewise not judged beyond http/https: a device resolving to a
+// plaintext http mirror is the most security-relevant drift an admin can have, so
+// it must travel as evidence and surface as a registry_url diff rather than be
+// discarded as malformed. validateRegistryURL stays https-only for the POLICY
+// side, where we compose the URL and a non-https value is our own bug; here the
+// URL is someone else's input, so it is data to report. What still fails is a
+// value that is not a credible registry read at all — another scheme, or no host.
+func transmittableRegistryURL(raw string) error {
+	if len(raw) > npmrcMaxRegistryURLBytes {
+		return fmt.Errorf("npmrc: effective registry_url exceeds %d bytes", npmrcMaxRegistryURLBytes)
+	}
+	if hasControlBytes(raw) {
+		return errors.New("npmrc: effective registry_url contains control characters")
+	}
+	if strings.ContainsAny(raw, "#?") {
+		return errors.New("npmrc: effective registry_url contains '#' or '?'")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("npmrc: effective registry_url is not a valid URL")
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return errors.New("npmrc: effective registry_url is not an http(s) URL")
+	}
+	if u.Host == "" {
+		return errors.New("npmrc: effective registry_url has no host")
+	}
+	if u.User != nil {
+		return errors.New("npmrc: effective registry_url contains userinfo")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return errors.New("npmrc: effective registry_url contains a query")
+	}
+	if u.Fragment != "" {
+		return errors.New("npmrc: effective registry_url contains a fragment")
+	}
+	return nil
+}
+
+// tenantKeyPrefix returns the tenant api_key portion of a device token —
+// everything before the "::dev:<serial>" suffix. A token with no suffix is
+// already the bare tenant key and returns unchanged.
+func tenantKeyPrefix(token string) string {
+	return strings.SplitN(token, "::dev:", 2)[0]
+}
+
+// npmObservedBag builds the observed bag. Exactly three keys, JSON strings — the
+// backend rejects any unknown key, and nothing derived from the token beyond the
+// verdict is included.
+func npmObservedBag(registryURL, authStatus string) (bool, map[string]json.RawMessage, error) {
+	reg, err := json.Marshal(registryURL)
+	if err != nil {
+		return false, nil, fmt.Errorf("npmrc: encode observed registry_url: %w", err)
+	}
+	eco, err := json.Marshal("npm")
+	if err != nil {
+		return false, nil, fmt.Errorf("npmrc: encode observed ecosystem: %w", err)
+	}
+	status, err := json.Marshal(authStatus)
+	if err != nil {
+		return false, nil, fmt.Errorf("npmrc: encode observed auth_token_status: %w", err)
+	}
+	return true, map[string]json.RawMessage{
+		observedKeyEcosystem:       eco,
+		observedKeyRegistryURL:     reg,
+		observedKeyAuthTokenStatus: status,
+	}, nil
 }
 
 // ---------------------------------------------------------------------------

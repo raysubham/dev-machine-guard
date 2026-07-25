@@ -818,6 +818,9 @@ func runPackageConfigEnforce(exec executor.Executor, log *progress.Logger) {
 			return devicepolicy.RenderNPMRCBlock(policy, serial)
 		},
 		OwnsByMarker: true,
+		// The managed block is one atomic unit, so the lane owns exactly one
+		// WrittenSettings entry under this key.
+		OwnershipKey: devicepolicy.NPMOwnedKey,
 		Logf:         func(format string, args ...any) { log.Debug(format, args...) },
 	}
 
@@ -848,6 +851,12 @@ func runPackageConfigEnforce(exec executor.Executor, log *progress.Logger) {
 		r.ProbeExpected = w.ProbeExpected
 		r.RestoreSnapshot = w.RestoreSnapshot
 		r.State = devicepolicy.NewStateStoreFor(w.TargetUser())
+		// Verify-only channel (enforcement=mdm): read the effective ~/.npmrc and
+		// report the observed bag instead of writing. Bound here because it needs the
+		// writer's identity-checked read path; with no writer the reconciler's
+		// category-aware fallback reports verification_failed rather than probing VS
+		// Code policy for an npm category.
+		r.ProbeContent = w.ProbeContentNPM
 	}
 
 	if err := r.Reconcile(ctx); err != nil {
