@@ -13,63 +13,55 @@ import (
 )
 
 // The tests here drive the reconciler with the seams the ~/.npmrc path sets
-// (Render, Converged, ProbeExpected, RestoreSnapshot, OwnsByMarker, State). The
+// (Render, Converged, ProbeExpected, RestoreSnapshot, OwnsByMarker). The
 // existing reconcile_test.go covers the settings.json path with every seam at
 // its zero value; together they show the ladder serves both targets from one
 // body — the seams change behavior ONLY when set.
 
-// --- in-memory StateStore fake ---------------------------------------------
+// --- state fixture ----------------------------------------------------------
 
-// memStateStore is an in-memory StateStore for the npm reconcile tests. The npm
-// category always drives ownership through the State seam (never the shared
-// package-level cache), so these tests inject this instead of using
-// withTempCache. It counts calls so a test can assert the ladder routed through
-// the store, and failWriteFrom forces the post-write persist to fail.
-type memStateStore struct {
-	m             map[string]AppliedTargetState
+// npmStore is these tests' handle on the ONE state file (device-policy-state.json,
+// redirected to a temp dir for the test). There is no npm-specific store to fake:
+// the npm category records ownership under categories.package_config.targets.npm
+// through the same ReadAppliedState / WriteAppliedState / ClearAppliedState the
+// IDE lane uses, so assertions read the real file back. The counters prove the
+// ladder went through the store, and writeErr / dropErr / failWriteFrom inject
+// persist failures through the reconciler's writeState / clearState seams —
+// failWriteFrom is how a test fails the POST-WRITE persist specifically.
+type npmStore struct {
+	path          string
 	writeErr      error
 	dropErr       error
-	failWriteFrom int // when >0, Write errors on the Nth call and after
+	failWriteFrom int // when >0, the Nth persist and every one after it fails
 	writes        int
 	drops         int
-	reads         int
 }
 
-func msKey(cat, tgt string) string { return cat + "\x00" + tgt }
-
-func (s *memStateStore) Read(cat, tgt string) (AppliedTargetState, bool) {
-	s.reads++
-	st, ok := s.m[msKey(cat, tgt)]
-	return st, ok
+func newNPMStore(t *testing.T) *npmStore {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), CacheFilename)
+	t.Cleanup(SetCachePathForTest(path))
+	return &npmStore{path: path}
 }
 
-func (s *memStateStore) Write(cat, tgt string, st AppliedTargetState) error {
-	s.writes++
-	if s.failWriteFrom > 0 && s.writes >= s.failWriteFrom {
-		return errors.New("state store write failed")
+// seed writes a record straight to the file, bypassing the counters: it is the
+// state the cycle STARTS from, not something the reconciler did.
+func (s *npmStore) seed(t *testing.T, cat, tgt string, st AppliedTargetState) *npmStore {
+	t.Helper()
+	if err := WriteAppliedState(cat, tgt, st); err != nil {
+		t.Fatalf("seeding %s/%s: %v", cat, tgt, err)
 	}
-	if s.writeErr != nil {
-		return s.writeErr
-	}
-	if s.m == nil {
-		s.m = map[string]AppliedTargetState{}
-	}
-	s.m[msKey(cat, tgt)] = st
-	return nil
+	return s
 }
 
-func (s *memStateStore) Drop(cat, tgt string) error {
-	s.drops++
-	if s.dropErr != nil {
-		return s.dropErr
-	}
-	delete(s.m, msKey(cat, tgt))
-	return nil
+func (s *npmStore) get(cat, tgt string) (AppliedTargetState, bool) {
+	return ReadAppliedState(cat, tgt)
 }
 
-func (s *memStateStore) get(cat, tgt string) (AppliedTargetState, bool) {
-	st, ok := s.m[msKey(cat, tgt)]
-	return st, ok
+// exists reports whether the state file was created at all.
+func (s *npmStore) exists() bool {
+	_, err := os.Stat(s.path)
+	return err == nil
 }
 
 // --- npm fixtures -----------------------------------------------------------
@@ -93,15 +85,15 @@ func npmPolicyEP(hash string) EffectivePolicy {
 	}
 }
 
-// newNPMRec builds a marker-owned, State-backed reconciler wired like the
-// ~/.npmrc path: OwnsByMarker, OwnershipKey, a Render seam that produces the
-// managed block, a content-aware ProbeExpected, and a Converged seam. It mirrors
+// newNPMRec builds a marker-owned reconciler wired like the ~/.npmrc path:
+// OwnsByMarker, OwnershipKey, a Render seam that produces the managed block, a
+// content-aware ProbeExpected, and a Converged seam. It mirrors
 // runPackageConfigEnforce's wiring, so a seam the production path sets and this
 // one does not would show up as a behavior difference. Defaults: Render → the
 // fixed block, probe → not managed, Converged → false (proceed to write). Tests
-// override a single seam to exercise one rung. No withTempCache — State routes
-// every ownership access away from the shared file.
-func newNPMRec(t *testing.T, ep EffectivePolicy, w *fakeWriter, st *memStateStore) (*Reconciler, *fakeReporter) {
+// override a single seam to exercise one rung. Ownership lands in st's file — the
+// same shared state file the IDE lane writes.
+func newNPMRec(t *testing.T, ep EffectivePolicy, w *fakeWriter, st *npmStore) (*Reconciler, *fakeReporter) {
 	t.Helper()
 	rep := &fakeReporter{}
 	r := &Reconciler{
@@ -115,11 +107,29 @@ func newNPMRec(t *testing.T, ep EffectivePolicy, w *fakeWriter, st *memStateStor
 		Target:        TargetNPM,
 		OwnsByMarker:  true,
 		OwnershipKey:  NPMOwnedKey,
-		State:         st,
 		Render:        npmRenderOK,
 		ProbeExpected: func(string) (bool, string) { return false, "" },
 		Converged:     func(string) (bool, error) { return false, nil },
 		Now:           func() time.Time { return time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC) },
+	}
+	// The counters and fault injection sit on the real store calls, so a test can
+	// both fail a persist and assert what the file ended up holding.
+	r.writeState = func(cat, tgt string, s AppliedTargetState) error {
+		st.writes++
+		if st.failWriteFrom > 0 && st.writes >= st.failWriteFrom {
+			return errors.New("state persist failed")
+		}
+		if st.writeErr != nil {
+			return st.writeErr
+		}
+		return WriteAppliedState(cat, tgt, s)
+	}
+	r.clearState = func(cat, tgt string) error {
+		st.drops++
+		if st.dropErr != nil {
+			return st.dropErr
+		}
+		return ClearAppliedState(cat, tgt)
 	}
 	return r, rep
 }
@@ -128,7 +138,7 @@ func newNPMRec(t *testing.T, ep EffectivePolicy, w *fakeWriter, st *memStateStor
 
 func TestNPMEnforceRendersBlockAndWrites(t *testing.T) {
 	w := &fakeWriter{}
-	st := &memStateStore{}
+	st := newNPMStore(t)
 	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -144,9 +154,9 @@ func TestNPMEnforceRendersBlockAndWrites(t *testing.T) {
 	if got.AppliedHash != "sha256:N" {
 		t.Fatalf("applied_hash = %q, want sha256:N", got.AppliedHash)
 	}
-	// Ownership recorded through the State seam (never the shared file).
+	// Ownership recorded in the one shared state file, under this category/target.
 	if st.writes == 0 {
-		t.Fatal("ownership must be recorded through the State seam")
+		t.Fatal("ownership must be recorded in the state file")
 	}
 	rec, ok := st.get(CategoryPackageConfig, TargetNPM)
 	if !ok || rec.WrittenSettings[NPMOwnedKey] != npmRendered || rec.AppliedHash != "sha256:N" {
@@ -159,7 +169,7 @@ func TestNPMRenderFailureReportsPolicyNotApplied(t *testing.T) {
 	// cycle reports policy_not_applied (not a silent no-op). Render runs FIRST, so
 	// the writer is never read or written and the probe never runs.
 	w := &fakeWriter{}
-	st := &memStateStore{}
+	st := newNPMStore(t)
 	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
 	probed := false
 	r.ProbeExpected = func(string) (bool, string) { probed = true; return false, "" }
@@ -182,7 +192,7 @@ func TestNPMProbeExpectedReceivesRenderedBlockAndYields(t *testing.T) {
 	// compares the desired state. When it reports the MDM lane already governs the
 	// same state, the reconciler yields mdm_managed without touching the file.
 	w := &fakeWriter{value: "whatever", present: true}
-	st := &memStateStore{}
+	st := newNPMStore(t)
 	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
 	var gotArg string
 	r.ProbeExpected = func(expected string) (bool, string) {
@@ -210,9 +220,8 @@ func TestNPMConvergedSeamOverridesBodyEquality(t *testing.T) {
 	// (body-equal) and the recorded hash matches, but Converged=false → the
 	// reconciler still rewrites, where plain body-equality would have skipped.
 	w := &fakeWriter{value: npmRendered, present: true}
-	st := &memStateStore{m: map[string]AppliedTargetState{
-		msKey(CategoryPackageConfig, TargetNPM): {AppliedHash: "sha256:N", WrittenSettings: npmOwnRec(npmRendered)},
-	}}
+	st := newNPMStore(t).seed(t, CategoryPackageConfig, TargetNPM,
+		AppliedTargetState{AppliedHash: "sha256:N", WrittenSettings: npmOwnRec(npmRendered)})
 	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
 	r.Converged = func(string) (bool, error) { return false, nil }
 	if err := r.Reconcile(context.Background()); err != nil {
@@ -231,9 +240,8 @@ func TestNPMConvergedTrueIsIdempotent(t *testing.T) {
 	// and effective. No write; still reports compliant so the backend sees a fresh
 	// evaluation.
 	w := &fakeWriter{value: npmRendered, present: true}
-	st := &memStateStore{m: map[string]AppliedTargetState{
-		msKey(CategoryPackageConfig, TargetNPM): {AppliedHash: "sha256:N", WrittenSettings: npmOwnRec(npmRendered)},
-	}}
+	st := newNPMStore(t).seed(t, CategoryPackageConfig, TargetNPM,
+		AppliedTargetState{AppliedHash: "sha256:N", WrittenSettings: npmOwnRec(npmRendered)})
 	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
 	r.Converged = func(string) (bool, error) { return true, nil }
 	if err := r.Reconcile(context.Background()); err != nil {
@@ -248,24 +256,26 @@ func TestNPMConvergedTrueIsIdempotent(t *testing.T) {
 }
 
 func TestNPMAdoptsAlreadyConvergedState(t *testing.T) {
-	// Cross-mode store split: the exact block is fully applied on disk
-	// (Converged=true) but THIS store carries no matching hash — the other
-	// privilege mode applied and recorded it in its own per-mode store, or our
-	// record is stale. The reconciler must adopt the on-disk state (no rewrite, no
-	// false drift) and report compliant, recording the current hash for next cycle.
+	// The exact block is fully applied on disk (Converged=true) but the state file
+	// carries no matching hash — our record is stale or gone, or the cycle that
+	// applied it resolved a different home for the file. The reconciler must adopt
+	// the on-disk state (no rewrite, no false drift) and report compliant, recording
+	// the current hash for next cycle.
 	cases := []struct {
 		name string
-		st   *memStateStore
+		seed *AppliedTargetState
 	}{
-		{"empty store (other mode applied)", &memStateStore{}},
-		{"stale hash in store", &memStateStore{m: map[string]AppliedTargetState{
-			msKey(CategoryPackageConfig, TargetNPM): {AppliedHash: "sha256:OLD", WrittenSettings: npmOwnRec(npmRendered)},
-		}}},
+		{"no record at all", nil},
+		{"stale hash recorded", &AppliedTargetState{AppliedHash: "sha256:OLD", WrittenSettings: npmOwnRec(npmRendered)}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			st := newNPMStore(t)
+			if tc.seed != nil {
+				st.seed(t, CategoryPackageConfig, TargetNPM, *tc.seed)
+			}
 			w := &fakeWriter{value: npmRendered, present: true}
-			r, rep := newNPMRec(t, npmPolicyEP("sha256:NEW"), w, tc.st)
+			r, rep := newNPMRec(t, npmPolicyEP("sha256:NEW"), w, st)
 			r.Converged = func(string) (bool, error) { return true, nil }
 			if err := r.Reconcile(context.Background()); err != nil {
 				t.Fatalf("Reconcile: %v", err)
@@ -276,7 +286,7 @@ func TestNPMAdoptsAlreadyConvergedState(t *testing.T) {
 			if got := lastReport(t, rep); got.State != StateCompliant || got.AppliedHash != "sha256:NEW" {
 				t.Fatalf("report = %+v, want compliant + adopted hash", got)
 			}
-			rec, ok := tc.st.get(CategoryPackageConfig, TargetNPM)
+			rec, ok := st.get(CategoryPackageConfig, TargetNPM)
 			if !ok || rec.AppliedHash != "sha256:NEW" || rec.WrittenSettings[NPMOwnedKey] != npmRendered {
 				t.Fatalf("state not adopted: rec=%+v ok=%v", rec, ok)
 			}
@@ -299,7 +309,7 @@ func TestNPMReadErrorClassification(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			w := &fakeWriter{readErr: tc.err}
-			st := &memStateStore{}
+			st := newNPMStore(t)
 			r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
 			if err := r.Reconcile(context.Background()); err == nil {
 				t.Fatal("a read error must surface")
@@ -328,7 +338,7 @@ func TestNPMConvergedErrorClassification(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			w := &fakeWriter{value: "x", present: true}
-			st := &memStateStore{}
+			st := newNPMStore(t)
 			r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
 			r.Converged = func(string) (bool, error) { return false, tc.err }
 			if err := r.Reconcile(context.Background()); err == nil {
@@ -351,18 +361,20 @@ func TestNPMClearByMarkerAlwaysClearsAndDrops(t *testing.T) {
 	// record can never strand a token-bearing block.
 	cases := []struct {
 		name string
-		st   *memStateStore
+		seed *AppliedTargetState
 	}{
-		{"no record", &memStateStore{}},
-		{"stale record", &memStateStore{m: map[string]AppliedTargetState{
-			msKey(CategoryPackageConfig, TargetNPM): {WrittenSettings: npmOwnRec("old-block")},
-		}}},
+		{"no record", nil},
+		{"stale record", &AppliedTargetState{WrittenSettings: npmOwnRec("old-block")}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			st := newNPMStore(t)
+			if tc.seed != nil {
+				st.seed(t, CategoryPackageConfig, TargetNPM, *tc.seed)
+			}
 			w := &fakeWriter{value: "a-managed-block", present: true}
 			ep := EffectivePolicy{Category: CategoryPackageConfig, Target: TargetNPM, Clear: true}
-			r, rep := newNPMRec(t, ep, w, tc.st)
+			r, rep := newNPMRec(t, ep, w, st)
 			if err := r.Reconcile(context.Background()); err != nil {
 				t.Fatalf("Reconcile: %v", err)
 			}
@@ -372,10 +384,10 @@ func TestNPMClearByMarkerAlwaysClearsAndDrops(t *testing.T) {
 			if w.reads != 0 {
 				t.Fatalf("marker clear must not read the file, reads=%d", w.reads)
 			}
-			if tc.st.drops != 1 {
-				t.Fatalf("marker clear must Drop the record unconditionally, drops=%d", tc.st.drops)
+			if st.drops != 1 {
+				t.Fatalf("marker clear must Drop the record unconditionally, drops=%d", st.drops)
 			}
-			if _, ok := tc.st.get(CategoryPackageConfig, TargetNPM); ok {
+			if _, ok := st.get(CategoryPackageConfig, TargetNPM); ok {
 				t.Fatal("state record must be gone after a marker clear")
 			}
 			if len(rep.reports) != 0 {
@@ -403,7 +415,8 @@ func TestNPMRestoreSnapshotRollbackClassification(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			w := &fakeWriter{}
-			st := &memStateStore{failWriteFrom: 2} // preflight ok, post-write persist fails
+			st := newNPMStore(t)
+			st.failWriteFrom = 2 // preflight ok, post-write persist fails
 			r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
 			restored := 0
 			r.RestoreSnapshot = func() error { restored++; return tc.restoreErr }
@@ -443,7 +456,7 @@ func TestNPMWriteErrorClassification(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			w := &fakeWriter{writeErr: tc.err}
-			st := &memStateStore{}
+			st := newNPMStore(t)
 			r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
 			if err := r.Reconcile(context.Background()); err == nil {
 				t.Fatal("a write error must surface")
@@ -478,6 +491,7 @@ func TestNPMWriterInitErrClassification(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			withTempCache(t)
 			rep := &fakeReporter{}
 			r := &Reconciler{
 				Fetcher:       &fakeFetcher{ep: tc.ep},
@@ -511,28 +525,55 @@ func TestNPMWriterInitErrClassification(t *testing.T) {
 	}
 }
 
-func TestNPMStateRoutingBypassesSharedFile(t *testing.T) {
-	// With the State seam set, every ownership access routes to the injected store;
-	// the shared device-policy-state.json is never created or read. This keeps the
-	// npm record out of the shared file's unlocked read-modify-write.
-	path := filepath.Join(t.TempDir(), CacheFilename)
-	restore := SetCachePathForTest(path)
-	defer restore()
-
+func TestNPMStateLivesInTheOneSharedFile(t *testing.T) {
+	// npm ownership goes in device-policy-state.json under
+	// categories.package_config.targets.npm — the same file, and the same
+	// category→target shape, as every other lane. The npm category gets NO file of
+	// its own: this asserts the record's location on disk, and that reconciling npm
+	// creates that one file and nothing else beside it (a lock artifact aside — it
+	// carries no state).
 	w := &fakeWriter{}
-	st := &memStateStore{}
+	st := newNPMStore(t)
 	r, _ := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if st.writes == 0 {
-		t.Fatal("ownership must have routed through the State seam")
+	if _, ok := ReadAppliedState(CategoryPackageConfig, TargetNPM); !ok {
+		t.Fatal("the npm record must be readable through the shared accessors")
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("shared state file must never be created when State is set; stat err = %v", err)
+
+	raw, err := os.ReadFile(st.path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", CacheFilename, err)
 	}
-	if _, ok := ReadAppliedState(CategoryPackageConfig, TargetNPM); ok {
-		t.Fatal("shared store must hold no npm record")
+	var f AppliedStateFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("on-disk file is not an AppliedStateFile: %v (%s)", err, raw)
+	}
+	if f.SchemaVersion != CacheSchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", f.SchemaVersion, CacheSchemaVersion)
+	}
+	rec, ok := f.Categories[CategoryPackageConfig].Targets[TargetNPM]
+	if !ok {
+		t.Fatalf("categories.%s.targets.%s missing: %s", CategoryPackageConfig, TargetNPM, raw)
+	}
+	if rec.WrittenSettings[NPMOwnedKey] != npmRendered {
+		t.Fatalf("record = %+v, want the rendered block under %s", rec, NPMOwnedKey)
+	}
+
+	// One JSON state file in the directory, whatever else the run leaves behind.
+	entries, err := os.ReadDir(filepath.Dir(st.path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jsonFiles []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".json") {
+			jsonFiles = append(jsonFiles, e.Name())
+		}
+	}
+	if len(jsonFiles) != 1 || jsonFiles[0] != CacheFilename {
+		t.Fatalf("state directory holds %v, want only %s", jsonFiles, CacheFilename)
 	}
 }
 
@@ -607,7 +648,7 @@ func TestNPMDMGChannelStillWrites(t *testing.T) {
 	for _, channel := range []string{"", "dmg", "DMG", "  dmg  ", "wat"} {
 		t.Run("channel="+channel, func(t *testing.T) {
 			w := &fakeWriter{}
-			st := &memStateStore{}
+			st := newNPMStore(t)
 			ep := npmPolicyEP("sha256:N")
 			ep.Enforcement = channel
 			r, rep := newNPMRec(t, ep, w, st)
@@ -628,7 +669,7 @@ func TestNPMDMGChannelStillWrites(t *testing.T) {
 
 func TestNPMMDMChannelVerifiesAndNeverWrites(t *testing.T) {
 	w := &fakeWriter{}
-	st := &memStateStore{}
+	st := newNPMStore(t)
 	r, rep := newNPMRec(t, npmMDMEP("sha256:N"), w, st)
 	r.ProbeContent = func(expected string) (bool, map[string]json.RawMessage, error) {
 		// verifyMDM renders the desired value FIRST and hands it over — the npm probe
@@ -665,8 +706,12 @@ func TestNPMMDMChannelVerifiesAndNeverWrites(t *testing.T) {
 	if len(w.writes) != 0 || w.clears != 0 || w.reads != 0 {
 		t.Fatalf("mdm mode touched the writer: writes=%v clears=%d reads=%d", w.writes, w.clears, w.reads)
 	}
-	if st.writes != 0 || st.drops != 0 || st.reads != 0 {
-		t.Fatalf("mdm mode touched the state store: writes=%d drops=%d reads=%d", st.writes, st.drops, st.reads)
+	if st.writes != 0 || st.drops != 0 {
+		t.Fatalf("mdm mode touched the state store: writes=%d drops=%d", st.writes, st.drops)
+	}
+	// Nothing was recorded, so the state file was never even created.
+	if st.exists() {
+		t.Fatal("mdm mode must not create the state file — it owns nothing to record")
 	}
 }
 
@@ -699,7 +744,7 @@ func TestNPMMDMChannelStatesFromProbe(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			w := &fakeWriter{}
-			r, rep := newNPMRec(t, npmMDMEP("sha256:N"), w, &memStateStore{})
+			r, rep := newNPMRec(t, npmMDMEP("sha256:N"), w, newNPMStore(t))
 			r.ProbeContent = tc.probe
 			if err := r.Reconcile(context.Background()); err != nil {
 				t.Fatalf("Reconcile: %v", err)
@@ -726,7 +771,7 @@ func TestNPMMDMChannelRenderFailureIsVerificationFailed(t *testing.T) {
 	// verify against, so nothing could be checked — verification_failed, not the
 	// DMG lane's policy_not_applied (which asserts a failed APPLY).
 	w := &fakeWriter{}
-	r, rep := newNPMRec(t, npmMDMEP("sha256:N"), w, &memStateStore{})
+	r, rep := newNPMRec(t, npmMDMEP("sha256:N"), w, newNPMStore(t))
 	r.Render = func(json.RawMessage) (string, error) { return "", errors.New("bad policy") }
 	probed := false
 	r.ProbeContent = func(string) (bool, map[string]json.RawMessage, error) {
@@ -752,9 +797,8 @@ func TestNPMMDMChannelClearIsANoOp(t *testing.T) {
 	// there is nothing to verify either. No write, no clear, no state change, and no
 	// report (an unassigned device is backend-derived).
 	w := &fakeWriter{}
-	st := &memStateStore{m: map[string]AppliedTargetState{
-		msKey(CategoryPackageConfig, TargetNPM): {AppliedHash: "sha256:OLD", WrittenSettings: npmOwnRec(npmRendered)},
-	}}
+	st := newNPMStore(t).seed(t, CategoryPackageConfig, TargetNPM,
+		AppliedTargetState{AppliedHash: "sha256:OLD", WrittenSettings: npmOwnRec(npmRendered)})
 	ep := npmMDMEP("")
 	ep.Clear = true
 	ep.Policy = nil
@@ -781,7 +825,7 @@ func TestNPMMDMChannelRunsWithNoWriter(t *testing.T) {
 	// The MDM fork sits ABOVE the writer gates, so a cycle with no constructible
 	// writer still verifies and reports — the DMG lane's handleNoWriter
 	// classification must not swallow it.
-	st := &memStateStore{}
+	st := newNPMStore(t)
 	r, rep := newNPMRec(t, npmMDMEP("sha256:N"), nil, st)
 	r.Writer = nil
 	r.Converged = nil
@@ -806,7 +850,7 @@ func TestNPMMDMChannelNoProbeSeamIsVerificationFailed(t *testing.T) {
 	// verification_failed is the discriminating outcome: had it fallen through to
 	// ProbeManagedContent, a machine with no VS Code policy would have answered
 	// present=false and reported the clean policy_not_applied.
-	st := &memStateStore{}
+	st := newNPMStore(t)
 	r, rep := newNPMRec(t, npmMDMEP("sha256:N"), nil, st)
 	r.Writer = nil
 	r.Converged = nil
@@ -858,11 +902,10 @@ func TestNPMOwnershipLifecycleThroughWrittenSettings(t *testing.T) {
 	// The collapse of the retired single-value WrittenValue field into one
 	// WrittenSettings entry must leave the npm DMG lane behaving identically:
 	// enforce records ownership, a hand-edit is detected as drift and converged
-	// back, and clear removes the block by marker and drops the record. Every state
-	// access routes through the injected StateStore (r.readState), never the shared
-	// file.
+	// back, and clear removes the block by marker and drops the record — all of it
+	// against the one shared state file, under package_config/npm.
 	w := &fakeWriter{}
-	st := &memStateStore{}
+	st := newNPMStore(t)
 	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
 	// Converged mirrors the writer: the block is in place iff the last write stands.
 	r.Converged = func(expected string) (bool, error) { return w.present && w.value == expected, nil }
@@ -937,12 +980,10 @@ func TestNPMEnforceIgnoresForeignOwnershipKeys(t *testing.T) {
 	// own value was changed) — and the post-write persist records the npm key alone,
 	// never inheriting the foreign one.
 	w := &fakeWriter{}
-	st := &memStateStore{m: map[string]AppliedTargetState{
-		msKey(CategoryPackageConfig, TargetNPM): {
-			AppliedHash:     "sha256:N",
-			WrittenSettings: map[string]string{allowedExtensionsSettingKey: "not-ours"},
-		},
-	}}
+	st := newNPMStore(t).seed(t, CategoryPackageConfig, TargetNPM, AppliedTargetState{
+		AppliedHash:     "sha256:N",
+		WrittenSettings: map[string]string{allowedExtensionsSettingKey: "not-ours"},
+	})
 	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -974,7 +1015,7 @@ func TestNPMNeverLogsOrReportsTheToken(t *testing.T) {
 		w := &fakeWriter{}
 		ep := npmPolicyEP("sha256:N")
 		ep.Enforcement = channel
-		r, rep := newNPMRec(t, ep, w, &memStateStore{})
+		r, rep := newNPMRec(t, ep, w, newNPMStore(t))
 		r.Render = func(json.RawMessage) (string, error) { return rendered, nil }
 		r.Converged = func(expected string) (bool, error) { return w.present && w.value == expected, nil }
 		r.ProbeContent = probe

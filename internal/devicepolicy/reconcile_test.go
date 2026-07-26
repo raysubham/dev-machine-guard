@@ -518,6 +518,29 @@ func TestEnforceStateUnwritablePreflightWritesNothing(t *testing.T) {
 	}
 }
 
+func TestEnforcePreflightCatchesLockContentionBeforeWriting(t *testing.T) {
+	// What keeps a fail-closed state lock from costing anything in the common case.
+	// The preflight persist goes through the same locked accessor as the real one, so
+	// a peer process holding the lock is discovered BEFORE the settings file is
+	// touched: write_failed is reported, nothing is written, and there is nothing to
+	// roll back. Only contention arriving in the window between the preflight and the
+	// post-write persist reaches the rollback path — accepted, because a rollback the
+	// next cycle retries beats losing another category's ownership record.
+	w := &fakeWriter{}
+	r, rep := newRec(t, policyEP("sha256:H"), nil, w)
+	holdStateLockUntilCleanup(t) // after newRec: its withTempCache redirects the lock too
+
+	if err := r.Reconcile(context.Background()); err == nil {
+		t.Fatal("a held state lock should surface an error")
+	}
+	if len(w.writes) != 0 {
+		t.Fatalf("the settings file must not be touched when the lock is unavailable, writes=%v", w.writes)
+	}
+	if got := lastReport(t, rep); got.State != StateWriteFailed {
+		t.Fatalf("state = %q, want write_failed", got.State)
+	}
+}
+
 func TestEnforceStatePersistFailureRollsBackWrite(t *testing.T) {
 	// Preflight succeeds but the post-write persist fails: the agent undoes the
 	// just-written value (no prior value → remove the key) so it never leaves

@@ -112,13 +112,6 @@ type Reconciler struct {
 	// Writer is the ordinary unsupported-platform silent no-op.
 	WriterInitErr error
 
-	// State, when set, is the ownership store this cycle reads and writes through,
-	// replacing the package-level shared-file functions. The npm category uses
-	// its own per-mode/per-user store so its record can never share the IDE
-	// file's unlocked read-modify-write. nil → the shared package-level store
-	// (settings.json), byte-identical to before.
-	State StateStore
-
 	// Now and Logf are optional seams. Now defaults to time.Now().UTC; Logf to a
 	// no-op.
 	Now  func() time.Time
@@ -126,7 +119,6 @@ type Reconciler struct {
 
 	// writeState and clearState are test seams over the ownership store
 	// (WriteAppliedState / ClearAppliedState). nil → the real implementation.
-	// They apply only to the shared store (State == nil).
 	writeState func(category, target string, s AppliedTargetState) error
 	clearState func(category, target string) error
 
@@ -137,21 +129,17 @@ type Reconciler struct {
 	enforcement string
 }
 
-// readState / persistState / dropState route through the injected StateStore
-// when one is set, and otherwise fall back to the shared package-level store
-// (with the writeState/clearState test seams) exactly as before — so the IDE
-// wiring, which sets no State, is unchanged.
+// readState / persistState / dropState are every category's access to the one
+// state file (device-policy-state.json), keyed by (category, target). No category
+// has a store of its own: the file's read-modify-write preserves every other
+// category and target, and takes a cross-process lock so two agent processes
+// reconciling different categories cannot drop each other's record. The
+// writeState/clearState test seams inject persist failures.
 func (r *Reconciler) readState(cat, tgt string) (AppliedTargetState, bool) {
-	if r.State != nil {
-		return r.State.Read(cat, tgt)
-	}
 	return ReadAppliedState(cat, tgt)
 }
 
 func (r *Reconciler) persistState(cat, tgt string, s AppliedTargetState) error {
-	if r.State != nil {
-		return r.State.Write(cat, tgt, s)
-	}
 	if r.writeState != nil {
 		return r.writeState(cat, tgt, s)
 	}
@@ -159,9 +147,6 @@ func (r *Reconciler) persistState(cat, tgt string, s AppliedTargetState) error {
 }
 
 func (r *Reconciler) dropState(cat, tgt string) error {
-	if r.State != nil {
-		return r.State.Drop(cat, tgt)
-	}
 	if r.clearState != nil {
 		return r.clearState(cat, tgt)
 	}
@@ -700,13 +685,14 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 
 	// The full-state convergence seam (npm) proves the exact desired block is on
 	// disk, effective, and correctly owned — a strictly stronger fact than body
-	// equality — yet THIS cycle's store does not carry this hash. That happens when
-	// the other privilege mode applied it and recorded in its own per-mode store,
-	// or our record is stale. Adopt the on-disk state into this store rather than
-	// churn a redundant rewrite or misreport it as drift, and report compliant.
-	// Best-effort: the block is already applied, so a store hiccup only defers the
-	// record one cycle. Gated on the Converged seam so the settings.json path
-	// (body equality, shared store) is byte-identical to before.
+	// equality — yet the state file does not carry this hash. That happens when our
+	// record is stale or was removed by hand, or when the cycle that applied it
+	// resolved a different home for the state file (a root daemon and the user's own
+	// cycle do not always agree on one). Adopt the on-disk state rather than churn a
+	// redundant rewrite or misreport it as drift, and report compliant. Best-effort:
+	// the block is already applied, so a persist hiccup only defers the record one
+	// cycle. Gated on the Converged seam so the settings.json path (body equality)
+	// is byte-identical to before.
 	if converged && r.Converged != nil {
 		if perr := r.persistState(cat, tgt, AppliedTargetState{
 			AppliedHash:     ep.Hash,

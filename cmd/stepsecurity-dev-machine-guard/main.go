@@ -846,11 +846,12 @@ func runPackageConfigEnforce(exec executor.Executor, log *progress.Logger) {
 		// briefly leave the superseded value, reconverged next cycle — eventual
 		// consistency, the same model the VS Code settings.json lane relies on.
 		// The telemetry singleton lock already serializes the preceding scan phase.
+		// Ownership state is the exception: it shares one file with every other
+		// category, so its read-modify-write does take a cross-process lock.
 		r.Writer = w
 		r.Converged = w.Converged
 		r.ProbeExpected = w.ProbeExpected
 		r.RestoreSnapshot = w.RestoreSnapshot
-		r.State = devicepolicy.NewStateStoreFor(w.TargetUser())
 		// Verify-only channel (enforcement=mdm): read the effective ~/.npmrc and
 		// report the observed bag instead of writing. Bound here because it needs the
 		// writer's identity-checked read path; with no writer the reconciler's

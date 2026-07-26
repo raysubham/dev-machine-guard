@@ -248,12 +248,6 @@ func (w *NPMRCWriter) Close() error {
 	return err
 }
 
-// TargetUser is the console user resolved once at construction and immutable
-// for the writer's lifetime. The per-user state store must be built from this
-// identity, never a second independent resolution — two resolutions can
-// straddle a console-user switch and bind one user's file to another's record.
-func (w *NPMRCWriter) TargetUser() *user.User { return w.targetUser }
-
 // Location is a human-readable target description for logs. It never includes
 // file contents or key material.
 func (w *NPMRCWriter) Location() string {
@@ -1111,8 +1105,9 @@ func (w *NPMRCWriter) clearContent(current []byte) ([]byte, error) {
 }
 
 // stripBOM splits a leading UTF-8 BOM off the content. The BOM is removed for
-// parsing (so a first-line key is matched correctly) and re-prepended on
-// rewrite so the byte is preserved.
+// parsing (an INI key on the first line is matched correctly, a JSON document
+// starts on a value) and re-prepended on rewrite so the bytes are preserved.
+// Used by both the ~/.npmrc block writer and the settings.json writer.
 func stripBOM(b []byte) (rest, bom []byte) {
 	const bomSeq = "\ufeff"
 	if bytes.HasPrefix(b, []byte(bomSeq)) {
