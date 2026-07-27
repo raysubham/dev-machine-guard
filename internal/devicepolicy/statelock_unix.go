@@ -18,6 +18,10 @@ const stateLockSupported = true
 // should retry within its budget. A non-nil error fails the operation closed
 // unless lockUnavailable classifies it as "this filesystem cannot lock at all".
 func tryLockHandle(f *os.File) (bool, error) {
+	// #nosec G115 -- f.Fd() is a live descriptor from an *os.File: a small
+	// non-negative int widened to uintptr, so narrowing it back cannot overflow. The
+	// one edge value, the ^uintptr(0) a closed file returns, converts to -1, which
+	// flock rejects with EBADF — an error this function already fails closed on.
 	err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err == nil {
 		return true, nil
@@ -32,6 +36,8 @@ func tryLockHandle(f *os.File) (bool, error) {
 // doing it explicitly keeps the release path symmetric with Windows, where the
 // unlock is not implied.
 func unlockHandle(f *os.File) {
+	// #nosec G115 -- see tryLockHandle: narrowing a live *os.File descriptor back to
+	// int cannot overflow.
 	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
 
