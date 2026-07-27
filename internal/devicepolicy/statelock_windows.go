@@ -44,6 +44,19 @@ func tryLockHandle(f *os.File) (bool, error) {
 // while failing closed would leave the agent permanently unable to persist state
 // on such a volume. Local NTFS always locks; a network redirector or a
 // third-party filesystem filter may not.
+//
+// ERROR_NOT_SUPPORTED and ERROR_INVALID_FUNCTION — the latter being what a driver
+// returns for an operation it has no implementation for — are the whole list.
+// Everything else fails the operation, including the errors that look like they
+// belong here and do not: ERROR_NO_SYSTEM_RESOURCES and ERROR_NOT_ENOUGH_MEMORY
+// mean the kernel could not allocate a lock record on a volume where peers may
+// well already HOLD locks this call cannot join, and ERROR_INVALID_PARAMETER means
+// the request itself was malformed, which says nothing about whether the volume
+// can lock. All three are transient or local faults where locking works, exactly
+// the case in which running unlocked loses a record. ERROR_LOCK_VIOLATION never
+// reaches here at all — tryLockHandle turns contention into ok=false with no error
+// — and must never be added: it is the one error that proves a peer holds the
+// lock.
 func lockUnavailable(err error) bool {
 	return errors.Is(err, windows.ERROR_NOT_SUPPORTED) ||
 		errors.Is(err, windows.ERROR_INVALID_FUNCTION)
