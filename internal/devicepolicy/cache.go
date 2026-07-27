@@ -76,10 +76,15 @@ type AppliedCategoryState struct {
 //     does not own.
 //
 // A zero-value entry means "the agent owns nothing on disk" for that
-// category/target. A pre-collapse file carrying the retired written_value key
-// decodes with an empty WrittenSettings — i.e. "owns nothing" — and the next
-// enforce re-converges and re-records it; there are no production devices, so no
-// migrator is owed.
+// category/target.
+//
+// AppliedHash and WrittenSettings are persisted as one struct in one write, so a
+// record whose AppliedHash equals the freshly-fetched hash always carries the
+// complete ownership map for that policy. Convergence checks rely on that: a
+// cycle that finds the target converged with an unchanged hash short-circuits
+// without persisting, which is only safe because a matching hash cannot coexist
+// with partial ownership. A record hand-edited to break that pairing is outside
+// the supported inputs — the value-based clear would leave those keys in place.
 type AppliedTargetState struct {
 	AppliedHash     string            `json:"applied_hash"`
 	WrittenSettings map[string]string `json:"written_settings,omitempty"`
