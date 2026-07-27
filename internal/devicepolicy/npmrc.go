@@ -574,29 +574,30 @@ func (w *NPMRCWriter) Write(value string) (string, error) {
 
 // Clear removes the managed block and restores the user's commented-out
 // `registry=` lines. It carries the same transactional and metadata guarantees
-// as Write and never deletes the file.
-func (w *NPMRCWriter) Clear() error {
+// as Write and never deletes the file. The returned bool reports whether the
+// file actually changed; the two no-op paths below return false.
+func (w *NPMRCWriter) Clear() (bool, error) {
 	rt, err := w.resolveLeaf()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer rt.close()
 
 	cur, existed, mode, err := w.readCurrent(rt)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !existed {
 		// Nothing to clear; leave the (absent) file alone. A backup from an earlier
 		// cycle can still hold a managed block, and with the live file gone this is
 		// the only path that ever reaches it — so retry the purge here.
 		w.purgeBackups(rt)
-		return nil
+		return false, nil
 	}
 
 	next, err := w.clearContent(cur)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if bytes.Equal(next, cur) {
 		// No managed block and no prefixed lines — a no-op that performs no write at
@@ -604,7 +605,7 @@ func (w *NPMRCWriter) Clear() error {
 		// an earlier purge that could not unlink it, or a block someone removed by
 		// hand. Retry the purge; the clear itself stays a no-op.
 		w.purgeBackups(rt)
-		return nil
+		return false, nil
 	}
 
 	snap := &pendingSnapshot{existed: true, data: cur, mode: mode, leaf: rt.rel}
@@ -617,9 +618,9 @@ func (w *NPMRCWriter) Clear() error {
 			// The cleared bytes landed but unverified — revert to the pre-clear state
 			// rather than leave an unverified file; a failed revert leaves disk
 			// indeterminate (ErrWriteUnverified). The backup stays as a recovery aid.
-			return w.afterFailedRollback(rt, snap, err, "clear commit verification")
+			return false, w.afterFailedRollback(rt, snap, err, "clear commit verification")
 		}
-		return err
+		return false, err
 	}
 	snap.committed = out.committed
 	w.pending = snap
@@ -629,7 +630,7 @@ func (w *NPMRCWriter) Clear() error {
 	// would defeat offboarding, so drop our own backups here. Rollback is
 	// unaffected: RestoreSnapshot reverts from snap's in-memory bytes.
 	w.purgeBackups(rt)
-	return nil
+	return true, nil
 }
 
 // RestoreSnapshot reverts the last successful Write/Clear. It re-resolves the

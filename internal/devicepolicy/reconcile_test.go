@@ -68,10 +68,11 @@ func (w *fakeWriter) Write(v string) (string, error) {
 	return v, nil
 }
 
-func (w *fakeWriter) Clear() error {
+func (w *fakeWriter) Clear() (bool, error) {
 	w.clears++
+	changed := w.present
 	w.value, w.present = "", false
-	return nil
+	return changed, nil
 }
 
 func (w *fakeWriter) Location() string { return "fake://settings.json" }
@@ -805,10 +806,11 @@ func (w *fakeManagedWriter) Write(v string) (string, error) {
 	w.state[allowedExtensionsSettingKey] = settingValue{Present: true, Raw: v}
 	return v, nil
 }
-func (w *fakeManagedWriter) Clear() error {
+func (w *fakeManagedWriter) Clear() (bool, error) {
 	w.ensure()
+	_, changed := w.state[allowedExtensionsSettingKey]
 	delete(w.state, allowedExtensionsSettingKey)
-	return nil
+	return changed, nil
 }
 func (w *fakeManagedWriter) Location() string { return "fake://managed-settings.json" }
 

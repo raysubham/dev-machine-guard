@@ -487,10 +487,13 @@ func (r *Reconciler) clearSingle(cat, tgt string, prev AppliedTargetState, hadPr
 	owns := present && prevWritten != "" && onDisk == prevWritten
 	switch {
 	case owns:
-		if err := r.Writer.Clear(); err != nil {
-			return fmt.Errorf("devicepolicy: clear %s: %w", r.Writer.Location(), err)
+		changed, cerr := r.Writer.Clear()
+		if cerr != nil {
+			return fmt.Errorf("devicepolicy: clear %s: %w", r.Writer.Location(), cerr)
 		}
-		r.logf("devicepolicy: cleared agent-owned policy at %s", r.Writer.Location())
+		if changed {
+			r.logf("devicepolicy: cleared agent-owned policy at %s", r.Writer.Location())
+		}
 	case present:
 		// A value the agent did not write — leave it to whoever set it.
 		r.logf("devicepolicy: clear requested but %s holds a value the agent did not write; leaving it", r.Writer.Location())
@@ -554,10 +557,15 @@ func (r *Reconciler) dropClearedState(cat, tgt string, hadPrev bool) error {
 // record is dropped UNCONDITIONALLY afterward — a store read that failed or lied
 // (no record found) must not leave an orphan behind; Drop is idempotent.
 func (r *Reconciler) handleClearByMarker(cat, tgt string) error {
-	if err := r.Writer.Clear(); err != nil {
+	changed, err := r.Writer.Clear()
+	if err != nil {
 		return fmt.Errorf("devicepolicy: clear %s: %w", r.Writer.Location(), err)
 	}
-	r.logf("devicepolicy: cleared managed block at %s", r.Writer.Location())
+	if changed {
+		r.logf("devicepolicy: cleared managed block at %s", r.Writer.Location())
+	} else {
+		r.logf("devicepolicy: clear requested but %s holds no managed block; nothing to remove", r.Writer.Location())
+	}
 	if err := r.dropState(cat, tgt); err != nil {
 		return fmt.Errorf("devicepolicy: clear: update state: %w", err)
 	}
@@ -1028,7 +1036,7 @@ func (r *Reconciler) rollbackWrite(prevOnDisk string, prevPresent bool) {
 	if prevPresent {
 		_, err = r.Writer.Write(prevOnDisk)
 	} else {
-		err = r.Writer.Clear()
+		_, err = r.Writer.Clear()
 	}
 	if err != nil {
 		r.logf("devicepolicy: rollback at %s failed: %v", r.Writer.Location(), err)

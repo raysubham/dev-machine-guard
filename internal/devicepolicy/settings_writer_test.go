@@ -266,7 +266,7 @@ func TestSettingsClearRemovesOnlyTheKey(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	if err := w.Clear(); err != nil {
+	if _, err := w.Clear(); err != nil {
 		t.Fatalf("Clear: %v", err)
 	}
 	after := readFileString(t, path)
@@ -283,7 +283,7 @@ func TestSettingsClearAbsentIsNoOp(t *testing.T) {
 	w, path := newTestSettingsWriter(t)
 
 	// Missing file: Clear must not create it.
-	if err := w.Clear(); err != nil {
+	if _, err := w.Clear(); err != nil {
 		t.Fatalf("Clear(missing file): %v", err)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -292,7 +292,7 @@ func TestSettingsClearAbsentIsNoOp(t *testing.T) {
 
 	// File without the key: Clear must not rewrite it.
 	writeSettingsFixture(t, path, sampleSettings)
-	if err := w.Clear(); err != nil {
+	if _, err := w.Clear(); err != nil {
 		t.Fatalf("Clear(no key): %v", err)
 	}
 	if got := readFileString(t, path); got != sampleSettings {
@@ -312,7 +312,7 @@ func TestSettingsUnsalvageableFileIsNeverTouched(t *testing.T) {
 	if _, err := w.Write(samplePolicyObject); err == nil {
 		t.Fatal("Write on unparseable file: want error")
 	}
-	if err := w.Clear(); err == nil {
+	if _, err := w.Clear(); err == nil {
 		t.Fatal("Clear on unparseable file: want error")
 	}
 	if got := readFileString(t, path); got != broken {
@@ -734,7 +734,7 @@ func TestSettingsClearPreservesBOM(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	if err := w.Clear(); err != nil {
+	if _, err := w.Clear(); err != nil {
 		t.Fatalf("Clear on BOM file: %v", err)
 	}
 	if _, present, err := w.Read(); err != nil || present {
@@ -865,4 +865,54 @@ func TestReconcileEnforcesAndClearsThroughABOM(t *testing.T) {
 	if final := readFileString(t, path); !strings.HasPrefix(final, utf8BOM) || strings.Count(final, utf8BOM) != 1 {
 		t.Fatalf("BOM not preserved exactly once through clear: %q", final)
 	}
+}
+
+// The settings lane needs the same three-way answer from Clear as the npm lane:
+// an absent file, a present file without the key, and a real removal must be
+// distinguishable, since only the last is a removal a caller may report.
+func TestSettingsClear_ReportsWhetherAnythingChanged(t *testing.T) {
+	t.Run("absent file changes nothing", func(t *testing.T) {
+		w, _ := newTestSettingsWriter(t)
+		changed, err := w.Clear()
+		if err != nil {
+			t.Fatalf("Clear: %v", err)
+		}
+		if changed {
+			t.Fatal("Clear on an absent file must report changed=false")
+		}
+	})
+
+	t.Run("key absent changes nothing", func(t *testing.T) {
+		w, path := newTestSettingsWriter(t)
+		const fixture = "{\n  \"editor.fontSize\": 13\n}\n"
+		writeSettingsFixture(t, path, fixture)
+		changed, err := w.Clear()
+		if err != nil {
+			t.Fatalf("Clear: %v", err)
+		}
+		if changed {
+			t.Fatal("Clear over a file without the managed key must report changed=false")
+		}
+		if got := readFileString(t, path); got != fixture {
+			t.Fatalf("a no-op clear must leave the file byte-identical, got %q", got)
+		}
+	})
+
+	t.Run("key present changes the file", func(t *testing.T) {
+		w, path := newTestSettingsWriter(t)
+		writeSettingsFixture(t, path, "{\n  \"editor.fontSize\": 13\n}\n")
+		if _, err := w.Write(`{"*":false}`); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		changed, err := w.Clear()
+		if err != nil {
+			t.Fatalf("Clear: %v", err)
+		}
+		if !changed {
+			t.Fatal("Clear that removed the managed key must report changed=true")
+		}
+		if got := readFileString(t, path); strings.Contains(got, allowedExtensionsSettingKey) {
+			t.Fatalf("key not removed: %q", got)
+		}
+	})
 }

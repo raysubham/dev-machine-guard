@@ -47,7 +47,12 @@ type Writer interface {
 
 	// Clear removes the extensions.allowed key, leaving the rest of the file
 	// (and the file itself) intact. A missing file or absent key is a no-op.
-	Clear() error
+	//
+	// changed reports whether anything was actually removed. Callers must keep
+	// calling Clear unconditionally — that is what stops a lost ownership record
+	// from stranding a live block — and use changed only to describe what
+	// happened, so a clean device does not report a removal every cycle.
+	Clear() (changed bool, err error)
 
 	// Location is a human-readable description of the target, for logs.
 	Location() string
@@ -323,24 +328,27 @@ func (w *settingsWriter) Write(value string) (string, error) {
 // Clear removes the extensions.allowed key. The file is never deleted (it is
 // the user's settings.json); a file or key already absent is a no-op that
 // performs no write at all.
-func (w *settingsWriter) Clear() error {
+func (w *settingsWriter) Clear() (bool, error) {
 	v, existed, bom, err := w.load()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !existed {
-		return nil
+		return false, nil
 	}
 	if _, present, err := extractAllowedExtensions(v); err != nil {
-		return err
+		return false, err
 	} else if !present {
-		return nil
+		return false, nil
 	}
 	patch := `[{"op":"remove","path":"/` + allowedExtensionsSettingKey + `"}]`
 	if err := v.Patch([]byte(patch)); err != nil {
-		return fmt.Errorf("devicepolicy: patch %s: %w", w.path, err)
+		return false, fmt.Errorf("devicepolicy: patch %s: %w", w.path, err)
 	}
-	return w.store(v, bom)
+	if err := w.store(v, bom); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // store atomically replaces the settings file with the packed tree, preserving

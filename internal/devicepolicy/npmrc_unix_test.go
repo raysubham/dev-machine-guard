@@ -186,7 +186,7 @@ func TestClear_RemovesBlockKeepsFile(t *testing.T) { // edge 9 / 24 on disk
 	if _, err := w.Write(stdBody); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if err := w.Clear(); err != nil {
+	if _, err := w.Clear(); err != nil {
 		t.Fatalf("Clear: %v", err)
 	}
 	got := readFile(t, npmrcPath(home))
@@ -201,12 +201,70 @@ func TestClear_RemovesBlockKeepsFile(t *testing.T) { // edge 9 / 24 on disk
 func TestClear_AbsentFileIsNoOp(t *testing.T) {
 	home := t.TempDir()
 	w := newDiskWriter(t, home)
-	if err := w.Clear(); err != nil {
+	if _, err := w.Clear(); err != nil {
 		t.Fatalf("Clear on absent file: %v", err)
 	}
 	if _, err := os.Stat(npmrcPath(home)); !os.IsNotExist(err) {
 		t.Fatal("Clear must not create the file")
 	}
+}
+
+// Clear's bool is what lets a caller describe what happened without weakening the
+// unconditional call: the clear must still run when no block is present (a lost
+// ownership record must never strand a live one), so "did anything change" cannot
+// be inferred from whether it was invoked. All three outcomes are pinned because
+// only the true case may be reported as a removal.
+func TestClear_ReportsWhetherAnythingChanged(t *testing.T) {
+	const seed = "registry=https://registry.npmjs.org/\n"
+
+	t.Run("absent file changes nothing", func(t *testing.T) {
+		home := t.TempDir()
+		changed, err := newDiskWriter(t, home).Clear()
+		if err != nil {
+			t.Fatalf("Clear: %v", err)
+		}
+		if changed {
+			t.Fatal("Clear on an absent file must report changed=false")
+		}
+	})
+
+	t.Run("no managed block changes nothing", func(t *testing.T) {
+		home := t.TempDir()
+		if err := os.WriteFile(npmrcPath(home), []byte(seed), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		changed, err := newDiskWriter(t, home).Clear()
+		if err != nil {
+			t.Fatalf("Clear: %v", err)
+		}
+		if changed {
+			t.Fatal("Clear over a file with no managed block must report changed=false")
+		}
+		if got := readFile(t, npmrcPath(home)); got != seed {
+			t.Fatalf("a no-op clear must leave the file byte-identical, got %q", got)
+		}
+	})
+
+	t.Run("live block changes the file", func(t *testing.T) {
+		home := t.TempDir()
+		if err := os.WriteFile(npmrcPath(home), []byte(seed), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		w := newDiskWriter(t, home)
+		if _, err := w.Write(stdBody); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		changed, err := w.Clear()
+		if err != nil {
+			t.Fatalf("Clear: %v", err)
+		}
+		if !changed {
+			t.Fatal("Clear that removed a live block must report changed=true")
+		}
+		if got := readFile(t, npmrcPath(home)); strings.Contains(got, npmrcBeginMarker) {
+			t.Fatalf("block not removed: %q", got)
+		}
+	})
 }
 
 func TestRestoreSnapshot(t *testing.T) {
@@ -480,7 +538,7 @@ func TestClear_RemovesDuplicateBlocks(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	w := newDiskWriter(t, home)
-	if err := w.Clear(); err != nil {
+	if _, err := w.Clear(); err != nil {
 		t.Fatalf("Clear: %v", err)
 	}
 	got := readFile(t, npmrcPath(home))
@@ -632,7 +690,7 @@ func TestClear_PurgesTokenBearingBackups(t *testing.T) {
 	if backups := dmgBackups(t, home); len(backups) == 0 {
 		t.Fatal("expected the writes to leave backups to purge")
 	}
-	if err := w.Clear(); err != nil {
+	if _, err := w.Clear(); err != nil {
 		t.Fatalf("Clear: %v", err)
 	}
 	if backups := dmgBackups(t, home); len(backups) != 0 {
@@ -685,7 +743,7 @@ func TestClear_NoOpClearRetriesTheBackupPurge(t *testing.T) {
 				t.Fatal(err)
 			}
 			w := newDiskWriter(t, home)
-			if err := w.Clear(); err != nil {
+			if _, err := w.Clear(); err != nil {
 				t.Fatalf("Clear: %v", err)
 			}
 			if _, err := os.Stat(stale); !os.IsNotExist(err) {
@@ -712,7 +770,7 @@ func TestClear_LoneCRIsAnErrorAndKeepsTheBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := newDiskWriter(t, home)
-	err := w.Clear()
+	_, err := w.Clear()
 	if !isTargetUnusable(err) {
 		t.Fatalf("Clear must fail closed with ErrTargetUnusable, got %v", err)
 	}
