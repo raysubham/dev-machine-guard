@@ -10,4 +10,6 @@ import "encoding/json"
 // the package compiling on every GOOS.
 func ProbeManagedPolicy() (bool, string) { return false, "" }
 
-func ProbeManagedContent() (bool, map[string]json.RawMessage, error) { return false, nil, nil }
+func ProbeManagedContent(expected string) (bool, map[string]json.RawMessage, error) {
+	return false, nil, nil
+}

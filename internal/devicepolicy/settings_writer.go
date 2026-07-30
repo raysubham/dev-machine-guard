@@ -47,7 +47,12 @@ type Writer interface {
 
 	// Clear removes the extensions.allowed key, leaving the rest of the file
 	// (and the file itself) intact. A missing file or absent key is a no-op.
-	Clear() error
+	//
+	// changed reports whether anything was actually removed. Callers must keep
+	// calling Clear unconditionally — that is what stops a lost ownership record
+	// from stranding a live block — and use changed only to describe what
+	// happened, so a clean device does not report a removal every cycle.
+	Clear() (changed bool, err error)
 
 	// Location is a human-readable description of the target, for logs.
 	Location() string
@@ -198,33 +203,45 @@ func (w *settingsWriter) Location() string {
 //   - the syntax tree (an empty object when the file is absent or blank, so
 //     callers can patch a first key into a fresh file);
 //   - existed=false when the file is absent;
+//   - bom, the leading UTF-8 byte-order mark if the file carried one, for the
+//     caller to hand back to store so the write preserves it;
 //   - an error when the file exists but is unreadable, is not parseable JSONC,
 //     or its root is not an object — the never-clobber contract.
-func (w *settingsWriter) load() (v hujson.Value, existed bool, err error) {
+//
+// The BOM is split off BEFORE both the blank check and the parse. A BOM is not
+// whitespace to bytes.TrimSpace and not a valid start of a JSON value, so
+// without this a file whose only difference is those three bytes reads as
+// unparseable — permanently, since the agent's only way to remove them is the
+// write it then refuses to attempt. VS Code strips it on read; tooling that
+// seeds settings.json emits it (PowerShell 5.1's Set-Content -Encoding UTF8,
+// editors set to utf8bom).
+func (w *settingsWriter) load() (v hujson.Value, existed bool, bom []byte, err error) {
 	// #nosec G304 -- w.path is settingsPath() (env/home + fixed segments) or a
 	// test override, never external input.
 	b, err := os.ReadFile(w.path)
 	if errors.Is(err, os.ErrNotExist) {
 		v, _ := hujson.Parse([]byte("{}"))
-		return v, false, nil
+		return v, false, nil, nil
 	}
 	if err != nil {
-		return hujson.Value{}, false, fmt.Errorf("devicepolicy: read %s: %w", w.path, err)
+		return hujson.Value{}, false, nil, fmt.Errorf("devicepolicy: read %s: %w", w.path, err)
 	}
+	b, bom = stripBOM(b)
 	if len(bytes.TrimSpace(b)) == 0 {
 		// An empty file is how VS Code-adjacent tooling often seeds settings;
-		// treat it as an empty object rather than a parse error.
+		// treat it as an empty object rather than a parse error. A BOM-only file
+		// lands here too, now that the mark is off the front.
 		v, _ := hujson.Parse([]byte("{}"))
-		return v, true, nil
+		return v, true, bom, nil
 	}
 	v, perr := hujson.Parse(b)
 	if perr != nil {
-		return hujson.Value{}, true, fmt.Errorf("devicepolicy: %s is not valid JSONC, refusing to touch it: %w", w.path, perr)
+		return hujson.Value{}, true, bom, fmt.Errorf("devicepolicy: %s is not valid JSONC, refusing to touch it: %w", w.path, perr)
 	}
 	if _, ok := v.Value.(*hujson.Object); !ok {
-		return hujson.Value{}, true, fmt.Errorf("devicepolicy: %s root is not a JSON object, refusing to touch it", w.path)
+		return hujson.Value{}, true, bom, fmt.Errorf("devicepolicy: %s root is not a JSON object, refusing to touch it", w.path)
 	}
-	return v, true, nil
+	return v, true, bom, nil
 }
 
 // extractAllowedExtensions returns the compacted current value of the
@@ -268,7 +285,7 @@ func compactJSON(raw []byte) (string, error) {
 }
 
 func (w *settingsWriter) Read() (string, bool, error) {
-	v, existed, err := w.load()
+	v, existed, _, err := w.load()
 	if err != nil {
 		return "", false, err
 	}
@@ -288,7 +305,7 @@ func (w *settingsWriter) Write(value string) (string, error) {
 		// fetcher already enforces object shape).
 		return "", fmt.Errorf("devicepolicy: refusing to write non-object policy value to %s", w.path)
 	}
-	v, _, err := w.load()
+	v, _, bom, err := w.load()
 	if err != nil {
 		return "", err
 	}
@@ -298,7 +315,7 @@ func (w *settingsWriter) Write(value string) (string, error) {
 	if err := v.Patch([]byte(patch)); err != nil {
 		return "", fmt.Errorf("devicepolicy: patch %s: %w", w.path, err)
 	}
-	if err := w.store(v); err != nil {
+	if err := w.store(v, bom); err != nil {
 		return "", err
 	}
 	rb, _, err := w.Read()
@@ -311,32 +328,44 @@ func (w *settingsWriter) Write(value string) (string, error) {
 // Clear removes the extensions.allowed key. The file is never deleted (it is
 // the user's settings.json); a file or key already absent is a no-op that
 // performs no write at all.
-func (w *settingsWriter) Clear() error {
-	v, existed, err := w.load()
+func (w *settingsWriter) Clear() (bool, error) {
+	v, existed, bom, err := w.load()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !existed {
-		return nil
+		return false, nil
 	}
 	if _, present, err := extractAllowedExtensions(v); err != nil {
-		return err
+		return false, err
 	} else if !present {
-		return nil
+		return false, nil
 	}
 	patch := `[{"op":"remove","path":"/` + allowedExtensionsSettingKey + `"}]`
 	if err := v.Patch([]byte(patch)); err != nil {
-		return fmt.Errorf("devicepolicy: patch %s: %w", w.path, err)
+		return false, fmt.Errorf("devicepolicy: patch %s: %w", w.path, err)
 	}
-	return w.store(v)
+	if err := w.store(v, bom); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // store atomically replaces the settings file with the packed tree, preserving
 // the existing file mode and keeping a capped sibling backup of the previous
 // content (atomicfile: temp in target dir → fsync → rename).
-func (w *settingsWriter) store(v hujson.Value) error {
+//
+// bom is the mark load split off the file being replaced, re-prepended here so
+// the write preserves the encoding the user's file already had. The agent owns
+// specific keys, not the file's encoding — and dropping the mark would fight an
+// editor configured to re-add it. nil (the BOM-free case) prepends nothing.
+func (w *settingsWriter) store(v hujson.Value, bom []byte) error {
+	out := v.Pack()
+	if len(bom) > 0 {
+		out = append(append([]byte(nil), bom...), out...)
+	}
 	mode := atomicfile.PickMode(w.path, settingsFileMode)
-	if _, err := atomicfile.WriteAtomic(w.path, v.Pack(), mode); err != nil {
+	if _, err := atomicfile.WriteAtomic(w.path, out, mode); err != nil {
 		return fmt.Errorf("devicepolicy: write %s: %w", w.path, err)
 	}
 	return nil
@@ -346,7 +375,7 @@ func (w *settingsWriter) store(v hujson.Value) error {
 // file read. An absent/blank file yields all-absent; an unparseable or
 // non-object file is an error (the never-clobber contract), same as Read.
 func (w *settingsWriter) ReadManaged(keys []string) (map[string]settingValue, error) {
-	v, existed, err := w.load()
+	v, existed, _, err := w.load()
 	if err != nil {
 		return nil, err
 	}
@@ -403,7 +432,7 @@ func jsonPointerPath(key string) (string, error) {
 // writes nothing, so a remove-absent or preserve-only call leaves the file
 // untouched. Returns a readback of every op's key.
 func (w *settingsWriter) ApplyManaged(ops []settingOp) (map[string]settingValue, error) {
-	v, _, err := w.load()
+	v, _, bom, err := w.load()
 	if err != nil {
 		return nil, err
 	}
@@ -448,7 +477,7 @@ func (w *settingsWriter) ApplyManaged(ops []settingOp) (map[string]settingValue,
 		if err := v.Patch([]byte(patch)); err != nil {
 			return nil, fmt.Errorf("devicepolicy: patch %s: %w", w.path, err)
 		}
-		if err := w.store(v); err != nil {
+		if err := w.store(v, bom); err != nil {
 			return nil, err
 		}
 	}

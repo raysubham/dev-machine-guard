@@ -97,8 +97,10 @@ const (
 // ProbeManagedContent reads the VS Code managed-policy values from the registry
 // for the verify-only path. Each value is resolved with its own HKLM-then-HKCU
 // fallback (values may live in different hives), reading only the string types
-// VS Code's policy watcher honors.
-func ProbeManagedContent() (bool, map[string]json.RawMessage, error) {
+// VS Code's policy watcher honors. expected is unused — the backend compares
+// observed against desired, so reading the managed values needs nothing from the
+// policy (see ProbeContentNPM for a probe that does).
+func ProbeManagedContent(expected string) (bool, map[string]json.RawMessage, error) {
 	return probeRegistryContent([]registryProbe{
 		{registry.LOCAL_MACHINE, "HKLM", windowsPolicyKeyPath},
 		{registry.CURRENT_USER, "HKCU", windowsPolicyKeyPath},

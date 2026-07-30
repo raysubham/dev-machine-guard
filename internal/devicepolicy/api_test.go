@@ -64,7 +64,7 @@ func TestFetchPolicy(t *testing.T) {
 		t.Fatalf("hash = %q", ep.Hash)
 	}
 	// The allowlist value in the settings map must round-trip as the bytes the backend sent.
-	al, ok := ep.Policy[allowedExtensionsSettingKey]
+	al, ok := policySettings(t, ep)[allowedExtensionsSettingKey]
 	if !ok {
 		t.Fatal("settings map missing extensions.allowed")
 	}
@@ -95,7 +95,7 @@ func TestFetchLiftsGalleryServiceURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
-	gal, ok := ep.Policy[galleryServiceURLSettingKey]
+	gal, ok := policySettings(t, ep)[galleryServiceURLSettingKey]
 	if !ok || string(gal) != `"https://mkt.example/api/v1"` {
 		t.Fatalf("gallery value = %q ok=%v, want the URL as a JSON string", string(gal), ok)
 	}
@@ -111,8 +111,8 @@ func TestFetchAbsentGalleryServiceURLIsEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
-	if _, ok := ep.Policy[galleryServiceURLSettingKey]; ok {
-		t.Fatalf("gallery key should be absent from the settings map, got %q", string(ep.Policy[galleryServiceURLSettingKey]))
+	if got, ok := policySettings(t, ep)[galleryServiceURLSettingKey]; ok {
+		t.Fatalf("gallery key should be absent from the settings map, got %q", string(got))
 	}
 }
 
@@ -160,7 +160,7 @@ func TestFetchIgnoresDetectionRules(t *testing.T) {
 	if ep.Hash != "sha256:xyz" {
 		t.Fatalf("hash = %q, want sha256:xyz", ep.Hash)
 	}
-	if got := string(ep.Policy[allowedExtensionsSettingKey]); !strings.Contains(got, `"ms-python.python":true`) {
+	if got := string(policySettings(t, ep)[allowedExtensionsSettingKey]); !strings.Contains(got, `"ms-python.python":true`) {
 		t.Fatalf("allowlist = %s", got)
 	}
 	// The policy object omits `target`; Fetch defaults it to the requested target.

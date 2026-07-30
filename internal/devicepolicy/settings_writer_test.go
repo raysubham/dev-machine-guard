@@ -1,6 +1,7 @@
 package devicepolicy
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -265,7 +266,7 @@ func TestSettingsClearRemovesOnlyTheKey(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	if err := w.Clear(); err != nil {
+	if _, err := w.Clear(); err != nil {
 		t.Fatalf("Clear: %v", err)
 	}
 	after := readFileString(t, path)
@@ -282,7 +283,7 @@ func TestSettingsClearAbsentIsNoOp(t *testing.T) {
 	w, path := newTestSettingsWriter(t)
 
 	// Missing file: Clear must not create it.
-	if err := w.Clear(); err != nil {
+	if _, err := w.Clear(); err != nil {
 		t.Fatalf("Clear(missing file): %v", err)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -291,7 +292,7 @@ func TestSettingsClearAbsentIsNoOp(t *testing.T) {
 
 	// File without the key: Clear must not rewrite it.
 	writeSettingsFixture(t, path, sampleSettings)
-	if err := w.Clear(); err != nil {
+	if _, err := w.Clear(); err != nil {
 		t.Fatalf("Clear(no key): %v", err)
 	}
 	if got := readFileString(t, path); got != sampleSettings {
@@ -311,7 +312,7 @@ func TestSettingsUnsalvageableFileIsNeverTouched(t *testing.T) {
 	if _, err := w.Write(samplePolicyObject); err == nil {
 		t.Fatal("Write on unparseable file: want error")
 	}
-	if err := w.Clear(); err == nil {
+	if _, err := w.Clear(); err == nil {
 		t.Fatal("Clear on unparseable file: want error")
 	}
 	if got := readFileString(t, path); got != broken {
@@ -626,7 +627,7 @@ func TestApplyManagedEscapesUnusualKeys(t *testing.T) {
 
 // TestGalleryValueRoundTrips pins the ownership invariant on the value path the
 // reconciler now uses: the gallery URL arrives as a JSON string in the settings
-// map, is compacted (compactSettings), written, and recorded as owned — and that
+// map, is compacted (compactPolicySettings), written, and recorded as owned — and that
 // value must equal what a write→read round-trip returns, or ownership /
 // convergence would churn forever. Includes a URL with &, =, <, > — the
 // HTML-escaping edge (canonical JSON must not HTML-escape; json.Compact and the
@@ -653,4 +654,265 @@ func TestGalleryValueRoundTrips(t *testing.T) {
 			t.Fatalf("wire %s: readback Raw=%q, want %q (owned value must equal readback)", wire, sv.Raw, gv)
 		}
 	}
+}
+
+// --- UTF-8 BOM ---------------------------------------------------------------
+//
+// A settings.json carrying a leading BOM must be fully enforceable. The mark is
+// not whitespace and is not a valid start of a JSON value, so before it was
+// split off in load() every entry point failed with "not valid JSONC" — and
+// permanently, because removing the three bytes needs the write the writer then
+// refused. VS Code strips it on read; tooling that seeds the file emits it
+// (PowerShell 5.1's Set-Content -Encoding UTF8, editors set to utf8bom).
+
+// Escaped, not literal: the Go scanner rejects a raw BOM inside a source file.
+const utf8BOM = "\ufeff"
+
+func TestSettingsBOMFileIsReadable(t *testing.T) {
+	w, path := newTestSettingsWriter(t)
+	writeSettingsFixture(t, path, utf8BOM+`{"extensions.allowed":`+samplePolicyObject+`}`)
+
+	got, present, err := w.Read()
+	if err != nil {
+		t.Fatalf("Read on BOM file: %v", err)
+	}
+	if !present || got != samplePolicyObject {
+		t.Fatalf("Read = (%q, %v), want (%q, true)", got, present, samplePolicyObject)
+	}
+
+	m, err := w.ReadManaged([]string{allowedExtensionsSettingKey, galleryServiceURLSettingKey})
+	if err != nil {
+		t.Fatalf("ReadManaged on BOM file: %v", err)
+	}
+	if sv := m[allowedExtensionsSettingKey]; !sv.Present || sv.Raw != samplePolicyObject {
+		t.Fatalf("ReadManaged allowed = %+v, want present %q", sv, samplePolicyObject)
+	}
+	if sv := m[galleryServiceURLSettingKey]; sv.Present {
+		t.Fatalf("ReadManaged gallery = %+v, want absent", sv)
+	}
+}
+
+// The BOM is the user's file encoding, not a value the agent owns: a write
+// preserves it, exactly once, still at the very front.
+func TestSettingsWritePreservesBOM(t *testing.T) {
+	w, path := newTestSettingsWriter(t)
+	writeSettingsFixture(t, path, utf8BOM+sampleSettings)
+
+	rb, err := w.Write(samplePolicyObject)
+	if err != nil {
+		t.Fatalf("Write on BOM file: %v", err)
+	}
+	if rb != samplePolicyObject {
+		t.Fatalf("readback = %q, want %q", rb, samplePolicyObject)
+	}
+
+	after := readFileString(t, path)
+	if !strings.HasPrefix(after, utf8BOM) {
+		t.Fatalf("BOM lost from the front of the file: %q", after)
+	}
+	if n := strings.Count(after, utf8BOM); n != 1 {
+		t.Fatalf("BOM appears %d times, want exactly 1: %q", n, after)
+	}
+	assertFragmentsPreserved(t, after)
+
+	// A second write must not accumulate marks, and must stay byte-idempotent.
+	before := after
+	if _, err := w.Write(samplePolicyObject); err != nil {
+		t.Fatalf("second Write: %v", err)
+	}
+	if got := readFileString(t, path); got != before {
+		t.Fatalf("second write not byte-idempotent on a BOM file:\n%q\n--- vs ---\n%q", got, before)
+	}
+}
+
+// Clear must work on a BOM file too — otherwise an unassignment can never
+// remove the key the agent wrote, leaving policy applied after offboarding.
+func TestSettingsClearPreservesBOM(t *testing.T) {
+	w, path := newTestSettingsWriter(t)
+	writeSettingsFixture(t, path, utf8BOM+sampleSettings)
+	if _, err := w.Write(samplePolicyObject); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if _, err := w.Clear(); err != nil {
+		t.Fatalf("Clear on BOM file: %v", err)
+	}
+	if _, present, err := w.Read(); err != nil || present {
+		t.Fatalf("Read after Clear = (present=%v, err=%v), want absent", present, err)
+	}
+
+	after := readFileString(t, path)
+	if !strings.HasPrefix(after, utf8BOM) || strings.Count(after, utf8BOM) != 1 {
+		t.Fatalf("BOM not preserved exactly once through Clear: %q", after)
+	}
+	assertFragmentsPreserved(t, after)
+}
+
+// ApplyManaged / RestoreManaged share load+store with the single-key path, so
+// the multi-key lane must round-trip a BOM file too.
+func TestApplyAndRestoreManagedPreserveBOM(t *testing.T) {
+	w, path := newTestSettingsWriter(t)
+	writeSettingsFixture(t, path, utf8BOM+sampleSettings)
+
+	gallery := `"https://mkt.example/api/v1"`
+	snapshot, err := w.ReadManaged([]string{allowedExtensionsSettingKey, galleryServiceURLSettingKey})
+	if err != nil {
+		t.Fatalf("ReadManaged: %v", err)
+	}
+	if _, err := w.ApplyManaged([]settingOp{
+		{Key: allowedExtensionsSettingKey, Set: true, Value: json.RawMessage(samplePolicyObject)},
+		{Key: galleryServiceURLSettingKey, Set: true, Value: json.RawMessage(gallery)},
+	}); err != nil {
+		t.Fatalf("ApplyManaged on BOM file: %v", err)
+	}
+	after := readFileString(t, path)
+	if !strings.HasPrefix(after, utf8BOM) || strings.Count(after, utf8BOM) != 1 {
+		t.Fatalf("BOM not preserved exactly once through ApplyManaged: %q", after)
+	}
+
+	if err := w.RestoreManaged(snapshot); err != nil {
+		t.Fatalf("RestoreManaged: %v", err)
+	}
+	restored := readFileString(t, path)
+	if !strings.HasPrefix(restored, utf8BOM) || strings.Count(restored, utf8BOM) != 1 {
+		t.Fatalf("BOM not preserved exactly once through RestoreManaged: %q", restored)
+	}
+	if m, err := w.ReadManaged([]string{allowedExtensionsSettingKey, galleryServiceURLSettingKey}); err != nil {
+		t.Fatal(err)
+	} else if m[allowedExtensionsSettingKey].Present || m[galleryServiceURLSettingKey].Present {
+		t.Fatalf("rollback left a managed key behind: %+v", m)
+	}
+	assertFragmentsPreserved(t, restored)
+}
+
+// A file holding nothing but a BOM is the blank-file case once the mark is off
+// the front — an empty object to patch a first key into, not a parse error.
+func TestSettingsBOMOnlyFileIsTreatedAsEmptyObject(t *testing.T) {
+	w, path := newTestSettingsWriter(t)
+	writeSettingsFixture(t, path, utf8BOM)
+
+	if _, err := w.Write(samplePolicyObject); err != nil {
+		t.Fatalf("Write on BOM-only file: %v", err)
+	}
+	got, present, err := w.Read()
+	if err != nil || !present || got != samplePolicyObject {
+		t.Fatalf("Read = (%q, %v, %v), want (%q, true, nil)", got, present, err, samplePolicyObject)
+	}
+	if after := readFileString(t, path); !strings.HasPrefix(after, utf8BOM) || strings.Count(after, utf8BOM) != 1 {
+		t.Fatalf("BOM not preserved exactly once: %q", after)
+	}
+}
+
+// The BOM must not become a way to smuggle a broken file past the
+// never-clobber contract: with the mark off the front, the remainder is still
+// parsed, and unparseable content is still refused without a write.
+func TestSettingsBOMDoesNotBypassNeverClobber(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"unparseable", `{"extensions.allowed": ,,,}`},
+		{"root not object", `[1,2,3]`},
+		{"second BOM inside", utf8BOM + `{}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, path := newTestSettingsWriter(t)
+			content := utf8BOM + tc.body
+			writeSettingsFixture(t, path, content)
+
+			if _, err := w.Write(samplePolicyObject); err == nil {
+				t.Fatal("Write must refuse a BOM file whose remainder is not a JSON object")
+			}
+			if got := readFileString(t, path); got != content {
+				t.Fatalf("file was modified:\n%q\n--- want unchanged ---\n%q", got, content)
+			}
+		})
+	}
+}
+
+// End to end over the REAL writer (not a fake), because the symptom was a
+// compliance state, not a parse error: a BOM'd settings.json reported
+// verification_failed on every cycle forever, with the file untouched, and no
+// signal to the developer beyond the agent log. Enforce must converge and report
+// compliant instead — and the clear that follows must remove the key it wrote.
+func TestReconcileEnforcesAndClearsThroughABOM(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "User", "settings.json")
+	writeSettingsFixture(t, path, utf8BOM+sampleSettings)
+
+	r, rep := newRec(t, policyEP("sha256:H"), nil, nil)
+	r.Writer = newSettingsWriterAt(path)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := lastReport(t, rep); got.State != StateCompliant {
+		t.Fatalf("state = %q, want %q", got.State, StateCompliant)
+	}
+	after := readFileString(t, path)
+	if !strings.HasPrefix(after, utf8BOM) || strings.Count(after, utf8BOM) != 1 {
+		t.Fatalf("BOM not preserved exactly once through enforce: %q", after)
+	}
+	assertFragmentsPreserved(t, after)
+
+	// Unassignment: the key the agent just wrote must come back out.
+	rep.reports = nil
+	r.Fetcher = &fakeFetcher{ep: EffectivePolicy{Category: CategoryIDEExtension, Clear: true}}
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile(clear): %v", err)
+	}
+	if m, err := r.Writer.(managedSettingsWriter).ReadManaged([]string{allowedExtensionsSettingKey}); err != nil {
+		t.Fatal(err)
+	} else if m[allowedExtensionsSettingKey].Present {
+		t.Fatalf("clear left the agent-written key behind: %+v", m)
+	}
+	if final := readFileString(t, path); !strings.HasPrefix(final, utf8BOM) || strings.Count(final, utf8BOM) != 1 {
+		t.Fatalf("BOM not preserved exactly once through clear: %q", final)
+	}
+}
+
+// The settings lane needs the same three-way answer from Clear as the npm lane:
+// an absent file, a present file without the key, and a real removal must be
+// distinguishable, since only the last is a removal a caller may report.
+func TestSettingsClear_ReportsWhetherAnythingChanged(t *testing.T) {
+	t.Run("absent file changes nothing", func(t *testing.T) {
+		w, _ := newTestSettingsWriter(t)
+		changed, err := w.Clear()
+		if err != nil {
+			t.Fatalf("Clear: %v", err)
+		}
+		if changed {
+			t.Fatal("Clear on an absent file must report changed=false")
+		}
+	})
+
+	t.Run("key absent changes nothing", func(t *testing.T) {
+		w, path := newTestSettingsWriter(t)
+		const fixture = "{\n  \"editor.fontSize\": 13\n}\n"
+		writeSettingsFixture(t, path, fixture)
+		changed, err := w.Clear()
+		if err != nil {
+			t.Fatalf("Clear: %v", err)
+		}
+		if changed {
+			t.Fatal("Clear over a file without the managed key must report changed=false")
+		}
+		if got := readFileString(t, path); got != fixture {
+			t.Fatalf("a no-op clear must leave the file byte-identical, got %q", got)
+		}
+	})
+
+	t.Run("key present changes the file", func(t *testing.T) {
+		w, path := newTestSettingsWriter(t)
+		writeSettingsFixture(t, path, "{\n  \"editor.fontSize\": 13\n}\n")
+		if _, err := w.Write(`{"*":false}`); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		changed, err := w.Clear()
+		if err != nil {
+			t.Fatalf("Clear: %v", err)
+		}
+		if !changed {
+			t.Fatal("Clear that removed the managed key must report changed=true")
+		}
+		if got := readFileString(t, path); strings.Contains(got, allowedExtensionsSettingKey) {
+			t.Fatalf("key not removed: %q", got)
+		}
+	})
 }
