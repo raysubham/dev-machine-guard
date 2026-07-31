@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 
 	"github.com/tailscale/hujson"
 
@@ -45,10 +47,55 @@ type Writer interface {
 
 	// Clear removes the extensions.allowed key, leaving the rest of the file
 	// (and the file itself) intact. A missing file or absent key is a no-op.
-	Clear() error
+	//
+	// changed reports whether anything was actually removed. Callers must keep
+	// calling Clear unconditionally — that is what stops a lost ownership record
+	// from stranding a live block — and use changed only to describe what
+	// happened, so a clean device does not report a removal every cycle.
+	Clear() (changed bool, err error)
 
 	// Location is a human-readable description of the target, for logs.
 	Location() string
+}
+
+// settingOp is a requested mutation of ONE managed settings.json key. Exactly
+// one of Set / Remove is chosen by the caller; neither set (the zero value)
+// means "preserve" — leave whatever is on disk, the ownership-safe default that
+// never deletes a value the agent did not write. Remove is ownership-gated by
+// the caller (reconcile), not here.
+type settingOp struct {
+	Key    string          // e.g. allowedExtensionsSettingKey, galleryServiceURLSettingKey
+	Set    bool            // set Key to Value
+	Value  json.RawMessage // already-encoded, compacted JSON value (when Set)
+	Remove bool            // remove Key
+}
+
+// settingValue is a key's on-disk state. Present distinguishes an absent key
+// from a present-but-empty one (needed for convergence + readback); Raw is the
+// compacted encoded value (empty when absent).
+type settingValue struct {
+	Present bool
+	Raw     string
+}
+
+// managedSettingsWriter is implemented by settingsWriter. The reconciler
+// type-asserts for it; a Writer without it keeps the single-key Write/Read/Clear
+// path. Each method acts on one atomic file write over a set of keyed ops.
+type managedSettingsWriter interface {
+	// ReadManaged returns each requested key's on-disk value + presence in one
+	// file read. An unparseable / non-object settings.json is an error (the
+	// never-clobber contract), exactly as Read.
+	ReadManaged(keys []string) (map[string]settingValue, error)
+	// ApplyManaged performs ONE atomic load→patch→store over the ops (Set →
+	// add, Remove → remove-if-present, preserve → skipped), then reads back and
+	// returns every op key's resulting value + presence. All requested mutations
+	// land or none do. When no op mutates anything (all preserve, or every
+	// Remove targets an absent key) it performs no write at all.
+	ApplyManaged(ops []settingOp) (map[string]settingValue, error)
+	// RestoreManaged restores each key in the snapshot to its recorded state
+	// (Present → set to Raw, absent → remove) in one atomic write. Used by
+	// enforce's post-write rollback.
+	RestoreManaged(snapshot map[string]settingValue) error
 }
 
 // allowedExtensionsSettingKey is the `extensions.allowed` SETTING ID — the key
@@ -58,6 +105,14 @@ type Writer interface {
 // probed read-only (probe_*.go); the settings file is keyed by setting id and
 // is the surface the agent writes.
 const allowedExtensionsSettingKey = "extensions.allowed"
+
+// galleryServiceURLSettingKey is the `extensions.gallery.serviceUrl` SETTING ID
+// — the (hidden, application-scope) key VS Code reads from settings.json to
+// repoint the extension marketplace. Like allowedExtensionsSettingKey it is
+// deliberately NOT the registered policy name "ExtensionGalleryServiceUrl"
+// (galleryServiceURLName), which the read-only probes look for at OS policy
+// locations; this is the setting id the agent writes.
+const galleryServiceURLSettingKey = "extensions.gallery.serviceUrl"
 
 // settingsFileMode is the fallback mode for a settings.json the agent creates.
 // An existing file keeps its current mode (atomicfile.PickMode); 0600 for a
@@ -148,47 +203,65 @@ func (w *settingsWriter) Location() string {
 //   - the syntax tree (an empty object when the file is absent or blank, so
 //     callers can patch a first key into a fresh file);
 //   - existed=false when the file is absent;
+//   - bom, the leading UTF-8 byte-order mark if the file carried one, for the
+//     caller to hand back to store so the write preserves it;
 //   - an error when the file exists but is unreadable, is not parseable JSONC,
 //     or its root is not an object — the never-clobber contract.
-func (w *settingsWriter) load() (v hujson.Value, existed bool, err error) {
+//
+// The BOM is split off BEFORE both the blank check and the parse. A BOM is not
+// whitespace to bytes.TrimSpace and not a valid start of a JSON value, so
+// without this a file whose only difference is those three bytes reads as
+// unparseable — permanently, since the agent's only way to remove them is the
+// write it then refuses to attempt. VS Code strips it on read; tooling that
+// seeds settings.json emits it (PowerShell 5.1's Set-Content -Encoding UTF8,
+// editors set to utf8bom).
+func (w *settingsWriter) load() (v hujson.Value, existed bool, bom []byte, err error) {
 	// #nosec G304 -- w.path is settingsPath() (env/home + fixed segments) or a
 	// test override, never external input.
 	b, err := os.ReadFile(w.path)
 	if errors.Is(err, os.ErrNotExist) {
 		v, _ := hujson.Parse([]byte("{}"))
-		return v, false, nil
+		return v, false, nil, nil
 	}
 	if err != nil {
-		return hujson.Value{}, false, fmt.Errorf("devicepolicy: read %s: %w", w.path, err)
+		return hujson.Value{}, false, nil, fmt.Errorf("devicepolicy: read %s: %w", w.path, err)
 	}
+	b, bom = stripBOM(b)
 	if len(bytes.TrimSpace(b)) == 0 {
 		// An empty file is how VS Code-adjacent tooling often seeds settings;
-		// treat it as an empty object rather than a parse error.
+		// treat it as an empty object rather than a parse error. A BOM-only file
+		// lands here too, now that the mark is off the front.
 		v, _ := hujson.Parse([]byte("{}"))
-		return v, true, nil
+		return v, true, bom, nil
 	}
 	v, perr := hujson.Parse(b)
 	if perr != nil {
-		return hujson.Value{}, true, fmt.Errorf("devicepolicy: %s is not valid JSONC, refusing to touch it: %w", w.path, perr)
+		return hujson.Value{}, true, bom, fmt.Errorf("devicepolicy: %s is not valid JSONC, refusing to touch it: %w", w.path, perr)
 	}
 	if _, ok := v.Value.(*hujson.Object); !ok {
-		return hujson.Value{}, true, fmt.Errorf("devicepolicy: %s root is not a JSON object, refusing to touch it", w.path)
+		return hujson.Value{}, true, bom, fmt.Errorf("devicepolicy: %s root is not a JSON object, refusing to touch it", w.path)
 	}
-	return v, true, nil
+	return v, true, bom, nil
 }
 
-// extract returns the compacted current value of the extensions.allowed key
-// from a parsed tree, or ok=false when the key is absent. Compaction
-// normalizes whitespace (and any comments inside the value, which Standardize
-// strips) so values compare canonically regardless of on-disk formatting.
+// extractAllowedExtensions returns the compacted current value of the
+// extensions.allowed key, or ok=false when it is absent.
 func extractAllowedExtensions(v hujson.Value) (string, bool, error) {
+	return extractKey(v, allowedExtensionsSettingKey)
+}
+
+// extractKey returns the compacted current value of one top-level settings key
+// from a parsed tree, or ok=false when the key is absent. Compaction normalizes
+// whitespace (and any comments inside the value, which Standardize strips) so
+// values compare canonically regardless of on-disk formatting.
+func extractKey(v hujson.Value, key string) (string, bool, error) {
 	std := v.Clone()
 	std.Standardize()
 	m := map[string]json.RawMessage{}
 	if err := json.Unmarshal(std.Pack(), &m); err != nil {
 		return "", false, fmt.Errorf("devicepolicy: standardize settings: %w", err)
 	}
-	raw, ok := m[allowedExtensionsSettingKey]
+	raw, ok := m[key]
 	if !ok {
 		return "", false, nil
 	}
@@ -212,7 +285,7 @@ func compactJSON(raw []byte) (string, error) {
 }
 
 func (w *settingsWriter) Read() (string, bool, error) {
-	v, existed, err := w.load()
+	v, existed, _, err := w.load()
 	if err != nil {
 		return "", false, err
 	}
@@ -232,7 +305,7 @@ func (w *settingsWriter) Write(value string) (string, error) {
 		// fetcher already enforces object shape).
 		return "", fmt.Errorf("devicepolicy: refusing to write non-object policy value to %s", w.path)
 	}
-	v, _, err := w.load()
+	v, _, bom, err := w.load()
 	if err != nil {
 		return "", err
 	}
@@ -242,7 +315,7 @@ func (w *settingsWriter) Write(value string) (string, error) {
 	if err := v.Patch([]byte(patch)); err != nil {
 		return "", fmt.Errorf("devicepolicy: patch %s: %w", w.path, err)
 	}
-	if err := w.store(v); err != nil {
+	if err := w.store(v, bom); err != nil {
 		return "", err
 	}
 	rb, _, err := w.Read()
@@ -255,33 +328,185 @@ func (w *settingsWriter) Write(value string) (string, error) {
 // Clear removes the extensions.allowed key. The file is never deleted (it is
 // the user's settings.json); a file or key already absent is a no-op that
 // performs no write at all.
-func (w *settingsWriter) Clear() error {
-	v, existed, err := w.load()
+func (w *settingsWriter) Clear() (bool, error) {
+	v, existed, bom, err := w.load()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !existed {
-		return nil
+		return false, nil
 	}
 	if _, present, err := extractAllowedExtensions(v); err != nil {
-		return err
+		return false, err
 	} else if !present {
-		return nil
+		return false, nil
 	}
 	patch := `[{"op":"remove","path":"/` + allowedExtensionsSettingKey + `"}]`
 	if err := v.Patch([]byte(patch)); err != nil {
-		return fmt.Errorf("devicepolicy: patch %s: %w", w.path, err)
+		return false, fmt.Errorf("devicepolicy: patch %s: %w", w.path, err)
 	}
-	return w.store(v)
+	if err := w.store(v, bom); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // store atomically replaces the settings file with the packed tree, preserving
 // the existing file mode and keeping a capped sibling backup of the previous
 // content (atomicfile: temp in target dir → fsync → rename).
-func (w *settingsWriter) store(v hujson.Value) error {
+//
+// bom is the mark load split off the file being replaced, re-prepended here so
+// the write preserves the encoding the user's file already had. The agent owns
+// specific keys, not the file's encoding — and dropping the mark would fight an
+// editor configured to re-add it. nil (the BOM-free case) prepends nothing.
+func (w *settingsWriter) store(v hujson.Value, bom []byte) error {
+	out := v.Pack()
+	if len(bom) > 0 {
+		out = append(append([]byte(nil), bom...), out...)
+	}
 	mode := atomicfile.PickMode(w.path, settingsFileMode)
-	if _, err := atomicfile.WriteAtomic(w.path, v.Pack(), mode); err != nil {
+	if _, err := atomicfile.WriteAtomic(w.path, out, mode); err != nil {
 		return fmt.Errorf("devicepolicy: write %s: %w", w.path, err)
 	}
 	return nil
+}
+
+// ReadManaged returns each requested key's compacted value + presence in one
+// file read. An absent/blank file yields all-absent; an unparseable or
+// non-object file is an error (the never-clobber contract), same as Read.
+func (w *settingsWriter) ReadManaged(keys []string) (map[string]settingValue, error) {
+	v, existed, _, err := w.load()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]settingValue, len(keys))
+	if !existed {
+		for _, k := range keys {
+			out[k] = settingValue{}
+		}
+		return out, nil
+	}
+	// Standardize + unmarshal once, then look up every key (cheaper than
+	// extractKey per key, and identical in result).
+	std := v.Clone()
+	std.Standardize()
+	m := map[string]json.RawMessage{}
+	if err := json.Unmarshal(std.Pack(), &m); err != nil {
+		return nil, fmt.Errorf("devicepolicy: standardize settings: %w", err)
+	}
+	for _, k := range keys {
+		raw, ok := m[k]
+		if !ok {
+			out[k] = settingValue{}
+			continue
+		}
+		s, err := compactJSON(raw)
+		if err != nil {
+			return nil, err
+		}
+		out[k] = settingValue{Present: true, Raw: s}
+	}
+	return out, nil
+}
+
+// jsonPointerPath returns key as a ready-to-splice RFC 6902 patch path: the
+// single-segment JSON Pointer "/"+token, the token RFC 6901-escaped ('~'→'~0',
+// '/'→'~1'), the whole thing JSON-string-encoded (quotes included). VS Code
+// setting ids are dotted (extensions.allowed), so this is normally just quoting
+// — but the managed key set is backend-driven, and escaping + encoding stop an
+// unusual key (one holding '/', '~', '"', '\\', or a control char) from forging
+// a nested pointer path or corrupting the patch document.
+func jsonPointerPath(key string) (string, error) {
+	token := strings.ReplaceAll(key, "~", "~0")
+	token = strings.ReplaceAll(token, "/", "~1")
+	b, err := json.Marshal("/" + token)
+	if err != nil {
+		return "", fmt.Errorf("devicepolicy: encode patch path for %q: %w", key, err)
+	}
+	return string(b), nil
+}
+
+// ApplyManaged builds one RFC-6902 patch from ops — Set → add (upsert), Remove
+// → remove (pre-checked so an absent key is skipped, not an error), preserve →
+// nothing — and applies it in a single atomic load→patch→store. An empty patch
+// writes nothing, so a remove-absent or preserve-only call leaves the file
+// untouched. Returns a readback of every op's key.
+func (w *settingsWriter) ApplyManaged(ops []settingOp) (map[string]settingValue, error) {
+	v, _, bom, err := w.load()
+	if err != nil {
+		return nil, err
+	}
+	patchOps := make([]string, 0, len(ops))
+	for _, op := range ops {
+		switch {
+		case op.Set:
+			// The patch document embeds the value verbatim; reject anything that
+			// is not valid JSON before it can corrupt the patch (defense in depth
+			// — the caller passes already-compacted, validated values). Object
+			// shape is NOT required: a managed value may be a JSON string (the
+			// gallery URL) as well as an object (the allowlist).
+			if !json.Valid(op.Value) {
+				return nil, fmt.Errorf("devicepolicy: refusing to write invalid JSON value for %q to %s", op.Key, w.path)
+			}
+			path, perr := jsonPointerPath(op.Key)
+			if perr != nil {
+				return nil, perr
+			}
+			// Value is spliced verbatim (already json.Valid-checked) — never
+			// re-encoded, which would reorder members or HTML-escape it and break
+			// the backend's byte-exact applied==desired check.
+			patchOps = append(patchOps, `{"op":"add","path":`+path+`,"value":`+string(op.Value)+`}`)
+		case op.Remove:
+			// RFC 6902 "remove" errors on an absent member; pre-check presence so
+			// a Remove of a key that is not there is simply skipped.
+			_, present, perr := extractKey(v, op.Key)
+			if perr != nil {
+				return nil, perr
+			}
+			if present {
+				path, perr := jsonPointerPath(op.Key)
+				if perr != nil {
+					return nil, perr
+				}
+				patchOps = append(patchOps, `{"op":"remove","path":`+path+`}`)
+			}
+		}
+	}
+	if len(patchOps) > 0 {
+		patch := "[" + strings.Join(patchOps, ",") + "]"
+		if err := v.Patch([]byte(patch)); err != nil {
+			return nil, fmt.Errorf("devicepolicy: patch %s: %w", w.path, err)
+		}
+		if err := w.store(v, bom); err != nil {
+			return nil, err
+		}
+	}
+	keys := make([]string, len(ops))
+	for i, op := range ops {
+		keys[i] = op.Key
+	}
+	return w.ReadManaged(keys)
+}
+
+// RestoreManaged restores each key in the snapshot to its recorded state in one
+// atomic write: a Present key is set back to its Raw value, an absent key is
+// removed. Keys are applied in sorted order so the output is deterministic.
+// Used by enforce's post-write rollback to undo a multi-key write atomically.
+func (w *settingsWriter) RestoreManaged(snapshot map[string]settingValue) error {
+	keys := make([]string, 0, len(snapshot))
+	for k := range snapshot {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	ops := make([]settingOp, 0, len(keys))
+	for _, k := range keys {
+		sv := snapshot[k]
+		if sv.Present {
+			ops = append(ops, settingOp{Key: k, Set: true, Value: json.RawMessage(sv.Raw)})
+		} else {
+			ops = append(ops, settingOp{Key: k, Remove: true})
+		}
+	}
+	_, err := w.ApplyManaged(ops)
+	return err
 }
