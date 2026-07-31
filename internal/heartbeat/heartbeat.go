@@ -20,9 +20,11 @@ package heartbeat
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/step-security/dev-machine-guard/internal/buildinfo"
@@ -37,9 +39,13 @@ const SchemaVersion = 1
 // and diagnostics can reference it without duplicating the literal.
 const Filename = "last-run.json"
 
-// Record is the last-run.json envelope: a point-in-time stamp that a run
-// began. It deliberately carries only start-of-run facts — outcome lives in
-// scan-state.json (LastSuccessfulExecutionID) and agent.error.log.
+// Record is the last-run.json envelope. The top-level fields are a
+// point-in-time stamp that a run began — start-of-run facts only; the scan
+// outcome lives in scan-state.json (LastSuccessfulExecutionID) and
+// agent.error.log. RunGate is the run gate's small cache, folded into this
+// same file rather than a sibling run-gate-state.json: it is the same "last
+// run" kind of data written to the same install dir, and is consulted only on
+// the offline fallback path.
 type Record struct {
 	SchemaVersion    int       `json:"schema_version"`
 	WrittenAt        time.Time `json:"written_at"`
@@ -48,27 +54,89 @@ type Record struct {
 	Command          string    `json:"command"`           // subcommand that started the run, e.g. "send-telemetry"
 	InvocationMethod string    `json:"invocation_method"` // scheduler footprint vs manual; see telemetry.DetectInvocationMethod
 	OS               string    `json:"os"`
+	RunGate          *RunGate  `json:"run_gate,omitempty"`
 }
+
+// RunGate is the run gate's cached memory: the resolved device id (so skipped
+// wakeups never re-probe the serial), the last completed full run (stamped
+// after upload), and the last directive's gating fields. Nil until the first
+// successful check-in. Everything here is advisory — a missing, corrupt, or
+// future-schema file only costs one serial probe and one fail-open run, never
+// a wrong skip. Fields mirror the wire directive; see internal/rungate.
+type RunGate struct {
+	DeviceID                 string `json:"device_id,omitempty"`
+	LastFullRunAt            int64  `json:"last_full_run_at,omitempty"` // unix sec; stamped on upload success
+	GatingEnabled            bool   `json:"gating_enabled,omitempty"`
+	EffectiveIntervalMinutes int    `json:"effective_interval_minutes,omitempty"`
+	DirectiveFetchedAt       int64  `json:"directive_fetched_at,omitempty"` // unix sec of the last successful check-in
+}
+
+// mu serializes the read-modify-write writers (Write for the breadcrumb,
+// UpdateRunGate for the gate cache). Within a single run they execute
+// sequentially on the main goroutine; the mutex is cheap insurance for any
+// future concurrent caller. Cross-process safety is atomic-rename
+// last-writer-wins, same as internal/state.
+var mu sync.Mutex
 
 // Write stamps last-run.json at path with this run's start metadata. An empty
 // path is a no-op returning nil — callers pass paths.HeartbeatFile(), which is
 // "" when the install dir is disabled (--install-dir=""), and treat the
 // heartbeat as off in that case. Best-effort: callers should log a write error
 // at debug/warn and continue, never fail the run on it.
+//
+// It read-modify-writes so the RunGate cache survives: the heartbeat is
+// stamped at the very top of every run, before the gate reads that cache on
+// the offline path, so a blind overwrite here would erase it every wakeup.
 func Write(path, command, invocationMethod string) error {
 	if path == "" {
 		return nil
 	}
-	rec := Record{
-		SchemaVersion:    SchemaVersion,
-		WrittenAt:        time.Now().UTC(),
-		PID:              os.Getpid(),
-		AgentVersion:     buildinfo.Version,
-		Command:          command,
-		InvocationMethod: invocationMethod,
-		OS:               runtime.GOOS,
-	}
+	mu.Lock()
+	defer mu.Unlock()
+	rec := loadForUpdate(path)
+	rec.SchemaVersion = SchemaVersion
+	rec.WrittenAt = time.Now().UTC()
+	rec.PID = os.Getpid()
+	rec.AgentVersion = buildinfo.Version
+	rec.Command = command
+	rec.InvocationMethod = invocationMethod
+	rec.OS = runtime.GOOS
 	return writeRecord(path, rec)
+}
+
+// UpdateRunGate applies a read-modify-write to the RunGate cache in the file
+// at path, preserving the breadcrumb fields and any RunGate fields the apply
+// func leaves untouched. internal/rungate uses it to stamp the last full run
+// and record each check-in. Best-effort by contract: on failure the next
+// gated invocation simply re-probes / re-checks. Empty path errors so the
+// caller can log it.
+func UpdateRunGate(path string, apply func(*RunGate)) error {
+	if path == "" {
+		return errors.New("heartbeat: no path for run-gate state")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	rec := loadForUpdate(path)
+	rec.SchemaVersion = SchemaVersion
+	if rec.RunGate == nil {
+		rec.RunGate = &RunGate{}
+	}
+	apply(rec.RunGate)
+	return writeRecord(path, rec)
+}
+
+// loadForUpdate returns the record at path for a read-modify-write, or a zero
+// Record when the file is absent, unreadable, corrupt, or a schema mismatch —
+// all treated as "start fresh". The breadcrumb must always write, and the gate
+// cache is fail-open-safe, so (unlike a versioned config) a newer-schema file
+// is overwritten rather than preserved; only a rare downgrade hits that, and
+// it costs at most one fail-open run. UNLOCKED — callers hold mu.
+func loadForUpdate(path string) Record {
+	rec, err := Load(path)
+	if err != nil || rec == nil {
+		return Record{}
+	}
+	return *rec
 }
 
 // Load reads last-run.json. A missing file, parse error, or schema mismatch

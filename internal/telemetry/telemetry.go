@@ -30,6 +30,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/paths"
 	"github.com/step-security/dev-machine-guard/internal/progress"
+	"github.com/step-security/dev-machine-guard/internal/rungate"
 	"github.com/step-security/dev-machine-guard/internal/schedinfo"
 	"github.com/step-security/dev-machine-guard/internal/state"
 	"github.com/step-security/dev-machine-guard/internal/tcc"
@@ -354,6 +355,14 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	// own output. The loader appends them to .loader_log; we read and then delete
 	// it, so it's scoped to the current run. Best-effort; see loader_log.go.
 	seedLoaderLog(capture)
+
+	// Echo the run-gate decision into the captured log so a downloaded
+	// execution log shows the gate checked in and allowed this run. The gate
+	// runs before StartCapture (in gateSkipsRun), so its live lines aren't
+	// captured; this one is.
+	if cfg != nil && cfg.GateProceedReason != "" {
+		log.Progress("Run gate: checked scan cadence, proceeding with this scan (%s)", cfg.GateProceedReason)
+	}
 
 	// Bind the throttled log-tail emitter to the live capture so every
 	// subsequent postPhase() can ship a recent stderr slice attached to
@@ -1156,6 +1165,11 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 				log.Debug("scan-state: saved %s (telemetry-out mode)", scanStatePath)
 			}
 		}
+		// Same rationale for the run-gate stamp: the dev harness should show
+		// the same second-invocation gating behavior as a real upload.
+		if err := rungate.StampLastFullRun(time.Now()); err != nil {
+			log.Debug("run-gate: could not stamp last full run: %v", err)
+		}
 		return nil
 	}
 
@@ -1187,6 +1201,12 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		} else {
 			log.Debug("scan-state: saved %s", scanStatePath)
 		}
+	}
+
+	// Record the completed full run for the run gate. Best-effort by
+	// contract: a missing stamp only means the next gated invocation runs.
+	if err := rungate.StampLastFullRun(time.Now()); err != nil {
+		log.Debug("run-gate: could not stamp last full run: %v", err)
 	}
 
 	fmt.Fprintln(os.Stderr)

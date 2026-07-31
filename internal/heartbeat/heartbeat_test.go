@@ -115,3 +115,39 @@ func TestLoadEmptyPathReturnsNilNil(t *testing.T) {
 		t.Errorf("Load(\"\") = (%+v, %v), want (nil, nil)", rec, err)
 	}
 }
+
+func TestUpdateRunGateEmptyPathErrors(t *testing.T) {
+	if err := UpdateRunGate("", func(*RunGate) {}); err == nil {
+		t.Error("UpdateRunGate(\"\") must error so the gate caller logs it")
+	}
+}
+
+// TestWriteAndUpdateRunGatePreserveEachOther is the merge invariant: the
+// breadcrumb write keeps the RunGate cache, and the RunGate write keeps the
+// breadcrumb (both read-modify-write the one last-run.json).
+func TestWriteAndUpdateRunGatePreserveEachOther(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "last-run.json")
+
+	if err := UpdateRunGate(path, func(rg *RunGate) {
+		rg.DeviceID = "SER123"
+		rg.LastFullRunAt = 42
+		rg.GatingEnabled = true
+		rg.EffectiveIntervalMinutes = 240
+	}); err != nil {
+		t.Fatalf("UpdateRunGate: %v", err)
+	}
+	if err := Write(path, "send-telemetry", "one_time"); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	rec, err := Load(path)
+	if err != nil || rec == nil {
+		t.Fatalf("Load: rec=%+v err=%v", rec, err)
+	}
+	if rec.Command != "send-telemetry" {
+		t.Errorf("Write did not stamp the breadcrumb: %+v", rec)
+	}
+	if rec.RunGate == nil || rec.RunGate.DeviceID != "SER123" || rec.RunGate.LastFullRunAt != 42 || rec.RunGate.EffectiveIntervalMinutes != 240 {
+		t.Errorf("Write erased the run-gate cache: %+v", rec.RunGate)
+	}
+}
