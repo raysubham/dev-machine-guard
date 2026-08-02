@@ -63,7 +63,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	// Detect AI agents and tools
 	log.StepStart("Detecting AI agents and tools")
 	start = time.Now()
-	cliDetector := detector.NewAICLIDetector(exec).WithLogger(log)
+	cliDetector := detector.NewAICLIDetector(exec).WithLogger(log).WithSkipper(tccSkipper)
 	cliTools := cliDetector.Detect(ctx)
 	agentDetector := detector.NewAgentDetector(exec).WithLogger(log)
 	agents := agentDetector.Detect(ctx, searchDirs)

@@ -596,7 +596,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Detecting AI CLI tools...")
-	cliTools := detector.NewAICLIDetector(userExec).WithLogger(log).Detect(phaseCtx)
+	cliTools := detector.NewAICLIDetector(userExec).WithLogger(log).WithSkipper(tccSkipper).Detect(phaseCtx)
 	for _, t := range cliTools {
 		log.Progress("  Found: %s (%s) v%s at %s", t.Name, t.Vendor, t.Version, t.BinaryPath)
 	}
