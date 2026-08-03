@@ -12,7 +12,7 @@ Releases are a three-phase process, where each phase is its own GitHub Actions w
 
 1. **Build and draft (`release.yml`)**: builds binaries for all platforms, Authenticode-signs the Windows `.exe`s and `.msi`s via Azure Trusted Signing, Sigstore-signs the Linux and Windows artifacts (after Authenticode for Windows, so cosign bundles match the bytes users download), creates a **draft** release with the unsigned macOS binary, and emits SLSA build provenance attestations for every artifact except macOS. The Windows signing job runs in the `release` GitHub Environment, which requires two reviewers and is restricted to `main`.
 2. **Sign and notarize macOS (`release-macos.yml`)**: a dispatch-only workflow that downloads the unsigned macOS binary from the draft release, codesigns it with the Apple Developer ID certificate, notarizes it with Apple, then Sigstore-signs and attests the final notarized bytes and uploads them to the draft release. It runs in the `release` environment as well. Because Apple notarization can hang, this is kept separate from `release.yml` so it can be re-run on its own without repeating the build. A companion workflow, `check-notarization-status.yml`, inspects a notarization submission that did not finish in time.
-3. **Publish**: mark the draft release as published.
+3. **Verify and publish (`verify-release.yml` + `publish-release.yml`)**: `verify-release.yml` checks that every distributable binary has a valid out-of-band signed checksum (`.sha256.sig`), that the Windows `.exe`s and `.msi`s are Authenticode-signed and timestamped, and that the macOS binary is codesigned and notarized. It can be dispatched on its own to check that a draft (or published) release is healthy. `publish-release.yml` calls it as a reusable workflow and, only if every check passes, marks the draft release as published and latest.
 
 macOS signing runs entirely in GitHub Actions; no local Mac is required. The signing credentials are stored as encrypted secrets in the `release` environment (see [Signing credentials](#signing-credentials-one-time-setup)).
 
@@ -70,12 +70,36 @@ The workflow will:
 2. Click **Run workflow** and enter the submission id from the failed run. It reports the current status and the notary log.
 3. Once the status is `Accepted`, re-run the Release macOS workflow for the same tag. Apple keeps processing server-side, so no resubmission is needed.
 
-### 4. Publish the release
+### 4. (Optional) Verify the draft release
+
+To check that a draft is good and healthy without publishing it:
+
+1. Go to [Actions > Verify Release](https://github.com/step-security/dev-machine-guard/actions/workflows/verify-release.yml)
+2. Click **Run workflow** and enter the release tag (e.g. `v1.9.1`)
+
+The workflow verifies, for every distributable binary (macOS, Linux, Windows `.exe`s, MSIs, and `.intunewin` packages):
+
+- **Signed checksums**: each artifact has a `<artifact>.sha256.sig` asset — an Ed25519 (SSH) signature over the artifact's SHA-256, created with a key held **outside this repository** — and the signature verifies against the artifact's actual bytes. This is the gate that prevents a repository compromise alone from producing a release that passes verification.
+- **Windows Authenticode**: every `.exe` and `.msi` has a valid signature with an RFC3161 timestamp.
+- **macOS notarization**: the darwin binary is codesigned with the Step Security Developer ID and hardened runtime, and Gatekeeper reports it as notarized.
+
+A final `gate` job gives a single pass/fail status for the release.
+
+> The signed checksums are produced and uploaded out-of-band; make sure the `.sha256.sig` assets are attached to the draft before running verification, or the run will fail.
+
+### 5. Publish the release
+
+1. Go to [Actions > Publish Release](https://github.com/step-security/dev-machine-guard/actions/workflows/publish-release.yml)
+2. Click **Run workflow** and enter the release tag (e.g. `v1.9.1`)
+
+The workflow re-runs the entire Verify Release suite above (it calls `verify-release.yml` as a reusable workflow), and only if every check passes runs the equivalent of:
 
 ```bash
 gh release edit "v${VERSION}" --repo step-security/dev-machine-guard \
   --draft=false --latest
 ```
+
+so a draft can never be published without passing verification.
 
 ---
 
@@ -121,6 +145,10 @@ Each release includes:
 | `stepsecurity-dev-machine-guard-VERSION-x64.msi.bundle` | Sigstore cosign bundle for the MSI |
 | `stepsecurity-dev-machine-guard-VERSION-arm64.msi` | Authenticode-signed Windows ARM64 MSI installer |
 | `stepsecurity-dev-machine-guard-VERSION-arm64.msi.bundle` | Sigstore cosign bundle for the MSI |
+| `stepsecurity-dev-machine-guard-VERSION-x64.intunewin` | Intune Win32 package (x64) wrapping the signed MSI |
+| `stepsecurity-dev-machine-guard-VERSION-x64.intunewin.bundle` | Sigstore cosign bundle for the Intune x64 package |
+| `stepsecurity-dev-machine-guard-VERSION-arm64.intunewin` | Intune Win32 package (ARM64) wrapping the signed MSI |
+| `stepsecurity-dev-machine-guard-VERSION-arm64.intunewin.bundle` | Sigstore cosign bundle for the Intune ARM64 package |
 | `stepsecurity-dev-machine-guard-VERSION-linux_amd64` | Linux 64-bit binary |
 | `stepsecurity-dev-machine-guard-linux_amd64.bundle` | Sigstore cosign bundle for the Linux amd64 binary |
 | `stepsecurity-dev-machine-guard-VERSION-linux_arm64` | Linux ARM64 binary |
@@ -135,6 +163,8 @@ Each release includes:
 | `stepsecurity-dev-machine-guard-VERSION-arm64.rpm.bundle` | Sigstore cosign bundle for the RPM arm64 package |
 | `stepsecurity-dev-machine-guard.sh` | Legacy shell script |
 | `stepsecurity-dev-machine-guard.sh.bundle` | Sigstore cosign bundle for the shell script |
+
+In addition, every distributable binary (the darwin, `linux_*`, `.exe`, `.msi`, and `.intunewin` artifacts) has a `<artifact>.sha256.sig` asset: a base64-wrapped SSH (Ed25519) signature over the artifact's SHA-256, created with a key held outside this repository and uploaded out-of-band. `verify-release.yml` — and the loader on customer machines — verify these against the artifact's actual bytes.
 
 ---
 
@@ -264,12 +294,13 @@ gh attestation verify "stepsecurity-dev-machine-guard-${VERSION}-linux_${ARCH}" 
 
 ## Immutability Guarantees
 
-1. **Draft then publish flow**: binaries are uploaded to a draft release, the macOS binary is signed and notarized by the gated `release-macos.yml` workflow, then the release is published. Once published, the release is immutable.
+1. **Draft then publish flow**: binaries are uploaded to a draft release, the macOS binary is signed and notarized by the gated `release-macos.yml` workflow, then the release is published via `publish-release.yml`, which refuses to publish unless the full Verify Release suite passes. Once published, the release is immutable.
 2. **Sigstore transparency log**: every artifact's signature is recorded in the public [Rekor](https://rekor.sigstore.dev/) transparency log. The Windows cosign bundles cover the post-Authenticode bytes and the macOS bundle covers the post-notarization bytes, so they match what users download.
 3. **SLSA build provenance** — attestation links the artifact to the exact workflow run, commit SHA, and build environment.
 4. **Authenticode + RFC3161 timestamp** — Windows `.exe` and `.msi` signatures from Azure Trusted Signing are timestamped by Microsoft's RFC3161 timestamp server, so they remain verifiable on Windows after the signing certificate expires.
 5. **Release environment gate**: the Windows and macOS signing jobs won't run without approval from two reviewers, and only from `main`.
-6. **Duplicate tag check** — the release workflow fails if the tag already exists.
+6. **Out-of-band signed checksums** — every distributable binary ships a `.sha256.sig` signed with an Ed25519 key held outside the repository, so compromising the repository alone is not enough to publish a release that passes verification. `verify-release.yml` and the publish gate check these signatures against the artifacts' actual bytes.
+7. **Duplicate tag check** — the release workflow fails if the tag already exists.
 
 ---
 

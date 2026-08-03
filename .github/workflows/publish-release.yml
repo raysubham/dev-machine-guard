@@ -1,0 +1,49 @@
+name: Publish Release
+# Publishes a draft release, but only after the full Verify Release suite
+# (signed checksums, Windows Authenticode, macOS notarization) passes. This
+# replaces the manual:
+#   gh release edit vX.Y.Z --repo <repo> --draft=false --latest
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Draft release tag to verify and publish, e.g. v1.12.0.'
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  # Runs every check from verify-release.yml. Its `gate` job fails the whole
+  # workflow if any requirement is not met, so `publish` below only runs when
+  # the release is verified safe.
+  verify:
+    name: Verify release
+    uses: ./.github/workflows/verify-release.yml
+    permissions:
+      contents: write # required to see DRAFT releases; verification only downloads assets
+    with:
+      tag: ${{ inputs.tag }}
+
+  publish:
+    name: Publish release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release edit needs push access to flip draft -> published
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        with:
+          egress-policy: audit
+
+      - name: Make draft release public and mark as latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          echo "Release ${TAG} is now public and marked as latest."
+          echo "✅ Release \`${TAG}\` verified and published as latest." >> "$GITHUB_STEP_SUMMARY"
