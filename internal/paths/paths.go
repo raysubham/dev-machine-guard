@@ -153,7 +153,10 @@ func ScanStateFile() string {
 
 // HeartbeatFile returns the absolute path to last-run.json, or "" when
 // Home() is disabled. Callers must treat "" as "heartbeat unavailable" and
-// skip writing it (same contract as ScanStateFile).
+// skip writing it (same contract as ScanStateFile). Besides the start-of-run
+// breadcrumb, this file also holds the run gate's offline cache (see
+// heartbeat.RunGate / internal/rungate) — one file for the same "last run"
+// data rather than a separate run-gate-state.json.
 func HeartbeatFile() string {
 	home := Home()
 	if home == "" {

@@ -46,6 +46,13 @@ type Config struct {
 	YarnRCOnly          bool     // --yarnrc: run only the yarn config audit (both flavors) and render verbose pretty output
 	SearchDirs          []string // defaults to ["$HOME"]
 
+	// GateProceedReason is populated at runtime (not a CLI flag) by the run
+	// gate when it lets a run proceed, so telemetry.Run can echo the gate
+	// decision into the captured execution log (what "Download logs" shows).
+	// The gate itself runs before log capture starts, so its live lines never
+	// reach the downloadable log without this.
+	GateProceedReason string
+
 	// HooksAgent is the --agent value on `hooks install` / `hooks uninstall`;
 	// "" means "every detected agent".
 	HooksAgent string
@@ -75,6 +82,14 @@ type Config struct {
 	// Internal — not advertised in --help. Equivalent env var:
 	// STEPSECURITY_OVERRIDE_GATE=1.
 	OverrideGate bool
+
+	// ForceScan bypasses the server-driven run gate for this invocation: the
+	// scan proceeds even when the backend's run-directive says "skip". The
+	// documented debug/support escape — manual runs are otherwise gated
+	// exactly like scheduler-fired ones (an MDM-launched run detects as
+	// one_time too, so invocation method deliberately can't exempt manual
+	// use). Equivalent env var: STEPSEC_FORCE_SCAN=1.
+	ForceScan bool
 
 	// RulesFile makes the malicious-file detection engine load its RuleSet
 	// from a local JSON file instead of fetching it from the backend.
@@ -283,6 +298,8 @@ func Parse(args []string) (*Config, error) {
 			cfg.Verbose = true
 		case arg == "--override-gate":
 			cfg.OverrideGate = true
+		case arg == "--force-scan":
+			cfg.ForceScan = true
 		case strings.HasPrefix(arg, "--rules-file="):
 			cfg.RulesFile = strings.TrimPrefix(arg, "--rules-file=")
 		case arg == "--rules-file":
