@@ -1,4 +1,8 @@
 name: Verify Release
+# Two entry points share the same verification jobs:
+#   - workflow_dispatch: manually verify a release is good and healthy.
+#   - workflow_call: reused by publish-release.yml, which publishes the draft
+#     only after every check here passes.
 on:
   workflow_dispatch:
     inputs:
@@ -13,6 +17,17 @@ on:
           an upstream PUBLISHED release (handy for confirming this workflow
           works before opening a PR — draft releases in another repo are not
           visible to this repo's token, so only published upstream releases work).
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to verify, e.g. v1.11.6 (draft or published).'
+        required: true
+        type: string
+      repository:
+        description: 'Repo to verify, as owner/name. Blank = the calling repo.'
         required: false
         type: string
         default: ''
@@ -89,6 +104,8 @@ jobs:
             "stepsecurity-dev-machine-guard-task-${VERSION}-windows_arm64.exe"
             "stepsecurity-dev-machine-guard-${VERSION}-x64.msi"
             "stepsecurity-dev-machine-guard-${VERSION}-arm64.msi"
+            "stepsecurity-dev-machine-guard-${VERSION}-x64.intunewin"
+            "stepsecurity-dev-machine-guard-${VERSION}-arm64.intunewin"
           )
 
           fail=0
