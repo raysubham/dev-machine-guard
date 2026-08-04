@@ -314,6 +314,16 @@ func (d *SkillsDetector) resolveGlobalRoots(info *model.AgentSkillScanInfo) []sk
 	// copilot_user: ~/.copilot/skills.
 	add(filepath.Join(home, ".copilot", "skills"), "copilot_user", "copilot", "global", "")
 
+	// amp_user also covers ~/.config/amp/skills — Amp's own root, third in its
+	// precedence list — under the same source label, two roots, as with
+	// opencode_user above.
+	add(filepath.Join(home, ".config", "amp", "skills"), "amp_user", "amp", "global", "")
+
+	// factory_agent_user: ~/.agent/skills — Factory's singular-.agent compat
+	// root. The plural ~/.agents/skills above is the shared convention, and the
+	// project-level .agent/skills is factory_agent_project.
+	add(filepath.Join(home, ".agent", "skills"), "factory_agent_user", "factory", "global", "")
+
 	return roots
 }
 
