@@ -111,7 +111,7 @@ jobs:
   #     the kernel's own final path for the handle
   # This job executes them natively; scoped to these packages so the rest of the
   # suite (which assumes a POSIX host) is untouched.
-  test-windows-devicepolicy:
+  test-windows-native:
     name: Test (windows native packages)
     runs-on: windows-latest
     steps:
