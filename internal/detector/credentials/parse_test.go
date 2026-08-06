@@ -22,9 +22,6 @@ type parseCase struct {
 func obsPlain(n int) observation {
 	return observation{Count: n, Protection: model.CredentialProtectionPlaintext}
 }
-func obsProt(n int) observation {
-	return observation{Count: n, Protection: model.CredentialProtectionProtected}
-}
 func obsExt(n int) observation {
 	return observation{Count: n, Protection: model.CredentialProtectionExternal}
 }
