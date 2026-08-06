@@ -83,6 +83,10 @@ func (execRunner) Run(ctx context.Context, req ghRequest) ([]byte, error) {
 		args = append(args, ghStatusArgs...)
 	}
 
+	// #nosec G204 -- name is the path a PATH lookup returned for the CLI, or the
+	// literal below it; the arguments are package constants plus that same path
+	// and the account name the user enumeration produced. Nothing here is spelled
+	// by a scanned file or by the environment.
 	cmd := exec.CommandContext(ctx, name, args...)
 	if !req.DropPrivileges {
 		cmd.Env = append(strippedEnv(), "GH_CONFIG_DIR="+req.ConfigDir)
@@ -296,7 +300,7 @@ const ghStateAuthenticated = "success"
 // configuration is spelled after the grant that produced it rather than after
 // the file it sits in.
 const (
-	ghTokenSourceInline  = "oauth_token"
+	ghTokenSourceInline  = "oauth_token" //#nosec G101 -- the CLI's own word for where it keeps a token; the value read from the tool is compared against it and never stored.
 	ghTokenSourceKeyring = "keyring"
 )
 

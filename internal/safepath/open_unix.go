@@ -59,6 +59,9 @@ func openVerified(resolved string, wantDir bool) (*os.File, os.FileInfo, error) 
 	if err != nil {
 		return nil, nil, openErr(err)
 	}
+	// #nosec G115 -- fd is the descriptor openat just returned on success: a small
+	// non-negative int, which is what uintptr carries for the rest of its life. A
+	// failure returns above rather than reaching this line.
 	f := os.NewFile(uintptr(fd), resolved)
 	info, serr := f.Stat()
 	if serr != nil {

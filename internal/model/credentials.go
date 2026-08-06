@@ -51,8 +51,8 @@ const (
 	CredentialReasonRefusedTCC          = "refused_tcc"
 	CredentialReasonRefusedOutsideRoots = "refused_outside_user_roots"
 	CredentialReasonPermissionDenied    = "permission_denied"
-	CredentialReasonLocationUnresolved  = "location_unresolved"
-	CredentialReasonUnsupportedEncoding = "unsupported_encoding"
+	CredentialReasonLocationUnresolved  = "location_unresolved"  //#nosec G101 -- a reason code on the wire; no value read from a file reaches this vocabulary.
+	CredentialReasonUnsupportedEncoding = "unsupported_encoding" //#nosec G101 -- see above: a reason code, not anything read.
 	CredentialReasonSkippedNoUser       = "skipped_no_user"
 	CredentialReasonCapped              = "capped"
 	CredentialReasonTimedOut            = "timed_out"
@@ -82,8 +82,8 @@ const (
 const (
 	CredentialScopeObserved            = "observed"
 	CredentialScopeUnavailable         = "unavailable"
-	CredentialScopeUnsupportedCLI      = "unsupported_cli_version"
-	CredentialScopeAccessDenied        = "credential_access_denied"
+	CredentialScopeUnsupportedCLI      = "unsupported_cli_version"  //#nosec G101 -- an outcome code on the wire, reported in place of permissions rather than carrying any.
+	CredentialScopeAccessDenied        = "credential_access_denied" //#nosec G101 -- see above: an outcome code, not a permission or a token.
 	CredentialScopeNetworkError        = "network_error"
 	CredentialScopeNotReportedByGitHub = "not_reported_by_github"
 )

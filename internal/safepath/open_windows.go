@@ -79,9 +79,11 @@ const (
 // extended-length prefix removed so it is comparable to an ordinary path.
 func finalPath(h windows.Handle) (string, error) {
 	// One page of UTF-16 covers any real path; the retry below handles the rest
-	// rather than allocating MAX_LONG_PATH on every read.
-	buf := make([]uint16, 1024)
-	n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), fileNameNormalized|volumeNameDOS)
+	// rather than allocating MAX_LONG_PATH on every read. The size is a constant
+	// so the API's word count is spelled without a conversion that could wrap.
+	const words = 1024
+	buf := make([]uint16, words)
+	n, err := windows.GetFinalPathNameByHandle(h, &buf[0], words, fileNameNormalized|volumeNameDOS)
 	if err != nil {
 		return "", err
 	}

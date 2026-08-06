@@ -62,7 +62,7 @@ const (
 	sourceDockerConfig         = "docker_config"
 	sourceKubeconfig           = "kubeconfig"
 	sourceMCPConfig            = "mcp_config"
-	sourceTerraformCredentials = "terraform_credentials"
+	sourceTerraformCredentials = "terraform_credentials" //#nosec G101 -- the wire identifier for a source, naming a kind of file rather than holding anything read out of one.
 	sourceVaultToken           = "vault_token"
 
 	// The GitHub CLI's own account and permission report, deliberately absent from

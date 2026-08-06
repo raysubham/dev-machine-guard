@@ -23,7 +23,7 @@ import (
 const (
 	tokenHome      = "$HOME"
 	tokenAppData   = "$APPDATA"
-	tokenXDGConfig = "$XDG_CONFIG_HOME"
+	tokenXDGConfig = "$XDG_CONFIG_HOME" //#nosec G101 -- the spelling of a path root in a reported location, which is an environment variable's name.
 	// The fallback for a path matching no root: the directories above the file
 	// become a short identifier of themselves and only the final element is kept.
 	// Such a path is not one this inventory can describe, and its full spelling

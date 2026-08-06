@@ -199,8 +199,10 @@ func readSSHString(b []byte) (value, rest []byte, ok bool) {
 	if len(b) < 4 {
 		return nil, nil, false
 	}
+	// Compared as int64, which both a uint32 length and a slice length widen into
+	// without wrapping, so the bound holds for any header the file can carry.
 	n := binary.BigEndian.Uint32(b[:4])
-	if uint64(n) > uint64(len(b)-4) {
+	if int64(n) > int64(len(b)-4) {
 		return nil, nil, false
 	}
 	return b[4 : 4+n], b[4+n:], true
