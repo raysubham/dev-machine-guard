@@ -182,7 +182,15 @@ func (d *Detector) resolveUser() (userPaths, bool) {
 			return userPaths{}, false
 		}
 	}
-	return newUserPaths(u.Username, home, d.exec.GOOS()), true
+	paths := newUserPaths(u.Username, home, d.exec.GOOS())
+	// Containment holds the home in both spellings, so tokenisation is told about
+	// the second one too. A failure here is not a refusal: the written spelling
+	// still bounds and labels every path, and the resolved one only lets a path
+	// that arrived in the filesystem's spelling be recognised as the same place.
+	if resolved, err := d.exec.EvalSymlinks(home); err == nil {
+		paths = paths.withResolvedHome(resolved)
+	}
+	return paths, true
 }
 
 // collectSource runs one catalog entry.

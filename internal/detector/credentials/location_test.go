@@ -97,6 +97,62 @@ func TestTokenise(t *testing.T) {
 			filepath.Join(outside, "git", "credentials"),
 			"$XDG_CONFIG_HOME/git/credentials",
 		},
+		// A home the filesystem spells differently is still the home. Containment
+		// admits both spellings, so a file under the resolved one is inside the
+		// account's tree, and the opaque root would give it a second identity for
+		// the same file and hide the only root a reader can interpret.
+		{
+			"a file under the resolved spelling of the home",
+			userPaths{Home: home}.withResolvedHome(filepath.Join(string(filepath.Separator), "export", "home", "octocat")),
+			filepath.Join(string(filepath.Separator), "export", "home", "octocat", ".aws", "credentials"),
+			"$HOME/.aws/credentials",
+		},
+		// The written spelling keeps working when a second one is known.
+		{
+			"a file under the written spelling when both are known",
+			userPaths{Home: home}.withResolvedHome(filepath.Join(string(filepath.Separator), "export", "home", "octocat")),
+			filepath.Join(home, ".aws", "credentials"),
+			"$HOME/.aws/credentials",
+		},
+		// The resolved spelling is respelled and then matched against the same roots,
+		// so it can still reach a more specific one. Carrying it as a root of its own
+		// would match the home and stop here, reporting the roaming file under the
+		// home token — a second identity for a file whose location did not change.
+		{
+			"a roaming file under the resolved spelling of the home",
+			userPaths{Home: winHome, AppData: filepath.Join(winHome, "AppData", "Roaming")}.
+				withResolvedHome(filepath.Join(string(filepath.Separator), "Volumes", "Profiles", "Octocat")),
+			filepath.Join(string(filepath.Separator), "Volumes", "Profiles", "Octocat", "AppData", "Roaming", "GitHub CLI", "hosts.yml"),
+			"$APPDATA/GitHub CLI/hosts.yml",
+		},
+		// Same for a configuration root the developer moved: the file is not where the
+		// default puts it, and that stays true of a path spelled the other way.
+		{
+			"a moved configuration root reached through the resolved home",
+			userPaths{Home: home, XDGConfig: nested}.
+				withResolvedHome(filepath.Join(string(filepath.Separator), "export", "home", "octocat")),
+			filepath.Join(string(filepath.Separator), "export", "home", "octocat", "config", "deeply", "nested", "git", "credentials"),
+			"$XDG_CONFIG_HOME/git/credentials",
+		},
+		// The configuration root spelled with the resolved home is the default, not a
+		// move: a shell reporting the resolved home has set the variable to the same
+		// directory. Giving it a token would name, for this one machine, the place
+		// every other machine reports under the home.
+		{
+			"the default configuration root spelled with the resolved home",
+			userPaths{Home: home, XDGConfig: filepath.Join(string(filepath.Separator), "export", "home", "octocat", ".config")}.
+				withResolvedHome(filepath.Join(string(filepath.Separator), "export", "home", "octocat")),
+			filepath.Join(string(filepath.Separator), "export", "home", "octocat", ".config", "git", "credentials"),
+			"$HOME/.config/git/credentials",
+		},
+		// A path under neither spelling is still opaque; the respelling is not a
+		// second chance at containment.
+		{
+			"outside both spellings of the home",
+			userPaths{Home: home}.withResolvedHome(filepath.Join(string(filepath.Separator), "export", "home", "octocat")),
+			filepath.Join(string(filepath.Separator), "opt", "secrets", "creds.json"),
+			"$ABS/39722e7bf8a8/creds.json",
+		},
 	}
 
 	for _, tt := range tests {
@@ -105,6 +161,30 @@ func TestTokenise(t *testing.T) {
 				t.Errorf("tokenise(%q) = %q, want %q", tt.path, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestWithResolvedHome_OnlyStoresASecondSpelling keeps the ordinary machine at one
+// home: the second spelling exists to recognise one the account record does not
+// carry, and storing an identical one would only add a respelling pass to every
+// path that failed to match — including one that should stay opaque.
+func TestWithResolvedHome_OnlyStoresASecondSpelling(t *testing.T) {
+	home := filepath.Join(string(filepath.Separator), "home", "octocat")
+	base := userPaths{Home: home}
+
+	if got := base.withResolvedHome(home); got.HomeResolved != "" {
+		t.Errorf("an identical spelling was stored as %q", got.HomeResolved)
+	}
+	if got := base.withResolvedHome(home + string(filepath.Separator)); got.HomeResolved != "" {
+		t.Errorf("a trailing separator was treated as a different home: %q", got.HomeResolved)
+	}
+	if got := base.withResolvedHome(""); got.HomeResolved != "" {
+		t.Errorf("an unresolved home was stored as %q", got.HomeResolved)
+	}
+
+	elsewhere := filepath.Join(string(filepath.Separator), "export", "home", "octocat")
+	if got := base.withResolvedHome(elsewhere); got.HomeResolved != elsewhere {
+		t.Errorf("HomeResolved = %q, want %q", got.HomeResolved, elsewhere)
 	}
 }
 
@@ -146,24 +226,50 @@ func TestCandidatesFor(t *testing.T) {
 		env      map[string]string
 		want     []string
 	}{
-		{name: "the override comes before the default", sourceID: sourceAWSCredentials, home: unixHome, platform: model.PlatformLinux, env: map[string]string{"AWS_SHARED_CREDENTIALS_FILE": relocated}, want: []string{relocated, awsDefault}},
+		// The tool reads the relocated file and stops reading the default, so the
+		// default is not a candidate. Offering it would report a credential in a
+		// file nothing consults.
+		{name: "an override replaces the default", sourceID: sourceAWSCredentials, home: unixHome, platform: model.PlatformLinux, env: map[string]string{"AWS_SHARED_CREDENTIALS_FILE": relocated}, want: []string{relocated}},
 		{name: "an unset override is skipped", sourceID: sourceAWSCredentials, home: unixHome, platform: model.PlatformLinux, env: map[string]string{"AWS_SHARED_CREDENTIALS_FILE": "   "}, want: []string{awsDefault}},
-		{name: "a directory override joins the file", sourceID: sourceGitHubCLIHosts, home: unixHome, platform: model.PlatformLinux, env: map[string]string{"GH_CONFIG_DIR": ghDir}, want: []string{filepath.Join(ghDir, "hosts.yml"), filepath.Join(unixHome, ".config", "gh", "hosts.yml")}},
+		{name: "a directory override joins the file", sourceID: sourceGitHubCLIHosts, home: unixHome, platform: model.PlatformLinux, env: map[string]string{"GH_CONFIG_DIR": ghDir}, want: []string{filepath.Join(ghDir, "hosts.yml")}},
 		{
 			// Reverse of the usual assumption, on Windows too: unset, this tool falls
 			// back to the roaming profile rather than to a directory below the home,
 			// which is why the variable is an override and the default is not.
 			name: "the configuration variable outranks the roaming profile", sourceID: sourceGitHubCLIHosts,
 			home: winHome, platform: model.PlatformWindows,
-			env: map[string]string{"XDG_CONFIG_HOME": xdg},
-			want: []string{
-				filepath.Join(xdg, "gh", "hosts.yml"),
-				filepath.Join(winHome, "AppData", "Roaming", "GitHub CLI", "hosts.yml"),
-			},
+			env:  map[string]string{"XDG_CONFIG_HOME": xdg},
+			want: []string{filepath.Join(xdg, "gh", "hosts.yml")},
+		},
+		{
+			// This tool reads the first variable in preference to the second, so the
+			// second names a file it has stopped reading.
+			name: "the higher-precedence override wins outright", sourceID: sourceGitHubCLIHosts,
+			home: unixHome, platform: model.PlatformLinux,
+			env:  map[string]string{"GH_CONFIG_DIR": ghDir, "XDG_CONFIG_HOME": xdg},
+			want: []string{filepath.Join(ghDir, "hosts.yml")},
+		},
+		{
+			// An override naming somewhere empty is still where the tool looks. The
+			// answer is one candidate that will not be there, not a fallback.
+			name: "a missing target does not fall through", sourceID: sourceGitHubCLIHosts,
+			home: unixHome, platform: model.PlatformLinux,
+			env:  map[string]string{"XDG_CONFIG_HOME": xdg},
+			want: []string{filepath.Join(xdg, "gh", "hosts.yml")},
 		},
 		// Every element is live, so each is its own candidate; the empty
-		// element is not a path.
-		{name: "a list override splits on the platform separator", sourceID: sourceKubeconfig, home: unixHome, platform: model.PlatformLinux, env: map[string]string{"KUBECONFIG": strings.Join([]string{kubeA, "", kubeB}, string(os.PathListSeparator))}, want: []string{kubeA, kubeB, filepath.Join(unixHome, ".kube", "config")}},
+		// element is not a path. The default is displaced, as with any override.
+		{name: "a list override splits on the platform separator", sourceID: sourceKubeconfig, home: unixHome, platform: model.PlatformLinux, env: map[string]string{"KUBECONFIG": strings.Join([]string{kubeA, "", kubeB}, string(os.PathListSeparator))}, want: []string{kubeA, kubeB}},
+		{
+			// Set is what displaces the default, not naming somewhere real. The tool
+			// itself splits any non-empty value and then ignores the empty elements
+			// without restoring its default, which is only restored by unsetting the
+			// variable — so a value of nothing but separators names nowhere to look.
+			name: "a list naming no path still displaces the default", sourceID: sourceKubeconfig,
+			home: unixHome, platform: model.PlatformLinux,
+			env:  map[string]string{"KUBECONFIG": strings.Repeat(string(os.PathListSeparator), 3)},
+			want: []string{},
+		},
 		{name: "the dotted spelling on unix", sourceID: sourceNetrc, home: unixHome, platform: model.PlatformDarwin, want: []string{filepath.Join(unixHome, ".netrc")}},
 		// The Windows name uses an underscore.
 		{name: "the underscored spelling on windows", sourceID: sourceNetrc, home: winHome, platform: model.PlatformWindows, want: []string{filepath.Join(winHome, "_netrc")}},

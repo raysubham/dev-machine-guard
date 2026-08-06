@@ -37,6 +37,13 @@ const (
 type userPaths struct {
 	Username string
 	Home     string
+	// The home as the filesystem spells it, kept only when that differs from the
+	// account record's spelling. Containment admits both, so a path can arrive in
+	// either, and tokenisation respells the resolved one before matching: a home
+	// reached through a symlink is still the home, and labelling its resolved form
+	// with the opaque root would give one file two identities and hide the only
+	// root a reader can interpret.
+	HomeResolved string
 	// The roaming application data directory, derived from the home rather than
 	// read from the environment for the same reason.
 	AppData string
@@ -67,35 +74,33 @@ func (p userPaths) withXDGConfig(value string) userPaths {
 	return p
 }
 
-// candidatesFor expands one source into the locations to try, overrides first.
-// Each is absolute and unresolved. Overrides are not an edge case: relocating these
-// files is how monorepos, multi-account setups and CI parity are configured, so
-// probing the default alone would report such a machine as holding nothing.
-func candidatesFor(s source, paths userPaths, env map[string]string, platform string) []string {
-	var out []string
-	for _, o := range s.Overrides {
-		value := strings.TrimSpace(env[o.Var])
-		if value == "" {
-			continue
-		}
-		switch o.Kind {
-		case overrideFile:
-			out = append(out, value)
-		case overrideDir:
-			out = append(out, filepath.Join(value, filepath.FromSlash(o.Rel)))
-		case overrideList:
-			// The value is every path the tool reads, not a replacement for one.
-			for _, element := range filepath.SplitList(value) {
-				if element = strings.TrimSpace(element); element != "" {
-					out = append(out, element)
-				}
-			}
-		case overridePrefix:
-			// A prefix override rewrites paths arriving from elsewhere, so
-			// there is nothing here for it to expand. Only a delegated source
-			// may declare one, which a catalog invariant enforces.
-		}
+// withResolvedHome records the filesystem's spelling of the home. An identical
+// spelling is not stored, so in the ordinary case there is nothing to respell and
+// the second spelling exists only where it changes an answer.
+func (p userPaths) withResolvedHome(value string) userPaths {
+	if value == "" || pathsEqual(filepath.Clean(value), filepath.Clean(p.Home)) {
+		return p
 	}
+	p.HomeResolved = value
+	return p
+}
+
+// candidatesFor expands one source into the locations to try. Each is absolute and
+// unresolved. Overrides are not an edge case: relocating these files is how
+// monorepos, multi-account setups and CI parity are configured, so probing the
+// default alone would report such a machine as holding nothing.
+//
+// A relocation override replaces the catalog defaults rather than merely preceding
+// them, and it does so on being set rather than on naming something that exists.
+// The tools stop reading their default path once the variable is set, so a default
+// reported alongside an override claims a credential is in use somewhere its tool
+// never looks — the same over-report the first-match policy exists to prevent,
+// arriving by a different route.
+func candidatesFor(s source, paths userPaths, env map[string]string, platform string) []string {
+	if relocated, isSet := relocationCandidates(s, env); isSet {
+		return relocated
+	}
+	var out []string
 	for _, l := range s.Locations {
 		if !l.appliesTo(platform) {
 			continue
@@ -107,6 +112,63 @@ func candidatesFor(s source, paths userPaths, env map[string]string, platform st
 		out = append(out, filepath.Join(root, filepath.FromSlash(l.Rel)))
 	}
 	return out
+}
+
+// relocationCandidates expands the first override that is set, in the declaration
+// order the tools themselves apply, and reports that one was. Later overrides are
+// not consulted: where a tool reads one variable in preference to another, so does
+// this, and probing the lower-precedence target would report a file the tool has
+// stopped reading.
+//
+// Being set is what displaces the defaults, not naming somewhere real. A target
+// that does not exist is still the answer: the developer pointed the tool somewhere
+// and nothing is there, which describes a source holding no credential. So is a
+// value that resolves to no path at all — a list of nothing but separators — which
+// is how the tools read it, the default restored by unsetting the variable and not
+// by emptying it. Neither is an error, because nothing failed.
+func relocationCandidates(s source, env map[string]string) ([]string, bool) {
+	for _, o := range s.Overrides {
+		if o.Kind == overridePrefix {
+			// A prefix override rewrites paths arriving from elsewhere, so it
+			// expands to nothing here and displaces no default. Only a delegated
+			// source may declare one, which a catalog invariant enforces.
+			continue
+		}
+		value := strings.TrimSpace(env[o.Var])
+		if value == "" {
+			continue
+		}
+		out, expandable := expandOverride(o, value)
+		if !expandable {
+			continue
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+// expandOverride turns one variable's value into candidates, and reports whether
+// its kind is one that replaces defaults at all. A path list can expand to nothing
+// while remaining the answer, so emptiness is carried in the slice and never in the
+// second return — that is reserved for a kind with no expansion, where standing
+// aside for the default is the safer way for an inventory to be wrong.
+func expandOverride(o envOverride, value string) ([]string, bool) {
+	switch o.Kind {
+	case overrideFile:
+		return []string{value}, true
+	case overrideDir:
+		return []string{filepath.Join(value, filepath.FromSlash(o.Rel))}, true
+	case overrideList:
+		// The value is every path the tool reads, not a replacement for one.
+		out := make([]string, 0, 1)
+		for _, element := range filepath.SplitList(value) {
+			if element = strings.TrimSpace(element); element != "" {
+				out = append(out, element)
+			}
+		}
+		return out, true
+	}
+	return nil, false
 }
 
 // root resolves a catalog path root.
@@ -149,24 +211,63 @@ func applyPrefixOverrides(path string, s source, paths userPaths, env map[string
 // tried longest first: the roaming and configuration directories sit below the
 // home, so matching the home first would label every path with the least
 // specific root it happens to be under.
+//
+// A path spelled with the filesystem's home rather than the account record's is
+// respelled and tried again against the same roots. That is deliberately not the
+// same as carrying the resolved home as a second root: as a root it would match the
+// home and stop, taking every path below it away from the more specific roots that
+// live there — the roaming directory, a moved configuration directory — and
+// reporting one file under a different token depending on which spelling of the home
+// it happened to arrive with.
 func (p userPaths) tokenise(path string) string {
 	if path == "" {
 		return ""
 	}
-	for _, r := range p.tokenRoots() {
-		rest, ok := trimPathPrefix(path, r.dir)
-		if !ok {
-			continue
+	roots := p.tokenRoots()
+	if out, ok := tokeniseWith(roots, path); ok {
+		return out
+	}
+	if respelled, ok := p.respellResolvedHome(path); ok {
+		if out, ok := tokeniseWith(roots, respelled); ok {
+			return out
 		}
-		if rest == "" {
-			return r.token
-		}
-		return r.token + "/" + filepath.ToSlash(rest)
 	}
 	// An opaque root still carries an identifier segment before the remainder, so
 	// it keeps the shape every other location has: a reader that has to
 	// special-case one root's segment count will eventually get it wrong.
 	return tokenAbsolute + "/" + opaqueParent(path) + "/" + filepath.Base(path)
+}
+
+// tokeniseWith applies one root set to one spelling of a path.
+func tokeniseWith(roots []rootToken, path string) (string, bool) {
+	for _, r := range roots {
+		rest, ok := trimPathPrefix(path, r.dir)
+		if !ok {
+			continue
+		}
+		if rest == "" {
+			return r.token, true
+		}
+		return r.token + "/" + filepath.ToSlash(rest), true
+	}
+	return "", false
+}
+
+// respellResolvedHome rewrites a path below the filesystem's home to name the
+// account record's home instead. Containment admits both spellings, so a path can
+// arrive in either, and the roots are all derived from the record's.
+func (p userPaths) respellResolvedHome(path string) (string, bool) {
+	if p.HomeResolved == "" {
+		return "", false
+	}
+	rest, ok := trimPathPrefix(path, p.HomeResolved)
+	if !ok {
+		return "", false
+	}
+	if rest == "" {
+		return p.Home, true
+	}
+	return filepath.Join(p.Home, rest), true
 }
 
 // opaqueParent identifies the directories above a path without naming them. Stable
@@ -196,11 +297,23 @@ func (p userPaths) tokenRoots() []rootToken {
 	// At its default below the home it is not a separate place, and several tools
 	// keep files there while ignoring the variable, so labelling them with its name
 	// would give one unchanged file two identities.
-	if p.XDGConfig != "" && !pathsEqual(filepath.Clean(p.XDGConfig), filepath.Join(p.Home, ".config")) {
+	if p.XDGConfig != "" && !p.xdgConfigIsDefault() {
 		roots = append(roots, rootToken{p.XDGConfig, tokenXDGConfig})
 	}
 	slices.SortStableFunc(roots, func(a, b rootToken) int { return len(b.dir) - len(a.dir) })
 	return roots
+}
+
+// xdgConfigIsDefault reports whether the configuration root is the default below the
+// home. Either spelling of the home counts: a shell that reports the resolved one
+// has set the variable to the same directory, not moved anything, and treating that
+// as a move would hand the default location a token of its own.
+func (p userPaths) xdgConfigIsDefault() bool {
+	clean := filepath.Clean(p.XDGConfig)
+	if pathsEqual(clean, filepath.Join(p.Home, ".config")) {
+		return true
+	}
+	return p.HomeResolved != "" && pathsEqual(clean, filepath.Join(p.HomeResolved, ".config"))
 }
 
 // trimPathPrefix reports whether path lies at or below prefix and returns the

@@ -9,8 +9,15 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/model"
 )
 
-// SSH key file markers. Classification reads the header and stops; the key body
-// is never loaded, which is why the read cap for this source is a kilobyte.
+// SSH key file markers. Classification reads the header and stops, which is why the
+// read cap for this source is a kilobyte rather than a megabyte.
+//
+// The cap bounds the exposure; it does not exclude the key body. A key file smaller
+// than the cap is read whole, and a modern one is: an unencrypted ed25519 key is
+// around four hundred bytes. The guarantee this source holds to is the one every
+// other parser here holds to — no byte of what was read is serialised, logged,
+// fingerprinted, counted or retained past the classification, and only the header
+// fields are ever examined.
 const (
 	opensshBegin   = "-----BEGIN OPENSSH PRIVATE KEY-----"
 	pkcs8Begin     = "-----BEGIN PRIVATE KEY-----"
@@ -141,10 +148,12 @@ func classifyOpenSSHKey(data []byte) string {
 	}
 }
 
-// decodeOpenSSHHeader decodes enough of the base64 body to reach the header fields.
+// decodeOpenSSHHeader decodes the base64 body far enough to reach the header fields.
 // The generator wraps at 70 characters, not a multiple of four, so truncating to the
-// last whole group is what makes a prefix decode at all — and decoding a prefix
-// rather than the whole body keeps the key material off the heap.
+// last whole group is what makes a truncated read decode at all.
+//
+// For a file smaller than the read cap this decodes the whole body, private section
+// included. Only the header fields are then read, and the blob is not retained.
 func decodeOpenSSHHeader(data []byte) ([]byte, bool) {
 	body := extractPEMBody(string(data), opensshBegin)
 	if body == "" {

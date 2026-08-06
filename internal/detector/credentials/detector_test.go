@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
@@ -25,10 +26,11 @@ const canary = "CANARY-b6f4c2e1-DO-NOT-EMIT"
 
 // Fixture bodies shared across the tables below.
 var (
-	awsBody  = "[default]\naws_secret_access_key = " + canary + "\n"
-	gitBody  = "https://octocat:" + canary + "@github.com\n"
-	kubeBody = "users:\n  - name: dev\n    user:\n      token: " + canary + "\n"
-	ghBody   = "github.com:\n    oauth_token: " + canary + "\n    user: octocat\n"
+	awsBody    = "[default]\naws_secret_access_key = " + canary + "\n"
+	gitBody    = "https://octocat:" + canary + "@github.com\n"
+	kubeBody   = "users:\n  - name: dev\n    user:\n      token: " + canary + "\n"
+	ghBody     = "github.com:\n    oauth_token: " + canary + "\n    user: octocat\n"
+	dockerBody = `{"auths":{"registry.example.com":{"auth":"` + canary + `"}}}`
 
 	awsTree = map[string]string{".aws/credentials": awsBody}
 	gitTree = map[string]string{".git-credentials": gitBody}
@@ -476,30 +478,77 @@ func TestDetect_Findings(t *testing.T) {
 		// That file is the credential: nothing to interpret, so its contents never
 		// reach a parser. The body is deliberately valid in no format here.
 		{name: "a token file is classified without parsing", tree: map[string]string{".vault-token": "\x00\x01\x02" + canary}, source: sourceVaultToken, want: obsPlain(1)},
-		// Reporting a superseded location as well would claim a credential is in
-		// use when the tool never looks at it.
+		// Both files are real and only one is read. Reporting the superseded one as
+		// well would claim a credential is in use where the tool never looks.
 		{
-			name: "first match stops at the file the tool reads", source: sourceAWSCredentials,
+			name: "a relocated file is reported and the default is not", source: sourceAWSCredentials,
 			tree:     map[string]string{"relocated/credentials": awsBody, ".aws/credentials": awsBody},
 			env:      map[string]string{"AWS_SHARED_CREDENTIALS_FILE": "{home}/relocated/credentials"},
 			want:     obsPlain(1),
 			location: "$HOME/relocated/credentials",
 		},
 		// This tool reads every element of the list instead, and each element is a
-		// separate file with its own mode and version-control status.
+		// separate file with its own mode and version-control status. The default is
+		// not among them: setting the variable is what stops the tool reading it, so
+		// a live file there is one nothing consults.
 		{
 			name: "all match reports every live location", source: sourceKubeconfig,
 			tree:      map[string]string{"clusters/a": kubeBody, "clusters/b": "users:\n  - name: b\n    user:\n      tokenFile: /var/run/secrets/token\n", ".kube/config": kubeBody},
 			env:       map[string]string{"KUBECONFIG": "{home}/clusters/a" + string(os.PathListSeparator) + "{home}/clusters/b"},
-			locations: []string{"$HOME/clusters/a", "$HOME/clusters/b", "$HOME/.kube/config"},
+			locations: []string{"$HOME/clusters/a", "$HOME/clusters/b"},
+		},
+		// A list holding nothing but separators is set, so it is still the answer.
+		// The tool splits any non-empty value and then ignores the empty elements
+		// without restoring its default, which comes back only when the variable is
+		// unset — so the file at the default is one it has stopped opening.
+		{
+			name: "a list naming nowhere reports nothing", source: sourceKubeconfig,
+			tree:      map[string]string{".kube/config": kubeBody},
+			env:       map[string]string{"KUBECONFIG": strings.Repeat(string(os.PathListSeparator), 3)},
+			noFinding: true, noError: true,
+		},
+		// The relocation is the whole answer even when it names nowhere. A default
+		// left standing here would be the one over-report a reader cannot detect:
+		// a real file, at a real path, that its tool has stopped opening.
+		{
+			name: "a relocation naming nowhere reports nothing", source: sourceAWSCredentials,
+			tree:      map[string]string{".aws/credentials": awsBody},
+			env:       map[string]string{"AWS_SHARED_CREDENTIALS_FILE": "{home}/relocated/credentials"},
+			noFinding: true, noError: true,
+		},
+		{
+			name: "a relocated directory naming nowhere reports nothing", source: sourceDockerConfig,
+			tree:      map[string]string{".docker/config.json": dockerBody},
+			env:       map[string]string{"DOCKER_CONFIG": "{home}/relocated/docker"},
+			noFinding: true, noError: true,
+		},
+		// This tool reads the first variable in preference to the second, so the
+		// second's target is a file it has stopped reading even though it is there.
+		{
+			name: "the lower-precedence relocation is not consulted", source: sourceGitHubCLIHosts,
+			tree:     map[string]string{"gh-dir/hosts.yml": ghBody, "cfg/gh/hosts.yml": ghBody},
+			env:      map[string]string{"GH_CONFIG_DIR": "{home}/gh-dir", "XDG_CONFIG_HOME": "{home}/cfg"},
+			want:     obsPlain(1),
+			location: "$HOME/gh-dir/hosts.yml",
 		},
 		// The family that does honour the configuration variable. Its default is not
 		// a separate place, so a path below it stays home-relative.
 		{name: "a configuration directory at its default", tree: map[string]string{".config/git/credentials": gitBody}, source: sourceGitCredentials, want: obsPlain(1), location: "$HOME/.config/git/credentials"},
 		{name: "a relocated configuration directory", tree: map[string]string{"cfg/git/credentials": gitBody}, env: map[string]string{"XDG_CONFIG_HOME": "{home}/cfg"}, source: sourceGitCredentials, want: obsPlain(1), location: "$XDG_CONFIG_HOME/git/credentials"},
 		// The one catalog location below a directory this agent's policy declines as
-		// a group while the platform serves it unprompted. Reading a named file
-		// there is a targeted read, not a traversal.
+		// a group while the platform serves it unprompted.
+		//
+		// This is the deliberate exception, and it is worth stating plainly because
+		// the two halves look contradictory next to each other: a predefined
+		// location under ~/Library is read despite the guard being active, while a
+		// location a variable moved into a gated directory is refused — see
+		// "a delegated path a variable moved is guarded too" below. The guard is
+		// about traversal, not about the byte. Walking ~/Library is what trips the
+		// services that fire a prompt, and each macOS release adds more of them, so
+		// the walk declines the tree wholesale; opening one named file in a reviewed
+		// set is not that walk. What makes the distinction safe is that the reviewed
+		// set is fixed in this repository, whereas a rewritten path has its leading
+		// directory chosen in the session being scanned.
 		{
 			name: "the application configuration directory", only: model.PlatformDarwin, guard: true,
 			tree:     map[string]string{"Library/Application Support/Code/User/mcp.json": `{"servers":{"demo":{"env":{"API_KEY":"` + canary + `"}}}}`},
@@ -508,6 +557,64 @@ func TestDetect_Findings(t *testing.T) {
 			location: "$HOME/Library/Application Support/Code/User/mcp.json",
 		},
 	})
+}
+
+// TestDetect_PredefinedMCPPathBypassesGuardButRelocatedPathDoesNot pins which
+// resolver each half of the delegated source reaches, so the one deliberate
+// exception to the consent guard cannot be widened or removed by accident: a
+// predefined location under the declined `~/Library` tree is read, and a path a
+// variable moved into a declined tree is refused untouched.
+//
+// This is a mechanical policy test, not a background-launch test. It runs in the
+// test process against a temporary tree with a mock executor, so it exercises
+// neither launchd attribution nor the real consent machinery, and the root flag it
+// sets only selects the console-user path — no privilege is held and `tccd` is never
+// consulted. Whether a scheduled run under a system account with no session to
+// prompt in still returns is a claim about the platform, and only a LaunchAgent or
+// LaunchDaemon run can settle it: that stays external validation until such a test
+// exists. The deadline below is a hang guard for this process, nothing more.
+func TestDetect_PredefinedMCPPathBypassesGuardButRelocatedPathDoesNot(t *testing.T) {
+	if runtime.GOOS != model.PlatformDarwin {
+		t.Skipf("the behaviour under test is %s-specific", model.PlatformDarwin)
+	}
+	home := testHome(t)
+	writeTree(t, home, map[string]string{
+		"Library/Application Support/Code/User/mcp.json": `{"servers":{"demo":{"env":{"API_KEY":"` + canary + `"}}}}`,
+	})
+
+	m := newMock(t, home)
+	// The shape of a scheduled run: describing a console account that is not the
+	// account this runs as. It selects the branch, it does not reproduce the context.
+	m.SetIsRoot(true)
+	relocated := filepath.Join(home, "Documents", "claude")
+	d := New(m).withRunner(&fakeRunner{}).
+		withEnv(staticEnv(map[string]string{"CLAUDE_CONFIG_DIR": relocated})).
+		WithSkipper(tcc.New(home))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	info := d.Detect(ctx)
+	if ctx.Err() != nil {
+		t.Fatal("the phase did not return before the deadline")
+	}
+
+	// The refusal is for a path that was never created, so the decision came before
+	// any access: probing first would have found silence, not a reason to refuse.
+	if _, err := os.Stat(relocated); !os.IsNotExist(err) {
+		t.Fatalf("%s exists; the case proves nothing", relocated)
+	}
+	e, ok := errorFor(info, sourceMCPConfig)
+	if !ok || e.ReasonCode != model.CredentialReasonRefusedTCC {
+		t.Errorf("errors = %+v, want %q for the relocated path", info.Errors, model.CredentialReasonRefusedTCC)
+	}
+
+	f, ok := findingFor(info, sourceMCPConfig)
+	if !ok {
+		t.Fatalf("the predefined location under the declined tree was not read: %+v", info)
+	}
+	if want := "$HOME/Library/Application Support/Code/User/mcp.json"; f.Location != want {
+		t.Errorf("location = %q, want %q", f.Location, want)
+	}
 }
 
 func TestDetect_Refusals(t *testing.T) {
@@ -824,36 +931,71 @@ func TestDetect_ProbeDoesNotRunAsAServiceAccountOnWindows(t *testing.T) {
 	}
 }
 
-// TestDetect_ProbeDoesNotRunForAConfigurationOutsideTheRoots holds because the
-// child is pointed at that directory: doing so would have the tool read a
-// configuration this run has no business reading.
-func TestDetect_ProbeDoesNotRunForAConfigurationOutsideTheRoots(t *testing.T) {
+// TestDetect_ProbeFollowsTheRelocatedConfiguration holds because the child is
+// pointed at a directory: at the relocated one, since that is the configuration the
+// tool reads, and at none at all when the relocation leaves the account's tree.
+//
+// The uncontained half is the one worth stating. The default directory is not a
+// fallback here even though a configuration is sitting in it: the variable is set,
+// so the tool has stopped reading that file, and reporting it would name the wrong
+// identity while asking the child about a directory the tool is not using. The
+// refusal is the whole answer, and it costs the run its completeness.
+func TestDetect_ProbeFollowsTheRelocatedConfiguration(t *testing.T) {
 	if runtime.GOOS == model.PlatformWindows {
 		t.Skip("the probe does not run on Windows under a service account")
 	}
-	home := testHome(t)
-	elsewhere := testHome(t)
-	writeTree(t, elsewhere, map[string]string{"gh/hosts.yml": ghBody})
-	// The override is read, refused by containment, and the default path holds a
-	// configuration of its own so the finding still exists.
-	writeTree(t, home, map[string]string{".config/gh/hosts.yml": "github.com:\n    user: octocat\n"})
+	status := []byte(`{"hosts":{"github.com":[{"active":true,"state":"success","scopes":"repo"}]}}`)
 
-	env := staticEnv(map[string]string{"GH_CONFIG_DIR": filepath.Join(elsewhere, "gh")})
-	runner := &fakeRunner{out: []byte(`{"hosts":{"github.com":[{"active":true,"state":"success","scopes":"repo"}]}}`)}
-	info := New(newMock(t, home)).withRunner(runner).withEnv(env).Detect(context.Background())
+	t.Run("outside the roots", func(t *testing.T) {
+		home := testHome(t)
+		elsewhere := testHome(t)
+		writeTree(t, elsewhere, map[string]string{"gh/hosts.yml": ghBody})
+		// The default holds a configuration of its own, so the case fails loudly if
+		// the uncontained relocation ever falls back to it.
+		writeTree(t, home, map[string]string{".config/gh/hosts.yml": "github.com:\n    user: octocat\n"})
 
-	if got, ok := errorFor(info, sourceGitHubCLIHosts); !ok || got.ReasonCode != model.CredentialReasonRefusedOutsideRoots {
-		t.Errorf("errors = %+v, want %q", info.Errors, model.CredentialReasonRefusedOutsideRoots)
-	}
-	if _, ok := findingFor(info, sourceGitHubCLIHosts); !ok {
-		t.Error("the location inside the roots must still be reported")
-	}
-	if runner.calls != 1 {
-		t.Errorf("probe ran %d times, want once for the contained configuration", runner.calls)
-	}
-	if runner.last.ConfigDir != filepath.Join(home, ".config", "gh") {
-		t.Errorf("configuration directory = %q, want the contained one", runner.last.ConfigDir)
-	}
+		env := staticEnv(map[string]string{"GH_CONFIG_DIR": filepath.Join(elsewhere, "gh")})
+		runner := &fakeRunner{out: status}
+		info := New(newMock(t, home)).withRunner(runner).withEnv(env).Detect(context.Background())
+
+		if got, ok := errorFor(info, sourceGitHubCLIHosts); !ok || got.ReasonCode != model.CredentialReasonRefusedOutsideRoots {
+			t.Errorf("errors = %+v, want %q", info.Errors, model.CredentialReasonRefusedOutsideRoots)
+		}
+		if f, ok := findingFor(info, sourceGitHubCLIHosts); ok {
+			t.Errorf("finding at %q: the default is not a fallback once the variable is set", f.Location)
+		}
+		if runner.calls != 0 {
+			t.Errorf("probe ran %d times against %q, want never", runner.calls, runner.last.ConfigDir)
+		}
+		if info.ScanComplete {
+			t.Error("a refused source leaves the run incomplete")
+		}
+	})
+
+	// The positive control: without it the assertion above passes even for a probe
+	// that never runs at all.
+	t.Run("inside the roots", func(t *testing.T) {
+		home := testHome(t)
+		writeTree(t, home, map[string]string{"gh-dir/hosts.yml": ghBody})
+
+		env := staticEnv(map[string]string{"GH_CONFIG_DIR": filepath.Join(home, "gh-dir")})
+		runner := &fakeRunner{out: status}
+		info := New(newMock(t, home)).withRunner(runner).withEnv(env).Detect(context.Background())
+
+		f, ok := findingFor(info, sourceGitHubCLIHosts)
+		if !ok {
+			t.Fatalf("no finding; errors = %+v", info.Errors)
+		}
+		if want := "$HOME/gh-dir/hosts.yml"; f.Location != want {
+			t.Errorf("location = %q, want %q", f.Location, want)
+		}
+		if runner.calls != 1 {
+			t.Errorf("probe ran %d times, want once for the relocated configuration", runner.calls)
+		}
+		if runner.last.ConfigDir != filepath.Join(home, "gh-dir") {
+			t.Errorf("configuration directory = %q, want the relocated one", runner.last.ConfigDir)
+		}
+	})
 }
 
 // TestDetect_WritesNothingToStandardError holds because enterprise runs tee this
