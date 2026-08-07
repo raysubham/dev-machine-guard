@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
 )
 
@@ -88,12 +89,21 @@ func (execRunner) Run(ctx context.Context, req ghRequest) ([]byte, error) {
 	// and the account name the user enumeration produced. Nothing here is spelled
 	// by a scanned file or by the environment.
 	cmd := exec.CommandContext(ctx, name, args...)
+	// The command is built here rather than run through the shared executor
+	// because that interface returns the child's standard error and its whole
+	// standard output as strings and offers no way to set the environment —
+	// which would undo the discard, the cap and the token strip below. The
+	// process-level safeguards are not stream or environment concerns, so they
+	// come from the one place that defines them.
+	executor.HardenCommand(cmd)
 	if !req.DropPrivileges {
 		cmd.Env = append(strippedEnv(), "GH_CONFIG_DIR="+req.ConfigDir)
 	}
 	out := &boundedBuffer{max: ghMaxOutput}
 	cmd.Stdout = out
 	cmd.Stderr = io.Discard
+	// Stated here rather than left to the group teardown, which is a no-op on
+	// Windows: the bound the phase depends on has to hold on every platform.
 	cmd.WaitDelay = ghWaitDelay
 	err := cmd.Run()
 	return out.data, err

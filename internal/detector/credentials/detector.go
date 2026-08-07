@@ -92,6 +92,10 @@ func (d *Detector) Detect(ctx context.Context) *model.CredentialScanInfo {
 		// Without a resolved account there is no root set to contain reads to
 		// and no home to look under. Guessing at a home would put the boundary
 		// under the control of whatever environment the agent inherited.
+		//
+		// The error carries no source: nothing was attempted, so there is no
+		// source to name. This is the one reason code that reports the run
+		// rather than a source.
 		info.ScanComplete = false
 		info.Errors = append(info.Errors, model.CredentialError{ReasonCode: model.CredentialReasonSkippedNoUser})
 		return info

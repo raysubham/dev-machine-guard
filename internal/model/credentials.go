@@ -194,6 +194,11 @@ type CredentialGitHubHost struct {
 // finding: before the first syscall the detector does not know whether anything
 // is there, so a finding would claim a credential on the strength of a path.
 type CredentialError struct {
+	// Empty for exactly one reason code, skipped_no_user, which reports that no
+	// account resolved and so no source was ever attempted. Every other reason
+	// names the source it belongs to, and a reader is entitled to reject an
+	// empty one. Naming the run here instead would put a value in this field
+	// that looks like a catalog source and matches none.
 	SourceID   string `json:"source_id"`
 	ReasonCode string `json:"reason_code"`
 }
