@@ -82,22 +82,10 @@ type Real struct {
 
 func NewReal() *Real { return &Real{} }
 
-// HardenCommand applies the process-level safeguards every command this agent
-// spawns needs: no console window on Windows, and a cancellation that reaches
-// the whole process group rather than only the immediate child.
-//
-// Exported because a caller that cannot express its streams or its environment
-// through this interface still builds an *exec.Cmd that needs the same
-// treatment. Sharing it keeps the group-teardown logic in one place instead of
-// being re-derived, correctly or otherwise, beside each such command.
-func HardenCommand(cmd *exec.Cmd) {
-	winproc.HideWindow(cmd)
-	setupKillgroupOnCancel(cmd)
-}
-
 func (r *Real) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
-	HardenCommand(cmd)
+	winproc.HideWindow(cmd)
+	setupKillgroupOnCancel(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -127,7 +115,8 @@ func (r *Real) RunInDir(ctx context.Context, dir string, timeout time.Duration, 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
-	HardenCommand(cmd)
+	winproc.HideWindow(cmd)
+	setupKillgroupOnCancel(cmd)
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
