@@ -49,6 +49,8 @@ Dev Machine Guard scans MCP configuration files for the following tools:
 | Zed | `~/.config/zed/settings.json` | _(same)_ | Zed |
 | Open Interpreter | `~/.config/open-interpreter/config.yaml` | _(same)_ | Open Source |
 | Codex | `~/.codex/config.toml` | _(same)_ | OpenAI |
+| OpenCode | `~/.config/opencode/opencode.json` (and `.jsonc`) | _(same)_ | OpenCode |
+| OpenCode (project) | `opencode.json` / `opencode.jsonc` in a project directory | _(same)_ | OpenCode |
 
 ---
 
@@ -66,11 +68,11 @@ The MCP audit is designed to provide **visibility without exposing secrets**.
 
 ### What is NOT collected
 
-- **Environment variables** (`env` blocks in MCP configs often contain API keys and tokens -- these are stripped before collection)
+- **Environment variables** (`env` blocks -- and OpenCode's `environment` blocks -- in MCP configs often contain API keys and tokens; these are stripped before collection)
 - **HTTP headers** (may contain authentication tokens)
 - **Any other sensitive fields** that are not directly related to server identification
 
-In the enterprise agent, a Go-native filter extracts only the fields listed above before base64-encoding the config. For JSON configs, only `mcpServers` / `context_servers` entries are kept, and within each server only `command`, `args`, `serverUrl`, and `url` fields are retained. Non-JSON configs (TOML, YAML) are included as-is.
+In the enterprise agent, a Go-native filter extracts only the fields listed above before base64-encoding the config. For JSON configs, only `mcpServers` / `context_servers` / `servers` / `mcp` entries are kept, and within each server only `command`, `args`, `serverUrl`, and `url` fields are retained. Each vendor's own key is preserved as written — the filter strips fields, it never rewrites one schema into another. Non-JSON configs (TOML, YAML) are included as-is.
 
 ---
 

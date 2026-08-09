@@ -81,17 +81,19 @@ Binaries are found via `$PATH` lookup (cross-platform). LM Studio is additionall
 
 On Windows, `~` refers to the user's home directory (`%USERPROFILE%`). Claude Desktop uses a Windows-specific path via `%APPDATA%`.
 
-| Source           | macOS / Linux Path                                               | Windows Path (if different)                    | Vendor    |
-|------------------|------------------------------------------------------------------|------------------------------------------------|-----------|
-| Claude Desktop   | `~/Library/Application Support/Claude/claude_desktop_config.json`| `%APPDATA%/Claude/claude_desktop_config.json`  | Anthropic |
-| Claude Code      | `~/.claude/settings.json`                                        | _(same)_                                       | Anthropic |
-| Claude Code      | `~/.claude.json`                                                 | _(same)_                                       | Anthropic |
-| Cursor           | `~/.cursor/mcp.json`                                             | _(same)_                                       | Cursor    |
-| Windsurf         | `~/.codeium/windsurf/mcp_config.json`                            | _(same)_                                       | Codeium   |
-| Antigravity      | `~/.gemini/antigravity/mcp_config.json`                          | _(same)_                                       | Google    |
-| Zed              | `~/.config/zed/settings.json`                                    | _(same)_                                       | Zed       |
-| Open Interpreter | `~/.config/open-interpreter/config.yaml`                         | _(same)_                                       | OpenSource|
-| Codex            | `~/.codex/config.toml`                                           | _(same)_                                       | OpenAI    |
+| Source             | macOS / Linux Path                                               | Windows Path (if different)                    | Vendor    |
+|--------------------|------------------------------------------------------------------|------------------------------------------------|-----------|
+| Claude Desktop     | `~/Library/Application Support/Claude/claude_desktop_config.json`| `%APPDATA%/Claude/claude_desktop_config.json`  | Anthropic |
+| Claude Code        | `~/.claude/settings.json`                                        | _(same)_                                       | Anthropic |
+| Claude Code        | `~/.claude.json`                                                 | _(same)_                                       | Anthropic |
+| Cursor             | `~/.cursor/mcp.json`                                             | _(same)_                                       | Cursor    |
+| Windsurf           | `~/.codeium/windsurf/mcp_config.json`                            | _(same)_                                       | Codeium   |
+| Antigravity        | `~/.gemini/antigravity/mcp_config.json`                          | _(same)_                                       | Google    |
+| Zed                | `~/.config/zed/settings.json`                                    | _(same)_                                       | Zed       |
+| Open Interpreter   | `~/.config/open-interpreter/config.yaml`                         | _(same)_                                       | OpenSource|
+| Codex              | `~/.codex/config.toml`                                           | _(same)_                                       | OpenAI    |
+| OpenCode           | `~/.config/opencode/opencode.json` (and `.jsonc`)                | _(same)_                                       | OpenCode  |
+| OpenCode (project) | `opencode.json` / `opencode.jsonc` in a project directory        | _(same)_                                       | OpenCode  |
 
 ## AI Agent Skills
 

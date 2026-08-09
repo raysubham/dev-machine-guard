@@ -77,6 +77,74 @@ func TestMCPVendorForPath(t *testing.T) {
 	}
 }
 
+// TestMCPVendorForPath_OpenCode: the OpenCode case matches the basename, so it
+// claims exactly the two files this detector knows and nothing else. A path
+// test would be wrong in both directions — it would relabel an ordinary
+// .mcp.json sitting inside a checkout of the tool itself.
+func TestMCPVendorForPath_OpenCode(t *testing.T) {
+	sep := string(filepath.Separator)
+	cases := map[string]string{
+		filepath.Join(sep+"Users", "x", ".config", "opencode", "opencode.json"):  "OpenCode",
+		filepath.Join(sep+"Users", "x", ".config", "opencode", "opencode.jsonc"): "OpenCode",
+		filepath.Join(sep+"Users", "x", "proj", "opencode.json"):                 "OpenCode",
+		// The labeller folds case, but note it is not what decides whether a file
+		// is walked at all: discoverWalkedMCPConfigs gates on a case-sensitive
+		// mcpConfigBasenames lookup, so a project file actually named
+		// OpenCode.JSONC is never offered to this function in the first place.
+		// That predates OpenCode and holds for every basename; folding here just
+		// means the label is right whenever a path does arrive spelled oddly.
+		filepath.Join(sep+"Users", "x", "proj", "OpenCode.JSONC"): "OpenCode",
+		// Ordering is load-bearing: the substring cases match on any ancestor
+		// directory, so each of these would be claimed by a case below if the
+		// basename case did not come first.
+		filepath.Join(sep+"Users", "x", "dev", "cursor-tools", "opencode.json"):  "OpenCode", // else Cursor
+		filepath.Join(sep+"Users", "x", "dev", "claude-tools", "opencode.jsonc"): "OpenCode", // else Anthropic
+		filepath.Join(sep+"Users", "x", ".vscode", "opencode.json"):              "OpenCode", // else Microsoft
+		// An unrelated config that merely lives inside an opencode checkout.
+		filepath.Join(sep+"Users", "x", "src", "opencode", "example", ".mcp.json"): "Discovered",
+		// A file whose name only starts with the prefix.
+		filepath.Join(sep+"Users", "x", "proj", "opencode.json.bak"): "Discovered",
+	}
+	for p, want := range cases {
+		if got := mcpVendorForPath(p); got != want {
+			t.Errorf("mcpVendorForPath(%q) = %q, want %q", p, got, want)
+		}
+	}
+}
+
+// TestDiscoverWalkedMCPConfigs_OpenCode: a project-level OpenCode config in
+// either spelling is found by the ordinary basename walk — no project-root
+// logic and no new walk root — and is reported as discovered_mcp / OpenCode.
+func TestDiscoverWalkedMCPConfigs_OpenCode(t *testing.T) {
+	root := t.TempDir()
+	wantJSON := writeFile(t, root, "proj-a/opencode.json")
+	wantJSONC := writeFile(t, root, "proj-b/nested/opencode.jsonc")
+	writeFile(t, root, "proj-c/node_modules/pkg/opencode.json") // excluded dir
+	writeFile(t, root, "proj-d/opencode.json.bak")              // not a config
+
+	d := &MCPDetector{} // no skipper
+	specs := d.discoverWalkedMCPConfigs([]string{root}, "")
+	got := gotPathSet(specs)
+
+	if !got[wantJSON] {
+		t.Errorf("did not find %s", wantJSON)
+	}
+	if !got[wantJSONC] {
+		t.Errorf("did not find %s", wantJSONC)
+	}
+	if len(got) != 2 {
+		t.Errorf("expected 2 configs, got %d: %v", len(got), got)
+	}
+	for _, s := range specs {
+		if s.SourceName != "discovered_mcp" {
+			t.Errorf("%s: source = %q, want discovered_mcp", s.ConfigPath, s.SourceName)
+		}
+		if s.Vendor != "OpenCode" {
+			t.Errorf("%s: vendor = %q, want OpenCode", s.ConfigPath, s.Vendor)
+		}
+	}
+}
+
 // TestDiscoverWalkedMCPConfigs_TCCSkip: a config inside a TCC-protected subtree
 // (~/Library) is never walked, while one outside it is found. macOS-only,
 // since the TCC skipper is a no-op on other platforms.
