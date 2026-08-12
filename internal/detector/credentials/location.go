@@ -128,12 +128,6 @@ func candidatesFor(s source, paths userPaths, env map[string]string, platform st
 // by emptying it. Neither is an error, because nothing failed.
 func relocationCandidates(s source, env map[string]string) ([]string, bool) {
 	for _, o := range s.Overrides {
-		if o.Kind == overridePrefix {
-			// A prefix override rewrites paths arriving from elsewhere, so it
-			// expands to nothing here and displaces no default. Only a delegated
-			// source may declare one, which a catalog invariant enforces.
-			continue
-		}
 		value := strings.TrimSpace(env[o.Var])
 		if value == "" {
 			continue
@@ -182,29 +176,6 @@ func (p userPaths) root(r pathRoot) string {
 		return p.XDGConfig
 	}
 	return ""
-}
-
-// applyPrefixOverrides rewrites a path whose leading directory a variable has
-// moved — how relocation variables reach locations another component declares. The
-// second return says a variable moved this path, which decides how it is read: a
-// declared location is one of a reviewed set, a rewritten one is not.
-func applyPrefixOverrides(path string, s source, paths userPaths, env map[string]string) (string, bool) {
-	for _, o := range s.Overrides {
-		if o.Kind != overridePrefix {
-			continue
-		}
-		value := strings.TrimSpace(env[o.Var])
-		if value == "" {
-			continue
-		}
-		prefix := filepath.Join(paths.Home, filepath.FromSlash(o.Rel))
-		rest, ok := trimPathPrefix(path, prefix)
-		if !ok {
-			continue
-		}
-		return filepath.Join(value, rest), true
-	}
-	return path, false
 }
 
 // tokenise rewrites an absolute path with its root replaced by a token. Roots are

@@ -3,7 +3,6 @@ package credentials
 import (
 	"bytes"
 	"net/url"
-	"path"
 	"slices"
 	"strings"
 
@@ -67,13 +66,18 @@ type iniSection struct {
 	Pairs []iniPair
 }
 
-// parseINI reads the INI dialect the credential files in this catalog use.
-// Deliberately tolerant: a malformed line is skipped rather than failing the
-// file, because one bad line must not hide the entries around it. Keys are
-// lowercased, values keep their spelling less surrounding quotes, and pairs
-// before any header land in a leading section with an empty name.
-func parseINI(data []byte) []iniSection {
-	sections := []iniSection{{}}
+// parseINI reads the INI dialect the credential files in this catalog use, and
+// reports separately whether any line had no interpretation. A malformed line no
+// longer disappears: skipping it silently would let a file this build cannot read
+// resolve to "holds no credential", which is the one wrong answer an inventory
+// must not give. Keys are lowercased, values keep their spelling less surrounding
+// quotes, and pairs before any header land in a leading section with an empty name.
+//
+// bareKeys admits a valueless word as a setting. Only one of these formats spells
+// a boolean that way, and admitting it everywhere would let a stray word in a file
+// with no such spelling pass as a line that was understood.
+func parseINI(data []byte, bareKeys bool) (sections []iniSection, malformed bool) {
+	sections = []iniSection{{}}
 	scanLines(data, func(line string) bool {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || trimmed[0] == '#' || trimmed[0] == ';' {
@@ -84,52 +88,93 @@ func parseINI(data []byte) []iniSection {
 			sections = append(sections, iniSection{Name: name})
 			return true
 		}
-		eq := strings.IndexByte(trimmed, '=')
-		if eq < 0 {
+		// A line opening a header that never closes one. It is caught ahead of the
+		// pair split because the torn remainder can itself hold an equals sign,
+		// which would file the header text away as a setting and every pair after
+		// it under whichever section came before. No key in these formats opens
+		// with a bracket, so a whole header is the only thing this can be.
+		if strings.HasPrefix(trimmed, "[") {
+			malformed = true
 			return true
 		}
-		key := strings.ToLower(strings.TrimSpace(trimmed[:eq]))
+		key, value, ok := strings.Cut(trimmed, "=")
+		if !ok {
+			switch {
+			case continuesPreviousValue(line, sections):
+				// An indented line under an open key carries that key's value on
+				// rather than stating one of its own. It is appended rather than
+				// skipped: a key written with its value on the next line is a
+				// layout every one of these readers accepts, and dropping the
+				// continuation would describe a filled-in field as empty.
+				appendContinuation(sections, trimmed)
+			case strings.HasSuffix(trimmed, "]"):
+				// A header closed but never opened. The same boundary is lost as
+				// when it opens without closing, and a value ending in a bracket
+				// is a value, so this is only read as a header where the line
+				// states no setting at all.
+				malformed = true
+			case bareKeys && len(strings.Fields(trimmed)) == 1:
+				// A boolean setting spelled as a bare word: a recognised line
+				// that holds no value and can therefore never be material.
+				addPair(sections, iniPair{Key: strings.ToLower(trimmed)})
+			default:
+				malformed = true
+			}
+			return true
+		}
+		key = strings.ToLower(strings.TrimSpace(key))
 		if key == "" {
+			malformed = true
 			return true
 		}
-		value := strings.TrimSpace(trimmed[eq+1:])
+		value = strings.TrimSpace(value)
 		if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
 			value = value[1 : len(value)-1]
 		}
-		last := len(sections) - 1
-		sections[last].Pairs = append(sections[last].Pairs, iniPair{Key: key, Value: value})
+		addPair(sections, iniPair{Key: key, Value: value})
 		return true
 	})
-	return sections
+	return sections, malformed
 }
 
-// get returns the first value for a key, and whether it was present.
-func (s iniSection) get(key string) (string, bool) {
-	for _, p := range s.Pairs {
-		if p.Key == key {
-			return p.Value, true
-		}
+// continuesPreviousValue reports an indented line that states no key, which is
+// how a value written across several lines carries on. It is only a continuation
+// where there is an open key to continue: the same line under a fresh header
+// states nothing this build has a reading for.
+func continuesPreviousValue(line string, sections []iniSection) bool {
+	if !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+		return false
 	}
-	return "", false
+	return len(sections[len(sections)-1].Pairs) > 0
 }
 
-// has reports whether any named key carries a non-empty value. A key present
-// but empty is not a credential: tools write an empty value to mean "unset",
-// and counting it would report a credential where the developer removed one.
-func (s iniSection) has(keys ...string) bool {
-	for _, key := range keys {
-		if v, ok := s.get(key); ok && v != "" {
-			return true
-		}
+// appendContinuation carries a value on to the line below it. The lines are
+// joined the way the readers of these formats join them, so a value spelled
+// across several lines is one value rather than a fragment.
+func appendContinuation(sections []iniSection, text string) {
+	pairs := sections[len(sections)-1].Pairs
+	last := &pairs[len(pairs)-1]
+	if last.Value == "" {
+		last.Value = text
+		return
 	}
-	return false
+	last.Value += "\n" + text
 }
 
-// structured reports whether an INI parse found any shape at all. A file with
-// bytes but no shape is a parse failure, which is a different outcome from a
-// file with shape and nothing credential-bearing in it.
-func structured(sections []iniSection) bool {
-	return len(sections) > 1 || len(sections[0].Pairs) > 0
+// addPair appends to the section being filled.
+func addPair(sections []iniSection, p iniPair) {
+	last := len(sections) - 1
+	sections[last].Pairs = append(sections[last].Pairs, p)
+}
+
+// holds reports whether a section fills in a key with material. Every pair for
+// the key is checked rather than the first: a key stated twice is a key whose
+// first statement can be the empty one, and reading only that would describe a
+// filled-in field as blank — which is the file's credential going unreported.
+func (s iniSection) holds(key string) bool {
+	return slices.ContainsFunc(s.Pairs, func(p iniPair) bool {
+		return p.Key == key && concrete(p.Value)
+	})
 }
 
 // blank reports a file of nothing but whitespace — neither a credential nor a
@@ -138,21 +183,54 @@ func blank(data []byte) bool {
 	return len(bytes.TrimSpace(data)) == 0
 }
 
-// isEnvRef reports whether a value defers to an environment variable rather
-// than carrying a secret. These are the forms the surrounding tools expand at
-// read time, so a value in this shape means the material is not in the file.
-func isEnvRef(value string) bool {
-	return strings.Contains(value, "${") || strings.HasPrefix(value, "$")
+// concrete reports whether a value is credential material sitting in the file
+// rather than a name for one kept somewhere else. This is the whole test applied
+// to a value: nothing here looks at the characters of a secret, only at whether
+// the field was filled in at all and whether what filled it defers elsewhere.
+func concrete(value string) bool {
+	return value != "" && !isEnvRef(value)
 }
 
-// protectionRank orders the states from safest to worst. `unknown` outranks
-// `protected` deliberately: ranking it lower would let one unrecognised entry
-// inherit the protection of the entries beside it.
+// isEnvRef reports whether a value is entirely a shell-style variable reference,
+// which the surrounding tool expands at read time — so the material is in the
+// developer's environment, not in this file. The match is on the whole value: a
+// string that merely embeds a reference still carries characters of its own, and
+// calling that a reference would drop a configured credential from the inventory.
+func isEnvRef(value string) bool {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}") {
+		return validEnvName(value[2 : len(value)-1])
+	}
+	if strings.HasPrefix(value, "$") {
+		return validEnvName(value[1:])
+	}
+	return false
+}
+
+// validEnvName reports whether a name is spelled the way a shell variable is: a
+// leading letter or underscore, then letters, digits and underscores.
+func validEnvName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c == '_':
+		case c >= '0' && c <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// protectionRank orders the two states a finding may carry. Nothing else has a
+// rank, which is what makes an unmapped state fail closed rather than fold into
+// its neighbours.
 var protectionRank = map[string]int{
-	model.CredentialProtectionExternal:  1,
-	model.CredentialProtectionProtected: 2,
-	model.CredentialProtectionUnknown:   3,
-	model.CredentialProtectionPlaintext: 4,
+	model.CredentialProtectionProtected: 1,
+	model.CredentialProtectionPlaintext: 2,
 }
 
 // fold accumulates the worst protection state across one source's entries and
@@ -161,54 +239,57 @@ var protectionRank = map[string]int{
 type fold struct {
 	count int
 	state string
+	// Set where something in the file could not be interpreted. Independent of
+	// the count: a file can hold one confirmed credential and one entry this
+	// build cannot read, and reporting only the first would call the rest clean.
+	unrecognized bool
 }
 
-// add records one entry. An unrecognised state becomes `unknown` rather than
-// being dropped, so a parser that grows a case and forgets to map it cannot
+// add records one credential. A state outside the two-value vocabulary is not a
+// credential this build understands, so it adds nothing and marks the source
+// uninterpreted — a parser that grows a case and forgets to map it cannot
 // silently improve a file's reported protection.
 func (f *fold) add(state string) {
-	f.count++
-	if _, known := protectionRank[state]; !known {
-		state = model.CredentialProtectionUnknown
+	rank, known := protectionRank[state]
+	if !known {
+		f.unrecognized = true
+		return
 	}
-	if protectionRank[state] > protectionRank[f.state] {
+	f.count++
+	if rank > protectionRank[f.state] {
 		f.state = state
 	}
 }
 
-// empty reports that nothing was found to fold. That source produces no
-// finding: the file existed but held no credential and no reference to one.
-func (f *fold) empty() bool { return f.count == 0 }
-
-// observation is the result of reading one credential location.
+// observation is the result of reading one credential location: how much
+// material was confirmed, how the worst of it is held, and whether any part of
+// the file resisted interpretation.
 type observation struct {
-	// Credentials for the plaintext, protected and unknown states;
-	// configuration references for external.
-	Count int
-	// The worst state among those entries.
+	Count      int
 	Protection string
+	// The file existed and was read, and something in it has no interpretation.
+	// Never a finding on its own — a parse failure is not evidence a credential
+	// is there — so it travels as an error and costs the scan its completeness.
+	Unrecognized bool
 }
 
-// result closes the fold. Only meaningful when empty() is false.
+// result closes the fold.
 func (f *fold) result() observation {
-	return observation{Count: f.count, Protection: f.state}
+	return observation{Count: f.count, Protection: f.state, Unrecognized: f.unrecognized}
 }
 
-// unparseable is the observation for a file that exists, was read, and could not
-// be interpreted. One entry rather than none, because zero would describe the
-// machine as not having the file; `unknown` because a parse failure says nothing
-// about what guards the contents.
+// unparseable is the observation for a file that exists, was read, and has no
+// recognisable shape at all.
 func unparseable() observation {
-	return observation{Count: 1, Protection: model.CredentialProtectionUnknown}
+	return observation{Unrecognized: true}
 }
 
 // observed runs one format's fold over a file and applies the outcomes every
 // source shares. fill reports whether the document had a shape it recognised.
 // Whitespace holds nothing and is not a failure; bytes with no recognisable shape
 // are a failure, since reporting those as holding nothing would describe an
-// unreadable credential file as a clean machine; shape with nothing
-// credential-bearing in it holds nothing. Each is a silent under-report if a
-// format decides it alone, and the byte-order mark comes off here for the same
+// unreadable credential file as a clean machine. Each is a silent under-report if
+// a format decides it alone, and the byte-order mark comes off here for the same
 // reason.
 func observed(data []byte, fill func(data []byte, f *fold) bool) observation {
 	body := stripBOM(data)
@@ -219,174 +300,132 @@ func observed(data []byte, fill func(data []byte, f *fold) bool) observation {
 	if !fill(body, &f) {
 		return unparseable()
 	}
-	if f.empty() {
-		return observation{}
-	}
 	return f.result()
 }
 
-// parser turns one source's bytes into an observation. The path is a parameter
-// because one family shares a parser across three serialisations distinguished by
-// extension. Only one source populates the host list.
-type parser func(path string, data []byte) (observation, []githubHostConfig)
-
-// fromBytes adapts a parser that needs neither the path nor a host list.
-func fromBytes(parse func(data []byte) observation) parser {
-	return func(_ string, data []byte) (observation, []githubHostConfig) {
-		return parse(data), nil
-	}
-}
+// parser turns one source's bytes into an observation.
+type parser func(data []byte) observation
 
 // parsers is the whole dispatch: one entry per catalog source that gets read.
 // Keeping it as data makes its invariant checkable — every source the agent opens
 // has a reader, and every reader is reachable from a source — so a source added
 // without one fails the suite rather than reporting an unreadable file.
 var parsers = map[string]parser{
-	sourceAWSCredentials:       fromBytes(parseAWSProfiles),
-	sourceAWSConfig:            fromBytes(parseAWSProfiles),
-	sourceGCPADC:               fromBytes(parseGCPADC),
-	sourceGitCredentials:       fromBytes(parseGitCredentials),
-	sourceNetrc:                fromBytes(parseNetrc),
-	sourceGitconfigHelper:      fromBytes(parseGitconfigHelper),
-	sourceNPMRC:                fromBytes(parseNPMRC),
-	sourcePypirc:               fromBytes(parsePypirc),
-	sourceDockerConfig:         fromBytes(parseDockerConfig),
-	sourceKubeconfig:           fromBytes(parseKubeconfig),
-	sourceTerraformCredentials: fromBytes(parseTerraformCredentials),
-	sourceMCPConfig: func(path string, data []byte) (observation, []githubHostConfig) {
-		return parseMCPConfig(path, data), nil
-	},
-	sourceGitHubCLIHosts: func(_ string, data []byte) (observation, []githubHostConfig) {
-		return parseGitHubCLIHosts(data)
-	},
+	sourceAWSCredentials:       parseAWSProfiles,
+	sourceAWSConfig:            parseAWSProfiles,
+	sourceGCPADC:               parseGCPADC,
+	sourceGitCredentials:       parseGitCredentials,
+	sourceNetrc:                parseNetrc,
+	sourceGitHubCLIHosts:       parseGitHubCLIHosts,
+	sourceNPMRC:                parseNPMRC,
+	sourcePypirc:               parsePypirc,
+	sourceDockerConfig:         parseDockerConfig,
+	sourceKubeconfig:           parseKubeconfig,
+	sourceTerraformCredentials: parseTerraformCredentials,
+	sourceVaultToken:           parseVaultToken,
 }
 
 // parseSource reads one location with the parser its source declares. A source
-// with no parser is reported unreadable rather than empty: describing the file as
-// holding nothing would turn this agent's own gap into a claim about the machine.
-func parseSource(s source, resolved string, data []byte) (observation, []githubHostConfig) {
+// with no parser is reported uninterpreted rather than empty: describing the file
+// as holding nothing would turn this agent's own gap into a claim about the machine.
+func parseSource(s source, data []byte) observation {
 	parse, ok := parsers[s.ID]
 	if !ok {
-		return unparseable(), nil
+		return unparseable()
 	}
-	return parse(resolved, data)
+	return parse(data)
 }
 
 // awsInlineSecretKeys hold usable material in the file itself. Only presence is
 // inspected: the identifier prefix that says whether a key is long or short lived
-// is derived from the credential's own characters, so it is never read.
+// is derived from the credential's own characters, so it is never read. The access
+// key identifier is absent deliberately — it names a credential, it is not one.
+//
+// Every other AWS credential mechanism — a helper process, a single-sign-on
+// session, an assumed role, a web identity token file — puts material somewhere
+// this file does not reach, so none of them appears here or anywhere below.
 var awsInlineSecretKeys = []string{"aws_secret_access_key", "aws_session_token"}
 
-// awsExternalKeys name a credential the tool obtains elsewhere at run time: a
-// helper process, a single-sign-on session, or a role it assumes through another
-// profile. None puts material in this file.
-var awsExternalKeys = []string{
-	"credential_process",
-	"credential_source",
-	"sso_start_url",
-	"sso_session",
-	"sso_account_id",
-	"sso_role_name",
-	"role_arn",
-	"source_profile",
-	"web_identity_token_file",
-}
-
-// parseAWSProfiles counts the profiles that carry credential material or point at
-// it. It serves both AWS sources: separate catalog entries because independent
-// variables relocate them, but either can legally hold the other's content.
+// parseAWSProfiles counts the profiles carrying credential material. It serves
+// both AWS sources: separate catalog entries because independent variables
+// relocate them, but either can legally hold the other's content.
 func parseAWSProfiles(data []byte) observation {
 	return observed(data, func(data []byte, f *fold) bool {
-		sections := parseINI(data)
-		if !structured(sections) {
-			return false
-		}
+		sections, malformed := parseINI(data, false)
+		f.unrecognized = malformed
 		for _, s := range sections {
-			// A profile whose keys are all unrecognised holds no material and
-			// points at nothing, so counting it would report a credential on
-			// the strength of a section header.
-			switch {
-			case s.has(awsInlineSecretKeys...):
+			for _, p := range s.Pairs {
+				if !slices.Contains(awsInlineSecretKeys, p.Key) || !concrete(p.Value) {
+					continue
+				}
+				// One profile is one credential however many of its fields
+				// carry material: the secret and its session token are halves
+				// of the same grant.
 				f.add(model.CredentialProtectionPlaintext)
-			case s.has(awsExternalKeys...):
-				f.add(model.CredentialProtectionExternal)
+				break
 			}
 		}
 		return true
 	})
 }
 
-// npmAuthKeySuffixes are the trailing key segments that carry registry
-// credentials, matched on the suffix because these keys are scoped by a registry
-// URI prefix. Keys naming TLS files are absent: a path is not a secret.
-var npmAuthKeySuffixes = []string{"_auth", "_authtoken", "_password", "-authtoken"}
+// npmAuthKeys are the documented fields that carry a registry credential. Keys
+// naming TLS files are absent: a path is not a secret.
+var npmAuthKeys = []string{"_auth", "_authtoken", "_password"}
 
-// parseNPMRC counts registry credentials and folds whether each is written in the
-// clear or deferred to the environment. Shallow on purpose: the same file is
-// inventoried in depth elsewhere, and one entry here keeps a reader from wondering
-// whether the category was checked at all.
+// parseNPMRC counts the registry credentials written into the file.
 func parseNPMRC(data []byte) observation {
 	return observed(data, func(data []byte, f *fold) bool {
-		sections := parseINI(data)
-		keyed := false
+		// This format spells a boolean setting as a bare word.
+		sections, malformed := parseINI(data, true)
+		f.unrecognized = malformed
 		for _, s := range sections {
 			for _, p := range s.Pairs {
-				keyed = true
 				// A list suffix is part of the setting's spelling, not its name.
-				if !isNPMAuthKey(strings.TrimSuffix(p.Key, "[]")) || p.Value == "" {
-					continue
+				if isNPMAuthKey(strings.TrimSuffix(p.Key, "[]")) && concrete(p.Value) {
+					f.add(model.CredentialProtectionPlaintext)
 				}
-				if isEnvRef(p.Value) {
-					// Expanded when the package manager runs, so the material
-					// lives in the developer's environment, not here.
-					f.add(model.CredentialProtectionExternal)
-					continue
-				}
-				f.add(model.CredentialProtectionPlaintext)
 			}
 		}
-		// This format puts every value in a key, so a file of section headers
-		// and no settings has not been read.
-		return keyed
+		return true
 	})
 }
 
+// isNPMAuthKey reports whether a setting names a credential. The name is
+// compared whole rather than by its ending: these keys are scoped by a registry
+// URI prefix and nothing else about their spelling is free, so a setting that
+// merely ends in one of these words is a different setting and counting it would
+// report a credential the file does not hold.
 func isNPMAuthKey(key string) bool {
 	// A scoped key carries its registry before the final colon.
 	if i := strings.LastIndexByte(key, ':'); i >= 0 {
 		key = key[i+1:]
 	}
-	return slices.ContainsFunc(npmAuthKeySuffixes, func(suffix string) bool {
-		return strings.HasSuffix(key, suffix)
-	})
+	return slices.Contains(npmAuthKeys, key)
 }
 
-// parsePypirc counts the configured index servers and folds whether each carries
-// a password. Server and user names are read to find the sections and then
-// discarded: a private index host is internal infrastructure detail.
+// pypircIndexList is the section that names the servers rather than describing
+// one. Its fields configure the list, so a password written there is a login to
+// nothing the tool would ever present it to.
+const pypircIndexList = "distutils"
+
+// parsePypirc counts the index servers that carry a password. Server and user
+// names are read to find the sections and then discarded: a private index host is
+// internal infrastructure detail. A server configured without a password is a
+// login the tool completes from a keyring or a prompt, so it is not counted.
 func parsePypirc(data []byte) observation {
 	return observed(data, func(data []byte, f *fold) bool {
-		sections := parseINI(data)
-		if !structured(sections) {
-			return false
-		}
+		sections, malformed := parseINI(data, false)
+		f.unrecognized = malformed
 		for _, s := range sections {
-			// The index list itself is not a server entry.
-			if strings.EqualFold(s.Name, "distutils") || s.Name == "" {
+			// A password belongs to the server whose section holds it. The
+			// leading section names no server at all, and the index list names
+			// the set rather than a login to any member of it.
+			if s.Name == "" || strings.EqualFold(s.Name, pypircIndexList) {
 				continue
 			}
-			switch {
-			case s.has("password"):
-				value, _ := s.get("password")
-				if isEnvRef(value) {
-					f.add(model.CredentialProtectionExternal)
-				} else {
-					f.add(model.CredentialProtectionPlaintext)
-				}
-			case s.has("username", "repository"):
-				// A server configured without a password is a login the tool
-				// completes from a keyring or a prompt when it runs.
-				f.add(model.CredentialProtectionExternal)
+			if s.holds("password") {
+				f.add(model.CredentialProtectionPlaintext)
 			}
 		}
 		return true
@@ -395,7 +434,7 @@ func parsePypirc(data []byte) observation {
 
 // parseGitCredentials counts the stored logins in the credential store file. Each
 // line is a URL whose userinfo carries the credential; the host is parsed only to
-// establish the line is real, and the userinfo only for whether a password is set.
+// establish the line is real, and the userinfo only for the password.
 func parseGitCredentials(data []byte) observation {
 	return observed(data, func(data []byte, f *fold) bool {
 		scanLines(data, func(line string) bool {
@@ -403,51 +442,71 @@ func parseGitCredentials(data []byte) observation {
 			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 				return true
 			}
-			u, err := url.Parse(trimmed)
-			if err != nil || u.Host == "" {
-				// An unescaped character in the password is enough to fail the
-				// parse, so the structural test keeps a strict parser from
-				// turning a plaintext credential into an inconclusive one.
-				if hasInlineURLPassword(trimmed) {
-					f.add(model.CredentialProtectionPlaintext)
-				} else {
-					f.add(model.CredentialProtectionUnknown)
+			if u, err := url.Parse(trimmed); err == nil && u.Host != "" {
+				if u.User != nil {
+					if password, set := u.User.Password(); set && concrete(password) {
+						f.add(model.CredentialProtectionPlaintext)
+					}
 				}
 				return true
 			}
-			if _, hasPassword := u.User.Password(); hasPassword {
+			// An unescaped character in the password is enough to fail a strict
+			// parse, so a structural reading is what keeps a plaintext credential
+			// from being dropped. A line neither reading recognises is not called
+			// clean: this file has one shape, and something else in it is a shape
+			// this build cannot account for.
+			password, recognized := structuralURLPassword(trimmed)
+			switch {
+			case !recognized:
+				f.unrecognized = true
+			case concrete(password):
 				f.add(model.CredentialProtectionPlaintext)
-				return true
 			}
-			// A user with no password is the store recording that this host is
-			// authenticated without holding the secret for it.
-			f.add(model.CredentialProtectionExternal)
 			return true
 		})
-		// Every line in this format is an entry, so a file of comments has a
-		// shape and simply holds nothing — the empty fold reports that.
 		return true
 	})
 }
 
-// hasInlineURLPassword reports whether a line has userinfo with both halves
-// present. It looks at the separator positions only and reads neither half.
-func hasInlineURLPassword(line string) bool {
-	_, rest, ok := strings.Cut(line, "://")
-	if !ok {
-		return false
+// structuralURLPassword extracts the password from a line the strict parser
+// rejected, and reports whether the line is a credential URL at all. The host is
+// validated separately so a line that merely contains an at-sign cannot pass as
+// one. Nothing but the password is returned, and nothing at all is retained.
+func structuralURLPassword(line string) (string, bool) {
+	scheme, rest, ok := strings.Cut(line, "://")
+	if !ok || scheme == "" {
+		return "", false
 	}
-	userinfo, _, ok := strings.Cut(rest, "@")
-	if !ok {
-		return false
+	// The last at-sign separates userinfo from host: an at-sign inside the
+	// password is legal and unescaped in files these helpers write.
+	at := strings.LastIndexByte(rest, '@')
+	if at <= 0 || at == len(rest)-1 {
+		return "", false
 	}
-	_, secret, ok := strings.Cut(userinfo, ":")
-	return ok && secret != ""
+	host, err := url.Parse("//" + rest[at+1:])
+	if err != nil || host.Host == "" || host.User != nil {
+		return "", false
+	}
+	userinfo := rest[:at]
+	colon := strings.IndexByte(userinfo, ':')
+	if colon < 0 {
+		// A username with no password: a real entry holding no material.
+		return "", true
+	}
+	return userinfo[colon+1:], true
 }
 
-// parseNetrc counts the machine entries in the network login file and folds
-// whether each carries a password. Names, logins and account fields are consumed
-// by the tokeniser and discarded: this inventory does not report who you log in to.
+// netrcDirectives is the whole grammar of the network login file. A token that is
+// neither one of these nor the value of one is text this build cannot account for.
+var netrcDirectives = []string{"machine", "default", "login", "password", "account", "macdef"}
+
+func isNetrcDirective(token string) bool {
+	return slices.Contains(netrcDirectives, strings.ToLower(token))
+}
+
+// parseNetrc counts the machine entries that carry a concrete password. Names,
+// logins and account fields are consumed by the tokeniser and discarded: this
+// inventory does not report who you log in to.
 func parseNetrc(data []byte) observation {
 	return observed(data, func(data []byte, f *fold) bool {
 		// Entries are whitespace-separated token pairs that may wrap across
@@ -456,19 +515,16 @@ func parseNetrc(data []byte) observation {
 		hasPassword := false
 		inMacro := false
 		pendingKey := ""
+		// Set where a directive appeared in the place its predecessor's value
+		// belonged, which leaves this entry's fields ambiguous: whatever follows
+		// cannot be attributed to the field it looks like it belongs to.
+		spoiled := false
 
 		closeEntry := func() {
-			if !inEntry {
-				return
-			}
-			if hasPassword {
+			if inEntry && hasPassword && !spoiled {
 				f.add(model.CredentialProtectionPlaintext)
-			} else {
-				// A login with no password beside it means the secret is
-				// supplied from somewhere else when the tool runs.
-				f.add(model.CredentialProtectionExternal)
 			}
-			inEntry, hasPassword = false, false
+			inEntry, hasPassword, spoiled = false, false, false
 		}
 
 		scanLines(data, func(line string) bool {
@@ -481,87 +537,67 @@ func parseNetrc(data []byte) observation {
 				}
 				return true
 			}
-			for _, token := range strings.Fields(line) {
+			// Stripped before tokenising, so commented-out text cannot supply a
+			// value to the directive above it.
+			content, _, _ := strings.Cut(line, "#")
+			for _, token := range strings.Fields(content) {
 				if pendingKey != "" {
-					if pendingKey == "password" {
-						hasPassword = true
+					if !isNetrcDirective(token) {
+						if pendingKey == "password" && concrete(token) {
+							hasPassword = true
+						}
+						pendingKey = ""
+						continue
 					}
+					// A directive where a value belongs leaves the previous
+					// directive unterminated, and the entry incomplete.
+					f.unrecognized = true
+					spoiled = true
 					pendingKey = ""
-					continue
 				}
 				switch strings.ToLower(token) {
-				case "machine", "default":
+				case "machine":
 					closeEntry()
 					inEntry = true
-				case "login", "password", "account", "port", "protocol":
+					// The host name follows and is consumed without being read.
+					pendingKey = "machine"
+				case "default":
+					// The catch-all entry names no host, so nothing follows it.
+					closeEntry()
+					inEntry = true
+				case "login", "password", "account":
 					pendingKey = strings.ToLower(token)
 				case "macdef":
 					// The macro name is the rest of this line and the body
 					// follows; neither is configuration.
 					inMacro = true
 					return true
+				default:
+					f.unrecognized = true
 				}
 			}
 			return true
 		})
+		if pendingKey != "" {
+			// The file ended where a value was owed, so the entry being built was
+			// never completed. Its password is dropped with the rest of it: an
+			// entry that stops mid-directive is one this build cannot say it read.
+			f.unrecognized = true
+			spoiled = true
+		}
 		closeEntry()
 		return true
 	})
 }
 
-// parseGitconfigHelper counts the configured credential helpers and classifies
-// where each keeps the secret. The helper is the whole signal: the file holds no
-// credential but says what the machine does with one. Nothing else is inspected.
-func parseGitconfigHelper(data []byte) observation {
-	return observed(data, func(data []byte, f *fold) bool {
-		sections := parseINI(data)
-		if !structured(sections) {
-			return false
-		}
-		for _, s := range sections {
-			// Both the bare section and the per-URL form configure a helper,
-			// and the name may repeat because the setting is a list.
-			if !isCredentialSection(s.Name) {
-				continue
-			}
-			for _, p := range s.Pairs {
-				if p.Key != "helper" || p.Value == "" {
-					continue
-				}
-				f.add(classifyGitHelper(p.Value))
-			}
-		}
-		return true
-	})
-}
-
-// isCredentialSection matches the credential section and its per-URL form,
-// comparing the first word only so the URL in the quoted subsection is never
-// interpreted.
-func isCredentialSection(name string) bool {
-	first, _, _ := strings.Cut(name, " ")
-	return strings.EqualFold(strings.TrimSpace(first), "credential")
-}
-
-// classifyGitHelper decides where a helper keeps the secret. The plaintext-storing
-// helper is the one case identified positively. Every other helper — a keystore, a
-// cache, a custom program — leaves nothing readable here, so an unrecognised one is
-// external rather than unknown: whatever it does, it is a redirection.
-func classifyGitHelper(value string) string {
-	name, _, _ := strings.Cut(strings.TrimSpace(value), " ")
-	// A helper may be a shell fragment or an absolute path to a program.
-	name = strings.TrimPrefix(name, "!")
-	name = path.Base(strings.ReplaceAll(name, `\`, "/"))
-	// An executable extension belongs to the file's name, not the helper's
-	// identity: the same helper spelled as a path on Windows would otherwise
-	// fail to match and a store in the clear would read as a redirection.
-	switch ext := strings.ToLower(path.Ext(name)); ext {
-	case ".exe", ".cmd", ".bat":
-		name = name[:len(name)-len(ext)]
+// parseVaultToken reads the one source whose whole contents are the credential.
+// The bytes are compared against nothing and retained nowhere: the value is
+// trimmed, tested for being a reference rather than material, and dropped with
+// the buffer when this returns.
+func parseVaultToken(data []byte) observation {
+	value := strings.TrimSpace(string(data))
+	if !concrete(value) {
+		return observation{}
 	}
-	name = strings.TrimPrefix(name, "git-credential-")
-	if strings.EqualFold(name, "store") {
-		return model.CredentialProtectionPlaintext
-	}
-	return model.CredentialProtectionExternal
+	return observation{Count: 1, Protection: model.CredentialProtectionPlaintext}
 }

@@ -9,8 +9,9 @@ import (
 	"testing"
 )
 
-// goldenPath holds one credential snapshot exercising every field, every
-// protection state, every reason code and both host-report shapes.
+// goldenPath holds one credential snapshot exercising every field, every source,
+// every protection state and every reason code. The same bytes are the contract
+// the reader in the other repository is tested against.
 const goldenPath = "testdata/credential_scan_golden.json"
 
 // TestCredentialScanGolden_RoundTripsWithNoDroppedField is the contract check between
@@ -61,27 +62,22 @@ func TestCredentialScanGolden_CoversTheWholeVocabulary(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	protections, roots := map[string]bool{}, map[string]bool{}
-	statuses, storages, reasons := map[string]bool{}, map[string]bool{}, map[string]bool{}
-	// The two shapes a host report takes: one the CLI answered for and one it did
-	// not, the second being where an empty scope list must not read as no permissions.
-	var observed, withheld bool
+	protections, roots, categories := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	sources := map[string]bool{}
 	for _, f := range info.Findings {
 		protections[f.Protection] = true
+		categories[f.Category] = true
+		sources[f.SourceID] = true
 		if root, _, ok := strings.Cut(f.Location, "/"); ok {
 			roots[root] = true
 		}
-		for _, h := range f.GitHub {
-			statuses[h.AuthenticationStatus] = true
-			storages[h.CredentialStorage] = true
-			switch h.ScopeStatus {
-			case CredentialScopeObserved:
-				observed = len(h.Scopes) > 0
-			case CredentialScopeUnavailable:
-				withheld = len(h.Scopes) == 0
-			}
+		// A finding is material that was found, so a count of none is a row
+		// asserting a credential nobody located.
+		if f.Count <= 0 {
+			t.Errorf("%s: count = %d, want at least one credential", f.SourceID, f.Count)
 		}
 	}
+	reasons := map[string]bool{}
 	for _, e := range info.Errors {
 		reasons[e.ReasonCode] = true
 	}
@@ -91,11 +87,11 @@ func TestCredentialScanGolden_CoversTheWholeVocabulary(t *testing.T) {
 		got  map[string]bool
 		want []string
 	}{
+		// Two states and no third: every finding is material that is either usable
+		// straight out of the file or not.
 		{"protection", protections, []string{
 			CredentialProtectionPlaintext,
 			CredentialProtectionProtected,
-			CredentialProtectionExternal,
-			CredentialProtectionUnknown,
 		}},
 		// Every reason code has to be reachable from a fixture, or the reader cannot
 		// test that an incomplete snapshot renders as incomplete. skipped_no_user is
@@ -108,18 +104,27 @@ func TestCredentialScanGolden_CoversTheWholeVocabulary(t *testing.T) {
 			CredentialReasonUnsupportedEncoding,
 			CredentialReasonCapped,
 			CredentialReasonTimedOut,
+			CredentialReasonUnrecognizedFormat,
 		}},
-		// Both host vocabularies in full. The reader groups hosts by these and
-		// refuses a value it does not know, so drift costs the whole snapshot.
-		{"authentication_status", statuses, []string{
-			CredentialAuthAuthenticated, CredentialAuthNotAuthenticated, CredentialAuthUnknown,
-		}},
-		{"credential_storage", storages, []string{
-			CredentialStorageInlineFile, CredentialStorageKeyring, CredentialStorageUnknown,
+		{"category", categories, []string{
+			CredentialCategoryCloud,
+			CredentialCategorySourceControl,
+			CredentialCategoryPackageReg,
+			CredentialCategoryContainers,
+			CredentialCategoryInfrastructure,
 		}},
 		// Every root token, including the opaque one, whose identifier segment
 		// is the part a reader validates and an agent is likeliest to omit.
 		{"location root", roots, []string{"$HOME", "$APPDATA", "$XDG_CONFIG_HOME", "$ABS"}},
+		// The whole catalog, so the reader is exercised against every identifier it
+		// will ever be asked to group by.
+		{"source", sources, []string{
+			"aws_credentials", "aws_config", "gcp_adc",
+			"ssh_private_keys", "git_credentials", "netrc",
+			"github_cli_hosts", "npmrc", "pypirc",
+			"docker_config", "kubeconfig",
+			"terraform_credentials", "vault_token",
+		}},
 	} {
 		for _, want := range tt.want {
 			if !tt.got[want] {
@@ -127,10 +132,17 @@ func TestCredentialScanGolden_CoversTheWholeVocabulary(t *testing.T) {
 			}
 		}
 	}
-
-	if !observed || !withheld {
-		t.Error("golden payload must carry both a reported and an unreported host")
+	if len(sources) != 13 {
+		t.Errorf("golden payload covers %d sources, want the whole catalog of 13", len(sources))
 	}
+
+	// The mixed result the three-state parser produces: one source both reported a
+	// credential and could not interpret the rest of its file. A reader that treats
+	// a finding as proof the source was fully understood breaks on exactly this row.
+	if !hasError(info, "kubeconfig", CredentialReasonUnrecognizedFormat) {
+		t.Error("golden payload must demonstrate a source that is both reported and incomplete")
+	}
+
 	// The run states its principal as well as each finding: a reader deciding
 	// whether it can honour the snapshot at all has only the run in front of it.
 	if info.CollectionPrincipal != CredentialPrincipalAgentEffective {
@@ -147,6 +159,35 @@ func TestCredentialScanGolden_CoversTheWholeVocabulary(t *testing.T) {
 	if info.PayloadSchemaVersion != CurrentCredentialSchemaVersion {
 		t.Errorf("golden payload declares schema %d, want %d", info.PayloadSchemaVersion, CurrentCredentialSchemaVersion)
 	}
+}
+
+// TestCredentialScanGolden_CarriesNoRetiredVocabulary is a check on the bytes
+// rather than on the decoded struct, because that is where the retired vocabulary
+// would survive: a reader keyed on any of these groups findings by a value this
+// agent no longer sends, and would show an empty category rather than an error.
+func TestCredentialScanGolden_CarriesNoRetiredVocabulary(t *testing.T) {
+	raw, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	for _, retired := range []string{
+		"gitconfig_helper", "github_cli_status", "mcp_config", "ai_mcp",
+		`"external"`, `"unknown"`, `"github":`, "scope_status", "credential_storage",
+		"authentication_status", "account_count",
+	} {
+		if bytes.Contains(raw, []byte(retired)) {
+			t.Errorf("golden payload carries retired vocabulary %q", retired)
+		}
+	}
+}
+
+func hasError(info CredentialScanInfo, sourceID, reason string) bool {
+	for _, e := range info.Errors {
+		if e.SourceID == sourceID && e.ReasonCode == reason {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeGeneric(t *testing.T, raw []byte) map[string]any {

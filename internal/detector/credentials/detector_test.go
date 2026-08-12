@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,29 +28,14 @@ const canary = "CANARY-b6f4c2e1-DO-NOT-EMIT"
 // Fixture bodies shared across the tables below.
 var (
 	awsBody    = "[default]\naws_secret_access_key = " + canary + "\n"
-	gitBody    = "https://octocat:" + canary + "@github.com\n"
+	gitBody    = "https://a-user:" + canary + "@example.invalid\n"
 	kubeBody   = "users:\n  - name: dev\n    user:\n      token: " + canary + "\n"
-	ghBody     = "github.com:\n    oauth_token: " + canary + "\n    user: octocat\n"
-	dockerBody = `{"auths":{"registry.example.com":{"auth":"` + canary + `"}}}`
+	ghBody     = "example.invalid:\n    oauth_token: " + canary + "\n    user: a-user\n"
+	dockerBody = `{"auths":{"registry.example.invalid":{"auth":"` + canary + `"}}}`
 
 	awsTree = map[string]string{".aws/credentials": awsBody}
 	gitTree = map[string]string{".git-credentials": gitBody}
 )
-
-// fakeRunner stands in for the one child process this phase starts, so the fence
-// around it is assertable without a CLI installed.
-type fakeRunner struct {
-	out   []byte
-	err   error
-	calls int
-	last  ghRequest
-}
-
-func (f *fakeRunner) Run(_ context.Context, req ghRequest) ([]byte, error) {
-	f.calls++
-	f.last = req
-	return f.out, f.err
-}
 
 // testHome returns a temporary directory with its symlinks resolved, which is the
 // form the operating system's own record of an account would carry.
@@ -80,11 +66,56 @@ func writeTree(t *testing.T, home string, files map[string]string) {
 func newMock(t *testing.T, home string) *executor.Mock {
 	t.Helper()
 	m := executor.NewMock()
-	m.SetUsername("octocat")
+	m.SetUsername("a-user")
 	m.SetHomeDir(home)
 	m.SetGOOS(runtime.GOOS)
 	m.SetPath("gh", filepath.Join(string(filepath.Separator), "usr", "local", "bin", "gh"))
 	return m
+}
+
+// recordingExec notes every program this phase asks for or starts, so "reads
+// files and nothing else" is assertable rather than asserted by reading the code.
+type recordingExec struct {
+	executor.Executor
+	mu  sync.Mutex
+	ran []string
+}
+
+func (r *recordingExec) note(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ran = append(r.ran, filepath.Base(name))
+}
+
+func (r *recordingExec) started() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.ran...)
+}
+
+func (r *recordingExec) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
+	r.note(name)
+	return r.Executor.Run(ctx, name, args...)
+}
+
+func (r *recordingExec) RunWithTimeout(ctx context.Context, timeout time.Duration, name string, args ...string) (string, string, int, error) {
+	r.note(name)
+	return r.Executor.RunWithTimeout(ctx, timeout, name, args...)
+}
+
+func (r *recordingExec) RunInDir(ctx context.Context, dir string, timeout time.Duration, name string, args ...string) (string, string, int, error) {
+	r.note(name)
+	return r.Executor.RunInDir(ctx, dir, timeout, name, args...)
+}
+
+func (r *recordingExec) RunAsUser(ctx context.Context, username, command string) (string, error) {
+	r.note(command)
+	return r.Executor.RunAsUser(ctx, username, command)
+}
+
+func (r *recordingExec) LookPath(name string) (string, error) {
+	r.note("lookpath:" + name)
+	return r.Executor.LookPath(name)
 }
 
 // staticEnv stands in for a login session exporting these values, so a case is
@@ -112,11 +143,10 @@ func unexpandedEnv(names ...string) envProbe {
 	}
 }
 
-// detect scans home for a machine that exports nothing and whose CLI reports
-// nothing.
+// detect scans home for a machine that exports nothing.
 func detect(t *testing.T, home string) *model.CredentialScanInfo {
 	t.Helper()
-	return New(newMock(t, home)).withRunner(&fakeRunner{}).withEnv(staticEnv(nil)).Detect(context.Background())
+	return New(newMock(t, home)).withEnv(staticEnv(nil)).Detect(context.Background())
 }
 
 func findingFor(info *model.CredentialScanInfo, sourceID string) (model.CredentialFinding, bool) {
@@ -147,6 +177,20 @@ func errorFor(info *model.CredentialScanInfo, sourceID string) (model.Credential
 		}
 	}
 	return model.CredentialError{}, false
+}
+
+// hasScanError reports whether one source carries one reason code.
+func hasScanError(errs []model.CredentialError, sourceID, reason string) bool {
+	return countScanErrors(errs, sourceID, reason) > 0
+}
+
+func countScanErrors(errs []model.CredentialError, sourceID, reason string) (n int) {
+	for _, e := range errs {
+		if e.SourceID == sourceID && e.ReasonCode == reason {
+			n++
+		}
+	}
+	return n
 }
 
 // detectCase is one scan of a home built for the case, stating what a single
@@ -201,12 +245,13 @@ func runDetectCases(t *testing.T, cases []detectCase) {
 				env[name] = filepath.FromSlash(expand.Replace(value))
 			}
 
-			m := newMock(t, home)
+			var m executor.Executor = newMock(t, home)
 			if tc.noUser {
-				m = executor.NewMock()
-				m.SetLoggedInUserError(os.ErrNotExist)
+				mock := executor.NewMock()
+				mock.SetLoggedInUserError(os.ErrNotExist)
+				m = mock
 			}
-			d := New(m).withRunner(&fakeRunner{}).withEnv(staticEnv(env))
+			d := New(m).withEnv(staticEnv(env))
 			switch {
 			case tc.noEnv:
 				d = d.withEnv(unreadableEnv())
@@ -242,6 +287,16 @@ func runDetectCases(t *testing.T, cases []detectCase) {
 			for _, f := range info.Findings {
 				if strings.HasPrefix(f.Location, "$ABS/") || strings.HasPrefix(f.ResolvedLocation, "$ABS/") {
 					t.Errorf("finding at %q resolved to %q, outside the account's tree", f.Location, f.ResolvedLocation)
+				}
+			}
+			// Every finding is material, so there is no third protection state a
+			// reader could be handed.
+			for _, f := range info.Findings {
+				if f.Protection != model.CredentialProtectionPlaintext && f.Protection != model.CredentialProtectionProtected {
+					t.Errorf("finding %+v carries protection %q", f, f.Protection)
+				}
+				if f.Count <= 0 {
+					t.Errorf("finding %+v counts no credential", f)
 				}
 			}
 
@@ -299,8 +354,8 @@ func runDetectCases(t *testing.T, cases []detectCase) {
 }
 
 // TestDetect_InventoriesTheKnownLocations is the end-to-end shape: a machine with
-// a credential in each family produces one finding per source, located by its
-// tokenised path and classified by how it is held.
+// credential material in each family produces one finding per source, located by
+// its tokenised path and classified by how it is held.
 func TestDetect_InventoriesTheKnownLocations(t *testing.T) {
 	home := testHome(t)
 
@@ -315,21 +370,22 @@ func TestDetect_InventoriesTheKnownLocations(t *testing.T) {
 	netrc := perPlatform("_netrc", ".netrc")
 	terraform := perPlatform("AppData/Roaming/terraform.d/credentials.tfrc.json", ".terraform.d/credentials.tfrc.json")
 	gcloud := perPlatform("AppData/Roaming/gcloud/application_default_credentials.json", ".config/gcloud/application_default_credentials.json")
+	ghHosts := perPlatform("AppData/Roaming/GitHub CLI/hosts.yml", ".config/gh/hosts.yml")
 
 	writeTree(t, home, map[string]string{
 		".aws/credentials":    awsBody,
-		".aws/config":         "[profile work]\nsso_start_url = https://example.awsapps.com/start\n",
+		".aws/config":         "[profile work]\naws_session_token = " + canary + "\n",
 		".git-credentials":    gitBody,
-		".gitconfig":          "[credential]\n\thelper = store\n",
-		".npmrc":              "//registry.example.com/:_authToken=" + canary + "\n",
+		".npmrc":              "//registry.example.invalid/:_authToken=" + canary + "\n",
 		".pypirc":             "[pypi]\nusername = __token__\npassword = " + canary + "\n",
-		".docker/config.json": `{"auths":{"registry.example.com":{"auth":"` + canary + `"}}}`,
+		".docker/config.json": dockerBody,
 		".kube/config":        kubeBody,
 		".vault-token":        canary,
-		".cursor/mcp.json":    `{"mcpServers":{"demo":{"command":"npx","env":{"GITHUB_TOKEN":"` + canary + `"}}}}`,
-		netrc:                 "machine example.com login octocat password " + canary + "\n",
+		".ssh/id_ed25519":     string(opensshKey("none", "none", "ssh-ed25519")),
+		netrc:                 "machine example.invalid login a-user password " + canary + "\n",
 		terraform:             `{"credentials":{"app.terraform.io":{"token":"` + canary + `"}}}`,
 		gcloud:                `{"type":"authorized_user","client_secret":"` + canary + `","refresh_token":"` + canary + `"}`,
+		ghHosts:               ghBody,
 	})
 
 	info := detect(t, home)
@@ -354,18 +410,23 @@ func TestDetect_InventoriesTheKnownLocations(t *testing.T) {
 		location string
 	}{
 		sourceAWSCredentials:       {obsPlain(1), "$HOME/.aws/credentials"},
-		sourceAWSConfig:            {obsExt(1), "$HOME/.aws/config"},
+		sourceAWSConfig:            {obsPlain(1), "$HOME/.aws/config"},
 		sourceGitCredentials:       {obsPlain(1), "$HOME/.git-credentials"},
-		sourceGitconfigHelper:      {obsPlain(1), "$HOME/.gitconfig"},
 		sourceNPMRC:                {obsPlain(1), "$HOME/.npmrc"},
 		sourcePypirc:               {obsPlain(1), "$HOME/.pypirc"},
 		sourceDockerConfig:         {obsPlain(1), "$HOME/.docker/config.json"},
 		sourceKubeconfig:           {obsPlain(1), "$HOME/.kube/config"},
 		sourceVaultToken:           {obsPlain(1), "$HOME/.vault-token"},
-		sourceMCPConfig:            {obsPlain(1), "$HOME/.cursor/mcp.json"},
+		sourceSSHPrivateKeys:       {obsPlain(1), "$HOME/.ssh/id_ed25519"},
 		sourceNetrc:                {obsPlain(1), "$HOME/" + netrc},
+		sourceGitHubCLIHosts:       {obsPlain(1), perPlatform("$APPDATA/GitHub CLI/hosts.yml", "$HOME/.config/gh/hosts.yml")},
 		sourceTerraformCredentials: {obsPlain(1), perPlatform("$APPDATA/terraform.d/credentials.tfrc.json", "$HOME/.terraform.d/credentials.tfrc.json")},
 		sourceGCPADC:               {obsPlain(1), perPlatform("$APPDATA/gcloud/application_default_credentials.json", "$HOME/.config/gcloud/application_default_credentials.json")},
+	}
+	// Every catalog source is covered, so a source added without a fixture fails
+	// here rather than going untested end to end.
+	if len(want) != len(sources) {
+		t.Fatalf("fixtures cover %d sources, catalog has %d", len(want), len(sources))
 	}
 	for id, expect := range want {
 		got, ok := findingFor(info, id)
@@ -393,25 +454,82 @@ func TestDetect_InventoriesTheKnownLocations(t *testing.T) {
 	}
 }
 
+// TestDetect_ReportsOnlyMaterial is the correction this catalog was rebuilt
+// around. Every file here is a real, fully configured credential mechanism, and
+// not one of them puts material where the agent can read it — so a machine
+// configured exactly this way holds nothing to report and is not incomplete
+// either, since each file was read and understood.
+func TestDetect_ReportsOnlyMaterial(t *testing.T) {
+	home := testHome(t)
+	writeTree(t, home, map[string]string{
+		".gitconfig":           "[credential]\n\thelper = store\n",
+		".aws/config":          "[profile work]\nsso_start_url = https://example.awsapps.com/start\nsso_account_id = 123456789012\n",
+		".aws/credentials":     "[default]\naws_access_key_id = AKIAEXAMPLE\n",
+		".docker/config.json":  `{"credsStore":"desktop","credHelpers":{"registry.example.invalid":"ecr-login"}}`,
+		".kube/config":         "users:\n  - name: dev\n    user:\n      exec:\n        command: aws\n",
+		".config/gh/hosts.yml": "example.invalid:\n    user: a-user\n    git_protocol: ssh\n",
+		".npmrc":               "//registry.example.invalid/:_authToken=${NPM_TOKEN}\n",
+		".git-credentials":     "https://a-user@example.invalid\n",
+		".vault-token":         "${VAULT_TOKEN}\n",
+		".ssh/id_ed25519.pub":  sshPublicKeyLine() + "\n",
+	})
+
+	info := detect(t, home)
+	if len(info.Findings) != 0 {
+		t.Errorf("findings = %+v, want none: none of these files holds material", info.Findings)
+	}
+	if !info.ScanComplete || len(info.Errors) != 0 {
+		t.Errorf("scan_complete = %v with errors %+v; every file here was read and understood", info.ScanComplete, info.Errors)
+	}
+}
+
+// TestDetect_AsksNoToolAboutItsCredentials holds the removal of the one program
+// this phase used to run for an answer about a secret. What a tool reports about a
+// credential it holds in a keystore is not material in a file, so asking is
+// neither evidence nor this agent's business — and a question never put cannot
+// leak through a child's arguments, environment or diagnostics. The environment
+// probe is the one command a run still makes, and it is told nothing about what is
+// being looked for.
+func TestDetect_AsksNoToolAboutItsCredentials(t *testing.T) {
+	home := testHome(t)
+	writeTree(t, home, map[string]string{
+		".config/gh/hosts.yml":                 ghBody,
+		"AppData/Roaming/GitHub CLI/hosts.yml": ghBody,
+		".aws/credentials":                     awsBody,
+	})
+
+	rec := &recordingExec{Executor: newMock(t, home)}
+	info := New(rec).withEnv(staticEnv(nil)).Detect(context.Background())
+
+	for _, name := range rec.started() {
+		if strings.Contains(name, "gh") {
+			t.Errorf("the phase reached for %q; commands run were %v", name, rec.started())
+		}
+	}
+	if _, ok := findingFor(info, sourceGitHubCLIHosts); !ok {
+		t.Fatalf("the inline token must still be reported without asking the tool: %+v", info)
+	}
+}
+
 // TestDetect_NeverEmitsCredentialMaterial is the property the whole phase exists
 // under. Every fixture carries the same distinctive value, so a parser leaking a
-// value, a substring or a digest surfaces here whatever field it chose.
+// value, a substring or a digest surfaces here whatever field it chose. The token
+// file is the case worth naming: its whole contents are the credential and this
+// build now opens it, so the canary is in the read buffer by construction.
 func TestDetect_NeverEmitsCredentialMaterial(t *testing.T) {
 	home := testHome(t)
 	writeTree(t, home, map[string]string{
 		".aws/credentials":     "[default]\naws_access_key_id = AKIA" + canary + "\naws_secret_access_key = " + canary + "\n",
 		".git-credentials":     gitBody,
-		".npmrc":               "//registry.example.com/:_authToken=" + canary + "\n",
-		".docker/config.json":  `{"auths":{"registry.example.com":{"auth":"` + canary + `"}}}`,
+		".npmrc":               "//registry.example.invalid/:_authToken=" + canary + "\n",
+		".docker/config.json":  dockerBody,
 		".kube/config":         kubeBody,
 		".vault-token":         canary,
-		".cursor/mcp.json":     `{"mcpServers":{"demo":{"env":{"GITHUB_TOKEN":"` + canary + `"}}}}`,
-		".ssh/id_ed25519":      string(opensshKey("none", "none", "ssh-ed25519", 512)),
+		".ssh/id_ed25519":      string(opensshKey("none", "none", "ssh-ed25519")),
 		".config/gh/hosts.yml": ghBody,
 	})
 
-	runner := &fakeRunner{out: []byte(`{"hosts":{"github.com":[{"active":true,"login":"octocat","state":"success","scopes":"repo","tokenSource":"keyring"}]}}`)}
-	info := New(newMock(t, home)).withRunner(runner).withEnv(staticEnv(nil)).Detect(context.Background())
+	info := New(newMock(t, home)).withEnv(staticEnv(nil)).Detect(context.Background())
 
 	payload, err := json.Marshal(info)
 	if err != nil {
@@ -420,10 +538,11 @@ func TestDetect_NeverEmitsCredentialMaterial(t *testing.T) {
 	if strings.Contains(string(payload), canary) {
 		t.Errorf("payload carries credential material: %s", payload)
 	}
-	// The account name is counted, never stored — and neither is the login the
-	// probe reported.
-	if strings.Contains(string(payload), "octocat") {
-		t.Errorf("payload names an account: %s", payload)
+	// Account and host names are read to iterate entries and never stored.
+	for _, named := range []string{"a-user", "example.invalid"} {
+		if strings.Contains(string(payload), named) {
+			t.Errorf("payload names %q: %s", named, payload)
+		}
 	}
 	if len(info.Findings) == 0 {
 		t.Fatal("the fixtures must produce findings for this to prove anything")
@@ -468,16 +587,14 @@ func TestDetect_Findings(t *testing.T) {
 		// the same as no section at all.
 		{name: "a machine holding nothing", noFinding: true},
 		// The three ways a source yields nothing without failing: the file is
-		// absent, empty, or holds no credential and no reference to one. A path
-		// name is not evidence, and a finding would assert one is in the file.
+		// absent, empty, or holds no material. A path name is not evidence, and a
+		// finding would assert something is in the file.
 		{name: "an empty file", tree: map[string]string{".vault-token": ""}, source: sourceVaultToken, noFinding: true, noError: true},
 		// The probed source is absent; the sibling that is present keeps the case
 		// from passing vacuously.
-		{name: "a file that is not there", tree: map[string]string{".aws/config": "[profile work]\nsso_session = corp\n"}, source: sourceAWSCredentials, noFinding: true, noError: true},
-		{name: "files holding no credential", tree: map[string]string{".gitconfig": "[user]\n\tname = Octocat\n", ".npmrc": "registry=https://registry.example.com/\n"}, noFinding: true},
-		// That file is the credential: nothing to interpret, so its contents never
-		// reach a parser. The body is deliberately valid in no format here.
-		{name: "a token file is classified without parsing", tree: map[string]string{".vault-token": "\x00\x01\x02" + canary}, source: sourceVaultToken, want: obsPlain(1)},
+		{name: "a file that is not there", tree: map[string]string{".aws/config": "[profile work]\naws_session_token = " + canary + "\n"}, source: sourceAWSCredentials, noFinding: true, noError: true},
+		{name: "files holding no material", tree: map[string]string{".gitconfig": "[user]\n\tname = A User\n", ".npmrc": "registry=https://registry.example.invalid/\n"}, noFinding: true},
+		{name: "a token file holds material", tree: map[string]string{".vault-token": canary}, source: sourceVaultToken, want: obsPlain(1)},
 		// Both files are real and only one is read. Reporting the superseded one as
 		// well would claim a credential is in use where the tool never looks.
 		{
@@ -493,7 +610,7 @@ func TestDetect_Findings(t *testing.T) {
 		// a live file there is one nothing consults.
 		{
 			name: "all match reports every live location", source: sourceKubeconfig,
-			tree:      map[string]string{"clusters/a": kubeBody, "clusters/b": "users:\n  - name: b\n    user:\n      tokenFile: /var/run/secrets/token\n", ".kube/config": kubeBody},
+			tree:      map[string]string{"clusters/a": kubeBody, "clusters/b": kubeBody, ".kube/config": kubeBody},
 			env:       map[string]string{"KUBECONFIG": "{home}/clusters/a" + string(os.PathListSeparator) + "{home}/clusters/b"},
 			locations: []string{"$HOME/clusters/a", "$HOME/clusters/b"},
 		},
@@ -535,85 +652,131 @@ func TestDetect_Findings(t *testing.T) {
 		// a separate place, so a path below it stays home-relative.
 		{name: "a configuration directory at its default", tree: map[string]string{".config/git/credentials": gitBody}, source: sourceGitCredentials, want: obsPlain(1), location: "$HOME/.config/git/credentials"},
 		{name: "a relocated configuration directory", tree: map[string]string{"cfg/git/credentials": gitBody}, env: map[string]string{"XDG_CONFIG_HOME": "{home}/cfg"}, source: sourceGitCredentials, want: obsPlain(1), location: "$XDG_CONFIG_HOME/git/credentials"},
-		// The one catalog location below a directory this agent's policy declines as
-		// a group while the platform serves it unprompted.
-		//
-		// This is the deliberate exception, and it is worth stating plainly because
-		// the two halves look contradictory next to each other: a predefined
-		// location under ~/Library is read despite the guard being active, while a
-		// location a variable moved into a gated directory is refused — see
-		// "a delegated path a variable moved is guarded too" below. The guard is
-		// about traversal, not about the byte. Walking ~/Library is what trips the
-		// services that fire a prompt, and each macOS release adds more of them, so
-		// the walk declines the tree wholesale; opening one named file in a reviewed
-		// set is not that walk. What makes the distinction safe is that the reviewed
-		// set is fixed in this repository, whereas a rewritten path has its leading
-		// directory chosen in the session being scanned.
+	})
+}
+
+// TestDetect_MalformedSourcesAreIncomplete is the outcome that replaced counting a
+// parse failure as a credential. A file the agent cannot interpret produces no
+// finding — there is no evidence one is in it — and costs the snapshot its
+// completeness, so it can never be read as a clean machine.
+func TestDetect_MalformedSourcesAreIncomplete(t *testing.T) {
+	runDetectCases(t, []detectCase{
 		{
-			name: "the application configuration directory", only: model.PlatformDarwin, guard: true,
-			tree:     map[string]string{"Library/Application Support/Code/User/mcp.json": `{"servers":{"demo":{"env":{"API_KEY":"` + canary + `"}}}}`},
-			source:   sourceMCPConfig,
-			want:     obsPlain(1),
-			location: "$HOME/Library/Application Support/Code/User/mcp.json",
+			name: "a malformed document", source: sourceKubeconfig,
+			tree:   map[string]string{".kube/config": "users: [ unterminated " + canary + "\n"},
+			reason: model.CredentialReasonUnrecognizedFormat, noFinding: true, incomplete: true,
+		},
+		{
+			name: "a malformed settings file", source: sourceAWSCredentials,
+			tree:   map[string]string{".aws/credentials": "[default]\naws_secret_access_key " + canary + "\n"},
+			reason: model.CredentialReasonUnrecognizedFormat, noFinding: true, incomplete: true,
+		},
+		// The line-oriented sources are where partial interpretation is possible,
+		// so the confirmed credential stands and the source is still incomplete.
+		{
+			name: "material beside a line that is not one", source: sourceGitCredentials,
+			tree:   map[string]string{".git-credentials": gitBody + "not a credential url\n"},
+			reason: model.CredentialReasonUnrecognizedFormat, want: obsPlain(1), incomplete: true,
+		},
+		{
+			name: "an unterminated login entry", source: sourceNetrc, skip: model.PlatformWindows,
+			tree:   map[string]string{".netrc": "machine example.invalid login a-user password"},
+			reason: model.CredentialReasonUnrecognizedFormat, noFinding: true, incomplete: true,
 		},
 	})
 }
 
-// TestDetect_PredefinedMCPPathBypassesGuardButRelocatedPathDoesNot pins which
-// resolver each half of the delegated source reaches, so the one deliberate
-// exception to the consent guard cannot be widened or removed by accident: a
-// predefined location under the declined `~/Library` tree is read, and a path a
-// variable moved into a declined tree is refused untouched.
-//
-// This is a mechanical policy test, not a background-launch test. It runs in the
-// test process against a temporary tree with a mock executor, so it exercises
-// neither launchd attribution nor the real consent machinery, and the root flag it
-// sets only selects the console-user path — no privilege is held and `tccd` is never
-// consulted. Whether a scheduled run under a system account with no session to
-// prompt in still returns is a claim about the platform, and only a LaunchAgent or
-// LaunchDaemon run can settle it: that stays external validation until such a test
-// exists. The deadline below is a hang guard for this process, nothing more.
-func TestDetect_PredefinedMCPPathBypassesGuardButRelocatedPathDoesNot(t *testing.T) {
-	if runtime.GOOS != model.PlatformDarwin {
-		t.Skipf("the behaviour under test is %s-specific", model.PlatformDarwin)
-	}
+// TestDetect_KeyDirectoryReportsOnePerKey holds because two keys in one directory
+// routinely differ in the only two things a customer acts on — file mode and
+// repository status — and one row for the directory would have to pick one.
+func TestDetect_KeyDirectoryReportsOnePerKey(t *testing.T) {
 	home := testHome(t)
 	writeTree(t, home, map[string]string{
-		"Library/Application Support/Code/User/mcp.json": `{"servers":{"demo":{"env":{"API_KEY":"` + canary + `"}}}}`,
+		".ssh/id_ed25519":       string(opensshKey("none", "none", "ssh-ed25519")),
+		".ssh/id_rsa_protected": string(opensshKey("aes256-ctr", "bcrypt", "ssh-rsa")),
+		".ssh/id_sk":            string(hardwareKey("sk-ssh-ed25519@openssh.com", 1, 0x01, deviceHandle)),
+		".ssh/id_ed25519.pub":   sshPublicKeyLine() + "\n",
+		".ssh/known_hosts":      "example.invalid " + sshPublicKeyLine() + "\n",
+		".ssh/config":           "Host *\n  AddKeysToAgent yes\n",
+		".ssh/authorized_keys":  sshPublicKeyLine() + "\n",
 	})
 
-	m := newMock(t, home)
-	// The shape of a scheduled run: describing a console account that is not the
-	// account this runs as. It selects the branch, it does not reproduce the context.
-	m.SetIsRoot(true)
-	relocated := filepath.Join(home, "Documents", "claude")
-	d := New(m).withRunner(&fakeRunner{}).
-		withEnv(staticEnv(map[string]string{"CLAUDE_CONFIG_DIR": relocated})).
-		WithSkipper(tcc.New(home))
+	info := detect(t, home)
+	got := findingsFor(info, sourceSSHPrivateKeys)
+	if len(got) != 3 {
+		t.Fatalf("findings = %d, want one per private key; got %+v", len(got), got)
+	}
+	states := map[string]string{}
+	for _, f := range got {
+		states[filepath.Base(f.Location)] = f.Protection
+		if f.Count != 1 {
+			t.Errorf("%s: count = %d, want 1", f.Location, f.Count)
+		}
+	}
+	// A hardware-backed key holds a handle rather than the secret.
+	want := map[string]string{
+		"id_ed25519":       model.CredentialProtectionPlaintext,
+		"id_rsa_protected": model.CredentialProtectionProtected,
+		"id_sk":            model.CredentialProtectionProtected,
+	}
+	for name, expect := range want {
+		if states[name] != expect {
+			t.Errorf("%s: protection = %q, want %q", name, states[name], expect)
+		}
+	}
+	if !info.ScanComplete {
+		t.Errorf("scan_complete = false with errors %+v", info.Errors)
+	}
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	info := d.Detect(ctx)
-	if ctx.Err() != nil {
-		t.Fatal("the phase did not return before the deadline")
-	}
+// TestDetect_KeyDirectoryKeepsGoingPastADamagedKey covers the mixed result for the
+// one source that is a directory: a candidate this build cannot confirm costs the
+// scan its completeness without taking the readable keys beside it out of the
+// inventory, and never becomes a finding of its own.
+func TestDetect_KeyDirectoryKeepsGoingPastADamagedKey(t *testing.T) {
+	home := testHome(t)
+	writeTree(t, home, map[string]string{
+		".ssh/id_ed25519":   string(opensshKey("none", "none", "ssh-ed25519")),
+		".ssh/id_damaged":   "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA",
+		".ssh/id_damaged_2": "-----BEGIN PRIVATE KEY-----\ndmFsdWU=\n-----END PRIVATE KEY-----\n",
+	})
 
-	// The refusal is for a path that was never created, so the decision came before
-	// any access: probing first would have found silence, not a reason to refuse.
-	if _, err := os.Stat(relocated); !os.IsNotExist(err) {
-		t.Fatalf("%s exists; the case proves nothing", relocated)
+	info := detect(t, home)
+	got := findingsFor(info, sourceSSHPrivateKeys)
+	if len(got) != 1 || filepath.Base(got[0].Location) != "id_ed25519" {
+		t.Fatalf("findings = %+v, want only the key that was confirmed", got)
 	}
-	e, ok := errorFor(info, sourceMCPConfig)
-	if !ok || e.ReasonCode != model.CredentialReasonRefusedTCC {
-		t.Errorf("errors = %+v, want %q for the relocated path", info.Errors, model.CredentialReasonRefusedTCC)
+	if !hasScanError(info.Errors, sourceSSHPrivateKeys, model.CredentialReasonUnrecognizedFormat) {
+		t.Errorf("errors = %+v, want the damaged candidate reported", info.Errors)
 	}
+	// An error names its source and nothing else, so a second copy of this one
+	// says nothing further and spends a budget a different failure needs.
+	if n := countScanErrors(info.Errors, sourceSSHPrivateKeys, model.CredentialReasonUnrecognizedFormat); n != 1 {
+		t.Errorf("errors = %+v, want one entry for the source however many candidates are damaged, got %d", info.Errors, n)
+	}
+	if info.ScanComplete {
+		t.Error("a candidate that could not be confirmed leaves the run incomplete")
+	}
+}
 
-	f, ok := findingFor(info, sourceMCPConfig)
-	if !ok {
-		t.Fatalf("the predefined location under the declined tree was not read: %+v", info)
+// TestDetect_KeyLargerThanItsCapIsNotClassified holds because a key is validated
+// over its complete bytes: a prefix is indistinguishable from the truncated
+// container that validation exists to reject, so the read is reported as capped
+// rather than guessed at.
+func TestDetect_KeyLargerThanItsCapIsNotClassified(t *testing.T) {
+	home := testHome(t)
+	oversized := string(opensshKey("none", "none", "ssh-ed25519")) + strings.Repeat("# padding\n", capPrivateKey/10+16)
+	writeTree(t, home, map[string]string{".ssh/id_ed25519": oversized})
+
+	info := detect(t, home)
+	if got := findingsFor(info, sourceSSHPrivateKeys); len(got) != 0 {
+		t.Fatalf("findings = %+v, want none for a candidate read only in part", got)
 	}
-	if want := "$HOME/Library/Application Support/Code/User/mcp.json"; f.Location != want {
-		t.Errorf("location = %q, want %q", f.Location, want)
+	if !hasScanError(info.Errors, sourceSSHPrivateKeys, model.CredentialReasonCapped) {
+		t.Errorf("errors = %+v, want the cap reported", info.Errors)
+	}
+	if info.ScanComplete || !info.Truncated {
+		t.Errorf("scan_complete = %v, truncated = %v", info.ScanComplete, info.Truncated)
 	}
 }
 
@@ -649,15 +812,6 @@ func TestDetect_Refusals(t *testing.T) {
 			name: "a consent-gated location is refused untouched", only: model.PlatformDarwin, guard: true,
 			env:    map[string]string{"KUBECONFIG": "{home}/Documents/kubeconfig"},
 			source: sourceKubeconfig, reason: model.CredentialReasonRefusedTCC, incomplete: true,
-		},
-		// The boundary between the two resolvers, and the one an attacker reaches. A
-		// delegated location is a named file in a reviewed set; a location a variable
-		// moved has its directory chosen in the scanned session, and a value naming a
-		// gated tree would block past this phase's whole budget.
-		{
-			name: "a delegated path a variable moved is guarded too", only: model.PlatformDarwin, guard: true,
-			env:    map[string]string{"CLAUDE_CONFIG_DIR": "{home}/Documents/claude"},
-			source: sourceMCPConfig, reason: model.CredentialReasonRefusedTCC, incomplete: true,
 		},
 		// The default path is still worth probing, but not as an authoritative
 		// absence while the setting that could have moved the file is unknown. A
@@ -729,7 +883,7 @@ func TestDetect_ReadsRelocationFromTheLoginSession(t *testing.T) {
 	m := newMock(t, home)
 	m.SetCommand("AWS_SHARED_CREDENTIALS_FILE="+relocated+"\n", "", 0, "bash", "-c", envProbeCommand(EnvVars()))
 
-	info := New(m).withRunner(&fakeRunner{}).Detect(context.Background())
+	info := New(m).Detect(context.Background())
 	got, ok := findingFor(info, sourceAWSCredentials)
 	if !ok {
 		t.Fatalf("no finding; errors = %+v", info.Errors)
@@ -742,262 +896,6 @@ func TestDetect_ReadsRelocationFromTheLoginSession(t *testing.T) {
 	}
 }
 
-// TestDetect_KeyDirectoryReportsOnePerKey holds because two keys in one directory
-// routinely differ in the only two things a customer acts on — file mode and
-// repository status — and one row for the directory would have to pick one.
-func TestDetect_KeyDirectoryReportsOnePerKey(t *testing.T) {
-	home := testHome(t)
-	writeTree(t, home, map[string]string{
-		".ssh/id_ed25519":       string(opensshKey("none", "none", "ssh-ed25519", 0)),
-		".ssh/id_rsa_protected": string(opensshKey("aes256-ctr", "bcrypt", "ssh-rsa", 0)),
-		".ssh/id_sk":            string(opensshKey("none", "none", "sk-ssh-ed25519@openssh.com", 0)),
-		".ssh/id_ed25519.pub":   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample octocat@example.com\n",
-		".ssh/known_hosts":      "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample\n",
-		".ssh/config":           "Host *\n  AddKeysToAgent yes\n",
-		".ssh/authorized_keys":  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample octocat@example.com\n",
-	})
-
-	info := detect(t, home)
-	got := findingsFor(info, sourceSSHPrivateKeys)
-	if len(got) != 3 {
-		t.Fatalf("findings = %d, want one per private key; got %+v", len(got), got)
-	}
-	states := map[string]string{}
-	for _, f := range got {
-		states[filepath.Base(f.Location)] = f.Protection
-		if f.Count != 1 {
-			t.Errorf("%s: count = %d, want 1", f.Location, f.Count)
-		}
-	}
-	// A hardware-backed key holds a handle rather than the secret.
-	want := map[string]string{
-		"id_ed25519":       model.CredentialProtectionPlaintext,
-		"id_rsa_protected": model.CredentialProtectionProtected,
-		"id_sk":            model.CredentialProtectionProtected,
-	}
-	for name, expect := range want {
-		if states[name] != expect {
-			t.Errorf("%s: protection = %q, want %q", name, states[name], expect)
-		}
-	}
-	if !info.ScanComplete {
-		t.Errorf("scan_complete = false with errors %+v", info.Errors)
-	}
-}
-
-// TestDetect_KeyLargerThanTheHeaderCapIsStillAWholeObservation holds because the cap
-// for that source is the header, not the file. Every usable key exceeds it, so
-// treating that as a partial read would leave the flag meaning nothing.
-func TestDetect_KeyLargerThanTheHeaderCapIsStillAWholeObservation(t *testing.T) {
-	home := testHome(t)
-	key := opensshKey("aes256-ctr", "bcrypt", "ssh-rsa", 4096)
-	if int64(len(key)) <= capKeyHeader {
-		t.Fatalf("key of %d bytes does not exceed the cap; the test proves nothing", len(key))
-	}
-	writeTree(t, home, map[string]string{".ssh/id_rsa": string(key)})
-
-	info := detect(t, home)
-	got := findingsFor(info, sourceSSHPrivateKeys)
-	if len(got) != 1 || got[0].Protection != model.CredentialProtectionProtected {
-		t.Fatalf("findings = %+v, want one protected key", got)
-	}
-	if info.Truncated || !info.ScanComplete {
-		t.Errorf("truncated = %v, scan_complete = %v; reading only the header is a whole result", info.Truncated, info.ScanComplete)
-	}
-	// The whole file is reported even though only its head was read.
-	if got[0].Size != int64(len(key)) {
-		t.Errorf("size = %d, want the file's own size %d", got[0].Size, len(key))
-	}
-}
-
-// TestDetect_GitHubHostsCarryTheProbeReport covers the fenced child process: pointed
-// at the developer's own configuration and run as that account, its report lands on
-// the host entries of the finding describing the same file.
-func TestDetect_GitHubHostsCarryTheProbeReport(t *testing.T) {
-	if runtime.GOOS == model.PlatformWindows {
-		t.Skip("the probe does not run on Windows under a service account")
-	}
-	home := testHome(t)
-	writeTree(t, home, map[string]string{
-		".config/gh/hosts.yml": "github.com:\n    user: octocat\n    users:\n        octocat:\n            git_protocol: ssh\n",
-	})
-
-	runner := &fakeRunner{out: []byte(`{"hosts":{"github.com":[{"active":true,"login":"octocat","state":"success","scopes":"repo, read:org","tokenSource":"keyring"}]}}`)}
-	info := New(newMock(t, home)).withRunner(runner).withEnv(staticEnv(nil)).Detect(context.Background())
-
-	got, ok := findingFor(info, sourceGitHubCLIHosts)
-	if !ok {
-		t.Fatalf("no finding; errors = %+v", info.Errors)
-	}
-	if got.Protection != model.CredentialProtectionExternal {
-		t.Errorf("protection = %q, want %q for a token held outside the file", got.Protection, model.CredentialProtectionExternal)
-	}
-	if len(got.GitHub) != 1 {
-		t.Fatalf("hosts = %+v, want one per configured host", got.GitHub)
-	}
-	host := got.GitHub[0]
-	if host.Host != "github.com" || !host.Configured || host.AccountCount != 1 {
-		t.Errorf("host = %+v, want the configuration carried through", host)
-	}
-	if host.ScopeStatus != model.CredentialScopeObserved || len(host.Scopes) != 2 {
-		t.Errorf("scope status = %q with scopes %v, want %q and the comma-separated string split", host.ScopeStatus, host.Scopes, model.CredentialScopeObserved)
-	}
-	if host.CredentialStorage != "keyring" {
-		t.Errorf("storage = %q, want what the probe reported", host.CredentialStorage)
-	}
-	if runner.calls != 1 {
-		t.Fatalf("probe ran %d times, want once", runner.calls)
-	}
-	// The child reads the developer's configuration, not the agent's.
-	if runner.last.ConfigDir != filepath.Join(home, ".config", "gh") || runner.last.Username != "octocat" {
-		t.Errorf("child given %q as %q, want the developer's directory and account", runner.last.ConfigDir, runner.last.Username)
-	}
-	// A finding is never withheld because the probe was unavailable, so it must be
-	// reported as a status rather than as an error on the source.
-	if _, ok := errorFor(info, sourceGitHubCLIStatus); ok {
-		t.Errorf("errors = %+v, want the probe's outcome carried as a scope status", info.Errors)
-	}
-}
-
-// TestDetect_GitHubHostsSurviveAProbeThatCannotRun holds because the
-// configuration was read successfully; what the tool could or could not add to it
-// does not change that.
-func TestDetect_GitHubHostsSurviveAProbeThatCannotRun(t *testing.T) {
-	if runtime.GOOS == model.PlatformWindows {
-		t.Skip("the probe does not run on Windows under a service account")
-	}
-	home := testHome(t)
-	writeTree(t, home, map[string]string{".config/gh/hosts.yml": ghBody})
-
-	cases := map[string]*fakeRunner{
-		"the child failed":             {err: os.ErrDeadlineExceeded},
-		"the child produced no report": {out: []byte("unknown flag: --json\n")},
-		"the child produced nothing":   {},
-	}
-	for name, runner := range cases {
-		t.Run(name, func(t *testing.T) {
-			info := New(newMock(t, home)).withRunner(runner).withEnv(staticEnv(nil)).Detect(context.Background())
-			got, ok := findingFor(info, sourceGitHubCLIHosts)
-			if !ok {
-				t.Fatalf("no finding; errors = %+v", info.Errors)
-			}
-			if got.Protection != model.CredentialProtectionPlaintext {
-				t.Errorf("protection = %q, want the on-disk reading kept", got.Protection)
-			}
-			if len(got.GitHub) != 1 {
-				t.Fatalf("hosts = %+v, want one per configured host", got.GitHub)
-			}
-			host := got.GitHub[0]
-			if host.ScopeStatus == model.CredentialScopeObserved || len(host.Scopes) != 0 {
-				t.Errorf("scope status = %q with scopes %v, want an outcome other than observed and no scopes", host.ScopeStatus, host.Scopes)
-			}
-			// The inline token is on-disk evidence and survives regardless.
-			if host.CredentialStorage != model.CredentialStorageInlineFile {
-				t.Errorf("storage = %q, want the inline token reported", host.CredentialStorage)
-			}
-			if _, ok := errorFor(info, sourceGitHubCLIHosts); ok {
-				t.Errorf("errors = %+v, want nothing on a source that was read", info.Errors)
-			}
-		})
-	}
-}
-
-// TestDetect_ProbeDoesNotRunAsAServiceAccountOnWindows holds because privilege
-// dropping there ignores the requested account: a child started that way would
-// report the service identity's credential state as the developer's.
-func TestDetect_ProbeDoesNotRunAsAServiceAccountOnWindows(t *testing.T) {
-	home := testHome(t)
-	writeTree(t, home, map[string]string{"AppData/Roaming/GitHub CLI/hosts.yml": ghBody})
-
-	m := newMock(t, home)
-	m.SetGOOS(model.PlatformWindows)
-	m.SetIsRoot(true)
-
-	runner := &fakeRunner{out: []byte(`{"hosts":{"github.com":[{"active":true,"state":"success","scopes":"repo"}]}}`)}
-	info := New(m).withRunner(runner).withEnv(staticEnv(nil)).Detect(context.Background())
-
-	if runner.calls != 0 {
-		t.Errorf("probe ran %d times, want never", runner.calls)
-	}
-	got, ok := findingFor(info, sourceGitHubCLIHosts)
-	if !ok {
-		t.Fatalf("no finding; errors = %+v", info.Errors)
-	}
-	if got.Mode != "" {
-		t.Errorf("mode = %q, want it omitted on Windows", got.Mode)
-	}
-	if len(got.GitHub) != 1 || got.GitHub[0].ScopeStatus != model.CredentialScopeUnavailable {
-		t.Errorf("hosts = %+v, want the outcome reported as unavailable", got.GitHub)
-	}
-}
-
-// TestDetect_ProbeFollowsTheRelocatedConfiguration holds because the child is
-// pointed at a directory: at the relocated one, since that is the configuration the
-// tool reads, and at none at all when the relocation leaves the account's tree.
-//
-// The uncontained half is the one worth stating. The default directory is not a
-// fallback here even though a configuration is sitting in it: the variable is set,
-// so the tool has stopped reading that file, and reporting it would name the wrong
-// identity while asking the child about a directory the tool is not using. The
-// refusal is the whole answer, and it costs the run its completeness.
-func TestDetect_ProbeFollowsTheRelocatedConfiguration(t *testing.T) {
-	if runtime.GOOS == model.PlatformWindows {
-		t.Skip("the probe does not run on Windows under a service account")
-	}
-	status := []byte(`{"hosts":{"github.com":[{"active":true,"state":"success","scopes":"repo"}]}}`)
-
-	t.Run("outside the roots", func(t *testing.T) {
-		home := testHome(t)
-		elsewhere := testHome(t)
-		writeTree(t, elsewhere, map[string]string{"gh/hosts.yml": ghBody})
-		// The default holds a configuration of its own, so the case fails loudly if
-		// the uncontained relocation ever falls back to it.
-		writeTree(t, home, map[string]string{".config/gh/hosts.yml": "github.com:\n    user: octocat\n"})
-
-		env := staticEnv(map[string]string{"GH_CONFIG_DIR": filepath.Join(elsewhere, "gh")})
-		runner := &fakeRunner{out: status}
-		info := New(newMock(t, home)).withRunner(runner).withEnv(env).Detect(context.Background())
-
-		if got, ok := errorFor(info, sourceGitHubCLIHosts); !ok || got.ReasonCode != model.CredentialReasonRefusedOutsideRoots {
-			t.Errorf("errors = %+v, want %q", info.Errors, model.CredentialReasonRefusedOutsideRoots)
-		}
-		if f, ok := findingFor(info, sourceGitHubCLIHosts); ok {
-			t.Errorf("finding at %q: the default is not a fallback once the variable is set", f.Location)
-		}
-		if runner.calls != 0 {
-			t.Errorf("probe ran %d times against %q, want never", runner.calls, runner.last.ConfigDir)
-		}
-		if info.ScanComplete {
-			t.Error("a refused source leaves the run incomplete")
-		}
-	})
-
-	// The positive control: without it the assertion above passes even for a probe
-	// that never runs at all.
-	t.Run("inside the roots", func(t *testing.T) {
-		home := testHome(t)
-		writeTree(t, home, map[string]string{"gh-dir/hosts.yml": ghBody})
-
-		env := staticEnv(map[string]string{"GH_CONFIG_DIR": filepath.Join(home, "gh-dir")})
-		runner := &fakeRunner{out: status}
-		info := New(newMock(t, home)).withRunner(runner).withEnv(env).Detect(context.Background())
-
-		f, ok := findingFor(info, sourceGitHubCLIHosts)
-		if !ok {
-			t.Fatalf("no finding; errors = %+v", info.Errors)
-		}
-		if want := "$HOME/gh-dir/hosts.yml"; f.Location != want {
-			t.Errorf("location = %q, want %q", f.Location, want)
-		}
-		if runner.calls != 1 {
-			t.Errorf("probe ran %d times, want once for the relocated configuration", runner.calls)
-		}
-		if runner.last.ConfigDir != filepath.Join(home, "gh-dir") {
-			t.Errorf("configuration directory = %q, want the relocated one", runner.last.ConfigDir)
-		}
-	})
-}
-
 // TestDetect_WritesNothingToStandardError holds because enterprise runs tee this
 // process's standard error into a buffer that ships with the telemetry, unredacted:
 // a parser naming the file it choked on would put a credential location there.
@@ -1005,11 +903,11 @@ func TestDetect_WritesNothingToStandardError(t *testing.T) {
 	home := testHome(t)
 	writeTree(t, home, map[string]string{
 		".aws/credentials":    awsBody,
-		".docker/config.json": `{"auths":{"registry.example.com":{"auth":"` + canary,
+		".docker/config.json": `{"auths":{"registry.example.invalid":{"auth":"` + canary,
 		".kube/config":        "users: [ unterminated " + canary + "\n",
-		".npmrc":              "//registry.example.com/:_authToken=" + canary + "\n",
-		".ssh/id_ed25519":     string(opensshKey("none", "none", "ssh-ed25519", 0)),
-		".cursor/mcp.json":    `{"mcpServers":{"demo":{"env":{"API_KEY":"` + canary,
+		".npmrc":              "//registry.example.invalid/:_authToken=" + canary + "\n",
+		".ssh/id_ed25519":     string(opensshKey("none", "none", "ssh-ed25519")),
+		".ssh/id_damaged":     "-----BEGIN OPENSSH PRIVATE KEY-----\n" + canary,
 	})
 
 	captured := filepath.Join(t.TempDir(), "stderr")
@@ -1092,7 +990,7 @@ func TestRefusalReason_CarriesTheResolverVocabularyUnchanged(t *testing.T) {
 	}
 	// Anything that is not a refusal at all still has to land inside the closed set
 	// rather than travelling as a library's own message.
-	if got := refusalReason(errors.New("read /home/octocat/.aws/credentials: some library detail")); got != model.CredentialReasonLocationUnresolved {
+	if got := refusalReason(errors.New("read /home/a-user/.aws/credentials: some library detail")); got != model.CredentialReasonLocationUnresolved {
 		t.Errorf("an unrecognised error mapped to %q, want %q", got, model.CredentialReasonLocationUnresolved)
 	}
 }

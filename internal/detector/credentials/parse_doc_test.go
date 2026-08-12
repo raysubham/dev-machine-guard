@@ -1,28 +1,45 @@
 package credentials
 
 import (
+	"encoding/base64"
 	"testing"
 )
 
-// TestParseGCPADC covers the three shapes this file takes plus the one it does not
-// recognise. Classification is by which fields are present: no value is read and no
-// type string inspected, so an unknown shape resolves to unclassified.
+// TestParseGCPADC covers the shapes this file takes. One file is one credential
+// however many of its fields are filled in, so a nested inline credential is read
+// for what it settles rather than added to a count — and a material field holding
+// something that is not a string is a document this build cannot account for.
 func TestParseGCPADC(t *testing.T) {
 	runParseCases(t, parseGCPADC, []parseCase{
 		{name: "interactive login holds material", body: `{"type":"authorized_user","client_id":"id.apps.googleusercontent.com","client_secret":"value","refresh_token":"value"}`, want: obsPlain(1)},
 		{name: "service account key holds material", body: `{"type":"service_account","client_email":"svc@example.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nvalue\n-----END PRIVATE KEY-----\n"}`, want: obsPlain(1)},
-		{name: "external account points elsewhere", body: `{"type":"external_account","audience":"//iam.googleapis.com/x","credential_source":{"file":"/var/run/secrets/token"}}`, want: obsExt(1)},
 		// Impersonation carries the credential it goes through inside itself, so
 		// the material can sit one level below the fields that describe it.
-		{name: "impersonation folds the nested credential", body: `{"type":"impersonated_service_account","service_account_impersonation_url":"https://iamcredentials.googleapis.com/v1/x","source_credentials":{"type":"authorized_user","client_secret":"value","refresh_token":"value"}}`, want: obsPlain(2)},
-		// The inline test wins, so a file that names an external source and also
-		// carries a secret of its own is not described by the safer half.
-		{name: "material beside an external source is plaintext", body: `{"type":"external_account","credential_source":{"file":"/var/run/secrets/token"},"client_secret":"value"}`, want: obsPlain(1)},
-		// This file is written by an interactive login, so its presence means a
-		// credential was established even when the shape is unfamiliar.
-		{name: "unrecognised shape is unclassified rather than absent", body: `{"type":"some_future_credential_family","account":"octocat"}`, want: obsUnk(1)},
-		{name: "null and empty fields are not material", body: `{"type":"authorized_user","client_secret":null,"refresh_token":""}`, want: obsUnk(1)},
-		{name: "malformed document", body: `{"type":"authorized_user",`, want: obsUnk(1)},
+		{name: "impersonation counts the nested credential once", body: `{"type":"impersonated_service_account","service_account_impersonation_url":"https://iamcredentials.googleapis.com/v1/x","source_credentials":{"type":"authorized_user","client_secret":"value","refresh_token":"value"}}`, want: obsPlain(1)},
+		{name: "material beside an external source is still one credential", body: `{"type":"external_account","credential_source":{"file":"/var/run/secrets/token"},"client_secret":"value"}`, want: obsPlain(1)},
+		// An external account fetches its credential at run time, so nothing here
+		// is material however completely the file is filled in.
+		{name: "external account alone is not material", body: `{"type":"external_account","audience":"//iam.googleapis.com/x","credential_source":{"file":"/var/run/secrets/token"}}`, want: obsNone},
+		{name: "impersonation with no inline source is not material", body: `{"type":"impersonated_service_account","service_account_impersonation_url":"https://iamcredentials.googleapis.com/v1/x"}`, want: obsNone},
+		// The nested credential is read whether or not the outer object held one:
+		// a nested shape this build cannot account for is uncertainty the outer
+		// credential does not resolve, since the file could be carrying a second
+		// credential nothing here can see.
+		{name: "material beside a nested source of the wrong shape", body: `{"client_secret":"value","source_credentials":["a"]}`, want: alsoUnrec(obsPlain(1))},
+		{name: "material beside a nested field of the wrong type", body: `{"client_secret":"value","source_credentials":{"refresh_token":42}}`, want: alsoUnrec(obsPlain(1))},
+		{name: "a nested source that is not an object", body: `{"source_credentials":"a-name"}`, want: obsUnrec},
+		{name: "a null nested source is not a failure", body: `{"source_credentials":null}`, want: obsNone},
+		// A shape this build does not know is not a failure: the fields it reads
+		// are simply absent, and an unrelated key proves nothing either way.
+		{name: "an unfamiliar shape holds no material", body: `{"type":"some_future_credential_family","account":"a-name"}`, want: obsNone},
+		{name: "null and empty fields are not material", body: `{"type":"authorized_user","client_secret":null,"refresh_token":""}`, want: obsNone},
+		{name: "environment reference is not material", body: `{"type":"authorized_user","refresh_token":"${GOOGLE_REFRESH_TOKEN}"}`, want: obsNone},
+		// The loader reads every one of these fields as a string, so another type
+		// in one is a document this build cannot read.
+		{name: "a material field of the wrong type", body: `{"refresh_token":{"nested":true}}`, want: obsUnrec},
+		{name: "material beside a field of the wrong type", body: `{"client_secret":"value","refresh_token":["a"]}`, want: alsoUnrec(obsPlain(1))},
+		{name: "malformed document", body: `{"type":"authorized_user",`, want: obsUnrec},
+		{name: "a root that is not an object", body: "null", want: obsUnrec},
 		{name: "blank file", body: "\n", want: obsNone},
 	})
 }
@@ -33,15 +50,19 @@ func TestParseDockerConfig(t *testing.T) {
 		// carries it is material in the clear.
 		{name: "inline registry auth is plaintext", body: `{"auths":{"registry.example.com":{"auth":"dXNlcjpwYXNz"}}}`, want: obsPlain(1)},
 		{name: "identity token is material", body: `{"auths":{"registry.example.com":{"identitytoken":"value"}}}`, want: obsPlain(1)},
-		{name: "entry with no inline material is a reference", body: `{"auths":{"registry.example.com":{}},"credsStore":"desktop"}`, want: obsExt(1)},
-		{name: "default helper alone is a reference", body: `{"credsStore":"desktop"}`, want: obsExt(1)},
-		{name: "per-registry helper is a reference", body: `{"credHelpers":{"123456789012.dkr.ecr.us-east-1.amazonaws.com":"ecr-login"}}`, want: obsExt(1)},
-		// A helper for a registry that already has an entry describes the same
-		// registry, so counting both would double it.
-		{name: "helper for an already-counted registry is not a second entry", body: `{"auths":{"registry.example.com":{"auth":"dXNlcjpwYXNz"}},"credHelpers":{"registry.example.com":"ecr-login"}}`, want: obsPlain(1)},
-		{name: "registries fold to the worst state", body: `{"auths":{"a.example.com":{},"b.example.com":{"auth":"dXNlcjpwYXNz"}}}`, want: obsPlain(2)},
+		{name: "one registry with both fields counts once", body: `{"auths":{"registry.example.com":{"auth":"dXNlcjpwYXNz","identitytoken":"value"}}}`, want: obsPlain(1)},
+		{name: "registries count separately", body: `{"auths":{"a.example.com":{"auth":"b25l"},"b.example.com":{"auth":"dHdv"}}}`, want: obsPlain(2)},
+		// A helper holds the secret somewhere this file does not reach, so none of
+		// these is a credential in it.
+		{name: "entry with no inline material", body: `{"auths":{"registry.example.com":{}},"credsStore":"desktop"}`, want: obsNone},
+		{name: "default helper alone", body: `{"credsStore":"desktop"}`, want: obsNone},
+		{name: "per-registry helper alone", body: `{"credHelpers":{"registry.example.com":"ecr-login"}}`, want: obsNone},
+		{name: "empty auth entry", body: `{"auths":{"registry.example.com":{"auth":""}}}`, want: obsNone},
 		{name: "configuration with no credential statement", body: `{"currentContext":"desktop-linux"}`, want: obsNone},
-		{name: "malformed document", body: `{"auths":`, want: obsUnk(1)},
+		{name: "malformed document", body: `{"auths":`, want: obsUnrec},
+		// A document with no mapping at its root is not this file's shape, and
+		// reading it as an object with no fields would call the file clean.
+		{name: "a root that is not an object", body: "null", want: obsUnrec},
 		{name: "blank file", body: "\n", want: obsNone},
 	})
 }
@@ -49,228 +70,80 @@ func TestParseDockerConfig(t *testing.T) {
 func TestParseTerraformCredentials(t *testing.T) {
 	runParseCases(t, parseTerraformCredentials, []parseCase{
 		{name: "host token", body: `{"credentials":{"app.terraform.io":{"token":"value"}}}`, want: obsPlain(1)},
-		{name: "hosts count separately", body: `{"credentials":{"app.terraform.io":{"token":"value"},"tfe.example.com":{"token":"value"}}}`, want: obsPlain(2)},
-		{name: "empty token is not a credential", body: `{"credentials":{"app.terraform.io":{"token":""}}}`, want: obsNone},
-		// Unlike the cloud login file, this one also holds unrelated settings, so
-		// its presence alone is not evidence that a token was ever stored.
+		{name: "hosts count separately", body: `{"credentials":{"app.terraform.io":{"token":"one"},"tfe.example.com":{"token":"two"}}}`, want: obsPlain(2)},
+		{name: "empty token is not material", body: `{"credentials":{"app.terraform.io":{"token":""}}}`, want: obsNone},
+		{name: "environment reference is not material", body: `{"credentials":{"app.terraform.io":{"token":"${TF_TOKEN}"}}}`, want: obsNone},
+		// Unrelated settings live here too, so the file's presence alone is not
+		// evidence that a token was ever stored.
 		{name: "valid document with no credentials block", body: `{"unrelated":true}`, want: obsNone},
-		{name: "malformed document", body: `{"credentials":`, want: obsUnk(1)},
+		{name: "malformed document", body: `{"credentials":`, want: obsUnrec},
+		{name: "a root that is not an object", body: "null", want: obsUnrec},
 		{name: "blank file", body: "\n", want: obsNone},
 	})
 }
 
-func TestJSONFieldSet(t *testing.T) {
-	obj, ok := decodeJSONObject([]byte(`{"filled":"value","empty":"","nulled":null,"zero":0,"object":{}}`))
-	if !ok {
-		t.Fatal("document must decode")
-	}
-	tests := []struct {
-		field string
-		want  bool
-	}{
-		{"filled", true},
-		// A tool writes an empty or null field to mean "no value here", so treating
-		// either as material would report a credential the developer does not have.
-		{"empty", false},
-		{"nulled", false},
-		{"missing", false},
-		{"zero", true},
-		{"object", true},
-	}
-	for _, tt := range tests {
-		if got := jsonFieldSet(obj, tt.field); got != tt.want {
-			t.Errorf("jsonFieldSet(%q) = %v, want %v", tt.field, got, tt.want)
-		}
-	}
-}
-
+// TestParseGitHubCLIHosts counts only tokens written into the file. The usual
+// arrangement keeps the token in an OS keystore, which is not material in any
+// file this agent reads — and nothing here asks the CLI what it holds.
 func TestParseGitHubCLIHosts(t *testing.T) {
-	tests := []struct {
-		name  string
-		body  string
-		want  observation
-		hosts []githubHostConfig
-	}{
-		{
-			name: "inline token",
-			body: "github.com:\n    users:\n        octocat:\n            oauth_token: value\n    oauth_token: value\n    user: octocat\n",
-			want: obsPlain(1),
-			hosts: []githubHostConfig{
-				{Host: "github.com", AccountCount: 1, InlineToken: true},
-			},
-		},
-		{
-			// The usual arrangement keeps the token in an OS keystore this file
-			// cannot show, so no inline token is a reference, not an absence.
-			name: "no inline token",
-			body: "github.com:\n    users:\n        octocat:\n            git_protocol: ssh\n    user: octocat\n",
-			want: obsExt(1),
-			hosts: []githubHostConfig{
-				{Host: "github.com", AccountCount: 1, InlineToken: false},
-			},
-		},
-		{
-			name: "token on an account rather than the host",
-			body: "github.com:\n    users:\n        octocat:\n            oauth_token: value\n        hubot:\n            git_protocol: https\n    user: octocat\n",
-			want: obsPlain(1),
-			hosts: []githubHostConfig{
-				{Host: "github.com", AccountCount: 2, InlineToken: true},
-			},
-		},
-		{
-			// Hosts come out of a map, so a stable order is what keeps two scans of an
-			// unchanged machine from looking like a change.
-			name: "hosts fold and sort",
-			body: "github.com:\n    user: octocat\n    oauth_token: value\nghe.example.com:\n    user: octocat\n",
-			want: obsPlain(2),
-			hosts: []githubHostConfig{
-				{Host: "ghe.example.com", AccountCount: 1, InlineToken: false},
-				{Host: "github.com", AccountCount: 1, InlineToken: true},
-			},
-		},
-		{name: "blank file", body: "\n", want: obsNone},
+	runParseCases(t, parseGitHubCLIHosts, []parseCase{
+		{name: "inline token on the host", body: "example.invalid:\n    oauth_token: value\n    user: a-user\n", want: obsPlain(1)},
+		{name: "inline token on an account", body: "example.invalid:\n    users:\n        a-user:\n            oauth_token: value\n", want: obsPlain(1)},
+		// One host is one credential however many of its accounts carry a token.
+		{name: "several accounts on one host count once", body: "example.invalid:\n    users:\n        a-user:\n            oauth_token: one\n        b-user:\n            oauth_token: two\n", want: obsPlain(1)},
+		{name: "hosts count separately", body: "a.invalid:\n    oauth_token: one\nb.invalid:\n    oauth_token: two\n", want: obsPlain(2)},
+		{name: "keyring-backed host holds no material", body: "example.invalid:\n    user: a-user\n    git_protocol: ssh\n", want: obsNone},
+		{name: "accounts without tokens hold no material", body: "example.invalid:\n    users:\n        a-user:\n            git_protocol: ssh\n", want: obsNone},
+		{name: "empty token is not material", body: "example.invalid:\n    oauth_token: \"\"\n", want: obsNone},
 		{name: "valid document with no hosts", body: "{}\n", want: obsNone},
-		{name: "malformed document", body: "github.com:\n  - this is a list where a map belongs\n", want: obsUnk(1)},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, hosts := parseGitHubCLIHosts([]byte(tt.body))
-			if got != tt.want {
-				t.Errorf("observation = %+v, want %+v", got, tt.want)
-			}
-			if len(hosts) != len(tt.hosts) {
-				t.Fatalf("hosts = %+v, want %+v", hosts, tt.hosts)
-			}
-			for i := range hosts {
-				if hosts[i] != tt.hosts[i] {
-					t.Errorf("host %d = %+v, want %+v", i, hosts[i], tt.hosts[i])
-				}
-			}
-		})
-	}
+		{name: "blank file", body: "\n", want: obsNone},
+		{name: "malformed document", body: "example.invalid:\n  - this is a list where a map belongs\n", want: obsUnrec},
+		{name: "a root that is not a mapping", body: "null\n", want: obsUnrec},
+	})
 }
 
 func TestParseKubeconfig(t *testing.T) {
 	runParseCases(t, parseKubeconfig, []parseCase{
 		{name: "embedded token", body: "users:\n  - name: dev\n    user:\n      token: value\n", want: obsPlain(1)},
-		{name: "embedded key material", body: "users:\n  - name: dev\n    user:\n      client-key-data: dmFsdWU=\n", want: obsPlain(1)},
-		{name: "basic password", body: "users:\n  - name: dev\n    user:\n      username: octocat\n      password: value\n", want: obsPlain(1)},
-		{name: "token file is a reference", body: "users:\n  - name: dev\n    user:\n      tokenFile: /var/run/secrets/token\n", want: obsExt(1)},
-		{name: "key path is a reference", body: "users:\n  - name: dev\n    user:\n      client-certificate: /home/octocat/.kube/client.crt\n      client-key: /home/octocat/.kube/client.key\n", want: obsExt(1)},
-		{name: "credential plugin is a reference", body: "users:\n  - name: dev\n    user:\n      exec:\n        command: aws\n        args: [eks, get-token]\n", want: obsExt(1)},
-		{name: "identity provider is a reference", body: "users:\n  - name: dev\n    user:\n      auth-provider:\n        name: oidc\n", want: obsExt(1)},
-		// The public half authenticates nothing without its key, so it is not an
-		// entry at all.
-		{name: "certificate alone is not a credential", body: "users:\n  - name: dev\n    user:\n      client-certificate: /home/octocat/.kube/client.crt\n", want: obsNone},
-		{name: "entries fold to the worst state", body: "users:\n  - name: a\n    user:\n      tokenFile: /var/run/secrets/token\n  - name: b\n    user:\n      token: value\n", want: obsPlain(2)},
+		{name: "basic password", body: "users:\n  - name: dev\n    user:\n      username: a-user\n      password: value\n", want: obsPlain(1)},
+		{name: "embedded key material", body: "users:\n  - name: dev\n    user:\n      client-key-data: " + base64PEM(testECPrivateKeyPEM()) + "\n", want: obsPlain(1)},
+		// The embedded key is the one place this format can hold material that is
+		// present without being usable, so the protection travels from the key.
+		{name: "embedded encrypted key material", body: "users:\n  - name: dev\n    user:\n      client-key-data: " + base64PEM(testEncryptedPKCS8PEM()) + "\n", want: obsProt(1)},
+		{name: "entries count separately", body: "users:\n  - name: a\n    user:\n      token: one\n  - name: b\n    user:\n      token: two\n", want: obsPlain(2)},
+		// Each of these names material fetched at run time, so none is a
+		// credential in this document.
+		{name: "token file is not material", body: "users:\n  - name: dev\n    user:\n      tokenFile: /var/run/secrets/token\n", want: obsNone},
+		{name: "key path is not material", body: "users:\n  - name: dev\n    user:\n      client-certificate: /home/a-user/.kube/client.crt\n      client-key: /home/a-user/.kube/client.key\n", want: obsNone},
+		{name: "credential plugin is not material", body: "users:\n  - name: dev\n    user:\n      exec:\n        command: aws\n        args: [eks, get-token]\n", want: obsNone},
+		{name: "identity provider is not material", body: "users:\n  - name: dev\n    user:\n      auth-provider:\n        name: oidc\n", want: obsNone},
+		// The public half authenticates nothing without its key.
+		{name: "certificate alone is not material", body: "users:\n  - name: dev\n    user:\n      client-certificate: /home/a-user/.kube/client.crt\n", want: obsNone},
+		{name: "environment reference is not material", body: "users:\n  - name: dev\n    user:\n      token: ${KUBE_TOKEN}\n", want: obsNone},
 		{name: "clusters with no user entries", body: "clusters:\n  - name: dev\n    cluster:\n      server: https://cluster.example.com\n", want: obsNone},
 		{name: "blank file", body: "\n", want: obsNone},
-		{name: "malformed document", body: "users: [ unterminated\n", want: obsUnk(1)},
+		{name: "malformed document", body: "users: [ unterminated\n", want: obsUnrec},
+		{name: "a root that is not a mapping", body: "null\n", want: obsUnrec},
+		// This field is declared to hold a private key, so anything else in it is
+		// a document this build cannot account for — even bytes that would be
+		// ignored harmlessly as a file in the key directory.
+		{name: "embedded key data that is not base64", body: "users:\n  - name: dev\n    user:\n      client-key-data: not-base64!!\n", want: obsUnrec},
+		{name: "embedded key data that is not a key", body: "users:\n  - name: dev\n    user:\n      client-key-data: " + base64.StdEncoding.EncodeToString([]byte("not a key at all")) + "\n", want: obsUnrec},
+		{name: "embedded public key is not material", body: "users:\n  - name: dev\n    user:\n      client-key-data: " + base64PEM(testCertificatePEM()) + "\n", want: obsUnrec},
+		// Mixed users: the inline credential counts and the unreadable sibling
+		// still costs the source its completeness.
+		{name: "inline material beside unreadable key data", body: "users:\n  - name: a\n    user:\n      token: value\n  - name: b\n    user:\n      client-key-data: not-base64!!\n", want: alsoUnrec(obsPlain(1))},
+		// Every field of an entry is read: a token beside key data that will not
+		// parse answers nothing about the key, and letting it stand in would
+		// report the entry as fully understood.
+		{name: "one entry holding both a token and unreadable key data", body: "users:\n  - name: dev\n    user:\n      token: value\n      client-key-data: not-base64!!\n", want: alsoUnrec(obsPlain(1))},
+		// The worst protection in an entry describes it, the same way the fold
+		// over a whole source does.
+		{name: "a token beside an encrypted key counts once as plaintext", body: "users:\n  - name: dev\n    user:\n      token: value\n      client-key-data: " + base64PEM(testEncryptedPKCS8PEM()) + "\n", want: obsPlain(1)},
 	})
 }
 
-func TestParseMCPConfig(t *testing.T) {
-	tests := []struct {
-		name string
-		path string
-		body string
-		want observation
-	}{
-		{name: "inline environment secret", path: "mcp.json", body: `{"mcpServers":{"demo":{"command":"npx","env":{"GITHUB_TOKEN":"value"}}}}`, want: obsPlain(1)},
-		{name: "environment reference defers the secret", path: "mcp.json", body: `{"mcpServers":{"demo":{"command":"npx","env":{"GITHUB_TOKEN":"${GH_PAT}"}}}}`, want: obsExt(1)},
-		{name: "remote server header", path: "mcp.json", body: `{"mcpServers":{"remote":{"url":"https://mcp.example.com","headers":{"Authorization":"Bearer value"}}}}`, want: obsPlain(1)},
-		// A configured tool handed no credential is not a credential location, so
-		// counting it would inflate the inventory with entries holding nothing.
-		{name: "server with no credential is not an entry", path: "mcp.json", body: `{"mcpServers":{"demo":{"command":"npx","args":["-y","server"],"env":{"LOG_LEVEL":"debug"}}}}`, want: obsNone},
-		// A server is one entry however many credentials it was given, and its own
-		// fold collapses to the worst of them.
-		{name: "several credentials on one server are one entry", path: "mcp.json", body: `{"mcpServers":{"demo":{"env":{"API_KEY":"${FROM_ENV}","GITHUB_TOKEN":"value"}}}}`, want: obsPlain(1)},
-		{name: "servers count separately", path: "mcp.json", body: `{"mcpServers":{"a":{"env":{"API_KEY":"value"}},"b":{"env":{"API_KEY":"${FROM_ENV}"}}}}`, want: obsPlain(2)},
-		// The tools that write these files spell the server map differently, and
-		// all the spellings are checked in every document.
-		{name: "alternate map key", path: "mcp.json", body: `{"servers":{"demo":{"env":{"API_KEY":"value"}}}}`, want: obsPlain(1)},
-		{name: "editor settings spelling", path: "settings.json", body: `{"context_servers":{"demo":{"env":{"API_KEY":"value"}}}}`, want: obsPlain(1)},
-		// These files are documented as accepting comments and trailing commas, so a
-		// strict decoder would report a fully configured machine as having none.
-		{name: "comments and trailing commas", path: "mcp.json", body: "{\n  // the server we use\n  \"mcpServers\": {\n    \"demo\": {\"env\": {\"API_KEY\": \"value\"},},\n  },\n}", want: obsPlain(1)},
-		{name: "toml serialisation", path: "config.toml", body: "[mcp_servers.demo]\ncommand = \"run\"\n\n[mcp_servers.demo.env]\nAPI_KEY = \"value\"\n", want: obsPlain(1)},
-		{name: "yaml serialisation", path: "config.yaml", body: "mcpServers:\n  demo:\n    env:\n      API_KEY: value\n", want: obsPlain(1)},
-		// One tool keeps per-directory definitions inside the user-level file.
-		// Reading them reads the file already opened; no directory is visited.
-		{name: "per-directory definitions inside the same file", path: "config.json", body: `{"projects":{"/home/octocat/work":{"mcpServers":{"demo":{"env":{"API_KEY":"value"}}}}}}`, want: obsPlain(1)},
-		{name: "user-level and per-directory definitions both count", path: "config.json", body: `{"mcpServers":{"a":{"env":{"API_KEY":"${FROM_ENV}"}}},"projects":{"/w":{"mcpServers":{"b":{"env":{"API_KEY":"value"}}}}}}`, want: obsPlain(2)},
-		{name: "valid document with no servers", path: "settings.json", body: `{"theme":"dark"}`, want: obsNone},
-		{name: "blank file", path: "mcp.json", body: "\n", want: obsNone},
-		{name: "malformed document", path: "mcp.json", body: `{"mcpServers":`, want: obsUnk(1)},
-		// A file whose serialisation this build cannot read is reported as
-		// unclassified rather than as holding nothing.
-		{name: "extension with no decoder", path: "config.hcl", body: `mcp_servers { demo { env = { API_KEY = "value" } } }`, want: obsUnk(1)},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := parseMCPConfig(tt.path, []byte(tt.body)); got != tt.want {
-				t.Errorf("got %+v, want %+v", got, tt.want)
-			}
-		})
-	}
-}
-
-// TestIsCredentialSettingName matches on the slot a setting occupies, never on what
-// the value looks like: that would mean classifying a secret by its contents.
-func TestIsCredentialSettingName(t *testing.T) {
-	tests := map[string]bool{
-		"GITHUB_TOKEN":      true,
-		"github_token":      true,
-		"API_KEY":           true,
-		"APIKEY":            true,
-		"api-key":           true,
-		"X-Api-Key":         true,
-		"Authorization":     true,
-		"AWS_SECRET_KEY":    true,
-		"DB_PASSWORD":       true,
-		"PASSWD":            true,
-		"AWS_ACCESS_KEY_ID": true,
-		"PRIVATE_KEY_PATH":  true,
-		"CREDENTIALS_FILE":  true,
-		"LOG_LEVEL":         false,
-		"HOME":              false,
-		"Content-Type":      false,
-		"NODE_ENV":          false,
-		"":                  false,
-	}
-	for name, want := range tests {
-		if got := isCredentialSettingName(name); got != want {
-			t.Errorf("isCredentialSettingName(%q) = %v, want %v", name, got, want)
-		}
-	}
-}
-
-func TestClassifyMCPServer_NonStringSettingsAreSkipped(t *testing.T) {
-	server := map[string]any{
-		"env": map[string]any{
-			"API_KEY":     nil,
-			"OTHER_TOKEN": 42,
-			"EMPTY_TOKEN": "",
-		},
-	}
-	if state, found := classifyMCPServer(server); found {
-		t.Errorf("classified %q, want no credential found", state)
-	}
-}
-
-func TestDecodeConfigDocument_FormatByExtension(t *testing.T) {
-	if _, ok := decodeConfigDocument("x.jsonc", []byte("{\n// comment\n\"a\":1}")); !ok {
-		t.Error("the tolerant reader must accept comments")
-	}
-	if _, ok := decodeConfigDocument("x.yml", []byte("a: 1\n")); !ok {
-		t.Error(".yml must decode")
-	}
-	if _, ok := decodeConfigDocument("x.toml", []byte("a = 1\n")); !ok {
-		t.Error(".toml must decode")
-	}
-	if _, ok := decodeConfigDocument("x.ini", []byte("a = 1\n")); ok {
-		t.Error("an extension with no decoder must not report success")
-	}
+// base64PEM encodes a PEM document the way a kubeconfig embeds one.
+func base64PEM(pem []byte) string {
+	return base64.StdEncoding.EncodeToString(pem)
 }

@@ -286,34 +286,6 @@ func TestCandidatesFor(t *testing.T) {
 	}
 }
 
-func TestApplyPrefixOverrides(t *testing.T) {
-	home := filepath.Join(string(filepath.Separator), "home", "octocat")
-	paths := newUserPaths("octocat", home, model.PlatformLinux)
-	s := sourceByID(t, sourceMCPConfig)
-	relocated := filepath.Join(string(filepath.Separator), "opt", "claude")
-
-	declared := filepath.Join(home, ".claude", "settings.json")
-	got, rewritten := applyPrefixOverrides(declared, s, paths, map[string]string{"CLAUDE_CONFIG_DIR": relocated})
-	if got != filepath.Join(relocated, "settings.json") {
-		t.Errorf("path = %q, want the leading directory replaced", got)
-	}
-	// The caller reads a rewritten path through the guard rather than as a targeted
-	// read, so saying a variable moved it is as load-bearing as where it moved to.
-	if !rewritten {
-		t.Error("rewritten = false for a path a variable relocated")
-	}
-
-	// A path the variable does not govern is returned untouched.
-	other := filepath.Join(home, ".cursor", "mcp.json")
-	if got, rewritten := applyPrefixOverrides(other, s, paths, map[string]string{"CLAUDE_CONFIG_DIR": relocated}); got != other || rewritten {
-		t.Errorf("path = %q (rewritten=%v), want it unchanged", got, rewritten)
-	}
-	// An unset variable relocates nothing.
-	if got, rewritten := applyPrefixOverrides(declared, s, paths, nil); got != declared || rewritten {
-		t.Errorf("path = %q (rewritten=%v), want it unchanged", got, rewritten)
-	}
-}
-
 func sourceByID(t *testing.T, id string) source {
 	t.Helper()
 	for _, s := range sources {
@@ -447,18 +419,32 @@ func TestCatalog_Invariants(t *testing.T) {
 		}
 	})
 
-	t.Run("ids are unique and distinct from the status source", func(t *testing.T) {
-		seen := map[string]bool{}
-		for _, s := range sources {
-			if seen[s.ID] {
-				t.Errorf("duplicate source id %q", s.ID)
-			}
-			seen[s.ID] = true
+	// The exact list, not a count: a source added without approval, or one
+	// quietly dropped, both have to fail here rather than in a customer's payload.
+	t.Run("the catalog is exactly the approved sources", func(t *testing.T) {
+		want := []string{
+			sourceAWSCredentials, sourceAWSConfig, sourceGCPADC,
+			sourceSSHPrivateKeys, sourceGitCredentials, sourceNetrc,
+			sourceGitHubCLIHosts, sourceNPMRC, sourcePypirc,
+			sourceDockerConfig, sourceKubeconfig,
+			sourceTerraformCredentials, sourceVaultToken,
 		}
-		// The GitHub CLI status collector reports through the hosts finding, so
-		// a table entry for it would produce a finding row that must not exist.
-		if seen[sourceGitHubCLIStatus] {
-			t.Errorf("%s must not be a table entry", sourceGitHubCLIStatus)
+		got := make([]string, 0, len(sources))
+		for _, s := range sources {
+			got = append(got, s.ID)
+		}
+		slices.Sort(got)
+		slices.Sort(want)
+		if !slices.Equal(got, want) {
+			t.Errorf("catalog = %v, want %v", got, want)
+		}
+		// Names retired with the reference-only inventory. Each described a
+		// configured mechanism rather than material in a file, so a table entry
+		// under any of them would put back the findings this catalog removed.
+		for _, retired := range []string{"gitconfig_helper", "github_cli_status", "mcp_config"} {
+			if slices.Contains(got, retired) {
+				t.Errorf("%s must not be a table entry", retired)
+			}
 		}
 	})
 
@@ -468,7 +454,6 @@ func TestCatalog_Invariants(t *testing.T) {
 			model.CredentialCategorySourceControl:  true,
 			model.CredentialCategoryPackageReg:     true,
 			model.CredentialCategoryContainers:     true,
-			model.CredentialCategoryAIMCP:          true,
 			model.CredentialCategoryInfrastructure: true,
 		}
 		for _, s := range sources {
@@ -478,19 +463,12 @@ func TestCatalog_Invariants(t *testing.T) {
 		}
 	})
 
-	// A source that reads without a bound. The stat-only source is the
-	// deliberate exception: it opens nothing, so it has no bytes to cap.
-	t.Run("every reading source has a cap", func(t *testing.T) {
+	// Every source opens a file now, including the one whose whole contents are
+	// the credential, so there is no mode left that may go without a bound.
+	t.Run("every source has a cap", func(t *testing.T) {
 		for _, s := range sources {
-			switch s.Mode {
-			case readStat:
-				if s.MaxBytes != 0 {
-					t.Errorf("%s: stat-only source declares a byte cap", s.ID)
-				}
-			default:
-				if s.MaxBytes <= 0 {
-					t.Errorf("%s: reads bytes with no cap", s.ID)
-				}
+			if s.MaxBytes <= 0 {
+				t.Errorf("%s: reads bytes with no cap", s.ID)
 			}
 		}
 	})
@@ -499,9 +477,6 @@ func TestCatalog_Invariants(t *testing.T) {
 	// location on any platform, or a Windows-only spelling and no unix one.
 	t.Run("every source resolves somewhere", func(t *testing.T) {
 		for _, s := range sources {
-			if s.Mode == readDelegated {
-				continue
-			}
 			for _, plat := range []string{model.PlatformDarwin, model.PlatformLinux, model.PlatformWindows} {
 				if !s.applies(plat) {
 					t.Errorf("%s: no location on %s", s.ID, plat)
@@ -533,9 +508,9 @@ func TestCatalog_Invariants(t *testing.T) {
 		declared := map[string]bool{}
 		for _, s := range sources {
 			declared[s.ID] = true
-			// Two modes classify without a parser: one from metadata alone, the
-			// other by the key classifier the directory listing drives.
-			if s.Mode == readStat || s.Mode == readKeyDir {
+			// One mode classifies without a parser: the key directory, whose
+			// entries go through the private-key validator instead.
+			if s.Mode == readKeyDir {
 				continue
 			}
 			if parsers[s.ID] == nil {
@@ -545,18 +520,6 @@ func TestCatalog_Invariants(t *testing.T) {
 		for id := range parsers {
 			if !declared[id] {
 				t.Errorf("parser %q matches no catalog source", id)
-			}
-		}
-	})
-
-	// A prefix override applies where paths arrive from elsewhere. On a source that
-	// resolves its own location it would be read from the environment and do nothing.
-	t.Run("prefix overrides only on delegated sources", func(t *testing.T) {
-		for _, s := range sources {
-			for _, o := range s.Overrides {
-				if o.Kind == overridePrefix && s.Mode != readDelegated {
-					t.Errorf("%s: prefix override %q has no effect on a %s source", s.ID, o.Var, s.Mode)
-				}
 			}
 		}
 	})

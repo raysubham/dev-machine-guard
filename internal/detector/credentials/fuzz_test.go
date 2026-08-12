@@ -6,31 +6,29 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/model"
 )
 
-// validProtections is the closed vocabulary a parser may resolve to. Anything else
+// materialProtections is the closed vocabulary a finding may carry. Anything else
 // reaches the wire as a value no reader knows how to render.
-var validProtections = map[string]bool{
+var materialProtections = map[string]bool{
 	model.CredentialProtectionPlaintext: true,
 	model.CredentialProtectionProtected: true,
-	model.CredentialProtectionExternal:  true,
-	model.CredentialProtectionUnknown:   true,
 }
 
 // checkObservation asserts the invariants every parser owes its caller, whatever
-// it was handed.
+// it was handed. The two directions matter equally: a count with no protection
+// would reach a reader as a credential it cannot render, and a protection with no
+// count would be a state describing nothing.
 func checkObservation(t *testing.T, sourceID string, obs observation) {
 	t.Helper()
 	switch {
 	case obs.Count < 0:
 		t.Errorf("%s: negative count %d", sourceID, obs.Count)
 	case obs.Count == 0:
-		// Nothing found is the one case with no protection state: there is nothing
-		// for a state to describe.
 		if obs.Protection != "" {
 			t.Errorf("%s: empty observation carries protection %q", sourceID, obs.Protection)
 		}
 	default:
-		if !validProtections[obs.Protection] {
-			t.Errorf("%s: count %d carries protection %q, which is not a model value", sourceID, obs.Count, obs.Protection)
+		if !materialProtections[obs.Protection] {
+			t.Errorf("%s: count %d carries protection %q, which is not a material state", sourceID, obs.Count, obs.Protection)
 		}
 	}
 }
@@ -54,14 +52,17 @@ func FuzzParseSource(f *testing.F) {
 		`{`,
 		`{"credentials":{"h":{"token":"v"}}}`,
 		`{"type":"authorized_user","client_secret":"v"}`,
+		`{"refresh_token":{"wrong":"type"}}`,
 		"users:\n  - user:\n      token: v\n",
-		"github.com:\n    oauth_token: v\n",
-		"machine example.com login u password p\n",
+		"users:\n  - user:\n      client-key-data: dmFsdWU=\n",
+		"example.invalid:\n    oauth_token: v\n",
+		"machine example.invalid login u password p\n",
 		"macdef x\n",
-		"https://u:p@example.com\n",
+		"machine example.invalid login password p\n",
+		"https://u:p@example.invalid\n",
+		"https://u:p@\n",
 		"//r/:_authToken=v\n",
-		"[credential]\n\thelper = store\n",
-		`{"mcpServers":{"d":{"env":{"API_KEY":"v"}}}}`,
+		"${VAULT_TOKEN}\n",
 		"\x00\x00\x00\x00",
 		"\r\n\r\n",
 	}
@@ -71,65 +72,19 @@ func FuzzParseSource(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		for _, s := range sources {
-			if s.Mode == readStat {
-				// That source is classified from its metadata; it has no parser to
-				// drive because it never opens the file.
+			if s.Mode == readKeyDir {
+				// That source is classified by the key validator the directory
+				// listing drives, not through the dispatch; it is driven below.
 				continue
 			}
-			obs, hosts := parseSource(s, "config.json", data)
-			checkObservation(t, s.ID, obs)
-			for _, h := range hosts {
-				if h.AccountCount < 0 {
-					t.Errorf("%s: negative account count for a host", s.ID)
-				}
-			}
+			checkObservation(t, s.ID, parseSource(s, data))
 		}
-		// The key classifier is reached through the directory listing rather than
-		// the dispatch, so it is driven directly.
-		if state, isKey := classifySSHKey(data); isKey && !validProtections[state] {
-			t.Errorf("ssh: key classified %q, which is not a model value", state)
-		}
-	})
-}
-
-// FuzzParseGHStatus drives the one parser whose input is another program's output.
-// That shape has changed across releases, so unfamiliar input is the expected case.
-func FuzzParseGHStatus(f *testing.F) {
-	seeds := []string{
-		"",
-		"{}",
-		`{"hosts":{}}`,
-		`{"hosts":{"github.com":[{"active":true,"state":"success","scopes":"repo,read:org"}]}}`,
-		`{"hosts":{"github.com":{"active":true,"state":"error"}}}`,
-		`{"hosts":{"github.com":"a string where a record belongs"}}`,
-		`{"hosts":[]}`,
-		"unknown flag: --json\n",
-	}
-	for _, seed := range seeds {
-		f.Add([]byte(seed))
-	}
-
-	f.Fuzz(func(t *testing.T, data []byte) {
-		byHost, ok := parseGHStatus(data)
-		if !ok {
-			if byHost != nil {
-				t.Error("a failed parse must return no hosts")
-			}
-			return
-		}
-		configs := []githubHostConfig{{Host: "github.com", AccountCount: 1}}
-		for _, report := range githubHostReports(configs, byHost, model.CredentialScopeUnavailable) {
-			if report.ScopeStatus == "" {
-				t.Error("scopes must never travel without a status")
-			}
-			if len(report.Scopes) > 0 && report.ScopeStatus != model.CredentialScopeObserved {
-				t.Errorf("scopes %v reported with status %q", report.Scopes, report.ScopeStatus)
-			}
-			for _, scope := range report.Scopes {
-				if scope == "" {
-					t.Error("an empty scope reached the wire")
-				}
-			}
+		state, material, _ := classifySSHKey(data)
+		switch {
+		case material && !materialProtections[state]:
+			t.Errorf("ssh: key classified %q, which is not a material state", state)
+		case !material && state != "":
+			t.Errorf("ssh: no material found but protection %q was reported", state)
 		}
 	})
 }

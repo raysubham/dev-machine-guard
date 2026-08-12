@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/step-security/dev-machine-guard/internal/detector"
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/safepath"
@@ -27,22 +26,21 @@ type userEnv struct {
 	Unresolved map[string]bool
 }
 
-// Detector inventories the developer's credential locations.
+// Detector inventories the developer's credential locations. No tool is ever
+// asked what credentials it holds: every finding comes from bytes in a file at a
+// path the catalog names, so a tool's own account of a secret it keeps elsewhere
+// is not this inventory's evidence and not its business to ask for. The one
+// command a run makes is the environment probe, which reads the variables that
+// move those paths and is told nothing about what is being looked for.
 type Detector struct {
 	exec    executor.Executor
 	skipper *tcc.Skipper
-	runner  ghRunner
 	readEnv envProbe
-	mcp     *detector.MCPDetector
 }
 
 // New builds a detector.
 func New(exec executor.Executor) *Detector {
-	d := &Detector{
-		exec:   exec,
-		runner: execRunner{},
-		mcp:    detector.NewMCPDetector(exec),
-	}
+	d := &Detector{exec: exec}
 	d.readEnv = d.resolveEnv
 	return d
 }
@@ -50,13 +48,6 @@ func New(exec executor.Executor) *Detector {
 // WithSkipper attaches the consent guard. A nil skipper is a no-op.
 func (d *Detector) WithSkipper(s *tcc.Skipper) *Detector {
 	d.skipper = s
-	return d
-}
-
-// withRunner replaces the program runner. Tests use it to exercise the fence
-// around the one child process this phase starts.
-func (d *Detector) withRunner(r ghRunner) *Detector {
-	d.runner = r
 	return d
 }
 
@@ -107,26 +98,22 @@ func (d *Detector) Detect(ctx context.Context) *model.CredentialScanInfo {
 	}
 	paths = paths.withXDGConfig(env.Values["XDG_CONFIG_HOME"])
 
-	// Two resolvers, differing only in whether the consent guard applies. The
-	// guarded one is the default and runs before the first syscall on every path,
-	// on every hop of every symlink along it. That ordering is the mitigation and
-	// there is no other: a read that blocks on a consent prompt does not observe
-	// the phase deadline, so the only way not to hang is not to make the call. The
-	// targeted one is for locations this agent's own policy declines wholesale
-	// while the platform does not gate reading them; containment still applies.
+	// One resolver for every read. The consent guard runs before the first syscall
+	// on every path, on every hop of every symlink along it. That ordering is the
+	// mitigation and there is no other: a read that blocks on a consent prompt does
+	// not observe the phase deadline, so the only way not to hang is not to make
+	// the call.
 	guarded := safepath.New(paths.Home, d.consentGuard())
-	targeted := safepath.New(paths.Home, nil)
 
 	scan := &scanState{
-		info:          info,
-		paths:         paths,
-		env:           env,
-		envOK:         envOK,
-		platform:      d.exec.GOOS(),
-		guarded:       guarded,
-		targeted:      targeted,
-		cappedSources: map[string]bool{},
-		gitRepos:      map[string]bool{},
+		info:     info,
+		paths:    paths,
+		env:      env,
+		envOK:    envOK,
+		platform: d.exec.GOOS(),
+		guarded:  guarded,
+		reported: map[string]bool{},
+		gitRepos: map[string]bool{},
 	}
 
 	for _, s := range sources {
@@ -157,11 +144,12 @@ type scanState struct {
 	envOK    bool
 	platform string
 	guarded  *safepath.Resolver
-	targeted *safepath.Resolver
 	capped   bool
-	// Which sources have already reported a cap, so a bound that bites
-	// repeatedly contributes one entry rather than one per item.
-	cappedSources map[string]bool
+	// Which source-and-reason pairs have already been recorded, for the
+	// conditions that hold per item of a listing rather than per source. An
+	// error names only its source, so repeating one describes nothing further
+	// and spends the error budget a genuinely different failure needs.
+	reported map[string]bool
 	// Per directory, whether it sits inside a working tree. Every key in one
 	// directory shares the answer, and the walk that establishes it costs one
 	// lstat per level up to the home.
@@ -206,39 +194,12 @@ func (d *Detector) collectSource(ctx context.Context, scan *scanState, s source)
 		scan.addError(s.ID, model.CredentialReasonLocationUnresolved)
 	}
 
-	if s.Mode == readDelegated {
-		d.collectDelegated(ctx, scan, s)
-		return
-	}
-
 	for _, c := range candidatesFor(s, scan.paths, scan.env.Values, scan.platform) {
 		found := d.collectCandidate(ctx, scan, s, c, scan.guarded)
 		if scan.capped {
 			return
 		}
 		if found && s.Match == matchFirst {
-			return
-		}
-	}
-}
-
-// collectDelegated runs a source whose paths another component declares.
-func (d *Detector) collectDelegated(ctx context.Context, scan *scanState, s source) {
-	for _, declared := range d.mcp.DetectKnownUserConfigs(scan.paths.Home, scan.paths.AppData) {
-		path, rewritten := applyPrefixOverrides(declared, s, scan.paths, scan.env.Values)
-		// A declared location is one of a fixed set this agent already reads:
-		// named files in per-application configuration directories its own
-		// policy declines as a group even though the platform serves them
-		// without prompting. Reading one is a targeted read, not a traversal.
-		// A rewritten location is not that — its leading directory came from a
-		// variable in the scanned session, and a value naming a consent-gated
-		// tree would block the read past any deadline.
-		resolver := scan.targeted
-		if rewritten {
-			resolver = scan.guarded
-		}
-		d.collectCandidate(ctx, scan, s, path, resolver)
-		if scan.capped {
 			return
 		}
 	}
@@ -252,7 +213,7 @@ func (d *Detector) collectCandidate(ctx context.Context, scan *scanState, s sour
 		return false
 	}
 
-	obs, hosts, resolved, info, truncated, err := d.observe(s, path, resolver)
+	obs, resolved, info, truncated, err := d.observe(s, path, resolver)
 	switch {
 	case err == nil:
 	case os.IsNotExist(err):
@@ -277,56 +238,43 @@ func (d *Detector) collectCandidate(ctx context.Context, scan *scanState, s sour
 		// credentials sit past the cap would otherwise read as empty and complete.
 		scan.markCapped(s.ID)
 	}
+	if obs.Unrecognized {
+		// Recorded before the count, and independently of it: a file can hold one
+		// confirmed credential and one entry this build cannot read, and reporting
+		// only the finding would present the rest of the file as clean.
+		scan.addErrorOnce(s.ID, model.CredentialReasonUnrecognizedFormat)
+	}
 	if obs.Count == 0 {
-		// The file is there and holds no credential and no reference to one. A
-		// finding would assert something is in it.
+		// The file is there and holds no credential material. A finding would
+		// assert something is in it.
 		return false
 	}
 
-	index := scan.addFinding(d.buildFinding(ctx, scan, s, path, resolved, info, obs))
-	if index >= 0 && len(hosts) > 0 {
-		d.enrichGitHubHosts(ctx, scan, hosts, path, index)
-	}
+	scan.addFinding(d.buildFinding(ctx, scan, s, path, resolved, info, obs))
 	return true
 }
 
-// observe resolves a location, reads it if its source is read by content, and
-// classifies whatever came back. One resolution and one read serve the whole
-// candidate: the metadata is that of the bytes read, not of a second look.
-func (d *Detector) observe(s source, path string, resolver *safepath.Resolver) (obs observation, hosts []githubHostConfig, resolved string, info os.FileInfo, truncated bool, err error) {
-	if s.Mode == readStat {
-		// The file is the credential in its entirety, so its existence and size
-		// are the observation. Nothing here opens it.
-		resolved, info, err = resolver.Stat(path)
-		if err != nil {
-			return observation{}, nil, "", nil, false, err
-		}
-		if info.IsDir() || info.Size() == 0 {
-			// An empty one holds nothing, and a directory is the wrong shape —
-			// the caller reports that from info.
-			return observation{}, nil, resolved, info, false, nil
-		}
-		return observation{Count: 1, Protection: model.CredentialProtectionPlaintext}, nil, resolved, info, false, nil
-	}
-
+// observe resolves a location, reads it, and classifies whatever came back. One
+// resolution and one read serve the whole candidate: the metadata is that of the
+// bytes read, not of a second look.
+func (d *Detector) observe(s source, path string, resolver *safepath.Resolver) (obs observation, resolved string, info os.FileInfo, truncated bool, err error) {
 	data, resolved, info, truncated, err := resolver.Read(path, s.MaxBytes)
 	if err != nil {
-		return observation{}, nil, "", nil, false, err
+		return observation{}, "", nil, false, err
 	}
 	if info.IsDir() {
 		// Nothing was read because there was nothing to read; the caller reports
 		// the shape mismatch from info.
-		return observation{}, nil, resolved, info, false, nil
+		return observation{}, resolved, info, false, nil
 	}
 	if hasUTF16BOM(data) {
 		// These parsers are byte-oriented, so a two-byte encoding parses to
 		// almost nothing rather than failing, and a file holding credentials
 		// would read as holding none. Reporting the encoding is the only
 		// outcome that does not under-report.
-		return observation{}, nil, "", nil, false, errUnsupportedEncoding
+		return observation{}, "", nil, false, errUnsupportedEncoding
 	}
-	obs, hosts = parseSource(s, resolved, data)
-	return obs, hosts, resolved, info, truncated, nil
+	return parseSource(s, data), resolved, info, truncated, nil
 }
 
 // collectKeyDir lists the key directory and classifies each key in it. Each key
@@ -355,10 +303,7 @@ func (d *Detector) collectKeyDir(ctx context.Context, scan *scanState, s source,
 		}
 
 		entry := filepath.Join(path, name)
-		// The cap here is the header, not the file: the fields that decide
-		// protection are at the front, so a capped read is a whole observation
-		// and does not mark the snapshot partial.
-		data, resolved, info, _, err := resolver.Read(entry, s.MaxBytes)
+		data, resolved, info, truncated, err := resolver.Read(entry, s.MaxBytes)
 		if err != nil {
 			if !os.IsNotExist(err) {
 				scan.addError(s.ID, refusalReason(err))
@@ -368,7 +313,20 @@ func (d *Detector) collectKeyDir(ctx context.Context, scan *scanState, s source,
 		if info.IsDir() {
 			continue
 		}
-		state, isKey := classifySSHKey(data)
+		if truncated {
+			// A key is validated over its complete bytes, so a prefix is not
+			// something to classify: it would be indistinguishable from the
+			// truncated container this validation exists to reject.
+			scan.markCapped(s.ID)
+			continue
+		}
+		state, isKey, malformed := classifySSHKey(data)
+		if malformed {
+			// One entry for the source however many candidates are damaged, and
+			// the siblings are still classified: a key this build cannot confirm
+			// must not take the readable keys beside it out of the inventory.
+			scan.addErrorOnce(s.ID, model.CredentialReasonUnrecognizedFormat)
+		}
 		if !isKey {
 			continue
 		}
@@ -408,57 +366,6 @@ func (d *Detector) buildFinding(ctx context.Context, scan *scanState, s source, 
 		finding.GitTracked = gitTracked(ctx, d.exec, resolved)
 	}
 	return finding
-}
-
-// enrichGitHubHosts attaches the CLI's own report to the finding just recorded.
-// Every way the report can fail becomes a scope status on the hosts it describes,
-// never an error on the source: the configuration itself was read successfully.
-func (d *Detector) enrichGitHubHosts(ctx context.Context, scan *scanState, hosts []githubHostConfig, configPath string, index int) {
-	scan.info.Findings[index].GitHub = d.githubScopeReports(ctx, scan, hosts, configPath)
-}
-
-// githubScopeReports runs the probe when it can run at all, and returns one
-// entry per configured host either way.
-func (d *Detector) githubScopeReports(ctx context.Context, scan *scanState, hosts []githubHostConfig, configPath string) []model.CredentialGitHubHost {
-	// The permissions a token carries are not on disk, so establishing them means
-	// asking the tool that holds it — and as a system account there is no way to
-	// reach the developer's keystore, so the child would answer for the wrong one.
-	if scan.platform == model.PlatformWindows && d.exec.IsRoot() {
-		return githubHostReports(hosts, nil, model.CredentialScopeUnavailable)
-	}
-
-	binary, err := d.exec.LookPath("gh")
-	if err != nil || binary == "" {
-		return githubHostReports(hosts, nil, model.CredentialScopeUnavailable)
-	}
-	configDir := filepath.Dir(configPath)
-	if !scan.guarded.Contains(configDir) {
-		// The child is pointed at this directory. Outside the developer's own
-		// tree, pointing the tool at it would have it read a configuration this
-		// run has no business reading.
-		return githubHostReports(hosts, nil, model.CredentialScopeUnavailable)
-	}
-
-	out, runErr := d.runner.Run(ctx, ghRequest{
-		Binary:         binary,
-		ConfigDir:      configDir,
-		Username:       scan.paths.Username,
-		DropPrivileges: d.exec.IsRoot(),
-	})
-	byHost, parsed := parseGHStatus(out)
-	switch {
-	case parsed:
-	case runErr != nil:
-		// The child did not complete — a timeout, or a refused privilege drop.
-		// Only whether it failed is used; its diagnostics are never read.
-		return githubHostReports(hosts, nil, model.CredentialScopeUnavailable)
-	default:
-		// It produced something that is not the document asked for, which an
-		// older build does. Success is judged on the document, not the exit
-		// status: this command exits successfully even when authentication fails.
-		return githubHostReports(hosts, nil, model.CredentialScopeUnsupportedCLI)
-	}
-	return githubHostReports(hosts, byHost, model.CredentialScopeUnavailable)
 }
 
 // errUnsupportedEncoding marks a file whose bytes are not in an encoding these
@@ -519,16 +426,23 @@ func (s *scanState) atFindingCap() bool {
 	return true
 }
 
-// markCapped records that a bound stopped a source short. One entry per source:
-// a bound biting on every item of a listing describes one incomplete source, not
-// two hundred.
+// markCapped records that a bound stopped a source short.
 func (s *scanState) markCapped(sourceID string) {
 	s.markTruncated()
-	if s.cappedSources[sourceID] {
+	s.addErrorOnce(sourceID, model.CredentialReasonCapped)
+}
+
+// addErrorOnce records a reason at most once for a source, for the conditions
+// that can hold for every item of one listing: a directory of damaged keys, or a
+// bound that bites on each of two hundred candidates, describes one source that
+// could not be fully read rather than two hundred failures.
+func (s *scanState) addErrorOnce(sourceID, reason string) {
+	key := sourceID + "\x00" + reason
+	if s.reported[key] {
 		return
 	}
-	s.cappedSources[sourceID] = true
-	s.addError(sourceID, model.CredentialReasonCapped)
+	s.reported[key] = true
+	s.addError(sourceID, reason)
 }
 
 // relocationKnown reports whether every variable that could move this source's

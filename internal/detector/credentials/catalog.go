@@ -7,6 +7,12 @@
 // substring, no digest, no fingerprint, and no classification derived from the
 // secret's own characters ever leaves this package.
 //
+// A finding means material is in the file: a concrete value in a field the tool
+// consumes as authentication, or a structurally valid private key. A file that
+// names a credential kept elsewhere is not a finding, and neither is one this
+// build could not interpret — that becomes an error, so a file the agent cannot
+// read can never resolve to "this machine holds nothing".
+//
 // Two properties hold for every source and are what keep the phase bounded and
 // consent-safe: each location is an exact path rather than a root to walk, and
 // each read has a byte cap. Adding a family is a table entry plus a parser.
@@ -24,10 +30,16 @@ const catalogVersion = "1"
 // what we think it is or is hostile, and either way there is no reason to pull
 // it into memory.
 const (
-	// The format fields that decide protection all sit in the first ~105
-	// decoded bytes, so an SSH key read covers the header and never the body.
-	capKeyHeader = 1 << 10 // 1 KiB
-	capConfig    = 1 << 20 // 1 MiB
+	// A private key is validated over its complete bytes, so the cap has to
+	// clear the largest key a developer plausibly holds — a header-sized read
+	// cannot tell a whole container from a truncated one. A candidate longer
+	// than this is reported capped rather than classified from its prefix.
+	capPrivateKey = 64 << 10 // 64 KiB
+	// The one source whose whole contents are the credential. Small on purpose:
+	// this read exists only to tell a filled file from an emptied one, and
+	// nothing about the value survives the parse.
+	capToken  = 4 << 10 // 4 KiB
+	capConfig = 1 << 20 // 1 MiB
 	// Larger because a kubeconfig legitimately accumulates one cluster entry
 	// per environment, each with an embedded CA certificate.
 	capKubeconfig = 4 << 20 // 4 MiB
@@ -37,7 +49,7 @@ const (
 // `scan_complete=false`: the snapshot replaces its predecessor wholesale, so it
 // carries its own incompleteness. Both match the bounds the reader applies to what
 // it receives — a result the reader would refuse or shorten is not a result — and
-// sixteen sources cannot reach either today, which is why exceeding them was never
+// thirteen sources cannot reach either today, which is why exceeding them was never
 // observed rather than never possible.
 const (
 	maxFindings = 400
@@ -55,21 +67,13 @@ const (
 	sourceSSHPrivateKeys       = "ssh_private_keys"
 	sourceGitCredentials       = "git_credentials"
 	sourceNetrc                = "netrc"
-	sourceGitconfigHelper      = "gitconfig_helper"
 	sourceGitHubCLIHosts       = "github_cli_hosts"
 	sourceNPMRC                = "npmrc"
 	sourcePypirc               = "pypirc"
 	sourceDockerConfig         = "docker_config"
 	sourceKubeconfig           = "kubeconfig"
-	sourceMCPConfig            = "mcp_config"
 	sourceTerraformCredentials = "terraform_credentials" //#nosec G101 -- the wire identifier for a source, naming a kind of file rather than holding anything read out of one.
 	sourceVaultToken           = "vault_token"
-
-	// The GitHub CLI's own account and permission report, deliberately absent from
-	// the table below: it collects no path, emits no finding row and no error.
-	// Every outcome it can have — including not running at all — lands as a scope
-	// status on the hosts finding, so an empty scope list is never ambiguous.
-	sourceGitHubCLIStatus = "github_cli_status"
 )
 
 // readMode is the only filesystem operation a source performs. Declared per
@@ -78,18 +82,11 @@ const (
 type readMode string
 
 const (
-	// Existence, size and mode without opening the file. Where the file *is*
-	// the credential there is nothing to parse, so there is no reason to read
-	// a byte.
-	readStat readMode = "stat"
 	readFile readMode = "file"
 	// One non-recursive listing followed by a bounded read of each entry. The
 	// only listing this phase performs, confined to a directory whose entire
 	// purpose is holding keys.
 	readKeyDir readMode = "key_dir"
-	// The exact paths come from a set another component declares, so the two
-	// cannot drift apart. Still one bounded read per file.
-	readDelegated readMode = "delegated"
 )
 
 // matchPolicy decides what to do when more than one candidate location exists.
@@ -141,9 +138,6 @@ const (
 	// The value is a separator-joined list of file paths, all of which the tool
 	// reads.
 	overrideList overrideKind = "list"
-	// The value replaces a directory appearing as the leading portion of a
-	// location, wherever that location was declared.
-	overridePrefix overrideKind = "prefix"
 )
 
 // envOverride relocates a source. Not an edge case: monorepos, CI-parity setups
@@ -223,7 +217,7 @@ var sources = []source{
 		ID:        sourceSSHPrivateKeys,
 		Category:  model.CredentialCategorySourceControl,
 		Mode:      readKeyDir,
-		MaxBytes:  capKeyHeader,
+		MaxBytes:  capPrivateKey,
 		Match:     matchFirst,
 		Locations: []location{{Root: rootHome, Rel: ".ssh"}},
 	},
@@ -249,17 +243,6 @@ var sources = []source{
 		Locations: []location{
 			{Root: rootHome, Rel: ".netrc", Platforms: unixOnly},
 			{Root: rootHome, Rel: "_netrc", Platforms: windowsOnly},
-		},
-	},
-	{
-		ID:       sourceGitconfigHelper,
-		Category: model.CredentialCategorySourceControl,
-		Mode:     readFile,
-		MaxBytes: capConfig,
-		Match:    matchAll,
-		Locations: []location{
-			{Root: rootHome, Rel: ".gitconfig"},
-			{Root: rootXDGConfig, Rel: "git/config"},
 		},
 	},
 	{
@@ -322,20 +305,6 @@ var sources = []source{
 		Locations: []location{{Root: rootHome, Rel: ".kube/config"}},
 	},
 	{
-		// Locations come from the shared set of known user-level MCP configuration
-		// files, so this source and MCP inventory cannot disagree about where they
-		// are. It takes the exact paths and none of the discovery around them.
-		ID:       sourceMCPConfig,
-		Category: model.CredentialCategoryAIMCP,
-		Mode:     readDelegated,
-		MaxBytes: capConfig,
-		Match:    matchAll,
-		Overrides: []envOverride{
-			{Var: "CLAUDE_CONFIG_DIR", Kind: overridePrefix, Rel: ".claude"},
-			{Var: "CODEX_HOME", Kind: overridePrefix, Rel: ".codex"},
-		},
-	},
-	{
 		// The JSON credentials file, where this tool stores a token in a form that
 		// can be read exactly. The adjacent CLI file may hold one too, but it is
 		// HCL, and a partial reading would report under this same identifier.
@@ -350,12 +319,15 @@ var sources = []source{
 		},
 	},
 	{
-		// Never opened. The file is the token, so a stat gives everything worth
-		// reporting and the bytes stay untouched. A zero-length file yields no
-		// finding.
+		// The one source whose whole contents are the credential, so establishing
+		// that it holds material means opening it. The read is bounded to a few
+		// kilobytes and the bytes are trimmed, tested for being a reference, and
+		// dropped — a stat alone cannot tell a live token from an emptied file
+		// carrying a placeholder or an environment reference.
 		ID:        sourceVaultToken,
 		Category:  model.CredentialCategoryInfrastructure,
-		Mode:      readStat,
+		Mode:      readFile,
+		MaxBytes:  capToken,
 		Match:     matchFirst,
 		Locations: []location{{Root: rootHome, Rel: ".vault-token"}},
 	},
@@ -408,9 +380,6 @@ func (l location) appliesTo(platform string) bool {
 // source that does not apply is not a source that failed: it produces neither a
 // finding nor an error, because there is nothing there to look for.
 func (s source) applies(platform string) bool {
-	if s.Mode == readDelegated {
-		return true
-	}
 	for _, l := range s.Locations {
 		if l.appliesTo(platform) {
 			return true

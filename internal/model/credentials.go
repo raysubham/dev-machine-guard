@@ -2,12 +2,20 @@ package model
 
 // Credential inventory wire types.
 //
-// A finding says which category of credential lives at a location, where it is,
-// and how well protected it is. It never carries the credential — no value, no
-// substring, no digest, no fingerprint, and no category derived from the
-// secret's own characters. Protection state is derived by reading
-// secret-bearing bytes (a key header, whether a token cache is JSON at all),
-// which describes how material is guarded rather than what it is.
+// A finding says which category of credential material lives at a location,
+// where it is, and how well protected it is. It never carries the credential —
+// no value, no substring, no digest, no fingerprint, and no category derived
+// from the secret's own characters. Protection state is derived by reading
+// secret-bearing bytes (a key container's structure, whether a field holds a
+// concrete value), which describes how material is guarded rather than what it
+// is.
+//
+// A finding means material was found in the file: a concrete value in a field
+// the tool consumes as authentication, or a structurally valid private key. A
+// file that only names a credential held elsewhere — a helper, an environment
+// reference, a single-sign-on session — is not a finding, and neither is a file
+// this build could not interpret. The second travels as an error instead, so an
+// uninterpretable file cannot read as a clean one.
 
 // Credential categories. The customer-facing grouping a finding rolls up to.
 const (
@@ -15,25 +23,17 @@ const (
 	CredentialCategorySourceControl  = "source_control"
 	CredentialCategoryPackageReg     = "package_registry"
 	CredentialCategoryContainers     = "containers"
-	CredentialCategoryAIMCP          = "ai_mcp"
 	CredentialCategoryInfrastructure = "infrastructure"
 )
 
-// Protection states, worst-case per source. The fold order is
-// plaintext > unknown > protected > external: `unknown` outranks `protected`
-// because it means bytes were read and protection could not be determined, and
-// folding it lower would let one unrecognised entry inherit a sibling's.
+// Protection states, worst-case per source. Two values and no third: every
+// finding is material that is either usable straight out of the file or not.
 const (
 	// A usable secret in the clear.
 	CredentialProtectionPlaintext = "plaintext"
 	// Present but not usable as-is — passphrase-encrypted, hardware-backed, or
-	// wrapped by an OS store.
+	// otherwise wrapped.
 	CredentialProtectionProtected = "protected"
-	// A file asserting a credential held elsewhere: a helper, an environment
-	// reference, an SSO session.
-	CredentialProtectionExternal = "external"
-	// Bytes read, protection undetermined. Never read as safe downstream.
-	CredentialProtectionUnknown = "unknown"
 )
 
 // Collection principals. AgentEffective is the agent process itself, which on
@@ -56,36 +56,11 @@ const (
 	CredentialReasonSkippedNoUser       = "skipped_no_user"
 	CredentialReasonCapped              = "capped"
 	CredentialReasonTimedOut            = "timed_out"
-)
-
-// GitHub CLI authentication outcomes, this inventory's own vocabulary rather
-// than the CLI's: the tool's verdict has changed spelling across releases, and a
-// reader cannot group hosts by a value it does not know. Every host carries one,
-// so an absent value is never read as a verdict.
-const (
-	CredentialAuthAuthenticated    = "authenticated"
-	CredentialAuthNotAuthenticated = "not_authenticated"
-	CredentialAuthUnknown          = "unknown"
-)
-
-// Where the GitHub CLI holds a host's token. A token written into a file is the
-// finding; a token in the OS keystore is not.
-const (
-	CredentialStorageInlineFile = "inline_file"
-	CredentialStorageKeyring    = "keyring"
-	CredentialStorageUnknown    = "unknown"
-)
-
-// Scope-reporting outcomes. Scopes only carries values GitHub authoritatively
-// returned; every other outcome is one of these, so a caller never reads an
-// empty Scopes as "this token has no permissions".
-const (
-	CredentialScopeObserved            = "observed"
-	CredentialScopeUnavailable         = "unavailable"
-	CredentialScopeUnsupportedCLI      = "unsupported_cli_version"  //#nosec G101 -- an outcome code on the wire, reported in place of permissions rather than carrying any.
-	CredentialScopeAccessDenied        = "credential_access_denied" //#nosec G101 -- see above: an outcome code, not a permission or a token.
-	CredentialScopeNetworkError        = "network_error"
-	CredentialScopeNotReportedByGitHub = "not_reported_by_github"
+	// The file was there and was read within its cap, and its format could not
+	// be interpreted well enough to state that it holds no material. Reported
+	// instead of a finding, never alongside one for the same entry: a parse
+	// failure is not evidence that a credential exists.
+	CredentialReasonUnrecognizedFormat = "unrecognized_format"
 )
 
 // CurrentCredentialSchemaVersion is the credential block's own shape version,
@@ -140,9 +115,8 @@ type CredentialFinding struct {
 
 	ResolvedLocation string `json:"resolved_location,omitempty"`
 
-	// Credentials seen for plaintext, protected and unknown; configuration
-	// references for external, which are not evidence that material exists
-	// anywhere. Never total this as "credentials" without that split.
+	// How many credentials the location holds. Always at least one: a location
+	// with none produces no finding at all.
 	Count int `json:"count"`
 
 	Protection string `json:"protection"`
@@ -170,24 +144,6 @@ type CredentialFinding struct {
 	MTime int64 `json:"mtime"`
 
 	CollectionPrincipal string `json:"collection_principal"`
-
-	// Present only on the GitHub CLI hosts finding, which describes the same
-	// configuration: a top-level list would force readers to re-join by host.
-	GitHub []CredentialGitHubHost `json:"github,omitempty"`
-}
-
-// CredentialGitHubHost is the GitHub CLI's own account and permission report
-// for one configured host.
-type CredentialGitHubHost struct {
-	Host                 string   `json:"host"`
-	Configured           bool     `json:"configured"`
-	AccountCount         int      `json:"account_count"`
-	AuthenticationStatus string   `json:"authentication_status"`
-	CredentialStorage    string   `json:"credential_storage"`
-	Scopes               []string `json:"scopes,omitempty"`
-	// An empty Scopes with ScopeStatus=observed means the token really carries
-	// none; any other status means they were not obtained.
-	ScopeStatus string `json:"scope_status"`
 }
 
 // CredentialError is one source attempted and not collected. Deliberately not a
