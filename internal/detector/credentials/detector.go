@@ -306,7 +306,11 @@ func (d *Detector) collectKeyDir(ctx context.Context, scan *scanState, s source,
 		data, resolved, info, truncated, err := resolver.Read(entry, s.MaxBytes)
 		if err != nil {
 			if !os.IsNotExist(err) {
-				scan.addError(s.ID, refusalReason(err))
+				// One entry per refusal however many keys it turned away: the
+				// record names no file, so a directory the account cannot read
+				// would otherwise spend the whole error budget restating one
+				// fact and leave no room for the sources read after it.
+				scan.addErrorOnce(s.ID, refusalReason(err))
 			}
 			continue
 		}

@@ -759,6 +759,46 @@ func TestDetect_KeyDirectoryKeepsGoingPastADamagedKey(t *testing.T) {
 	}
 }
 
+// TestDetect_KeyDirectoryReportsOneRefusalHowManyKeysItTurnedAway holds because an
+// error names its source and no file: a directory whose entries the account cannot
+// open would otherwise report the same refusal once per key, filling a budget the
+// sources read after it need to report anything at all.
+func TestDetect_KeyDirectoryReportsOneRefusalHowManyKeysItTurnedAway(t *testing.T) {
+	if runtime.GOOS == model.PlatformWindows {
+		t.Skip("a mode of zero does not deny the owner a read on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("the superuser is refused by no file mode")
+	}
+	home := testHome(t)
+	unreadable := map[string]string{}
+	for _, name := range []string{"id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"} {
+		unreadable[".ssh/"+name] = string(opensshKey("none", "none", "ssh-ed25519"))
+	}
+	unreadable[".ssh/id_readable"] = string(opensshKey("none", "none", "ssh-ed25519"))
+	writeTree(t, home, unreadable)
+	for rel := range unreadable {
+		if filepath.Base(rel) == "id_readable" {
+			continue
+		}
+		if err := os.Chmod(filepath.Join(home, filepath.FromSlash(rel)), 0); err != nil {
+			t.Fatalf("chmod %s: %v", rel, err)
+		}
+	}
+
+	info := detect(t, home)
+	got := findingsFor(info, sourceSSHPrivateKeys)
+	if len(got) != 1 || filepath.Base(got[0].Location) != "id_readable" {
+		t.Fatalf("findings = %+v, want only the key that could be opened", got)
+	}
+	if n := countScanErrors(info.Errors, sourceSSHPrivateKeys, model.CredentialReasonPermissionDenied); n != 1 {
+		t.Errorf("errors = %+v, want one refusal for the source however many keys it turned away, got %d", info.Errors, n)
+	}
+	if info.ScanComplete {
+		t.Error("a key that could not be read leaves the run incomplete")
+	}
+}
+
 // TestDetect_KeyLargerThanItsCapIsNotClassified holds because a key is validated
 // over its complete bytes: a prefix is indistinguishable from the truncated
 // container that validation exists to reject, so the read is reported as capped
