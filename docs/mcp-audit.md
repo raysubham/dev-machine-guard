@@ -72,7 +72,7 @@ The MCP audit is designed to provide **visibility without exposing secrets**.
 - **HTTP headers** (may contain authentication tokens)
 - **Any other sensitive fields** that are not directly related to server identification
 
-In the enterprise agent, a Go-native filter extracts only the fields listed above before base64-encoding the config. For JSON configs, only `mcpServers` / `context_servers` / `servers` / `mcp` entries are kept, and within each server only `command`, `args`, `serverUrl`, and `url` fields are retained. Each vendor's own key is preserved as written — the filter strips fields, it never rewrites one schema into another. Non-JSON configs (TOML, YAML) are included as-is.
+In the enterprise agent, a Go-native filter extracts only the fields listed above before base64-encoding the config. For JSON configs, only `mcpServers` / `context_servers` / `servers` / `mcp` entries are kept, and within each server only `command`, `args`, `serverUrl`, and `url` fields are retained. Each vendor's own key is preserved as written — the filter strips fields, it never rewrites one schema into another. Non-JSON configs (TOML, YAML) cannot be filtered safely, so the config's location is still reported but its contents are never collected. The same applies to a JSON config that fails to parse, or one with no recognized server key: the location is reported and the content is dropped rather than sent raw.
 
 ---
 
