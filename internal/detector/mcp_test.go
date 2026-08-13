@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -370,5 +372,478 @@ func TestMCPDetector_Windows_FindsConfigs(t *testing.T) {
 	}
 	if results[0].Vendor != "Anthropic" {
 		t.Errorf("expected Anthropic, got %s", results[0].Vendor)
+	}
+}
+
+// --------------------------------------------------------------------------
+// OpenCode
+//
+// OpenCode keeps its MCP servers under a top-level "mcp" map, in either
+// opencode.json or opencode.jsonc, and its own documented examples carry both
+// comments and trailing commas.
+// --------------------------------------------------------------------------
+
+// openCodeGoldenConfig and openCodeGoldenEmitted are the wire contract, byte
+// for byte. The backend parser is built in another repo against these same two
+// literals, and no unit test on either side can catch a discrepancy between
+// them — so they are copied verbatim rather than constructed, and a change to
+// either is a change to the contract.
+const openCodeGoldenConfig = `{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "widgets-local": {
+      "type": "local",
+      "command": ["npx", "-y", "widgets-mcp-server@1.2.3"],
+      "cwd": "packages/widgets",
+      "environment": { "WIDGETS_TOKEN": "s3cr3t" },
+      "enabled": true,
+      "timeout": 5000
+    },
+    "widgets-remote": {
+      "type": "remote",
+      "url": "https://mcp.example-org.test/mcp",
+      "headers": { "Authorization": "Bearer s3cr3t" },
+      "enabled": false
+    }
+  }
+}`
+
+const openCodeGoldenEmitted = `{"mcp":{"widgets-local":{"command":["npx","-y","widgets-mcp-server@1.2.3"]},"widgets-remote":{"url":"https://mcp.example-org.test/mcp"}}}`
+
+const openCodeGlobalDir = "/Users/testuser/.config/opencode/"
+
+// TestMCPDetector_OpenCode_KnownPaths: both spellings of the global config are
+// known paths, reported under source "opencode" and vendor "OpenCode", and a
+// home holding both yields both — one entry each, deduped by path.
+func TestMCPDetector_OpenCode_KnownPaths(t *testing.T) {
+	cases := []struct {
+		name  string
+		files []string
+		want  []string
+	}{
+		{"json", []string{"opencode.json"}, []string{openCodeGlobalDir + "opencode.json"}},
+		{"jsonc", []string{"opencode.jsonc"}, []string{openCodeGlobalDir + "opencode.jsonc"}},
+		{
+			"both spellings",
+			[]string{"opencode.json", "opencode.jsonc"},
+			[]string{openCodeGlobalDir + "opencode.json", openCodeGlobalDir + "opencode.jsonc"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := executor.NewMock()
+			for _, f := range tc.files {
+				mock.SetFile(openCodeGlobalDir+f, []byte(openCodeGoldenConfig))
+			}
+
+			results := NewMCPDetector(mock).Detect(context.Background(), "testuser", nil, false)
+
+			if len(results) != len(tc.want) {
+				t.Fatalf("expected %d configs, got %d: %+v", len(tc.want), len(results), results)
+			}
+			for i, want := range tc.want {
+				if results[i].ConfigPath != want {
+					t.Errorf("config %d: path = %q, want %q", i, results[i].ConfigPath, want)
+				}
+				if results[i].ConfigSource != "opencode" {
+					t.Errorf("config %d: source = %q, want opencode", i, results[i].ConfigSource)
+				}
+				if results[i].Vendor != "OpenCode" {
+					t.Errorf("config %d: vendor = %q, want OpenCode", i, results[i].Vendor)
+				}
+			}
+		})
+	}
+}
+
+// TestMCPDetector_OpenCode_GoldenPayload: the golden config on disk emits the
+// golden string byte for byte. encoding/json sorts map keys, so this is a
+// stable literal comparison rather than a structural one — which is what lets
+// the backend assert on the same string.
+func TestMCPDetector_OpenCode_GoldenPayload(t *testing.T) {
+	mock := executor.NewMock()
+	mock.SetFile(openCodeGlobalDir+"opencode.json", []byte(openCodeGoldenConfig))
+
+	results := NewMCPDetector(mock).DetectEnterprise(context.Background(), nil)
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 enterprise config, got %d", len(results))
+	}
+	decoded, err := base64.StdEncoding.DecodeString(results[0].ConfigContentBase64)
+	if err != nil {
+		t.Fatalf("failed to decode base64: %v", err)
+	}
+	if got := string(decoded); got != openCodeGoldenEmitted {
+		t.Errorf("emitted content mismatch\n got: %s\nwant: %s", got, openCodeGoldenEmitted)
+	}
+}
+
+// TestFilterMCPContent_OpenCode_DropsSecretBearingFields: environment, headers
+// and oauth all carry live credentials and are outside the allowlist, so none
+// of them — nor their values — reach the wire.
+func TestFilterMCPContent_OpenCode_DropsSecretBearingFields(t *testing.T) {
+	det := &MCPDetector{}
+
+	input := []byte(`{
+	  "mcp": {
+	    "local": {
+	      "type": "local",
+	      "command": ["npx", "-y", "widgets-mcp-server"],
+	      "environment": {"WIDGETS_TOKEN": "env-s3cr3t"}
+	    },
+	    "remote": {
+	      "type": "remote",
+	      "url": "https://mcp.example-org.test/mcp",
+	      "headers": {"Authorization": "Bearer hdr-s3cr3t"},
+	      "oauth": {"clientSecret": "oauth-s3cr3t"}
+	    }
+	  }
+	}`)
+
+	filtered, ok := det.filterMCPContent("opencode", openCodeGlobalDir+"opencode.json", input)
+	if !ok {
+		t.Fatal("expected filtering to succeed")
+	}
+
+	content := string(filtered)
+	for _, forbidden := range []string{
+		"environment", "headers", "oauth",
+		"env-s3cr3t", "hdr-s3cr3t", "oauth-s3cr3t",
+		"WIDGETS_TOKEN", "Authorization", "clientSecret",
+	} {
+		if strings.Contains(content, forbidden) {
+			t.Errorf("filtered content must not contain %q: %s", forbidden, content)
+		}
+	}
+	if !strings.Contains(content, `"command":["npx","-y","widgets-mcp-server"]`) {
+		t.Errorf("filtered content should preserve the argv array: %s", content)
+	}
+	if !strings.Contains(content, `"url":"https://mcp.example-org.test/mcp"`) {
+		t.Errorf("filtered content should preserve the remote url: %s", content)
+	}
+}
+
+// TestFilterMCPContent_OpenCode_JSONC: comments and trailing commas both parse.
+// The trailing-comma case is the one stripJSONCComments cannot handle — it
+// removes the comment and leaves the comma, and json.Unmarshal then rejects the
+// document — which is why OpenCode is normalized with hujson instead.
+func TestFilterMCPContent_OpenCode_JSONC(t *testing.T) {
+	// Copied from the vendor's own MCP documentation, which prints
+	// `"enabled": true,` immediately before a closing brace.
+	const trailingComma = `{
+	  "mcp": {
+	    "widgets": {
+	      "type": "local",
+	      "command": ["npx", "-y", "widgets-mcp-server@1.2.3"],
+	      "enabled": true,
+	    },
+	  },
+	}`
+
+	const comments = `{
+	  // the servers this project may talk to
+	  "mcp": {
+	    /* launched over stdio */
+	    "widgets": {
+	      "type": "local",
+	      "command": ["npx", "-y", "widgets-mcp-server@1.2.3"]
+	    }
+	  }
+	}`
+
+	const both = `{
+	  // the servers this project may talk to
+	  "mcp": {
+	    /* launched over stdio */
+	    "widgets": {
+	      "type": "local",
+	      "command": ["npx", "-y", "widgets-mcp-server@1.2.3"],
+	      "enabled": true,
+	    },
+	  },
+	}`
+
+	const wantEmitted = `{"mcp":{"widgets":{"command":["npx","-y","widgets-mcp-server@1.2.3"]}}}`
+
+	cases := []struct {
+		name  string
+		path  string
+		input string
+	}{
+		{"trailing comma", openCodeGlobalDir + "opencode.json", trailingComma},
+		{"comments", openCodeGlobalDir + "opencode.json", comments},
+		{"comments and trailing commas", openCodeGlobalDir + "opencode.json", both},
+		{"jsonc spelling", openCodeGlobalDir + "opencode.jsonc", both},
+		{"project-level, discovered source", "/Users/testuser/proj/opencode.jsonc", both},
+	}
+
+	det := &MCPDetector{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// A project-level config arrives labelled discovered_mcp, so the
+			// JSONC handling cannot key off the source name.
+			source := "opencode"
+			if strings.Contains(tc.path, "/proj/") {
+				source = "discovered_mcp"
+			}
+			filtered, ok := det.filterMCPContent(source, tc.path, []byte(tc.input))
+			if !ok {
+				t.Fatalf("expected filtering to succeed for %s", tc.path)
+			}
+			if got := string(filtered); got != wantEmitted {
+				t.Errorf("emitted content mismatch\n got: %s\nwant: %s", got, wantEmitted)
+			}
+		})
+	}
+}
+
+// TestFilterMCPContent_OpenCode_FailsClosed: a config with no mcp key, and one
+// that is not JSON at all, both emit nothing rather than falling back to raw
+// content. The location is still reported (I8) — that is DetectEnterprise's
+// job, asserted here through the full detector.
+func TestFilterMCPContent_OpenCode_FailsClosed(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"no mcp key", `{"theme":"dark","apiKey":"sk-secret-12345"}`},
+		{"malformed json", `{"mcp": {"widgets": {"command": ["npx"` + "\n"},
+		{"unterminated block comment", `{/* "mcp": {} }`},
+		{"not an object", `["mcp"]`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			det := &MCPDetector{}
+			filtered, ok := det.filterMCPContent("opencode", openCodeGlobalDir+"opencode.json", []byte(tc.content))
+			if ok {
+				t.Errorf("expected filtering to fail, got ok with %q", filtered)
+			}
+			if filtered != nil {
+				t.Errorf("expected nil content on failure, got %q", filtered)
+			}
+
+			// I8: the location is still reported, with empty content.
+			mock := executor.NewMock()
+			mock.SetFile(openCodeGlobalDir+"opencode.json", []byte(tc.content))
+			results := NewMCPDetector(mock).DetectEnterprise(context.Background(), nil)
+			if len(results) != 1 {
+				t.Fatalf("expected the location to still be reported, got %d configs", len(results))
+			}
+			if results[0].ConfigContentBase64 != "" {
+				t.Errorf("expected empty content, got %q", results[0].ConfigContentBase64)
+			}
+			if results[0].ConfigSource != "opencode" || results[0].Vendor != "OpenCode" {
+				t.Errorf("expected opencode/OpenCode, got %s/%s", results[0].ConfigSource, results[0].Vendor)
+			}
+		})
+	}
+}
+
+// TestFilterMCPContent_ScalarMCPKeyDoesNotEvictSiblings: "mcp" is an ordinary
+// enough word to appear as a scalar flag in a config whose real servers live
+// under mcpServers. Reading the key is new, so without a guard it would emit
+// "mcp":null for those files, the backend would reject the whole document, and
+// the valid mcpServers beside it would be lost — a regression reaching every
+// walked .mcp.json, not just OpenCode's own files.
+func TestFilterMCPContent_ScalarMCPKeyDoesNotEvictSiblings(t *testing.T) {
+	const siblings = `{"mcpServers":{"fs":{"command":"npx","args":["-y","s"]}},"mcp":%s}`
+	const wantSiblings = `{"mcpServers":{"fs":{"args":["-y","s"],"command":"npx"}}}`
+
+	for _, mcpValue := range []string{`true`, `"enabled"`, `["a"]`, `42`} {
+		t.Run("keeps siblings when mcp is "+mcpValue, func(t *testing.T) {
+			det := &MCPDetector{}
+			content := fmt.Sprintf(siblings, mcpValue)
+			filtered, ok := det.filterMCPContent("discovered_mcp", "/Users/testuser/proj/.mcp.json", []byte(content))
+			if !ok {
+				t.Fatalf("expected the valid mcpServers to still be emitted, got ok=false")
+			}
+			if string(filtered) != wantSiblings {
+				t.Errorf("emitted %s, want %s", filtered, wantSiblings)
+			}
+			if strings.Contains(string(filtered), `"mcp"`) {
+				t.Errorf("unusable mcp key must be dropped, not emitted empty: %s", filtered)
+			}
+		})
+
+		t.Run("fails closed when only mcp is "+mcpValue, func(t *testing.T) {
+			det := &MCPDetector{}
+			content := fmt.Sprintf(`{"mcp":%s}`, mcpValue)
+			filtered, ok := det.filterMCPContent("opencode", openCodeGlobalDir+"opencode.json", []byte(content))
+			if ok || filtered != nil {
+				t.Errorf("expected no content, got ok=%v %q", ok, filtered)
+			}
+		})
+	}
+
+	// An explicit null is the one non-map that json.Unmarshal accepts into a map
+	// type, so it decodes to an empty server set rather than a filter failure and
+	// is emitted as an empty object. That is not the eviction bug — an empty
+	// object parses backend-side and drops nothing — and it is exactly what a
+	// null under any of the other three keys already does, so the guard leaves
+	// the existing convention alone rather than making "mcp" the odd one out.
+	t.Run("null decodes to an empty set, like every other key", func(t *testing.T) {
+		// Asserted byte-exact, not just "mcpServers survived": the point of this
+		// subtest is that the empty object IS emitted. A looser check would keep
+		// passing if "mcp" started being dropped here too, silently turning the
+		// documented convention into the opposite behaviour.
+		const wantNull = `{"mcp":{},"mcpServers":{"fs":{"args":["-y","s"],"command":"npx"}}}`
+
+		det := &MCPDetector{}
+		filtered, ok := det.filterMCPContent("discovered_mcp", "/Users/testuser/proj/.mcp.json", fmt.Appendf(nil, siblings, `null`))
+		if !ok {
+			t.Fatalf("expected content, got ok=false")
+		}
+		if string(filtered) != wantNull {
+			t.Errorf("emitted %s, want %s", filtered, wantNull)
+		}
+
+		// Same shape under mcpServers, proving this is the pre-existing
+		// convention and not something the mcp branch introduced.
+		legacy, ok := det.filterMCPContent("cursor", "/Users/testuser/.cursor/mcp.json", []byte(`{"mcpServers":null}`))
+		if !ok || string(legacy) != `{"mcpServers":{}}` {
+			t.Errorf("mcpServers null convention changed: ok=%v %s", ok, legacy)
+		}
+	})
+
+	// Control: a well-formed mcp map is still emitted, so the guard rejects only
+	// what it cannot filter.
+	det := &MCPDetector{}
+	filtered, ok := det.filterMCPContent("opencode", openCodeGlobalDir+"opencode.json", []byte(openCodeGoldenConfig))
+	if !ok || string(filtered) != openCodeGoldenEmitted {
+		t.Errorf("valid mcp map regressed: ok=%v %s", ok, filtered)
+	}
+}
+
+// TestMCPDetector_OpenCode_ResolvesUnderResolvedHome: OpenCode uses the same
+// ~/.config/opencode layout on every platform, so both paths are expanded
+// against the home the detector was given — never against the process
+// environment, which on Windows belongs to the service account.
+func TestMCPDetector_OpenCode_ResolvesUnderResolvedHome(t *testing.T) {
+	cases := []struct {
+		goos string
+		home string
+	}{
+		{"windows", `C:\Users\testuser`},
+		{"linux", "/home/dev"},
+		{"darwin", "/Users/testuser"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.goos, func(t *testing.T) {
+			mock := executor.NewMock()
+			mock.SetGOOS(tc.goos)
+			mock.SetHomeDir(tc.home)
+			// A roaming profile belonging to somebody else entirely: no
+			// OpenCode path may be resolved through it.
+			mock.SetEnv("APPDATA", `C:\Users\svc-account\AppData\Roaming`)
+
+			for _, spelling := range []string{"opencode.json", "opencode.jsonc"} {
+				path := filepath.Join(tc.home, ".config", "opencode", spelling)
+				mock.SetFile(path, []byte(openCodeGoldenConfig))
+			}
+
+			results := NewMCPDetector(mock).Detect(context.Background(), "testuser", nil, false)
+
+			if len(results) != 2 {
+				t.Fatalf("expected 2 configs, got %d: %+v", len(results), results)
+			}
+			for _, r := range results {
+				if !strings.HasPrefix(r.ConfigPath, tc.home) {
+					t.Errorf("path %q is not under the resolved home %q", r.ConfigPath, tc.home)
+				}
+				if strings.Contains(r.ConfigPath, "svc-account") {
+					t.Errorf("path %q was resolved through the process environment", r.ConfigPath)
+				}
+				if r.ConfigSource != "opencode" || r.Vendor != "OpenCode" {
+					t.Errorf("expected opencode/OpenCode, got %s/%s", r.ConfigSource, r.Vendor)
+				}
+			}
+		})
+	}
+}
+
+// TestFilterMCPContent_NonOpenCodeUnchanged: adding OpenCode must not move any
+// other source onto a different code path. Zed still goes through
+// stripJSONCComments, the plain-JSON sources still go straight to the parser,
+// and a non-JSON config still emits nothing.
+func TestFilterMCPContent_NonOpenCodeUnchanged(t *testing.T) {
+	cases := []struct {
+		name    string
+		source  string
+		path    string
+		content string
+		wantOK  bool
+		want    string
+	}{
+		{
+			"cursor", "cursor", "/Users/testuser/.cursor/mcp.json",
+			`{"mcpServers":{"notion":{"url":"https://mcp.notion.com/mcp","headers":{"k":"v"}}}}`,
+			true, `{"mcpServers":{"notion":{"url":"https://mcp.notion.com/mcp"}}}`,
+		},
+		{
+			"claude_desktop", "claude_desktop", "/Users/testuser/Library/Application Support/Claude/claude_desktop_config.json",
+			`{"mcpServers":{"fs":{"command":"npx","args":["-y","server"],"env":{"K":"V"}}}}`,
+			true, `{"mcpServers":{"fs":{"args":["-y","server"],"command":"npx"}}}`,
+		},
+		{
+			"zed keeps the comment stripper", "zed", "/Users/testuser/.config/zed/settings.json",
+			"{\n  // servers\n  \"context_servers\":{\"fs\":{\"command\":\"npx\"}}\n}",
+			true, `{"context_servers":{"fs":{"command":"npx"}}}`,
+		},
+		{
+			"vscode", "vscode", "/Users/testuser/.vscode/mcp.json",
+			`{"servers":{"fs":{"command":"npx","env":{"K":"V"}}}}`,
+			true, `{"servers":{"fs":{"command":"npx"}}}`,
+		},
+		{
+			"codex toml still emits nothing", "codex", "/Users/testuser/.codex/config.toml",
+			"[mcp_servers.fs]\ncommand = \"npx\"\n",
+			false, "",
+		},
+	}
+
+	det := &MCPDetector{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			filtered, ok := det.filterMCPContent(tc.source, tc.path, []byte(tc.content))
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v (content %q)", ok, tc.wantOK, filtered)
+			}
+			if got := string(filtered); tc.wantOK && got != tc.want {
+				t.Errorf("emitted content mismatch\n got: %s\nwant: %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMCPConfigDefinitions_OpenCodeIsPlatformAgnostic: the two OpenCode
+// definitions leave the Windows and Linux fields empty on purpose, so every
+// consumer that walks mcpConfigDefinitions — including the known-user-config
+// resolver the credential inventory reads — expands them against the home it
+// was given rather than a per-platform override.
+func TestMCPConfigDefinitions_OpenCodeIsPlatformAgnostic(t *testing.T) {
+	found := make(map[string]bool)
+	for _, spec := range mcpConfigDefinitions {
+		if spec.SourceName != "opencode" {
+			continue
+		}
+		found[spec.ConfigPath] = true
+		if spec.Vendor != "OpenCode" {
+			t.Errorf("%s: vendor = %q, want OpenCode", spec.ConfigPath, spec.Vendor)
+		}
+		if spec.WinConfigPath != "" || spec.LinuxConfigPath != "" {
+			t.Errorf("%s: expected empty per-platform overrides, got win=%q linux=%q",
+				spec.ConfigPath, spec.WinConfigPath, spec.LinuxConfigPath)
+		}
+	}
+	for _, want := range []string{
+		"~/.config/opencode/opencode.json",
+		"~/.config/opencode/opencode.jsonc",
+	} {
+		if !found[want] {
+			t.Errorf("mcpConfigDefinitions is missing %s", want)
+		}
 	}
 }
