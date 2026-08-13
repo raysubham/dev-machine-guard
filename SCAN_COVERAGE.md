@@ -47,6 +47,11 @@ Detection is cross-platform — binaries are located via `$PATH` lookup and home
 | Aider                 | OpenSource| `aider`                     | `~/.aider`                      |
 | OpenCode              | OpenSource| `opencode`                  | `~/.config/opencode`            |
 | Cursor Agent          | Cursor    | `cursor-agent`              | `~/.cursor`                     |
+| Pi                    | Earendil  | `pi`                        | `~/.pi/agent`                   |
+| Factory Droid         | Factory   | `droid`                     | `~/.factory`                    |
+| Amp                   | Sourcegraph| `amp`                      | `~/.config/amp`                 |
+
+Pi, Factory Droid and Amp share their binary names with unrelated popular tools, so a `$PATH` hit alone does not report them — each is confirmed from an on-disk artifact (a package manifest, an installer anchor directory, a Homebrew cask root, a winget or pacman package entry), and is searched for in the common global-install prefixes as well as on `$PATH`. Pi and Amp are never executed because macOS Gatekeeper prompts on their binaries; their versions come from disk or are reported as `unknown`.
 
 ## General-Purpose AI Agents
 
@@ -76,21 +81,23 @@ Binaries are found via `$PATH` lookup (cross-platform). LM Studio is additionall
 
 On Windows, `~` refers to the user's home directory (`%USERPROFILE%`). Claude Desktop uses a Windows-specific path via `%APPDATA%`.
 
-| Source           | macOS / Linux Path                                               | Windows Path (if different)                    | Vendor    |
-|------------------|------------------------------------------------------------------|------------------------------------------------|-----------|
-| Claude Desktop   | `~/Library/Application Support/Claude/claude_desktop_config.json`| `%APPDATA%/Claude/claude_desktop_config.json`  | Anthropic |
-| Claude Code      | `~/.claude/settings.json`                                        | _(same)_                                       | Anthropic |
-| Claude Code      | `~/.claude.json`                                                 | _(same)_                                       | Anthropic |
-| Cursor           | `~/.cursor/mcp.json`                                             | _(same)_                                       | Cursor    |
-| Windsurf         | `~/.codeium/windsurf/mcp_config.json`                            | _(same)_                                       | Codeium   |
-| Antigravity      | `~/.gemini/antigravity/mcp_config.json`                          | _(same)_                                       | Google    |
-| Zed              | `~/.config/zed/settings.json`                                    | _(same)_                                       | Zed       |
-| Open Interpreter | `~/.config/open-interpreter/config.yaml`                         | _(same)_                                       | OpenSource|
-| Codex            | `~/.codex/config.toml`                                           | _(same)_                                       | OpenAI    |
+| Source             | macOS / Linux Path                                               | Windows Path (if different)                    | Vendor    |
+|--------------------|------------------------------------------------------------------|------------------------------------------------|-----------|
+| Claude Desktop     | `~/Library/Application Support/Claude/claude_desktop_config.json`| `%APPDATA%/Claude/claude_desktop_config.json`  | Anthropic |
+| Claude Code        | `~/.claude/settings.json`                                        | _(same)_                                       | Anthropic |
+| Claude Code        | `~/.claude.json`                                                 | _(same)_                                       | Anthropic |
+| Cursor             | `~/.cursor/mcp.json`                                             | _(same)_                                       | Cursor    |
+| Windsurf           | `~/.codeium/windsurf/mcp_config.json`                            | _(same)_                                       | Codeium   |
+| Antigravity        | `~/.gemini/antigravity/mcp_config.json`                          | _(same)_                                       | Google    |
+| Zed                | `~/.config/zed/settings.json`                                    | _(same)_                                       | Zed       |
+| Open Interpreter   | `~/.config/open-interpreter/config.yaml`                         | _(same)_                                       | OpenSource|
+| Codex              | `~/.codex/config.toml`                                           | _(same)_                                       | OpenAI    |
+| OpenCode           | `~/.config/opencode/opencode.json` (and `.jsonc`)                | _(same)_                                       | OpenCode  |
+| OpenCode (project) | `opencode.json` / `opencode.jsonc` in a project directory        | _(same)_                                       | OpenCode  |
 
 ## AI Agent Skills
 
-Dev Machine Guard inventories every installed **agent skill** — a directory containing a `SKILL.md` manifest — across Claude Code, Codex, OpenCode, Cursor, the cross-agent `~/.agents` convention, and skills installed via [skills.sh](https://skills.sh). It probes each agent's global, system, project, and plugin skill directories; skills.sh lock files add upstream provenance (joined by symlink-resolved path). Detection is pure filesystem reads (no subprocesses), bounded by a 60-second budget and per-root caps.
+Dev Machine Guard inventories every installed **agent skill** — a directory containing a `SKILL.md` manifest — across Claude Code, Codex, OpenCode, Cursor, Gemini CLI, GitHub Copilot, Pi, Factory, Amp, the cross-agent `~/.agents` convention, and skills installed via [skills.sh](https://skills.sh). It probes each agent's global, system, project, and plugin skill directories; skills.sh lock files add upstream provenance (joined by symlink-resolved path). Detection is pure filesystem reads (no subprocesses), bounded by a 60-second budget and per-root caps.
 
 **Privacy: only metadata and a single SHA-256 hash of each `SKILL.md` are collected — no other file is ever read, and file contents are never transmitted.** The file census (counts, sizes, timestamps) comes entirely from directory listings and `stat`. For skills installed from a local path, the on-disk source path is never serialized — only the skill's alias.
 

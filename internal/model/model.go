@@ -38,6 +38,11 @@ type ScanResult struct {
 	AgentSkills    []AgentSkill        `json:"agent_skills,omitempty"`
 	AgentSkillScan *AgentSkillScanInfo `json:"agent_skill_scan,omitempty"`
 
+	// CredentialScan is the credential-location inventory. Nil means the phase
+	// did not run, which is the only "no information" signal a reader has — a
+	// non-nil section with zero findings means it ran and found nothing.
+	CredentialScan *CredentialScanInfo `json:"credential_scan,omitempty"`
+
 	Summary Summary `json:"summary"`
 }
 
@@ -714,8 +719,8 @@ type AgentSkill struct {
 	//                              // "agents_user"|"agents_project"|"codex_user"|"codex_system"|"codex_admin"|
 	//                              // "opencode_user"|"opencode_project"|"cursor_user"|"cursor_project"|"pi_user"|
 	//                              // "pi_project"|"factory_user"|"factory_project"|"factory_agent_project"|
-	//                              // "amp_user"|"copilot_user"|"github_project"|"gemini_user"|"gemini_project"|
-	//                              // "aider_project"
+	//                              // "factory_agent_user"|"amp_user"|"copilot_user"|"github_project"|
+	//                              // "gemini_user"|"gemini_project"|"aider_project"
 	Scope       string `json:"scope"`                  // "global" | "project" | "system"
 	ProjectPath string `json:"project_path,omitempty"` // project root for project scope
 	PluginName  string `json:"plugin_name,omitempty"`  // owning plugin, from skills.sh lock pluginName

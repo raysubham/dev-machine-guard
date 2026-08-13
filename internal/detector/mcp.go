@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/tailscale/hujson"
+
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/tcc"
@@ -38,6 +40,12 @@ var mcpConfigDefinitions = []mcpConfigSpec{
 	{"cursor_user", "~/Library/Application Support/Cursor/User/mcp.json", "%APPDATA%/Cursor/User/mcp.json", "~/.config/Cursor/User/mcp.json", "Cursor"},
 	{"windsurf_user", "~/Library/Application Support/Windsurf/User/mcp.json", "%APPDATA%/Windsurf/User/mcp.json", "~/.config/Windsurf/User/mcp.json", "Codeium"},
 	{"vscodium", "~/Library/Application Support/VSCodium/User/mcp.json", "%APPDATA%/VSCodium/User/mcp.json", "~/.config/VSCodium/User/mcp.json", "VSCodium"},
+	// OpenCode uses the same ~/.config/opencode layout on every platform, so the
+	// Windows and Linux fields stay empty and resolveConfigPath expands
+	// ConfigPath against the resolved home. Both spellings are accepted by the
+	// tool, so both are listed.
+	{"opencode", "~/.config/opencode/opencode.json", "", "", "OpenCode"},
+	{"opencode", "~/.config/opencode/opencode.jsonc", "", "", "OpenCode"},
 }
 
 // MCPDetector collects MCP configuration files.
@@ -148,7 +156,7 @@ func (d *MCPDetector) resolveConfigPath(spec mcpConfigSpec, homeDir string) stri
 // Returns the filtered content and true on success, or nil and false if
 // filtering failed (to avoid leaking secrets from raw fallback).
 func (d *MCPDetector) filterMCPContent(sourceName, configPath string, content []byte) ([]byte, bool) {
-	if !strings.HasSuffix(configPath, ".json") {
+	if !strings.HasSuffix(configPath, ".json") && !strings.HasSuffix(configPath, ".jsonc") {
 		return nil, false // Non-JSON formats cannot be safely filtered
 	}
 
@@ -157,6 +165,19 @@ func (d *MCPDetector) filterMCPContent(sourceName, configPath string, content []
 	// Strip JSONC comments for Zed
 	if sourceName == "zed" {
 		jsonInput = stripJSONCComments(jsonInput)
+	}
+
+	// OpenCode accepts JSONC under either spelling, and its own documented
+	// examples carry trailing commas as well as comments. stripJSONCComments
+	// removes the comments but leaves the commas, which json.Unmarshal then
+	// rejects — dropping the content and losing the servers. hujson handles
+	// both, and is already this repo's front door for real-world JSONC.
+	if isOpenCodeConfigPath(configPath) {
+		standard, err := hujson.Standardize(jsonInput)
+		if err != nil {
+			return nil, false
+		}
+		jsonInput = standard
 	}
 
 	var raw map[string]json.RawMessage
@@ -176,7 +197,20 @@ func (d *MCPDetector) filterMCPContent(sourceName, configPath string, content []
 	return out, true
 }
 
-// extractMCPServers extracts mcpServers/context_servers/servers, keeping only command/args/serverUrl/url.
+// isOpenCodeConfigPath reports whether a path is an OpenCode config, in either
+// spelling. It tests the basename rather than the whole path on purpose: a
+// substring test would relabel an ordinary .mcp.json as OpenCode merely because
+// some ancestor directory is named "opencode" — a checkout of the tool itself,
+// say — while claiming nothing the basename does not already name.
+func isOpenCodeConfigPath(configPath string) bool {
+	switch strings.ToLower(filepath.Base(configPath)) {
+	case "opencode.json", "opencode.jsonc":
+		return true
+	}
+	return false
+}
+
+// extractMCPServers extracts mcpServers/context_servers/servers/mcp, keeping only command/args/serverUrl/url.
 // Also handles Claude Code's project-scoped mcpServers nested under projects → <path> → mcpServers.
 func (d *MCPDetector) extractMCPServers(raw map[string]json.RawMessage) map[string]any {
 	result := make(map[string]any)
@@ -196,6 +230,21 @@ func (d *MCPDetector) extractMCPServers(raw map[string]json.RawMessage) map[stri
 	if servers, ok := raw["servers"]; ok {
 		result["servers"] = filterServerFields(servers)
 		found = true
+	}
+	// Try mcp (OpenCode), entries tagged local or remote. The vendor's own key
+	// is preserved on the wire: this pipeline filters fields, it never rewrites
+	// another vendor's schema into mcpServers.
+	//
+	// Unlike the keys above, "mcp" is an ordinary enough word to show up as a
+	// scalar flag in a config that keeps its real servers elsewhere. Emitting a
+	// null for it would make the backend reject the whole document and drop the
+	// valid mcpServers sitting beside it, so a value that isn't a map of servers
+	// is skipped rather than emitted empty.
+	if servers, ok := raw["mcp"]; ok {
+		if filtered := filterServerFields(servers); filtered != nil {
+			result["mcp"] = filtered
+			found = true
+		}
 	}
 	// Try project-scoped mcpServers (Claude Code ~/.claude.json)
 	// Structure: { "projects": { "<path>": { "mcpServers": { ... } } } }

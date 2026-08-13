@@ -20,6 +20,12 @@ var mcpConfigBasenames = map[string]bool{
 	"mcp_settings.json":          true,
 	"cline_mcp_settings.json":    true,
 	"claude_desktop_config.json": true,
+	// OpenCode's project config sits in the working directory and is searched
+	// upward to the nearest Git directory. Recognizing the two basenames covers
+	// every project-level config under the search dirs without any project-root
+	// logic of its own.
+	"opencode.json":  true,
+	"opencode.jsonc": true,
 }
 
 // mcpWalkExcludeDirs are directory names never descended during the MCP walk:
@@ -176,6 +182,11 @@ func mcpVendorForPath(p string) string {
 	lp := strings.ToLower(p)
 	sep := string(filepath.Separator)
 	switch {
+	// Basename match, and deliberately first: the substring cases below match on
+	// any ancestor directory, so ~/dev/cursor-tools/opencode.json would otherwise
+	// be labelled Cursor. The filename is the stronger signal, so it wins.
+	case isOpenCodeConfigPath(p):
+		return "OpenCode"
 	case strings.Contains(lp, "vscodium"):
 		return "VSCodium"
 	case strings.Contains(lp, "cursor"):
