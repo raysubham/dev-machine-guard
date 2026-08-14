@@ -107,10 +107,23 @@ var cliToolDefinitions = []cliToolSpec{
 		},
 	},
 	{
-		Name:       "github-copilot-cli",
-		Vendor:     "Microsoft",
-		Binaries:   []string{"copilot", "gh-copilot"},
-		ConfigDirs: []string{"~/.config/github-copilot"},
+		Name:   "github-copilot-cli",
+		Vendor: "Microsoft",
+		// `gh copilot` launches this same CLI, downloading it into gh's own data
+		// directory when it isn't on PATH, so that install never lands on PATH.
+		// Bare names stay first, so PATH hits keep resolving from the npm
+		// manifest without exec'ing anything.
+		Binaries: []string{
+			"copilot", "gh-copilot",
+			"~/.local/share/gh/copilot/copilot",
+			"~/AppData/Local/GitHub CLI/copilot/copilot",
+			"~/.local/bin/copilot",
+			"~/AppData/Local/Microsoft/WinGet/Links/copilot.exe",
+			"~/AppData/Roaming/npm/copilot.cmd",
+			"~/.local/share/gh/extensions/gh-copilot/gh-copilot",
+			"~/AppData/Local/GitHub CLI/extensions/gh-copilot/gh-copilot",
+		},
+		ConfigDirs: []string{"~/.config/github-copilot", "~/.copilot"},
 		// Reject the VS Code Copilot Chat extension's shim, which lives on PATH
 		// even when the real CLI isn't installed and replies to `--version` with
 		// "GitHub Copilot CLI is not installed. Would you like to install it? (Y/n)".
