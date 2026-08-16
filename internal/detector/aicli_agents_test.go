@@ -915,6 +915,25 @@ func TestAICLIAgents_NoRegression(t *testing.T) {
 				version: "1.2.3", configRel: "~/.config/github-copilot",
 			}},
 		},
+		{
+			// Nothing on PATH: the only way to this row is the gh data-directory
+			// anchor, and with no manifest beside it both probes must be execs.
+			name: "(c) the Copilot CLI gh downloads for itself is found off PATH",
+			setup: func(m *executor.Mock, home string) {
+				bin := expandTilde("~/.local/share/gh/copilot/copilot", home)
+				addBinary(m, bin, 40<<20)
+				m.SetCommand("GitHub Copilot CLI 2077.1.1\n", "", 0, bin, "--version")
+			},
+			allowExec: true,
+			want: []aicliWant{{
+				tool: "github-copilot-cli", binary: "/home/u/.local/share/gh/copilot/copilot",
+				version: "2077.1.1",
+			}},
+			wantExecs: []aicliExecCall{
+				{name: "/home/u/.local/share/gh/copilot/copilot", args: []string{"--version"}},
+				{name: "/home/u/.local/share/gh/copilot/copilot", args: []string{"--version"}},
+			},
+		},
 	})
 }
 
