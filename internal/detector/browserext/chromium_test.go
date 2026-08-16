@@ -437,6 +437,66 @@ func TestChromium_Permissions(t *testing.T) {
 	}
 }
 
+// TestChromium_WithheldHostsAreNotReported covers the one case where the union
+// stops being true. Restricting an extension's site access does not rewrite the
+// up-front grant — the browser sets a flag and moves what survives into the
+// runtime record — so unioning the two reports the access the user took away.
+func TestChromium_WithheldHostsAreNotReported(t *testing.T) {
+	const granted = `"api": ["storage", "tabs"], "explicit_host": ["*://*/*", "<all_urls>"]`
+
+	for _, tt := range []struct {
+		name    string
+		entry   string
+		want    []string
+		wantAPI []string
+	}{
+		{
+			// Site access restricted to nothing: the extension holds no host at
+			// all, however much the up-front record still lists.
+			name:    "withheld with nothing granted back reaches no host",
+			entry:   `"withholding_permissions": true, "runtime_granted_permissions": {"api": ["cookies"]}`,
+			want:    nil,
+			wantAPI: []string{"cookies", "storage", "tabs"},
+		},
+		{
+			// Site access restricted to one site: that site, and not the pattern
+			// it was carved out of.
+			name: "withheld with one site granted back reaches that site",
+			entry: `"withholding_permissions": true, "runtime_granted_permissions": {
+				"api": ["cookies"], "scriptable_host": ["https://kept.internal/*"]
+			}`,
+			want:    []string{"https://kept.internal/*"},
+			wantAPI: []string{"cookies", "storage", "tabs"},
+		},
+		{
+			// Every browser that does not write the flag, and every extension
+			// whose access was never restricted.
+			name:    "no flag leaves the union alone",
+			entry:   `"runtime_granted_permissions": {"api": ["cookies"], "scriptable_host": ["https://kept.internal/*"]}`,
+			want:    []string{"*://*/*", "<all_urls>", "https://kept.internal/*"},
+			wantAPI: []string{"cookies", "storage", "tabs"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _ := chromeFinding(t, `"`+idA+`": {
+				"location": 1,
+				"manifest": {"name": "Example", "version": "1.0"},
+				"granted_permissions": {`+granted+`},
+				`+tt.entry+`
+			}`)
+
+			if strings.Join(got.HostPermissions, ",") != strings.Join(tt.want, ",") {
+				t.Errorf("host_permissions = %v, want %v", got.HostPermissions, tt.want)
+			}
+			// Withholding is about hosts. An API permission disappearing here
+			// means the branch caught the wrong list.
+			if strings.Join(got.Permissions, ",") != strings.Join(tt.wantAPI, ",") {
+				t.Errorf("permissions = %v, want %v", got.Permissions, tt.wantAPI)
+			}
+		})
+	}
+}
+
 // TestChromium_OverlongFieldsByClass pins the difference between a string a person
 // reads and a string something matches. A name is shortened; a permission is
 // dropped, because a shortened grant is a different grant and showing an auditor a

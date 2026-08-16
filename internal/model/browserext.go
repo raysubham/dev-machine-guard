@@ -234,10 +234,11 @@ type BrowserExtensionFinding struct {
 	SignedState string `json:"signed_state,omitempty"`
 
 	// The API permissions and host patterns the browser recorded as granted,
-	// including what the user granted at runtime — the honest upper bound of
-	// what the extension can reach, rather than what its manifest asked for. An
-	// entry too long for its cap is omitted rather than shortened: these strings
-	// are matched, so a shortened one is a different grant.
+	// including what the user granted at runtime, rather than what the manifest
+	// asked for. Hosts the user has since withheld are left out, because the
+	// browser has taken them back. An entry too long for its cap is omitted
+	// rather than shortened: these strings are matched, so a shortened one is a
+	// different grant.
 	Permissions     []string `json:"permissions"`
 	HostPermissions []string `json:"host_permissions"`
 }

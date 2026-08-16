@@ -269,7 +269,13 @@ type chromiumEntry struct {
 	WasInstalledByOEM     bool                 `json:"was_installed_by_oem"`
 	Granted               *chromiumPermissions `json:"granted_permissions"`
 	RuntimeGranted        *chromiumPermissions `json:"runtime_granted_permissions"`
-	CWSInfo               *chromiumCWSInfo     `json:"cws-info"`
+	// Set when the user restricted the extension's site access. The browser
+	// leaves the withheld hosts in granted_permissions as a record of the
+	// original grant, so reading that set alone reports access the extension
+	// does not have. Hosts then come from runtime_granted_permissions alone.
+	// API permissions are never withheld.
+	WithholdingHostPermissions bool             `json:"withholding_permissions"`
+	CWSInfo                    *chromiumCWSInfo `json:"cws-info"`
 }
 
 // chromiumManifest is the copy of the extension's manifest the browser keeps
@@ -381,7 +387,7 @@ func (d *Detector) chromiumOccurrence(scan *scanState, profileDir, id string, ra
 
 	state, disabledBy := chromiumEnabledState(e)
 	listing, violation := storeDisposition(e.CWSInfo)
-	perms, hosts, capped := permissionLists(e.Granted, e.RuntimeGranted)
+	perms, hosts, capped := permissionLists(e.Granted, e.RuntimeGranted, e.WithholdingHostPermissions)
 	if capped {
 		b.degrade(model.BrowserExtReasonCapped)
 	}
@@ -655,14 +661,21 @@ func lookupMessage(data []byte, key string) string {
 // Both grant paths are unioned, because either alone misreports what the
 // extension can reach: the up-front set keeps patterns the user has since
 // withheld, and the runtime set is the only home for what they granted on
-// demand. The union is the honest upper bound of effective access.
-func permissionLists(granted, runtime *chromiumPermissions) (perms, hosts []string, capped bool) {
+// demand. Once the user restricts site access the up-front set stops
+// describing the present, so the hosts then come from the runtime set alone
+// and the two lists part company: API permissions are never withheld.
+func permissionLists(granted, runtime *chromiumPermissions, withholdingHosts bool) (perms, hosts []string, capped bool) {
 	var api, host []string
 	for _, set := range []*chromiumPermissions{granted, runtime} {
 		if set == nil {
 			continue
 		}
 		api = append(api, set.API...)
+		// A withheld host is not a granted host: it sits in granted_permissions
+		// only as a record of what the user later took back.
+		if withholdingHosts && set != runtime {
+			continue
+		}
 		host = append(host, set.ExplicitHost...)
 		host = append(host, set.ScriptableHost...)
 	}
