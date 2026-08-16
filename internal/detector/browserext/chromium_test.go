@@ -1,0 +1,668 @@
+package browserext
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/step-security/dev-machine-guard/internal/model"
+)
+
+// Extension ids of the shape this family generates: thirty-two characters from a
+// through p.
+const (
+	idA = "abcdefghijklmnopabcdefghijklmnop"
+	idB = "bcdefghijklmnopabcdefghijklmnopa"
+	idC = "cdefghijklmnopabcdefghijklmnopab"
+)
+
+// manySettings builds n extension records, for the tests that push a bound. The
+// counter is spelled in the sixteen letters this family's ids are made of, so
+// every one of them passes the shape gate.
+func manySettings(n int) string {
+	const letters = "abcdefghijklmnop"
+	entries := make([]string, 0, n)
+	for i := range n {
+		var spelled strings.Builder
+		for _, digit := range fmt.Sprintf("%04d", i) {
+			spelled.WriteByte(letters[digit-'0'])
+		}
+		id := strings.Repeat("a", 28) + spelled.String()
+		entries = append(entries, `"`+id+`": {"location": 1, "manifest": {"name": "Example", "version": "1.0"}}`)
+	}
+	return strings.Join(entries, ",")
+}
+
+// chromeFinding runs one Chrome profile and returns its single finding plus the
+// browser's coverage entry, which is what most of the parsing rules are stated in
+// terms of.
+func chromeFinding(t *testing.T, settings string) (model.BrowserExtensionFinding, model.BrowserCoverage) {
+	t.Helper()
+	home := tempHome(t)
+	localState(t, chromeRoot(home), "Default")
+	securePrefs(t, chromeRoot(home), "Default", settings)
+
+	info := scanHome(t, home)
+	assertPayloadInvariants(t, info)
+	got := findingsFor(info, browserChrome)
+	if len(got) != 1 {
+		t.Fatalf("findings = %d, want exactly one", len(got))
+	}
+	return got[0], coverageFor(t, info, browserChrome)
+}
+
+// TestChromium_PrefsResidenceAndMerge pins where the extension map is read from.
+// It lives in the integrity-tracked file on every platform — the belief that Linux
+// keeps it in the plain one is wrong, and reading the plain file first would report
+// a stale record over the live one.
+func TestChromium_PrefsResidenceAndMerge(t *testing.T) {
+	home := tempHome(t)
+	root := chromeRoot(home)
+	localState(t, root, "Default")
+	securePrefs(t, root, "Default", `"`+idA+`": {
+		"location": 1, "manifest": {"name": "From Secure", "version": "1.0"}
+	}`)
+	writeFile(t, filepath.Join(root, "Default", "Preferences"), `{"extensions": {"settings": {
+		"`+idA+`": {"location": 1, "manifest": {"name": "From Plain", "version": "9.9"}},
+		"`+idB+`": {"location": 1, "manifest": {"name": "Only In Plain", "version": "2.0"}}
+	}}}`)
+
+	info := scanHome(t, home)
+	assertPayloadInvariants(t, info)
+	got := findingsFor(info, browserChrome)
+	if len(got) != 2 {
+		t.Fatalf("findings = %d, want the union of both files", len(got))
+	}
+	byID := map[string]model.BrowserExtensionFinding{}
+	for _, f := range got {
+		byID[f.ExtensionID] = f
+	}
+	if name := byID[idA].Name; name != "From Secure" {
+		t.Errorf("name = %q, want the integrity-tracked file to win", name)
+	}
+	if name := byID[idB].Name; name != "Only In Plain" {
+		t.Errorf("name = %q, want the plain file to fill an id the other lacks", name)
+	}
+}
+
+// TestChromium_EnabledState covers every shape the disable record takes in the
+// wild, and what each one says about who turned the extension off. Enabled is the
+// empty set — not a flag, and not the record's absence.
+func TestChromium_EnabledState(t *testing.T) {
+	tests := []struct {
+		name       string
+		record     string
+		state      string
+		disabledBy string
+	}{
+		{
+			name:   "no disable record is enabled",
+			record: `"location": 1`,
+			state:  model.BrowserExtEnabled,
+		},
+		{
+			name:   "empty list is enabled",
+			record: `"location": 1, "disable_reasons": []`,
+			state:  model.BrowserExtEnabled,
+		},
+		{
+			name:       "the user's own action",
+			record:     `"location": 1, "disable_reasons": [1]`,
+			state:      model.BrowserExtDisabled,
+			disabledBy: model.BrowserExtDisabledByUser,
+		},
+		{
+			// The browser's own decision, which is where a store takedown lands.
+			name:       "a reason of the browser's own",
+			record:     `"location": 1, "disable_reasons": [512]`,
+			state:      model.BrowserExtDisabled,
+			disabledBy: model.BrowserExtDisabledByBrowser,
+		},
+		{
+			name:       "an administrator's policy holding an update back",
+			record:     `"location": 1, "disable_reasons": [8192]`,
+			state:      model.BrowserExtDisabled,
+			disabledBy: model.BrowserExtDisabledByPolicy,
+		},
+		{
+			// The other policy bit, and the one an administrator reaches for to
+			// ban an extension outright.
+			name:       "an administrator's policy blocking it outright",
+			record:     `"location": 1, "disable_reasons": [32768]`,
+			state:      model.BrowserExtDisabled,
+			disabledBy: model.BrowserExtDisabledByPolicy,
+		},
+		{
+			// The user's action wins the cause when a set carries several.
+			name:       "the user's action alongside another reason",
+			record:     `"location": 1, "disable_reasons": [1, 512]`,
+			state:      model.BrowserExtDisabled,
+			disabledBy: model.BrowserExtDisabledByUser,
+		},
+		{
+			name:       "the older combined bitmask",
+			record:     `"location": 1, "disable_reasons": 513`,
+			state:      model.BrowserExtDisabled,
+			disabledBy: model.BrowserExtDisabledByUser,
+		},
+		{
+			name:   "the bitmask reading zero is enabled",
+			record: `"location": 1, "disable_reasons": 0`,
+			state:  model.BrowserExtEnabled,
+		},
+		{
+			name:   "the pre-list flag, read only when nothing else says",
+			record: `"location": 1, "state": 1`,
+			state:  model.BrowserExtEnabled,
+		},
+		{
+			name:       "the pre-list flag saying disabled",
+			record:     `"location": 1, "state": 0`,
+			state:      model.BrowserExtDisabled,
+			disabledBy: model.BrowserExtDisabledByUnknown,
+		},
+		{
+			// Present and unreadable: enabled and disabled are indistinguishable,
+			// and saying either would be a guess displayed as a fact.
+			name:   "an unreadable disable record",
+			record: `"location": 1, "disable_reasons": "wat"`,
+			state:  model.BrowserExtStateUnknown,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := chromeFinding(t, `"`+idA+`": {`+tc.record+`, "manifest": {"name": "Example", "version": "1.0"}}`)
+			if got.EnabledState != tc.state {
+				t.Errorf("enabled_state = %q, want %q", got.EnabledState, tc.state)
+			}
+			if got.DisabledBy != tc.disabledBy {
+				t.Errorf("disabled_by = %q, want %q", got.DisabledBy, tc.disabledBy)
+			}
+		})
+	}
+}
+
+// TestChromium_InstallSource maps every recorded location. The values the browser
+// uses for its own components are the only ones that produce no row at all.
+func TestChromium_InstallSource(t *testing.T) {
+	tests := []struct {
+		name     string
+		location string
+		want     string
+	}{
+		{name: "an ordinary install", location: "1", want: model.BrowserExtInstallUser},
+		{name: "a sideload through external preferences", location: "2", want: model.BrowserExtInstallSideload},
+		{name: "a downloaded sideload", location: "6", want: model.BrowserExtInstallSideload},
+		{name: "a registry sideload", location: "3", want: model.BrowserExtInstallRegistry},
+		{name: "developer mode", location: "4", want: model.BrowserExtInstallUnpacked},
+		{name: "a command-line load", location: "8", want: model.BrowserExtInstallUnpacked},
+		{name: "an administrator install", location: "7", want: model.BrowserExtInstallPolicy},
+		{name: "an administrator install, other form", location: "9", want: model.BrowserExtInstallPolicy},
+		{name: "a value this build does not know", location: "42", want: model.BrowserExtInstallUnknown},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := chromeFinding(t, `"`+idA+`": {"location": `+tc.location+
+				`, "manifest": {"name": "Example", "version": "1.0"}}`)
+			if got.InstallSource != tc.want {
+				t.Errorf("install_source = %q, want %q", got.InstallSource, tc.want)
+			}
+		})
+	}
+}
+
+// TestChromium_ExcludedAndNonMemberEntries covers everything that is in the
+// preference map and not an installed extension. None of them may degrade the
+// browser: they are classification, not damage — and a bookkeeping stub that
+// degraded it would do so on every scan for ever.
+func TestChromium_ExcludedAndNonMemberEntries(t *testing.T) {
+	tests := []struct {
+		name    string
+		id      string
+		record  string
+		reasons string
+	}{
+		{
+			name:   "the browser's own component",
+			id:     idA,
+			record: `"location": 5, "manifest": {"name": "Component", "version": "1.0"}`,
+		},
+		{
+			name:   "the browser's own external component",
+			id:     idA,
+			record: `"location": 10, "manifest": {"name": "Component", "version": "1.0"}`,
+		},
+		{
+			name:   "a theme",
+			id:     idA,
+			record: `"location": 1, "manifest": {"name": "Dark", "version": "1.0", "theme": {"colors": {}}}`,
+		},
+		{
+			name:   "a legacy packaged app",
+			id:     idA,
+			record: `"location": 1, "manifest": {"name": "Notes", "version": "1.0", "app": {"launch": {}}}`,
+		},
+		{
+			// Bookkeeping residue the browser's own loader cannot load. Reporting
+			// it would invent an extension and, having no manifest, would pin the
+			// browser to a degraded status permanently.
+			name:   "an update-ping stub",
+			id:     idA,
+			record: `"active_bit": true, "allowlist": {"state": 1}, "lastpingday": "13300000000000000"`,
+		},
+		{
+			name:   "a key that cannot be an extension id",
+			id:     "not-an-extension-id",
+			record: `"location": 1, "manifest": {"name": "Example", "version": "1.0"}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			home := tempHome(t)
+			localState(t, chromeRoot(home), "Default")
+			securePrefs(t, chromeRoot(home), "Default", `"`+tc.id+`": {`+tc.record+`}`)
+
+			info := scanHome(t, home)
+			assertPayloadInvariants(t, info)
+			if got := findingsFor(info, browserChrome); len(got) != 0 {
+				t.Errorf("findings = %d (%q), want none", len(got), got[0].Name)
+			}
+			got := coverageFor(t, info, browserChrome)
+			if got.Status != model.BrowserCoverageScanned || got.ReasonCode != "" {
+				t.Errorf("status = %q/%q, want the browser scanned and undegraded", got.Status, got.ReasonCode)
+			}
+		})
+	}
+}
+
+// TestChromium_CorruptRecordKeepsItsIdentity is the difference between the two
+// families: here the map key is the identity, so a record whose value cannot be
+// read still reports the extension. Dropping it under a status that claims a
+// complete list would retire that extension's stored row.
+func TestChromium_CorruptRecordKeepsItsIdentity(t *testing.T) {
+	got, coverage := chromeFinding(t, `"`+idA+`": "this is not a record"`)
+
+	if got.ExtensionID != idA {
+		t.Errorf("extension_id = %q, want the map key", got.ExtensionID)
+	}
+	if got.Name != "" || got.Version != "" {
+		t.Errorf("name/version = %q/%q, want both empty on a record that could not be read", got.Name, got.Version)
+	}
+	if got.EnabledState != model.BrowserExtStateUnknown {
+		t.Errorf("enabled_state = %q, want unknown", got.EnabledState)
+	}
+	// A reader requires both store fields on this family, and "cannot tell" is a
+	// value rather than an omission.
+	if got.StoreListing != model.BrowserExtStoreListingUnknown || got.StoreViolation != model.BrowserExtStoreViolationUnknown {
+		t.Errorf("store fields = %q/%q, want both unknown", got.StoreListing, got.StoreViolation)
+	}
+	if coverage.Status != model.BrowserCoveragePartial || coverage.ReasonCode != model.BrowserExtReasonManifestUnavailable {
+		t.Errorf("status = %q/%q, want partial and the missing metadata named",
+			coverage.Status, coverage.ReasonCode)
+	}
+}
+
+// TestChromium_StoreDisposition covers the pair this feature exists for: an
+// extension the store has pulled while the machine still runs it. Absent, the
+// answer is unknown and never listed — inferring that the store still carries it
+// would turn a missing answer into a reassuring one.
+func TestChromium_StoreDisposition(t *testing.T) {
+	tests := []struct {
+		name      string
+		record    string
+		listing   string
+		violation string
+		state     string
+	}{
+		{
+			name:      "listed and clean",
+			record:    `"cws-info": {"is-live": true, "violation-type": 0}`,
+			listing:   model.BrowserExtStoreListingListed,
+			violation: model.BrowserExtStoreViolationNone,
+			state:     model.BrowserExtEnabled,
+		},
+		{
+			name:      "pulled for a policy violation",
+			record:    `"disable_reasons": [512], "cws-info": {"is-live": false, "violation-type": 2}`,
+			listing:   model.BrowserExtStoreListingDelisted,
+			violation: model.BrowserExtStoreViolationFlagged,
+			state:     model.BrowserExtDisabled,
+		},
+		{
+			// The worst case, and the only field that finds it: no longer in the
+			// store, still running, still holding its permissions.
+			name:      "delisted and still enabled",
+			record:    `"cws-info": {"is-live": false, "violation-type": 0}`,
+			listing:   model.BrowserExtStoreListingDelisted,
+			violation: model.BrowserExtStoreViolationNone,
+			state:     model.BrowserExtEnabled,
+		},
+		{
+			name:      "no store record at all",
+			record:    `"location": 1`,
+			listing:   model.BrowserExtStoreListingUnknown,
+			violation: model.BrowserExtStoreViolationUnknown,
+			state:     model.BrowserExtEnabled,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := chromeFinding(t, `"`+idA+`": {"location": 1, `+tc.record+
+				`, "manifest": {"name": "Example", "version": "1.0"}}`)
+			if got.StoreListing != tc.listing || got.StoreViolation != tc.violation {
+				t.Errorf("store fields = %q/%q, want %q/%q",
+					got.StoreListing, got.StoreViolation, tc.listing, tc.violation)
+			}
+			if got.EnabledState != tc.state {
+				t.Errorf("enabled_state = %q, want %q: the listing is independent of it", got.EnabledState, tc.state)
+			}
+		})
+	}
+}
+
+// TestChromium_StoreAttribution reduces the update server to a label. The URL
+// itself never ships: a self-hosted one names internal infrastructure.
+func TestChromium_StoreAttribution(t *testing.T) {
+	tests := []struct {
+		name   string
+		record string
+		want   string
+	}{
+		{
+			name:   "the public store's update server",
+			record: `"manifest": {"name": "Example", "update_url": "` + chromeWebStoreUpdateURL + `"}`,
+			want:   model.BrowserExtStoreChromeWebStore,
+		},
+		{
+			name:   "the other vendor's store",
+			record: `"manifest": {"name": "Example", "update_url": "` + edgeAddonsUpdateURL + `?prod=edgechromium"}`,
+			want:   model.BrowserExtStoreEdgeAddons,
+		},
+		{
+			name:   "somebody's own server",
+			record: `"manifest": {"name": "Example", "update_url": "https://updates.example.internal/crx"}`,
+			want:   model.BrowserExtStoreSelfHosted,
+		},
+		{
+			name:   "no update server, but the store flag",
+			record: `"from_webstore": true, "manifest": {"name": "Example"}`,
+			want:   model.BrowserExtStoreChromeWebStore,
+		},
+		{
+			name:   "nothing to attribute it by",
+			record: `"manifest": {"name": "Example"}`,
+			want:   model.BrowserExtStoreUnknown,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := chromeFinding(t, `"`+idA+`": {"location": 1, `+tc.record+`}`)
+			if got.Store != tc.want {
+				t.Errorf("store = %q, want %q", got.Store, tc.want)
+			}
+			if strings.Contains(got.Store, "://") {
+				t.Errorf("store = %q, want a label rather than a URL", got.Store)
+			}
+		})
+	}
+}
+
+// TestChromium_Permissions covers the union that makes the list honest. Either
+// grant record alone misreports what the extension can reach: the up-front set
+// keeps patterns the user has since withheld, and the on-demand set is the only
+// home for what they granted later.
+func TestChromium_Permissions(t *testing.T) {
+	got, _ := chromeFinding(t, `"`+idA+`": {
+		"location": 1,
+		"manifest": {"name": "Example", "version": "1.0"},
+		"granted_permissions": {
+			"api": ["storage", "tabs"],
+			"explicit_host": ["https://example.internal/*"]
+		},
+		"runtime_granted_permissions": {
+			"api": ["storage", "cookies"],
+			"scriptable_host": ["https://other.internal/*"]
+		}
+	}`)
+
+	wantPerms := []string{"cookies", "storage", "tabs"}
+	if strings.Join(got.Permissions, ",") != strings.Join(wantPerms, ",") {
+		t.Errorf("permissions = %v, want %v deduplicated and sorted", got.Permissions, wantPerms)
+	}
+	wantHosts := []string{"https://example.internal/*", "https://other.internal/*"}
+	if strings.Join(got.HostPermissions, ",") != strings.Join(wantHosts, ",") {
+		t.Errorf("host_permissions = %v, want %v", got.HostPermissions, wantHosts)
+	}
+}
+
+// TestChromium_OverlongFieldsByClass pins the difference between a string a person
+// reads and a string something matches. A name is shortened; a permission is
+// dropped, because a shortened grant is a different grant and showing an auditor a
+// permission the extension never held is worse than showing one fewer.
+func TestChromium_OverlongFieldsByClass(t *testing.T) {
+	t.Run("a name is shortened and the browser stays clean", func(t *testing.T) {
+		long := strings.Repeat("N", maxNameBytes+50)
+		got, coverage := chromeFinding(t, `"`+idA+`": {"location": 1, "manifest": {"name": "`+long+`", "version": "1.0"}}`)
+		if len(got.Name) > maxNameBytes {
+			t.Errorf("name is %d bytes, want at most %d", len(got.Name), maxNameBytes)
+		}
+		if coverage.Status != model.BrowserCoverageScanned {
+			t.Errorf("status = %q, want no status change for a display field", coverage.Status)
+		}
+	})
+
+	t.Run("an overlong host pattern is absent, not shortened", func(t *testing.T) {
+		long := "https://" + strings.Repeat("h", maxPermissionBytes) + ".internal/*"
+		got, coverage := chromeFinding(t, `"`+idA+`": {
+			"location": 1, "manifest": {"name": "Example", "version": "1.0"},
+			"granted_permissions": {"explicit_host": ["`+long+`", "https://kept.internal/*"]}
+		}`)
+		want := []string{"https://kept.internal/*"}
+		if strings.Join(got.HostPermissions, ",") != strings.Join(want, ",") {
+			t.Errorf("host_permissions = %v, want exactly %v — a shortened pattern must never ship",
+				got.HostPermissions, want)
+		}
+		if coverage.Status != model.BrowserCoveragePartial || coverage.ReasonCode != model.BrowserExtReasonCapped {
+			t.Errorf("status = %q/%q, want partial and capped", coverage.Status, coverage.ReasonCode)
+		}
+	})
+}
+
+// TestChromium_ManifestFallbackAndLocalizedName covers the two reads beyond the
+// preferences: the manifest on disk when the preference copy is missing, and the
+// message table a localized name resolves through.
+func TestChromium_ManifestFallbackAndLocalizedName(t *testing.T) {
+	t.Run("the manifest on disk fills in for a store install", func(t *testing.T) {
+		home := tempHome(t)
+		root := chromeRoot(home)
+		localState(t, root, "Default")
+		securePrefs(t, root, "Default", `"`+idA+`": {"location": 1, "path": "`+idA+`/1.2.3_0"}`)
+		writeFile(t, filepath.Join(root, "Default", "Extensions", idA, "1.2.3_0", "manifest.json"),
+			`{"name": "Example From Disk", "version": "1.2.3"}`)
+
+		info := scanHome(t, home)
+		assertPayloadInvariants(t, info)
+		got := findingsFor(info, browserChrome)
+		if len(got) != 1 {
+			t.Fatalf("findings = %d, want one", len(got))
+		}
+		if got[0].Name != "Example From Disk" || got[0].Version != "1.2.3" {
+			t.Errorf("name/version = %q/%q, want the values from the manifest on disk", got[0].Name, got[0].Version)
+		}
+		if c := coverageFor(t, info, browserChrome); c.Status != model.BrowserCoverageScanned {
+			t.Errorf("status = %q/%q, want scanned: nothing was missing", c.Status, c.ReasonCode)
+		}
+	})
+
+	t.Run("a localized name resolves through the declared locale", func(t *testing.T) {
+		home := tempHome(t)
+		root := chromeRoot(home)
+		localState(t, root, "Default")
+		securePrefs(t, root, "Default", `"`+idA+`": {
+			"location": 1, "path": "`+idA+`/1.0_0",
+			"manifest": {"name": "__MSG_extName__", "version": "1.0", "default_locale": "en-GB"}
+		}`)
+		// Directory names use underscores rather than a language tag's hyphen,
+		// and the browser compares message names without case.
+		writeFile(t, filepath.Join(root, "Default", "Extensions", idA, "1.0_0", "_locales", "en_GB", "messages.json"),
+			`{"EXTNAME": {"message": "Example Localized"}}`)
+
+		got := findingsFor(scanHome(t, home), browserChrome)
+		if len(got) != 1 {
+			t.Fatalf("findings = %d, want one", len(got))
+		}
+		if got[0].Name != "Example Localized" {
+			t.Errorf("name = %q, want the resolved message", got[0].Name)
+		}
+	})
+
+	t.Run("an unresolvable name keeps its placeholder", func(t *testing.T) {
+		got, _ := chromeFinding(t, `"`+idA+`": {"location": 1, "path": "`+idA+`/1.0_0",
+			"manifest": {"name": "__MSG_extName__", "version": "1.0", "default_locale": "en"}}`)
+		if got.Name != "__MSG_extName__" {
+			t.Errorf("name = %q, want the placeholder kept rather than an empty name", got.Name)
+		}
+	})
+
+	// Both reads describe an extension the preference map has already listed.
+	// Neither can add or remove one, so a refusal costs the attribute and leaves
+	// membership — and every other extension in the browser — standing.
+	t.Run("a refused attribute read degrades rather than failing the browser", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			entry string
+			// Planted where the read expects a state file: something of that name
+			// which is not one. The read refuses it rather than describing
+			// whatever it is.
+			plant []string
+		}{
+			{
+				name:  "the manifest on disk",
+				entry: `"` + idA + `": {"location": 1, "path": "` + idA + `/1.0_0"}`,
+				plant: []string{"manifest.json", "anything"},
+			},
+			{
+				name: "the message table behind a localized name",
+				entry: `"` + idA + `": {"location": 1, "path": "` + idA + `/1.0_0",
+					"manifest": {"name": "__MSG_extName__", "version": "1.0", "default_locale": "en"}}`,
+				plant: []string{"_locales", "en", "messages.json", "anything"},
+			},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				home := tempHome(t)
+				root := chromeRoot(home)
+				localState(t, root, "Default")
+				securePrefs(t, root, "Default", tc.entry)
+				mkdir(t, filepath.Join(append([]string{root, "Default", "Extensions", idA, "1.0_0"}, tc.plant...)...))
+
+				info := scanHome(t, home)
+				assertPayloadInvariants(t, info)
+				got := findingsFor(info, browserChrome)
+				if len(got) != 1 || got[0].ExtensionID != idA {
+					t.Fatalf("findings = %d, want the listed extension still reported", len(got))
+				}
+				if c := coverageFor(t, info, browserChrome); c.Status != model.BrowserCoveragePartial {
+					t.Errorf("status = %q/%q, want partial: membership is still complete", c.Status, c.ReasonCode)
+				}
+			})
+		}
+	})
+}
+
+// TestChromium_UnpackedContentIsNeverOpened is the rule with no exception: an
+// unpacked extension's directory is an arbitrary user location, so its absolute
+// path is never resolved and never read. The manifest planted there would supply
+// a name if anything opened it.
+func TestChromium_UnpackedContentIsNeverOpened(t *testing.T) {
+	home := tempHome(t)
+	unpacked := filepath.Join(home, "projects", "client-work", "ext")
+	writeFile(t, filepath.Join(unpacked, "manifest.json"), `{"name": "Example Never Read", "version": "9.9"}`)
+
+	localState(t, chromeRoot(home), "Default")
+	securePrefs(t, chromeRoot(home), "Default",
+		`"`+idA+`": {"location": 4, "path": "`+filepath.ToSlash(unpacked)+`"}`)
+
+	info := scanHome(t, home)
+	assertPayloadInvariants(t, info)
+	got := findingsFor(info, browserChrome)
+	if len(got) != 1 {
+		t.Fatalf("findings = %d, want the extension reported with what the preferences held", len(got))
+	}
+	if got[0].Name != "" {
+		t.Errorf("name = %q, want none: the extension's own directory must never be opened", got[0].Name)
+	}
+	if got[0].InstallSource != model.BrowserExtInstallUnpacked {
+		t.Errorf("install_source = %q, want unpacked — the whole signal this row carries", got[0].InstallSource)
+	}
+	// No filesystem path of any kind reaches the wire, and this is the path that
+	// could have carried a client's name.
+	raw := marshalFindings(t, info)
+	if strings.Contains(raw, "client-work") {
+		t.Errorf("payload carries a filesystem path: %s", raw)
+	}
+	c := coverageFor(t, info, browserChrome)
+	if c.Status != model.BrowserCoveragePartial || c.ReasonCode != model.BrowserExtReasonManifestUnavailable {
+		t.Errorf("status = %q/%q, want partial and the missing metadata named", c.Status, c.ReasonCode)
+	}
+}
+
+// TestChromium_ByteOrderMarkedPrefsStillParse covers the class of failure a
+// Windows-authored file introduces: a mark in front of the document makes every
+// parser reject the whole thing, and a profile full of extensions would report as
+// empty.
+func TestChromium_ByteOrderMarkedPrefsStillParse(t *testing.T) {
+	home := tempHome(t)
+	root := chromeRoot(home)
+	localState(t, root, "Default")
+	const bom = "\uFEFF"
+	writeFile(t, filepath.Join(root, "Default", "Secure Preferences"),
+		bom+`{"extensions": {"settings": {"`+idA+`": {"location": 1, "manifest": {"name": "Example", "version": "1.0"}}}}}`)
+
+	info := scanHome(t, home)
+	assertPayloadInvariants(t, info)
+	if got := findingsFor(info, browserChrome); len(got) != 1 {
+		t.Fatalf("findings = %d, want the byte order mark stripped and the file parsed", len(got))
+	}
+}
+
+// TestChromium_TwoByteEncodingIsReportedRatherThanParsed covers the other
+// encoding. A byte-oriented parser reads almost nothing from it rather than
+// failing, so the file would read as holding no extensions.
+func TestChromium_TwoByteEncodingIsReportedRatherThanParsed(t *testing.T) {
+	home := tempHome(t)
+	root := chromeRoot(home)
+	localState(t, root, "Default")
+	if err := os.MkdirAll(filepath.Join(root, "Default"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Default", "Secure Preferences"),
+		[]byte{0xFF, 0xFE, 0x7B, 0x00}, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	info := scanHome(t, home)
+	assertPayloadInvariants(t, info)
+	got := coverageFor(t, info, browserChrome)
+	if got.Status != model.BrowserCoverageFailed || got.ReasonCode != model.BrowserExtReasonUnsupportedEncoding {
+		t.Errorf("status = %q/%q, want failed and the encoding named", got.Status, got.ReasonCode)
+	}
+}
+
+// TestChromium_PreinstalledIsReportedAndNotHidden keeps a default-installed
+// extension in the inventory. It is a real extension with real permissions; the
+// flag is there so a console can de-emphasize it rather than so this can drop it.
+func TestChromium_PreinstalledIsReportedAndNotHidden(t *testing.T) {
+	got, _ := chromeFinding(t, `"`+idA+`": {
+		"location": 6, "was_installed_by_default": true,
+		"manifest": {"name": "Example Bundled", "version": "1.0"}
+	}`)
+	if !got.Preinstalled {
+		t.Error("preinstalled = false, want the default-install flag reported")
+	}
+	if got.InstallSource != model.BrowserExtInstallSideload {
+		t.Errorf("install_source = %q, want the location's own answer rather than the flag's", got.InstallSource)
+	}
+}

@@ -28,7 +28,10 @@ type htmlData struct {
 	PythonProjects    []model.ProjectInfo
 	AgentSkills       []model.AgentSkill
 	AgentSkillScan    *model.AgentSkillScanInfo
-	Summary           model.Summary
+	// Nil means the phase did not run, which the template shows differently from a
+	// scan that ran and found nothing.
+	BrowserExtensionScan *model.BrowserExtensionScanInfo
+	Summary              model.Summary
 }
 
 func typeLabel(t string) string {
@@ -72,7 +75,9 @@ func HTML(outputFile string, result *model.ScanResult) error {
 		PythonProjects:    result.PythonProjects,
 		AgentSkills:       result.AgentSkills,
 		AgentSkillScan:    result.AgentSkillScan,
-		Summary:           result.Summary,
+
+		BrowserExtensionScan: result.BrowserExtensionScan,
+		Summary:              result.Summary,
 	}
 
 	funcMap := template.FuncMap{
@@ -268,6 +273,25 @@ const htmlTemplate = `<!DOCTYPE html>
     {{if .AgentSkillScan}}{{if .AgentSkills}}{{range .AgentSkills}}<tr><td>{{.SkillName}}</td><td>{{.Agent}}</td><td>{{.Source}}</td><td>{{.Scope}}</td><td>{{if .ManagedBy}}{{.ManagedBy}}{{else}}&mdash;{{end}}</td><td>{{if .SymlinkSources}}{{range $i, $s := .SymlinkSources}}{{if $i}}, {{end}}{{$s}}{{end}}{{else}}&mdash;{{end}}</td></tr>
     {{end}}{{else}}<tr><td colspan="6" style="text-align:center;color:#8a94a6;">None detected</td></tr>{{end}}{{else}}<tr><td colspan="6" style="text-align:center;color:#8a94a6;">Not scanned</td></tr>{{end}}
   </table>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-header" onclick="toggleSection(this)">
+    <h2>Browser Extensions <span class="count">{{if .BrowserExtensionScan}}{{len .BrowserExtensionScan.Findings}}{{else}}0{{end}}</span></h2>
+    <span class="toggle collapsed">&#9660;</span>
+  </div>
+  <div class="section-body collapsed">
+  <table>
+    <tr><th>Extension</th><th>Browser</th><th>Version</th><th>State</th><th>Install Source</th><th>Store Listing</th></tr>
+    {{if .BrowserExtensionScan}}{{if .BrowserExtensionScan.Findings}}{{range .BrowserExtensionScan.Findings}}<tr><td>{{if .Name}}{{.Name}}{{else}}{{.ExtensionID}}{{end}}</td><td>{{.BrowserID}}</td><td>{{if .Version}}{{.Version}}{{else}}&mdash;{{end}}</td><td>{{.EnabledState}}{{if .DisabledBy}} (by {{.DisabledBy}}){{end}}</td><td>{{.InstallSource}}</td><td>{{if .StoreListing}}{{.StoreListing}}{{else}}&mdash;{{end}}</td></tr>
+    {{end}}{{else}}<tr><td colspan="6" style="text-align:center;color:#8a94a6;">None detected</td></tr>{{end}}{{else}}<tr><td colspan="6" style="text-align:center;color:#8a94a6;">Not scanned</td></tr>{{end}}
+  </table>
+  {{if .BrowserExtensionScan}}<table>
+    <tr><th>Browser</th><th>Coverage</th><th>Reason</th><th>Profiles</th><th>Extensions</th></tr>
+    {{range .BrowserExtensionScan.Browsers}}<tr><td>{{.BrowserID}}</td><td>{{.Status}}</td><td>{{if .ReasonCode}}{{.ReasonCode}}{{else}}&mdash;{{end}}</td><td>{{.ProfileCount}}</td><td>{{.ExtensionCount}}</td></tr>
+    {{end}}
+  </table>{{end}}
   </div>
 </div>
 

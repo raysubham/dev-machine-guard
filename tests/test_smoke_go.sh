@@ -135,6 +135,15 @@ for key in scan_timestamp scan_timestamp_iso agent_version; do
     fi
 done
 
+# A gated phase must leave its section out entirely. Emitting it with zero
+# findings is the positive claim that the machine holds no browser extensions,
+# which the backend acts on by deleting what it has stored.
+if echo "$JSON_OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'browser_extension_scan' not in d" 2>/dev/null; then
+    pass "JSON omits browser_extension_scan while the feature is gated off"
+else
+    fail "JSON omits browser_extension_scan while the feature is gated off"
+fi
+
 # device object fields
 for key in hostname os_version serial_number platform user_identity; do
     if echo "$JSON_OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert '$key' in d['device']" 2>/dev/null; then

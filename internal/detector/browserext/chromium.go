@@ -1,0 +1,703 @@
+package browserext
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/step-security/dev-machine-guard/internal/model"
+)
+
+// The Chromium family: one parser for Chrome, Edge and Brave, whose data
+// directories have the same shape on every desktop platform — a `Local State`
+// file naming the profiles, and one directory per profile holding that profile's
+// preferences.
+
+// Update servers, matched by prefix because a real update URL carries query
+// parameters. The URL itself never leaves the machine: a self-hosted update
+// server's hostname is internal infrastructure, so only the label ships.
+const (
+	chromeWebStoreUpdateURL = "https://clients2.google.com/service/update2/crx"
+	edgeAddonsUpdateURL     = "https://edge.microsoft.com/extensionwebstorebase/v1/crx"
+)
+
+// Install locations, as the browser records them. Component extensions are the
+// browser's own parts and are not reported at all; every other value is, including
+// the ones the browser cannot classify.
+const (
+	locationInternal               = 1
+	locationExternalPref           = 2
+	locationExternalRegistry       = 3
+	locationUnpacked               = 4
+	locationComponent              = 5
+	locationExternalPrefDownload   = 6
+	locationExternalPolicyDownload = 7
+	locationCommandLine            = 8
+	locationExternalPolicy         = 9
+	locationExternalComponent      = 10
+)
+
+// Disable reasons worth naming, as the browser's own enumeration numbers them.
+// It records a set of them, and only these three change the answer: a set holding
+// the user's own action was the user's doing, one holding a policy reason was the
+// administrator's, and any other non-empty set means the browser disabled the
+// extension for a reason of its own — which is the case worth surfacing, since a
+// store takedown lands here. Bits are appended to that enumeration rather than
+// renumbered, so an unrecognised value deliberately reads as "the browser did it"
+// rather than as a value to interpret.
+const (
+	disableReasonUserAction          = 1 << 0
+	disableReasonPolicyUpdateRequire = 1 << 13
+	disableReasonBlockedByPolicy     = 1 << 15
+)
+
+// scanChromiumRoot reads one Chromium-family data directory and reports whether
+// it held an installation.
+func (d *Detector) scanChromiumRoot(ctx context.Context, scan *scanState, root string, b *browserScan) bool {
+	data, missing, reason := scan.readState(filepath.Join(root, "Local State"), maxLocalStateBytes)
+	if reason != "" {
+		b.fail(reason)
+		return true
+	}
+	if missing {
+		return d.classifyChromiumRoot(scan, root, b)
+	}
+
+	profiles, ok := parseProfileDirs(data)
+	if !ok {
+		// The profile list is what makes the extension list complete, so an
+		// unreadable one means membership is unknowable: an unknown profile can
+		// hold extensions. Guessing the layout instead — globbing for `Profile *`,
+		// or reading `Default` alone — would ship a partial list under a status
+		// that reads as complete.
+		b.fail(model.BrowserExtReasonParseError)
+		return true
+	}
+	for _, profile := range profiles {
+		if ctx.Err() != nil {
+			b.failPayload(model.BrowserExtReasonTimedOut, model.BrowserExtTruncatedDeadline)
+			return true
+		}
+		if b.profiles >= maxProfilesPerBrowser {
+			// An unscanned profile can hide extensions, so a bounded profile list
+			// is a membership question and fails the browser rather than
+			// degrading it.
+			b.failBounded(model.BrowserExtReasonCapped, model.BrowserExtTruncatedFindingCap)
+			return true
+		}
+		b.profiles++
+		d.scanChromiumProfile(scan, root, profile, b)
+		if b.failure != "" {
+			return true
+		}
+	}
+	return true
+}
+
+// classifyChromiumRoot decides what a data directory with no `Local State` is. A
+// directory can exist while the browser never has — installers leave one behind
+// holding nothing but an empty native-messaging folder — and calling that a
+// failure would paint a permanent red row for a browser nobody installed, on
+// every scan, which is how a coverage list stops being read.
+//
+// It reads directory entries only; no file is opened. Reporting the directory as
+// absent is authoritative, and safely so: the only rows it can retire are rows a
+// previous scan of this same empty directory wrote, and that scan cannot have
+// found anything either.
+func (d *Detector) classifyChromiumRoot(scan *scanState, root string, b *browserScan) bool {
+	names, missing, reason := scan.listNames(root, maxRootEntries)
+	if reason != "" {
+		b.fail(reason)
+		return true
+	}
+	if missing {
+		return false
+	}
+	for _, name := range names {
+		if name == "Default" || name == "Secure Preferences" || name == "Preferences" ||
+			strings.HasPrefix(name, "Profile ") {
+			// A profile is here but the file naming the profiles is not: this is
+			// a broken installation, not an absent one.
+			b.fail(model.BrowserExtReasonParseError)
+			return true
+		}
+	}
+	return false
+}
+
+// parseProfileDirs returns the profile directory names from `Local State`.
+//
+// The values beside those names carry the profile's display label, the signed-in
+// account's name and its e-mail address. They are decoded as raw bytes and never
+// looked at: the directory basename is the only part this reads, and even that
+// stays inside the detector.
+func parseProfileDirs(data []byte) ([]string, bool) {
+	var state struct {
+		Profile struct {
+			InfoCache map[string]json.RawMessage `json:"info_cache"`
+		} `json:"profile"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, false
+	}
+	if len(state.Profile.InfoCache) == 0 {
+		// A data directory that names no profile tells us nothing about which
+		// profiles exist, which is not the same as telling us there are none.
+		return nil, false
+	}
+	names := make([]string, 0, len(state.Profile.InfoCache))
+	for name := range state.Profile.InfoCache {
+		if !isDirName(name) {
+			// A key that is not a directory basename would move the read
+			// somewhere else entirely. The file is not trustworthy, so nothing
+			// derived from it is.
+			return nil, false
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, true
+}
+
+// isDirName reports whether name can be one directory entry: not empty, not a
+// traversal, and carrying no separator of either flavour.
+func isDirName(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	return !strings.ContainsAny(name, `/\`)
+}
+
+// hasParentComponent reports whether a relative path steps above its base. A
+// component test rather than a substring one: a version directory is free to
+// contain dots, and "1..0" walks nowhere.
+func hasParentComponent(path string) bool {
+	for _, c := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if c == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+// scanChromiumProfile reads one profile's extension records.
+//
+// `Secure Preferences` is read first on every platform, because that is where the
+// extension map lives on all of them — the belief that Linux keeps it in plain
+// `Preferences` is wrong: what differs per platform is whether the browser
+// enforces the file's integrity, not where it writes it. Plain `Preferences` fills
+// in ids the first file does not carry, which split preference tracking makes
+// possible. The integrity fields beside them are skipped: this reads, and the
+// browser's own tamper detection is not its business.
+func (d *Detector) scanChromiumProfile(scan *scanState, root, profile string, b *browserScan) {
+	dir := filepath.Join(root, profile)
+	settings := map[string]json.RawMessage{}
+	for _, name := range []string{"Secure Preferences", "Preferences"} {
+		data, missing, reason := scan.readState(filepath.Join(dir, name), maxPrefsBytes)
+		if reason != "" {
+			b.fail(reason)
+			return
+		}
+		if missing {
+			continue
+		}
+		entries, ok := parseExtensionSettings(data)
+		if !ok {
+			b.fail(model.BrowserExtReasonParseError)
+			return
+		}
+		for id, raw := range entries {
+			if _, seen := settings[id]; !seen {
+				settings[id] = raw
+			}
+		}
+	}
+
+	ids := make([]string, 0, len(settings))
+	for id := range settings {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	for _, id := range ids {
+		occ, ok := d.chromiumOccurrence(scan, dir, id, settings[id], b)
+		if !ok {
+			continue
+		}
+		// The data directory and profile together order the occurrences of one
+		// extension seen in several places.
+		occ.sortKey = dir
+		if !b.add(id, occ) {
+			return
+		}
+	}
+}
+
+// parseExtensionSettings returns the per-extension map from a preferences file.
+// Values stay raw so one corrupt record cannot cost the whole file.
+func parseExtensionSettings(data []byte) (map[string]json.RawMessage, bool) {
+	var prefs struct {
+		Extensions struct {
+			Settings map[string]json.RawMessage `json:"settings"`
+		} `json:"extensions"`
+	}
+	if err := json.Unmarshal(data, &prefs); err != nil {
+		return nil, false
+	}
+	return prefs.Extensions.Settings, true
+}
+
+// chromiumEntry is one record under the extension map. Every field is optional:
+// the file is written by a browser whose shape changes between releases, and a
+// missing field degrades one attribute rather than the record.
+type chromiumEntry struct {
+	Location       *int            `json:"location"`
+	DisableReasons json.RawMessage `json:"disable_reasons"`
+	// The pre-list form of the same fact, read only when disable_reasons is
+	// absent: current browsers do not write it.
+	State *int `json:"state"`
+	// Relative to the profile's own Extensions directory for a store install,
+	// absolute for an unpacked one. An absolute path is never opened and never
+	// ships.
+	Path                  string               `json:"path"`
+	Manifest              *chromiumManifest    `json:"manifest"`
+	FromWebstore          *bool                `json:"from_webstore"`
+	WasInstalledByDefault bool                 `json:"was_installed_by_default"`
+	WasInstalledByOEM     bool                 `json:"was_installed_by_oem"`
+	Granted               *chromiumPermissions `json:"granted_permissions"`
+	RuntimeGranted        *chromiumPermissions `json:"runtime_granted_permissions"`
+	CWSInfo               *chromiumCWSInfo     `json:"cws-info"`
+}
+
+// chromiumManifest is the copy of the extension's manifest the browser keeps
+// inside its own preferences. It covers almost every extension, which is what
+// keeps this phase to two file reads per profile.
+type chromiumManifest struct {
+	Name          string `json:"name"`
+	Version       string `json:"version"`
+	DefaultLocale string `json:"default_locale"`
+	UpdateURL     string `json:"update_url"`
+	// Presence alone is the test: a manifest with either key is a theme or a
+	// legacy packaged app rather than an extension.
+	Theme json.RawMessage `json:"theme"`
+	App   json.RawMessage `json:"app"`
+}
+
+// chromiumPermissions is one grant record. The granted sets are preferred over
+// what the manifest declared, because a declaration is a request and these are
+// what the browser actually handed over.
+type chromiumPermissions struct {
+	API            []string `json:"api"`
+	ExplicitHost   []string `json:"explicit_host"`
+	ScriptableHost []string `json:"scriptable_host"`
+}
+
+// chromiumCWSInfo is the browser's cached belief about the store's listing. It is
+// the highest-value pair in the record: an extension the store has pulled while
+// the machine still runs it, with its permissions granted, is exactly the shape of
+// a compromised extension, and nothing else on disk says so.
+type chromiumCWSInfo struct {
+	IsLive        *bool `json:"is-live"`
+	ViolationType *int  `json:"violation-type"`
+}
+
+// chromiumOccurrence turns one preference record into one occurrence, or reports
+// that the record does not describe an installed extension.
+func (d *Detector) chromiumOccurrence(scan *scanState, profileDir, id string, raw json.RawMessage, b *browserScan) (occurrence, bool) {
+	if !chromiumIDShape(id) {
+		// The browser generates every extension id — store, sideload, policy and
+		// unpacked alike — as thirty-two letters from the first sixteen of the
+		// alphabet, so a key of another shape cannot name an extension and the
+		// browser's own loader could not load it. A classification filter, not a
+		// degradation: what this key names is not in the extension set at all.
+		return occurrence{}, false
+	}
+
+	var e chromiumEntry
+	if err := json.Unmarshal(raw, &e); err != nil {
+		// The map key is the identity, so a corrupt record costs the metadata
+		// and not the extension. Reported with what survived, which keeps
+		// membership complete while the browser goes partial.
+		b.degrade(model.BrowserExtReasonManifestUnavailable)
+		return reducedOccurrence(), true
+	}
+	if e.Manifest == nil && e.Path == "" && e.Location == nil {
+		// Bookkeeping residue: an update-ping or allowlist stub with nothing the
+		// browser could load. It is not listed as an extension by the browser
+		// either, so reporting it would invent one — and, having no manifest, it
+		// would also degrade the browser on every scan for ever. Any one of the
+		// three fields present means there was something real to record, and the
+		// reduced-finding path below covers it.
+		return occurrence{}, false
+	}
+
+	source, reported := installSource(e.Location)
+	if !reported {
+		// A part of the browser itself rather than something installed into it.
+		return occurrence{}, false
+	}
+
+	manifest := e.Manifest
+	// Only a store install's path is relative, which is what makes it safe to
+	// resolve: it lands inside the browser's own tree. An unpacked extension's
+	// path is an arbitrary user location — this never opens one, and never ships
+	// it either, so nothing about it is read beyond what the preferences recorded.
+	extDir := ""
+	if e.Path != "" && !filepath.IsAbs(e.Path) && !hasParentComponent(e.Path) {
+		extDir = filepath.Join(profileDir, "Extensions", filepath.FromSlash(e.Path))
+	}
+	if manifest == nil && extDir != "" {
+		data, missing, reason := scan.readState(filepath.Join(extDir, "manifest.json"), maxManifestBytes)
+		if reason != "" {
+			// Membership came from the preference map, which has already been read
+			// whole. Nothing this file could have said would add or remove an
+			// extension, so a refusal costs the metadata and the browser goes
+			// partial rather than losing a list that is known complete.
+			b.degrade(reason)
+		}
+		if !missing && reason == "" {
+			var m chromiumManifest
+			if json.Unmarshal(data, &m) == nil {
+				manifest = &m
+			}
+		}
+	}
+	if manifest != nil && (len(manifest.Theme) > 0 || len(manifest.App) > 0) {
+		// A theme or a legacy packaged app. Neither runs code against pages, so
+		// neither is what this inventory is about.
+		return occurrence{}, false
+	}
+
+	name, version := "", ""
+	if manifest == nil {
+		b.degrade(model.BrowserExtReasonManifestUnavailable)
+	} else {
+		name = d.resolveExtensionName(scan, extDir, manifest, b)
+		version = manifest.Version
+	}
+
+	state, disabledBy := chromiumEnabledState(e)
+	listing, violation := storeDisposition(e.CWSInfo)
+	perms, hosts, capped := permissionLists(e.Granted, e.RuntimeGranted)
+	if capped {
+		b.degrade(model.BrowserExtReasonCapped)
+	}
+	return occurrence{
+		enabled:    state,
+		disabledBy: disabledBy,
+		block: model.BrowserExtensionFinding{
+			Name:            capBytes(name, maxNameBytes),
+			Version:         capBytes(version, maxVersionBytes),
+			EnabledState:    state,
+			StoreListing:    listing,
+			StoreViolation:  violation,
+			InstallSource:   source,
+			Store:           chromiumStore(manifest, e),
+			Preinstalled:    e.WasInstalledByDefault || e.WasInstalledByOEM,
+			Permissions:     perms,
+			HostPermissions: hosts,
+		},
+	}, true
+}
+
+// reducedOccurrence is what a record whose value could not be read produces: an
+// identity, and everything else spelled as unknown rather than left out. A reader
+// requires the two store fields on this family, and "cannot tell" is a value.
+func reducedOccurrence() occurrence {
+	return occurrence{
+		enabled: model.BrowserExtStateUnknown,
+		block: model.BrowserExtensionFinding{
+			EnabledState:    model.BrowserExtStateUnknown,
+			StoreListing:    model.BrowserExtStoreListingUnknown,
+			StoreViolation:  model.BrowserExtStoreViolationUnknown,
+			InstallSource:   model.BrowserExtInstallUnknown,
+			Store:           model.BrowserExtStoreUnknown,
+			Permissions:     []string{},
+			HostPermissions: []string{},
+		},
+	}
+}
+
+// chromiumIDShape reports whether id has the shape this family generates: exactly
+// thirty-two characters from a through p.
+func chromiumIDShape(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		if id[i] < 'a' || id[i] > 'p' {
+			return false
+		}
+	}
+	return true
+}
+
+// installSource maps a recorded location to how the extension got there,
+// reporting false for the values that are the browser's own components.
+func installSource(location *int) (string, bool) {
+	if location == nil {
+		return model.BrowserExtInstallUnknown, true
+	}
+	switch *location {
+	case locationInternal:
+		return model.BrowserExtInstallUser, true
+	case locationExternalPref, locationExternalPrefDownload:
+		return model.BrowserExtInstallSideload, true
+	case locationExternalRegistry:
+		return model.BrowserExtInstallRegistry, true
+	case locationUnpacked, locationCommandLine:
+		// The highest-signal rows in the whole inventory, and never excluded.
+		return model.BrowserExtInstallUnpacked, true
+	case locationExternalPolicyDownload, locationExternalPolicy:
+		// The installed state is evidence enough of a policy install; the policy
+		// sources themselves are not read, which keeps this phase to file reads
+		// inside one home.
+		return model.BrowserExtInstallPolicy, true
+	case locationComponent, locationExternalComponent:
+		return "", false
+	default:
+		return model.BrowserExtInstallUnknown, true
+	}
+}
+
+// chromiumEnabledState derives whether the extension runs, and who stopped it.
+//
+// Enabled is the empty disable-reason set — not a flag, and not the absence of
+// the record. The reason set names the actor rather than the cause: two very
+// different browser decisions carry the same value, which is why the store
+// disposition is read separately.
+func chromiumEnabledState(e chromiumEntry) (state, disabledBy string) {
+	if len(e.DisableReasons) == 0 {
+		if e.State != nil {
+			// A profile old enough to predate the reason set. Last resort: it
+			// says whether, not why.
+			if *e.State == 1 {
+				return model.BrowserExtEnabled, ""
+			}
+			return model.BrowserExtDisabled, model.BrowserExtDisabledByUnknown
+		}
+		return model.BrowserExtEnabled, ""
+	}
+	reasons, ok := parseDisableReasons(e.DisableReasons)
+	if !ok {
+		// The field is there and unreadable, so enabled and disabled are
+		// indistinguishable. Saying either would be a guess a console would
+		// display as fact.
+		return model.BrowserExtStateUnknown, ""
+	}
+	if len(reasons) == 0 {
+		return model.BrowserExtEnabled, ""
+	}
+	for _, r := range reasons {
+		if r == disableReasonUserAction {
+			return model.BrowserExtDisabled, model.BrowserExtDisabledByUser
+		}
+	}
+	for _, r := range reasons {
+		if r == disableReasonBlockedByPolicy || r == disableReasonPolicyUpdateRequire {
+			return model.BrowserExtDisabled, model.BrowserExtDisabledByPolicy
+		}
+	}
+	return model.BrowserExtDisabled, model.BrowserExtDisabledByBrowser
+}
+
+// parseDisableReasons reads both shapes in the wild: current browsers write a
+// list of values, older profiles a single combined bitmask.
+func parseDisableReasons(raw json.RawMessage) ([]int, bool) {
+	var list []int
+	if json.Unmarshal(raw, &list) == nil {
+		return list, true
+	}
+	var mask int
+	if json.Unmarshal(raw, &mask) != nil || mask < 0 {
+		return nil, false
+	}
+	var out []int
+	for bit := 1; bit > 0 && bit <= mask; bit <<= 1 {
+		if mask&bit != 0 {
+			out = append(out, bit)
+		}
+	}
+	return out, true
+}
+
+// storeDisposition reads the cached store listing. An absent record is unknown
+// and never listed: inferring that the store still carries an extension from the
+// absence of a record would turn a missing answer into a reassuring one.
+//
+// It is a cached belief, refreshed on the browser's update ping, so a browser that
+// has not run since a takedown still says listed. Delisted is a strong positive
+// and listed a weak negative, which is a distinction the copy in front of a
+// customer has to keep.
+func storeDisposition(info *chromiumCWSInfo) (listing, violation string) {
+	listing, violation = model.BrowserExtStoreListingUnknown, model.BrowserExtStoreViolationUnknown
+	if info == nil {
+		return listing, violation
+	}
+	if info.IsLive != nil {
+		if *info.IsLive {
+			listing = model.BrowserExtStoreListingListed
+		} else {
+			listing = model.BrowserExtStoreListingDelisted
+		}
+	}
+	if info.ViolationType != nil {
+		if *info.ViolationType == 0 {
+			violation = model.BrowserExtStoreViolationNone
+		} else {
+			violation = model.BrowserExtStoreViolationFlagged
+		}
+	}
+	return listing, violation
+}
+
+// chromiumStore attributes the extension to a store, as a label and never a URL.
+// A Brave install carries the Chrome Web Store's own update URL because Brave
+// proxies that store, which is the right answer from where the code came from.
+func chromiumStore(manifest *chromiumManifest, e chromiumEntry) string {
+	url := ""
+	if manifest != nil {
+		url = strings.TrimSpace(manifest.UpdateURL)
+	}
+	switch {
+	case url == "":
+		if e.FromWebstore != nil && *e.FromWebstore {
+			return model.BrowserExtStoreChromeWebStore
+		}
+		return model.BrowserExtStoreUnknown
+	case strings.HasPrefix(url, chromeWebStoreUpdateURL):
+		return model.BrowserExtStoreChromeWebStore
+	case strings.HasPrefix(url, edgeAddonsUpdateURL):
+		return model.BrowserExtStoreEdgeAddons
+	default:
+		return model.BrowserExtStoreSelfHosted
+	}
+}
+
+// resolveExtensionName resolves a localized name to the string a person would
+// see. Store installs only, on the same grounds as the manifest read: the message
+// table sits inside the browser's own tree.
+func (d *Detector) resolveExtensionName(scan *scanState, extDir string, manifest *chromiumManifest, b *browserScan) string {
+	key, localized := messageKey(manifest.Name)
+	if !localized || extDir == "" {
+		return manifest.Name
+	}
+	for _, locale := range localeCandidates(manifest.DefaultLocale) {
+		data, missing, reason := scan.readState(
+			filepath.Join(extDir, "_locales", locale, "messages.json"), maxMessagesBytes)
+		if reason != "" {
+			// A name is an attribute. The identity is already known, so an
+			// unreadable message table degrades the browser and leaves the
+			// placeholder standing.
+			b.degrade(reason)
+			return manifest.Name
+		}
+		if missing {
+			continue
+		}
+		if value := lookupMessage(data, key); value != "" {
+			return value
+		}
+	}
+	// Nothing resolved it. The placeholder is still the closest thing to a name
+	// this extension has, and an empty one would read as metadata never recorded.
+	return manifest.Name
+}
+
+// messageKey extracts the message name from a localized manifest value.
+func messageKey(name string) (string, bool) {
+	if !strings.HasPrefix(name, "__MSG_") || !strings.HasSuffix(name, "__") || len(name) <= len("__MSG___") {
+		return "", false
+	}
+	return name[len("__MSG_") : len(name)-len("__")], true
+}
+
+// localeCandidates returns the message tables to try, in order. The declared
+// default locale is read rather than the machine's, so the resolved name is the
+// same on every machine holding the same extension. Directory names use
+// underscores rather than the hyphen of a language tag.
+func localeCandidates(defaultLocale string) []string {
+	candidates := make([]string, 0, 3)
+	for _, locale := range []string{strings.ReplaceAll(defaultLocale, "-", "_"), "en_US", "en"} {
+		if locale == "" || !isDirName(locale) {
+			continue
+		}
+		if !slices.Contains(candidates, locale) {
+			candidates = append(candidates, locale)
+		}
+	}
+	return candidates
+}
+
+// lookupMessage returns one message's text. Keys are compared case-insensitively,
+// which is what the browser itself does on both sides of the lookup.
+func lookupMessage(data []byte, key string) string {
+	var table map[string]struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(data, &table); err != nil {
+		return ""
+	}
+	want := strings.ToLower(key)
+	for name, entry := range table {
+		if strings.ToLower(name) == want {
+			return entry.Message
+		}
+	}
+	return ""
+}
+
+// permissionLists reduces the grant records to the two wire lists.
+//
+// Both grant paths are unioned, because either alone misreports what the
+// extension can reach: the up-front set keeps patterns the user has since
+// withheld, and the runtime set is the only home for what they granted on
+// demand. The union is the honest upper bound of effective access.
+func permissionLists(granted, runtime *chromiumPermissions) (perms, hosts []string, capped bool) {
+	var api, host []string
+	for _, set := range []*chromiumPermissions{granted, runtime} {
+		if set == nil {
+			continue
+		}
+		api = append(api, set.API...)
+		host = append(host, set.ExplicitHost...)
+		host = append(host, set.ScriptableHost...)
+	}
+	perms, apiCapped := capPermissionList(api)
+	hosts, hostCapped := capPermissionList(host)
+	return perms, hosts, apiCapped || hostCapped
+}
+
+// capPermissionList sorts, deduplicates and bounds one permission list, reporting
+// whether anything was left out.
+//
+// An over-long entry is dropped rather than shortened. These strings are matched
+// and not read — a permission is compared for equality and a host pattern is a
+// match expression — so a shortened one is a different grant, and showing whoever
+// is auditing a permission the extension never held is worse than showing them
+// one fewer.
+func capPermissionList(in []string) ([]string, bool) {
+	out := make([]string, 0, len(in))
+	capped := false
+	seen := map[string]bool{}
+	for _, entry := range in {
+		if entry == "" || seen[entry] {
+			continue
+		}
+		seen[entry] = true
+		if len(entry) > maxPermissionBytes {
+			capped = true
+			continue
+		}
+		out = append(out, entry)
+	}
+	sort.Strings(out)
+	if len(out) > maxPermissionsPerFinding {
+		out = out[:maxPermissionsPerFinding]
+		capped = true
+	}
+	return out, capped
+}

@@ -21,6 +21,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/cli"
 	"github.com/step-security/dev-machine-guard/internal/config"
 	"github.com/step-security/dev-machine-guard/internal/detector"
+	"github.com/step-security/dev-machine-guard/internal/detector/browserext"
 	"github.com/step-security/dev-machine-guard/internal/detector/configaudit"
 	"github.com/step-security/dev-machine-guard/internal/detector/credentials"
 	"github.com/step-security/dev-machine-guard/internal/detector/rules"
@@ -108,6 +109,10 @@ type Payload struct {
 	AgentSkills             []model.AgentSkill              `json:"agent_skills,omitempty"`
 	AgentSkillScan          *model.AgentSkillScanInfo       `json:"agent_skill_scan,omitempty"`
 	CredentialScan          *model.CredentialScanInfo       `json:"credential_scan,omitempty"`
+	// Nil means the phase did not run, and that is the only signal a reader has
+	// for it: a section carrying zero findings is the positive claim that this
+	// machine's browsers hold no extensions.
+	BrowserExtensionScan *model.BrowserExtensionScanInfo `json:"browser_extension_scan,omitempty"`
 
 	ExecutionLogs      *ExecutionLogs      `json:"execution_logs,omitempty"`
 	PerformanceMetrics *PerformanceMetrics `json:"performance_metrics,omitempty"`
@@ -1002,6 +1007,33 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	endPhase(phaseCtx, phaseCancel, tracker, log, "credentials_scan")
 	postPhase()
 
+	// Browser extension inventory — which extensions are installed in this
+	// machine's browsers, whether they are enabled and why not, where they came
+	// from, and what they are permitted to touch. The browsers' own state files
+	// and nothing else: no browser is launched, no store is called, and the
+	// browsers' databases (cookies, history, passwords) are never opened.
+	//
+	// The target account is passed explicitly and the phase declines when it is a
+	// service identity: scanning the wrong home would find no browser and report
+	// every one of them missing, which a reader honours by deleting the device's
+	// real inventory. A nil section is that decline, and it must stay nil.
+	var browserExtensionScan *model.BrowserExtensionScanInfo
+	if featuregate.IsEnabled(featuregate.FeatureBrowserExtensionsScan) {
+		phaseCtx, phaseCancel = startPhase(ctx, tracker, "browser_extensions_scan")
+		log.Progress("Inventorying browser extensions...")
+		browserTarget, _ := exec.LoggedInUser()
+		browserExtensionScan = browserext.New(userExec).WithSkipper(tccSkipper).Detect(phaseCtx, browserTarget)
+		if browserExtensionScan == nil {
+			log.Progress("  Skipped: no interactive user to describe")
+		} else {
+			log.Progress("  Found %d browser extensions across %d browsers",
+				len(browserExtensionScan.Findings), len(browserExtensionScan.Browsers))
+		}
+		fmt.Fprintln(os.Stderr)
+		endPhase(phaseCtx, phaseCancel, tracker, log, "browser_extensions_scan")
+		postPhase()
+	}
+
 	// npm + pip configuration audits — surface-only inventory of every
 	// .npmrc and pip.conf on the host, plus the merged effective views
 	// each tool would resolve. We use the user-aware executor so npm and
@@ -1141,6 +1173,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		AgentSkills:             agentSkills,
 		AgentSkillScan:          agentSkillScan,
 		CredentialScan:          credentialScan,
+		BrowserExtensionScan:    browserExtensionScan,
 
 		ExecutionLogs: &ExecutionLogs{
 			OutputBase64: execLogsBase64,
