@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -152,6 +153,49 @@ func TestBrowserExtensionScanGolden_CoversTheWholeVocabulary(t *testing.T) {
 		}
 	}
 
+	// The four fields whose whole value is a distinction, so a fixture that
+	// stops showing both sides of one leaves the reader's handling of it
+	// unchecked. Scriptable hosts have three states, not two: a real subset, an
+	// empty list meaning the extension injects nowhere, and an absent one
+	// meaning nothing recorded the split.
+	scriptableSubset, scriptableEmpty, scriptableAbsent := false, false, false
+	manifestVersions := map[int]bool{}
+	dataCollection, installPath := false, false
+	for _, f := range info.Findings {
+		switch {
+		case f.ScriptableHostPermissions == nil:
+			scriptableAbsent = true
+		case len(*f.ScriptableHostPermissions) == 0:
+			scriptableEmpty = true
+		default:
+			scriptableSubset = true
+		}
+		manifestVersions[f.ManifestVersion] = true
+		if len(f.DataCollection) > 0 {
+			dataCollection = true
+		}
+		if f.InstallPath != "" {
+			installPath = true
+		}
+	}
+	for _, tt := range []struct {
+		got  bool
+		want string
+	}{
+		{scriptableSubset, "a finding whose scriptable_host_permissions names hosts"},
+		{scriptableEmpty, "a finding that injects nowhere, whose scriptable_host_permissions is empty"},
+		{scriptableAbsent, "a finding with no scriptable_host_permissions, where the split was not recorded"},
+		{manifestVersions[2], "a manifest version 2 finding, which can hold blocking request interception"},
+		{manifestVersions[3], "a manifest version 3 finding"},
+		{manifestVersions[0], "a finding whose manifest version the browser never recorded"},
+		{dataCollection, "a finding declaring data_collection"},
+		{installPath, "an unpacked finding carrying its install_path"},
+	} {
+		if !tt.got {
+			t.Errorf("golden payload must carry %s", tt.want)
+		}
+	}
+
 	// A reduced finding: metadata that could not be recovered, identity that
 	// could. A reader that requires a name drops a real extension on this row.
 	reduced := false
@@ -239,6 +283,29 @@ func TestBrowserExtensionScanGolden_HonoursTheCoverageInvariants(t *testing.T) {
 		if gecko == (f.StoreListing != "") || gecko == (f.StoreViolation != "") {
 			t.Errorf("%s: store fields %q/%q on browser %q",
 				f.ExtensionID, f.StoreListing, f.StoreViolation, f.BrowserID)
+		}
+		if f.ScriptableHostPermissions != nil {
+			// Gecko keeps one origins list, so a list here would be an answer
+			// the engine never gave.
+			if gecko {
+				t.Errorf("%s: scriptable_host_permissions on gecko browser %q", f.ExtensionID, f.BrowserID)
+			}
+			// A host that can be injected into is one the extension reaches, so
+			// a scriptable entry missing from host_permissions understates the
+			// row it appears on.
+			for _, h := range *f.ScriptableHostPermissions {
+				if !slices.Contains(f.HostPermissions, h) {
+					t.Errorf("%s: scriptable host %q is absent from host_permissions", f.ExtensionID, h)
+				}
+			}
+		}
+		// The path is the load location of an unpacked extension and means
+		// nothing on any other install source.
+		if f.InstallPath != "" && f.InstallSource != BrowserExtInstallUnpacked {
+			t.Errorf("%s: install_path on install_source %q", f.ExtensionID, f.InstallSource)
+		}
+		if f.ManifestVersion < 0 {
+			t.Errorf("%s: manifest_version %d", f.ExtensionID, f.ManifestVersion)
 		}
 	}
 }
