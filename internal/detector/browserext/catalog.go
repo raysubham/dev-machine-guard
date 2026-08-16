@@ -179,6 +179,34 @@ const (
 	maxPermissionsPerFinding = 64 // API permissions and host patterns each
 )
 
+// broadHostPatterns, together with the http/https pair below, is the same rule
+// the reader applies to decide broad host access. The two move together: a
+// pattern added on one side is a disagreement about what breadth means until it
+// is added on the other. Exact equality, never a judgment call about equivalent
+// patterns, because a host pattern is matched literally.
+var broadHostPatterns = map[string]struct{}{
+	"<all_urls>": {},
+	"*://*/*":    {},
+	"file://*/*": {},
+}
+
+// hasBroadHosts reports whether granted host patterns amount to whole-web reach.
+func hasBroadHosts(hosts []string) bool {
+	var http, https bool
+	for _, pattern := range hosts {
+		if _, ok := broadHostPatterns[pattern]; ok {
+			return true
+		}
+		switch pattern {
+		case "http://*/*":
+			http = true
+		case "https://*/*":
+			https = true
+		}
+	}
+	return http && https
+}
+
 // String caps in BYTES, not runes: the wire and the reader's caps are
 // byte-denominated, so the producer's have to be too. Truncation backs up to a
 // rune boundary so a capped string is still valid UTF-8.

@@ -264,7 +264,9 @@ type BrowserExtensionFinding struct {
 	ScriptableHostPermissions *[]string `json:"scriptable_host_permissions,omitempty"`
 
 	// What the extension declared it collects, as far as the user's grant records
-	// it. Gecko only. A list holding "none" is a positive declaration that it
+	// it. Written by gecko, the only engine that records the concept, though the
+	// wire carries it on any engine. A list holding "none" is a positive
+	// declaration that it
 	// collects nothing, which is not the same answer as an empty list, where
 	// nothing was declared at all.
 	DataCollection []string `json:"data_collection,omitempty"`

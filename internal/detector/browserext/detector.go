@@ -328,9 +328,9 @@ func (d *Detector) scanRoot(ctx context.Context, scan *scanState, spec browserSp
 // the wire — their names are user-chosen text and per-profile state was not the
 // ask — so they exist only to drive enumeration and this reduction.
 type occurrence struct {
-	// sortKey orders the occurrences of one extension: the data directory and
-	// then the profile directory. Arbitrary but fixed, which is what makes two
-	// runs over an unchanged machine emit identical findings.
+	// sortKey is the last tiebreak between the occurrences of one extension: the
+	// data directory and then the profile directory. Arbitrary but fixed, which
+	// is what makes two runs over an unchanged machine emit identical findings.
 	sortKey    string
 	enabled    string
 	disabledBy string
@@ -408,6 +408,56 @@ func (b *browserScan) add(id string, occ occurrence) bool {
 	return true
 }
 
+// stateRank orders the states the way the fold's union loop resolves them:
+// enabled in any profile wins, and a disabled profile still beats one whose
+// state could not be read.
+func stateRank(state string) int {
+	switch state {
+	case model.BrowserExtEnabled:
+		return 2
+	case model.BrowserExtDisabled:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// lessOccurrence orders one extension's occurrences so the first one describes
+// access the machine really has. The block is taken whole from the first, so
+// these keys rank whole profiles and never a field.
+//
+// State ranks first, by the same rule the union loop uses. That is an
+// invariant rather than a preference: the first occurrence is a maximum by
+// state, so its own state equals the state the loop resolves, and the version,
+// store and permissions under it belong to a profile that really is in it.
+func lessOccurrence(a, b occurrence) bool {
+	if ra, rb := stateRank(a.enabled), stateRank(b.enabled); ra != rb {
+		return ra > rb
+	}
+	// Breadth, not count: <all_urls> granted in one profile outranks twenty
+	// narrow patterns in another.
+	if ba, bb := hasBroadHosts(a.block.HostPermissions), hasBroadHosts(b.block.HostPermissions); ba != bb {
+		return ba
+	}
+	// Content scripts come from the manifest and usually match across profiles,
+	// but profiles can sit on different versions. A nil list is nothing read
+	// rather than nothing injected, and ranks as not broad either way.
+	sa := a.block.ScriptableHostPermissions != nil && hasBroadHosts(*a.block.ScriptableHostPermissions)
+	sb := b.block.ScriptableHostPermissions != nil && hasBroadHosts(*b.block.ScriptableHostPermissions)
+	if sa != sb {
+		return sa
+	}
+	if la, lb := len(a.block.HostPermissions), len(b.block.HostPermissions); la != lb {
+		return la > lb
+	}
+	if la, lb := len(a.block.Permissions), len(b.block.Permissions); la != lb {
+		return la > lb
+	}
+	// Last and total: this is what makes two runs over an unchanged machine
+	// emit identical findings.
+	return a.sortKey < b.sortKey
+}
+
 // fold reduces every extension's occurrences to one finding.
 func (b *browserScan) fold(browserID string) []model.BrowserExtensionFinding {
 	ids := make([]string, 0, len(b.occurrences))
@@ -419,7 +469,7 @@ func (b *browserScan) fold(browserID string) []model.BrowserExtensionFinding {
 	out := make([]model.BrowserExtensionFinding, 0, len(ids))
 	for _, id := range ids {
 		occs := b.occurrences[id]
-		sort.SliceStable(occs, func(i, j int) bool { return occs[i].sortKey < occs[j].sortKey })
+		sort.SliceStable(occs, func(i, j int) bool { return lessOccurrence(occs[i], occs[j]) })
 
 		f := occs[0].block
 		f.BrowserID = browserID

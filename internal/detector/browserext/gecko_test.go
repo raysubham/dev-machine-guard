@@ -511,6 +511,11 @@ func TestGecko_TwoDataDirectoriesDeduplicate(t *testing.T) {
 	if got[0].EnabledState != model.BrowserExtEnabled {
 		t.Errorf("enabled_state = %q, want enabled: it runs in one of the two", got[0].EnabledState)
 	}
+	// The reduction is shared with chromium, so the record comes from the
+	// directory whose state the row describes, not the first-sorting one.
+	if got[0].Version != "2.0" {
+		t.Errorf("version = %q, want the enabled directory's record", got[0].Version)
+	}
 	if c := coverageFor(t, info, browserFirefox); c.ProfileCount != 2 {
 		t.Errorf("profile_count = %d, want both directories' profiles counted together", c.ProfileCount)
 	}

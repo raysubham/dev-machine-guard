@@ -592,12 +592,138 @@ func TestDetect_FoldsOneExtensionSeenInTwoProfiles(t *testing.T) {
 	if f.DisabledBy != "" {
 		t.Errorf("disabled_by = %q, want none on an enabled extension", f.DisabledBy)
 	}
-	// The first-sorting profile owns the block, so both fields come from it.
-	if f.Version != "1.0.0" || len(f.Permissions) != 1 || f.Permissions[0] != "storage" {
-		t.Errorf("version/permissions = %q/%v, want one profile's whole record", f.Version, f.Permissions)
+	// The block comes from the profile the state describes, not from the
+	// first-sorting one, so both fields come from the enabled profile.
+	if f.Version != "2.0.0" || len(f.Permissions) != 1 || f.Permissions[0] != "tabs" {
+		t.Errorf("version/permissions = %q/%v, want the enabled profile's whole record", f.Version, f.Permissions)
 	}
 	if got := coverageFor(t, info, browserChrome); got.ProfileCount != 2 {
 		t.Errorf("profile_count = %d, want 2", got.ProfileCount)
+	}
+}
+
+// TestDetect_GrantedProfileOwnsTheAccessLists is the shape that made the ranking
+// necessary: the same extension in two profiles, host access withheld in the
+// first-sorting one and granted in the other. Reporting the withheld profile
+// says the machine has no broad access when it does, which is the wrong
+// direction for the reader to be wrong in.
+func TestDetect_GrantedProfileOwnsTheAccessLists(t *testing.T) {
+	home := tempHome(t)
+	localState(t, chromeRoot(home), "Default", "Profile 1")
+	securePrefs(t, chromeRoot(home), "Default", `"`+idA+`": {
+		"location": 1, "withholding_permissions": true,
+		"manifest": {"name": "Example Blocker", "version": "1.0.0"},
+		"granted_permissions": {"api": ["storage"], "explicit_host": ["<all_urls>"]}
+	}`)
+	securePrefs(t, chromeRoot(home), "Profile 1", `"`+idA+`": {
+		"location": 1,
+		"manifest": {"name": "Example Blocker", "version": "1.0.0"},
+		"granted_permissions": {"api": ["storage"], "explicit_host": ["<all_urls>"]}
+	}`)
+
+	got := findingsFor(scanHome(t, home), browserChrome)
+	if len(got) != 1 {
+		t.Fatalf("findings = %d, want one", len(got))
+	}
+	if len(got[0].HostPermissions) != 1 || got[0].HostPermissions[0] != "<all_urls>" {
+		t.Errorf("host_permissions = %v, want the granted profile's access", got[0].HostPermissions)
+	}
+	// It declares no content scripts in either profile, so an empty list here is
+	// the right answer and a filled one would be a different wrong one.
+	if got[0].ScriptableHostPermissions == nil || len(*got[0].ScriptableHostPermissions) != 0 {
+		t.Errorf("scriptable_host_permissions = %v, want the empty list it declared", got[0].ScriptableHostPermissions)
+	}
+}
+
+// TestLessOccurrence covers the ranking that decides which profile's record one
+// finding carries, key by key. State first, then breadth of access, and the path
+// only once nothing about the access itself separates them.
+func TestLessOccurrence(t *testing.T) {
+	list := func(entries ...string) *[]string { return &entries }
+	occ := func(sortKey, state string, hosts []string, scriptable *[]string, perms ...string) occurrence {
+		return occurrence{sortKey: sortKey, enabled: state, block: model.BrowserExtensionFinding{
+			Permissions:               perms,
+			HostPermissions:           hosts,
+			ScriptableHostPermissions: scriptable,
+		}}
+	}
+	specific := []string{"https://a.internal/*", "https://b.internal/*", "https://c.internal/*"}
+
+	// In every row the first occurrence is the one that should own the block, and
+	// it sorts second by path so the old rule would have picked the other.
+	tests := []struct {
+		name   string
+		first  occurrence
+		second occurrence
+	}{{
+		name:   "enabled wins however narrow, because the row says enabled",
+		first:  occ("b", model.BrowserExtEnabled, nil, nil),
+		second: occ("a", model.BrowserExtDisabled, []string{"<all_urls>"}, nil),
+	}, {
+		name:   "a disabled profile still beats one whose state could not be read",
+		first:  occ("b", model.BrowserExtDisabled, nil, nil),
+		second: occ("a", model.BrowserExtStateUnknown, []string{"<all_urls>"}, nil),
+	}, {
+		name:   "breadth is not count",
+		first:  occ("b", model.BrowserExtEnabled, []string{"<all_urls>"}, nil),
+		second: occ("a", model.BrowserExtEnabled, specific, nil),
+	}, {
+		name:   "http and https together are the whole web",
+		first:  occ("b", model.BrowserExtEnabled, []string{"http://*/*", "https://*/*"}, nil),
+		second: occ("a", model.BrowserExtEnabled, specific, nil),
+	}, {
+		name:   "one half of the pair is not broad, so count decides",
+		first:  occ("b", model.BrowserExtEnabled, specific, nil),
+		second: occ("a", model.BrowserExtEnabled, []string{"https://*/*"}, nil),
+	}, {
+		name:   "all disabled: breadth still decides, so a broad grant is reported",
+		first:  occ("b", model.BrowserExtDisabled, []string{"<all_urls>"}, nil),
+		second: occ("a", model.BrowserExtDisabled, specific, nil),
+	}, {
+		name:   "broad content scripts break a tie the host lists do not",
+		first:  occ("b", model.BrowserExtEnabled, []string{"<all_urls>"}, list("<all_urls>")),
+		second: occ("a", model.BrowserExtEnabled, []string{"<all_urls>"}, list()),
+	}, {
+		name:   "an unrecorded scriptable list is not a broad one",
+		first:  occ("b", model.BrowserExtEnabled, []string{"<all_urls>"}, list("<all_urls>")),
+		second: occ("a", model.BrowserExtEnabled, []string{"<all_urls>"}, nil),
+	}, {
+		name:   "with neither broad, the wider host list wins",
+		first:  occ("b", model.BrowserExtEnabled, specific, nil),
+		second: occ("a", model.BrowserExtEnabled, specific[:1], nil),
+	}, {
+		name:   "a runtime-granted API permission beats a path comparison",
+		first:  occ("b", model.BrowserExtEnabled, specific, nil, "storage", "tabs"),
+		second: occ("a", model.BrowserExtEnabled, specific, nil, "storage"),
+	}, {
+		name:   "everything equal: the path decides, and it is total",
+		first:  occ("a", model.BrowserExtEnabled, specific, nil),
+		second: occ("b", model.BrowserExtEnabled, specific, nil),
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !lessOccurrence(tt.first, tt.second) {
+				t.Error("the occurrence that describes the machine's access did not sort first")
+			}
+			if lessOccurrence(tt.second, tt.first) {
+				t.Error("both orderings compared less, so the ordering is not a strict one")
+			}
+
+			// The invariant: whichever way round the two arrive, the block the
+			// fold takes belongs to a profile in the state the fold resolves.
+			// It is what stops this comparator and that union loop drifting.
+			for _, occs := range [][]occurrence{{tt.first, tt.second}, {tt.second, tt.first}} {
+				b := &browserScan{occurrences: map[string][]occurrence{idA: occs}}
+				out := b.fold(browserChrome)
+				if len(out) != 1 {
+					t.Fatalf("findings = %d, want one", len(out))
+				}
+				if winner := b.occurrences[idA][0]; winner.enabled != out[0].EnabledState {
+					t.Errorf("block came from a %q profile on a %q row", winner.enabled, out[0].EnabledState)
+				}
+			}
+		})
 	}
 }
 
