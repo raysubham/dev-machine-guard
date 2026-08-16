@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -121,18 +122,49 @@ func TestChromium_EnabledState(t *testing.T) {
 			disabledBy: model.BrowserExtDisabledByBrowser,
 		},
 		{
-			name:       "an administrator's policy holding an update back",
-			record:     `"location": 1, "disable_reasons": [8192]`,
+			// The bit an administrator reaches for to ban an extension outright,
+			// as measured against a live blocklist.
+			name:       "an administrator's policy blocking it outright",
+			record:     `"location": 1, "disable_reasons": [65536]`,
 			state:      model.BrowserExtDisabled,
 			disabledBy: model.BrowserExtDisabledByPolicy,
 		},
 		{
-			// The other policy bit, and the one an administrator reaches for to
-			// ban an extension outright.
-			name:       "an administrator's policy blocking it outright",
-			record:     `"location": 1, "disable_reasons": [32768]`,
+			name:       "an administrator's policy holding an update back",
+			record:     `"location": 1, "disable_reasons": [16384]`,
 			state:      model.BrowserExtDisabled,
 			disabledBy: model.BrowserExtDisabledByPolicy,
+		},
+		{
+			// An externally installed extension awaiting the user's approval. No
+			// administrator is involved, so naming one would be wrong.
+			name:       "an external installation awaiting approval",
+			record:     `"location": 1, "disable_reasons": [8192]`,
+			state:      model.BrowserExtDisabled,
+			disabledBy: model.BrowserExtDisabledByBrowser,
+		},
+		{
+			// Family supervision, likewise not an administrator.
+			name:       "a custodian's approval outstanding",
+			record:     `"location": 1, "disable_reasons": [32768]`,
+			state:      model.BrowserExtDisabled,
+			disabledBy: model.BrowserExtDisabledByBrowser,
+		},
+		{
+			// Out of range of the enumeration entirely, which is what one browser
+			// in the family writes. Naming an actor for it would be invention.
+			name:       "a value the enumeration does not carry",
+			record:     `"location": 1, "disable_reasons": [134217728]`,
+			state:      model.BrowserExtDisabled,
+			disabledBy: model.BrowserExtDisabledByUnknown,
+		},
+		{
+			// A reason kept only for profiles old enough to still hold it. Still
+			// recognised, so it must not turn the whole set unknown.
+			name:       "a retired reason alongside the user's action",
+			record:     `"location": 1, "disable_reasons": [2097152, 1]`,
+			state:      model.BrowserExtDisabled,
+			disabledBy: model.BrowserExtDisabledByUser,
 		},
 		{
 			// The user's action wins the cause when a set carries several.
@@ -497,6 +529,122 @@ func TestChromium_WithheldHostsAreNotReported(t *testing.T) {
 	}
 }
 
+// TestChromium_ScriptableHostsAreASubset covers the stronger of the two host
+// capabilities. Injecting code into a page is not the same as sending it a
+// request, and the browser records the difference, so the payload keeps it.
+func TestChromium_ScriptableHostsAreASubset(t *testing.T) {
+	t.Run("the injectable hosts are named inside the reachable ones", func(t *testing.T) {
+		got, _ := chromeFinding(t, `"`+idA+`": {
+			"location": 1,
+			"manifest": {"name": "Example", "version": "1.0"},
+			"granted_permissions": {
+				"explicit_host": ["<all_urls>"],
+				"scriptable_host": ["https://example.internal/*"]
+			}
+		}`)
+
+		wantHosts := []string{"<all_urls>", "https://example.internal/*"}
+		if strings.Join(got.HostPermissions, ",") != strings.Join(wantHosts, ",") {
+			t.Errorf("host_permissions = %v, want %v", got.HostPermissions, wantHosts)
+		}
+		if got.ScriptableHostPermissions == nil {
+			t.Fatal("scriptable_host_permissions is absent, want the answer this family always has")
+		}
+		want := []string{"https://example.internal/*"}
+		if strings.Join(*got.ScriptableHostPermissions, ",") != strings.Join(want, ",") {
+			t.Errorf("scriptable_host_permissions = %v, want %v", *got.ScriptableHostPermissions, want)
+		}
+	})
+
+	t.Run("an extension that injects nowhere says so", func(t *testing.T) {
+		got, _ := chromeFinding(t, `"`+idA+`": {
+			"location": 1,
+			"manifest": {"name": "Example", "version": "1.0"},
+			"granted_permissions": {"explicit_host": ["https://example.internal/*"]}
+		}`)
+
+		if got.ScriptableHostPermissions == nil || len(*got.ScriptableHostPermissions) != 0 {
+			t.Errorf("scriptable_host_permissions = %v, want an empty list: this family knows the answer",
+				got.ScriptableHostPermissions)
+		}
+	})
+
+	t.Run("withholding empties both lists together", func(t *testing.T) {
+		got, _ := chromeFinding(t, `"`+idA+`": {
+			"location": 1,
+			"manifest": {"name": "Example", "version": "1.0"},
+			"withholding_permissions": true,
+			"granted_permissions": {"scriptable_host": ["https://taken-back.internal/*"]},
+			"runtime_granted_permissions": {"api": ["cookies"]}
+		}`)
+
+		if len(got.HostPermissions) != 0 {
+			t.Errorf("host_permissions = %v, want none", got.HostPermissions)
+		}
+		// A host the extension cannot reach is not one it can inject into, so the
+		// stronger list cannot outlive the weaker one.
+		if got.ScriptableHostPermissions == nil || len(*got.ScriptableHostPermissions) != 0 {
+			t.Errorf("scriptable_host_permissions = %v, want none", got.ScriptableHostPermissions)
+		}
+	})
+
+	t.Run("a host the cap drops is absent from both lists", func(t *testing.T) {
+		// Sorts after every filler entry, so the count cap is what removes it.
+		const last = `"https://zz-injectable.internal/*"`
+		filler := make([]string, maxPermissionsPerFinding)
+		for i := range filler {
+			filler[i] = fmt.Sprintf(`"https://a%02d.internal/*"`, i)
+		}
+		got, coverage := chromeFinding(t, `"`+idA+`": {
+			"location": 1,
+			"manifest": {"name": "Example", "version": "1.0"},
+			"granted_permissions": {
+				"explicit_host": [`+strings.Join(filler, ",")+`],
+				"scriptable_host": [`+last+`]
+			}
+		}`)
+
+		if slices.Contains(got.HostPermissions, strings.Trim(last, `"`)) {
+			t.Fatalf("host_permissions still carries the capped entry: %v", got.HostPermissions)
+		}
+		if got.ScriptableHostPermissions == nil {
+			t.Fatal("scriptable_host_permissions is absent")
+		}
+		if len(*got.ScriptableHostPermissions) != 0 {
+			t.Errorf("scriptable_host_permissions = %v, want none: the stronger list must not outlive the cap",
+				*got.ScriptableHostPermissions)
+		}
+		if coverage.Status != model.BrowserCoveragePartial || coverage.ReasonCode != model.BrowserExtReasonCapped {
+			t.Errorf("status = %q/%q, want partial and capped", coverage.Status, coverage.ReasonCode)
+		}
+	})
+}
+
+// TestChromium_ManifestVersion separates two extensions that otherwise look
+// identical. Version 2 can hold blocking request interception, which version 3
+// removed, so the same content blocker on two engines is not the same capability.
+func TestChromium_ManifestVersion(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		manifest string
+		want     int
+	}{
+		{"the revision that can still block requests", `"manifest_version": 2`, 2},
+		{"the revision that cannot", `"manifest_version": 3`, 3},
+		{"a record that does not say", `"version": "1.0"`, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _ := chromeFinding(t, `"`+idA+`": {
+				"location": 1,
+				"manifest": {"name": "Example", `+tt.manifest+`}
+			}`)
+			if got.ManifestVersion != tt.want {
+				t.Errorf("manifest_version = %d, want %d", got.ManifestVersion, tt.want)
+			}
+		})
+	}
+}
+
 // TestChromium_OverlongFieldsByClass pins the difference between a string a person
 // reads and a string something matches. A name is shortened; a permission is
 // dropped, because a shortened grant is a different grant and showing an auditor a
@@ -636,6 +784,12 @@ func TestChromium_ManifestFallbackAndLocalizedName(t *testing.T) {
 // unpacked extension's directory is an arbitrary user location, so its absolute
 // path is never resolved and never read. The manifest planted there would supply
 // a name if anything opened it.
+//
+// The path itself does ship. It is the one thing that makes the row actionable
+// once the name is gone, and it is reported exactly as the preferences recorded
+// it. Nothing was read and failed to read here, so the browser stays clean: a
+// developer with a build loaded would otherwise see a degraded browser on every
+// scan for ever.
 func TestChromium_UnpackedContentIsNeverOpened(t *testing.T) {
 	home := tempHome(t)
 	unpacked := filepath.Join(home, "projects", "client-work", "ext")
@@ -657,15 +811,59 @@ func TestChromium_UnpackedContentIsNeverOpened(t *testing.T) {
 	if got[0].InstallSource != model.BrowserExtInstallUnpacked {
 		t.Errorf("install_source = %q, want unpacked — the whole signal this row carries", got[0].InstallSource)
 	}
-	// No filesystem path of any kind reaches the wire, and this is the path that
-	// could have carried a client's name.
-	raw := marshalFindings(t, info)
-	if strings.Contains(raw, "client-work") {
-		t.Errorf("payload carries a filesystem path: %s", raw)
+	if got[0].InstallPath != filepath.ToSlash(unpacked) {
+		t.Errorf("install_path = %q, want %q: where it was loaded from is what this row is for",
+			got[0].InstallPath, unpacked)
 	}
 	c := coverageFor(t, info, browserChrome)
-	if c.Status != model.BrowserCoveragePartial || c.ReasonCode != model.BrowserExtReasonManifestUnavailable {
-		t.Errorf("status = %q/%q, want partial and the missing metadata named", c.Status, c.ReasonCode)
+	if c.Status != model.BrowserCoverageScanned {
+		t.Errorf("status = %q/%q, want scanned: no manifest was read, so none failed to read",
+			c.Status, c.ReasonCode)
+	}
+}
+
+// TestChromium_UnpackedPathIsOmittedRatherThanShortened keeps the load path in
+// the class of strings that are matched rather than read. Half a path names a
+// directory nobody has, and a browser is not degraded over it: the row still
+// carries the identity and the install source that make it worth looking at.
+func TestChromium_UnpackedPathIsOmittedRatherThanShortened(t *testing.T) {
+	home := tempHome(t)
+	long := "/" + strings.Repeat("d", maxInstallPathBytes)
+
+	localState(t, chromeRoot(home), "Default")
+	securePrefs(t, chromeRoot(home), "Default", `"`+idA+`": {"location": 4, "path": "`+long+`"}`)
+
+	info := scanHome(t, home)
+	assertPayloadInvariants(t, info)
+	got := findingsFor(info, browserChrome)
+	if len(got) != 1 {
+		t.Fatalf("findings = %d, want the extension reported without its path", len(got))
+	}
+	if got[0].InstallPath != "" {
+		t.Errorf("install_path = %q, want none: a shortened path is a different directory", got[0].InstallPath)
+	}
+	if got[0].InstallSource != model.BrowserExtInstallUnpacked {
+		t.Errorf("install_source = %q, want unpacked", got[0].InstallSource)
+	}
+}
+
+// TestChromium_UnreadableManifestStillDegrades is the other polarity of the same
+// branch. An unpacked extension is not degraded because nothing was read; a store
+// install whose manifest genuinely refuses to read still is, because something
+// was.
+func TestChromium_UnreadableManifestStillDegrades(t *testing.T) {
+	home := tempHome(t)
+	root := chromeRoot(home)
+	localState(t, root, "Default")
+	securePrefs(t, root, "Default", `"`+idA+`": {"location": 1, "path": "`+idA+`/1.2.3_0"}`)
+	writeFile(t, filepath.Join(root, "Default", "Extensions", idA, "1.2.3_0", "manifest.json"),
+		strings.Repeat("{", maxManifestBytes+1))
+
+	info := scanHome(t, home)
+	assertPayloadInvariants(t, info)
+	c := coverageFor(t, info, browserChrome)
+	if c.Status != model.BrowserCoveragePartial {
+		t.Errorf("status = %q, want partial: a document was reached and could not be read", c.Status)
 	}
 }
 

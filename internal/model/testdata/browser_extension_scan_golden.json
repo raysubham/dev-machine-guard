@@ -49,7 +49,9 @@
       "store": "chrome_web_store",
       "preinstalled": false,
       "permissions": ["storage", "tabs"],
-      "host_permissions": ["https://*/*", "http://*/*"]
+      "host_permissions": ["https://*/*", "http://*/*"],
+      "scriptable_host_permissions": ["https://*/*"],
+      "manifest_version": 3
     },
     {
       "browser_id": "chrome",
@@ -64,7 +66,10 @@
       "store": "self_hosted",
       "preinstalled": true,
       "permissions": ["cookies"],
-      "host_permissions": ["*://example.internal/*"]
+      "host_permissions": ["*://example.internal/*"],
+      "scriptable_host_permissions": ["*://example.internal/*"],
+      "manifest_version": 2,
+      "data_collection": ["locationInfo", "someCategoryWeHaveNotSeenBefore"]
     },
     {
       "browser_id": "chrome",
@@ -79,7 +84,8 @@
       "store": "unknown",
       "preinstalled": false,
       "permissions": [],
-      "host_permissions": []
+      "host_permissions": [],
+      "install_path": "/Users/example-user/Downloads/example-unpacked-extension"
     },
     {
       "browser_id": "chrome",
@@ -93,8 +99,10 @@
       "install_source": "policy",
       "store": "edge_addons",
       "preinstalled": false,
-      "permissions": ["management"],
-      "host_permissions": ["<all_urls>"]
+      "permissions": ["management", "scripting", "userScripts"],
+      "host_permissions": ["<all_urls>"],
+      "scriptable_host_permissions": [],
+      "manifest_version": 3
     },
     {
       "browser_id": "chrome",
@@ -136,7 +144,9 @@
       "preinstalled": false,
       "signed_state": "signed",
       "permissions": ["webRequest"],
-      "host_permissions": ["<all_urls>"]
+      "host_permissions": ["<all_urls>"],
+      "manifest_version": 2,
+      "data_collection": ["technicalAndInteraction"]
     },
     {
       "browser_id": "firefox",
@@ -149,7 +159,8 @@
       "preinstalled": false,
       "signed_state": "missing",
       "permissions": [],
-      "host_permissions": []
+      "host_permissions": [],
+      "install_path": "/Users/example-user/Downloads/example-local-build"
     },
     {
       "browser_id": "firefox",

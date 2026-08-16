@@ -187,6 +187,9 @@ const (
 	maxVersionBytes     = 64
 	maxExtensionIDBytes = 256 // gecko ids are e-mail or UUID shaped; chromium is 32
 	maxPermissionBytes  = 256 // per entry
+	// An unpacked extension's load path. Omitted rather than shortened when it
+	// exceeds this: half a path names a directory nobody has.
+	maxInstallPathBytes = 1024
 )
 
 // File read caps. Validated against the descriptor the bytes come from, and a

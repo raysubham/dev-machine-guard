@@ -5,10 +5,12 @@ package model
 // A finding says which extension is installed in which browser, whether it is
 // enabled and why not, where it came from, whether its store still lists it, and
 // what it is permitted to touch. It carries no browsing state: no history, no
-// cookies, no passwords, no page content, no profile identity, and no
-// filesystem paths. Host-access patterns do ship, because they are what an
-// extension can reach and can name an internal hostname, and that is the point
-// of collecting them.
+// cookies, no passwords, no page content and no profile identity. Two things do
+// ship that name a place: host-access patterns, because they are what an
+// extension can reach and can name an internal hostname, and the load path of an
+// unpacked extension, because an unreviewed extension running out of a user
+// directory is the signal and the path is the legible part of it. Neither is
+// ever opened.
 //
 // Two things make the shape what it is. The first is that state is stored per
 // extension rather than as one replaceable snapshot, so the payload has to say
@@ -211,6 +213,11 @@ type BrowserExtensionFinding struct {
 
 	Version string `json:"version"`
 
+	// The manifest revision the browser recorded. A version 2 extension can hold
+	// blocking request interception, which version 3 removed, so this is a risk
+	// class rather than trivia. Zero where the browser recorded none.
+	ManifestVersion int `json:"manifest_version,omitempty"`
+
 	EnabledState string `json:"enabled_state"`
 
 	// Present exactly when EnabledState is disabled.
@@ -222,6 +229,12 @@ type BrowserExtensionFinding struct {
 	StoreViolation string `json:"store_violation,omitempty"`
 
 	InstallSource string `json:"install_source"`
+
+	// Where an unpacked extension was loaded from, as the user pointed the
+	// browser at it. Empty for every other install source. Never opened and never
+	// resolved: it is reported because an unreviewed extension running out of a
+	// user directory is the signal, and a blank name is not.
+	InstallPath string `json:"install_path,omitempty"`
 
 	Store string `json:"store"`
 
@@ -241,4 +254,18 @@ type BrowserExtensionFinding struct {
 	// different grant.
 	Permissions     []string `json:"permissions"`
 	HostPermissions []string `json:"host_permissions"`
+
+	// The hosts the extension declared content scripts for, which the browser
+	// injects into automatically at page load. Not the limit of what it can
+	// inject into: with host access and the scripting, userScripts or debugger
+	// permission it can inject programmatically anywhere it holds a host. Nil
+	// where the engine does not record the distinction, so an empty list means
+	// "declared no content scripts" and an absent one means "cannot tell".
+	ScriptableHostPermissions *[]string `json:"scriptable_host_permissions,omitempty"`
+
+	// What the extension declared it collects, as far as the user's grant records
+	// it. Gecko only. A list holding "none" is a positive declaration that it
+	// collects nothing, which is not the same answer as an empty list, where
+	// nothing was declared at all.
+	DataCollection []string `json:"data_collection,omitempty"`
 }

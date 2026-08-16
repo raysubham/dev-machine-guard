@@ -310,6 +310,161 @@ func TestGecko_NameAndPermissions(t *testing.T) {
 	}
 }
 
+// firefoxFindingWithGrants runs one Firefox profile that also carries the
+// per-add-on preferences document, and returns its single finding.
+func firefoxFindingWithGrants(t *testing.T, addon, prefs string) (model.BrowserExtensionFinding, model.BrowserCoverage) {
+	t.Helper()
+	home := tempHome(t)
+	root := firefoxRoot(home)
+	profile := filepath.Join(root, "abcd1234.default-release")
+	writeFile(t, filepath.Join(root, "profiles.ini"), "[Profile0]\nIsRelative=1\nPath=abcd1234.default-release\n")
+	geckoAddonJSON(t, profile, addon)
+	writeFile(t, filepath.Join(profile, "extension-preferences.json"), prefs)
+
+	info := scanHome(t, home)
+	assertPayloadInvariants(t, info)
+	got := findingsFor(info, browserFirefox)
+	if len(got) != 1 {
+		t.Fatalf("findings = %d, want exactly one", len(got))
+	}
+	return got[0], coverageFor(t, info, browserFirefox)
+}
+
+// TestGecko_RuntimeGrants covers the permissions this engine records nowhere near
+// the rest of the add-on. What the user granted on demand lives in its own
+// document, and reading only the add-on database reports an add-on holding
+// cookies and history as holding neither.
+func TestGecko_RuntimeGrants(t *testing.T) {
+	const addon = `{
+		"id": "ext@example-org", "type": "extension", "active": true, "location": "app-profile",
+		"userPermissions": {"permissions": ["storage"], "origins": ["https://declared.internal/*"]}
+	}`
+
+	t.Run("what was granted later is unioned in", func(t *testing.T) {
+		got, coverage := firefoxFindingWithGrants(t, addon, `{
+			"ext@example-org": {
+				"permissions": ["cookies", "history", "<all_urls>", "internal:privateBrowsingAllowed"],
+				"origins": ["https://granted.internal/*"]
+			}
+		}`)
+
+		want := "cookies,history,storage"
+		if strings.Join(got.Permissions, ",") != want {
+			t.Errorf("permissions = %v, want %q", got.Permissions, want)
+		}
+		// The file mixes origins into the permissions list, and a host pattern
+		// reported as an API permission is a capability that does not exist.
+		wantHosts := "<all_urls>,https://declared.internal/*,https://granted.internal/*"
+		if strings.Join(got.HostPermissions, ",") != wantHosts {
+			t.Errorf("host_permissions = %v, want %q", got.HostPermissions, wantHosts)
+		}
+		if coverage.Status != model.BrowserCoverageScanned {
+			t.Errorf("status = %q/%q, want scanned", coverage.Status, coverage.ReasonCode)
+		}
+	})
+
+	t.Run("the browser's own bookkeeping never reaches the wire", func(t *testing.T) {
+		got, _ := firefoxFindingWithGrants(t, addon, `{
+			"ext@example-org": {
+				"permissions": ["internal:privateBrowsingAllowed", "internal:svgContextPropertiesAllowed"]
+			}
+		}`)
+
+		// These sit on every add-on on the machine and say nothing about any of
+		// them.
+		for _, entry := range append(got.Permissions, got.HostPermissions...) {
+			if strings.HasPrefix(entry, "internal:") {
+				t.Errorf("payload carries %q", entry)
+			}
+		}
+	})
+
+	t.Run("an entry the database does not list is not an extension", func(t *testing.T) {
+		// A temporary add-on: its preferences entry survives the add-on itself, so
+		// a finding built from one is an alert that can never clear. The helper
+		// requires exactly one finding, which is the assertion.
+		firefoxFindingWithGrants(t, addon, `{
+			"ext@example-org": {"permissions": ["cookies"]},
+			"probe@example-org": {"permissions": ["debugger", "history"]}
+		}`)
+	})
+
+	t.Run("the scriptable subset is absent on this engine", func(t *testing.T) {
+		got, _ := firefoxFindingWithGrants(t, addon, `{"ext@example-org": {"origins": ["<all_urls>"]}}`)
+		if got.ScriptableHostPermissions != nil {
+			t.Errorf("scriptable_host_permissions = %v, want absent: this engine draws no such line",
+				*got.ScriptableHostPermissions)
+		}
+	})
+
+	t.Run("a document that cannot be read is a gap and says so", func(t *testing.T) {
+		_, coverage := firefoxFindingWithGrants(t, addon, `{"ext@example-org": `)
+		if coverage.Status != model.BrowserCoveragePartial || coverage.ReasonCode != model.BrowserExtReasonParseError {
+			t.Errorf("status = %q/%q, want partial and the parse named", coverage.Status, coverage.ReasonCode)
+		}
+	})
+
+	t.Run("a document that was never written is silence", func(t *testing.T) {
+		// The browser writes this file when a preference is set, so a runtime grant
+		// cannot exist without it. Degrading here would paint a clean profile
+		// partial on every scan for no information lost.
+		_, coverage := firefoxFinding(t, addon)
+		if coverage.Status != model.BrowserCoverageScanned {
+			t.Errorf("status = %q/%q, want scanned", coverage.Status, coverage.ReasonCode)
+		}
+	})
+}
+
+// TestGecko_ManifestVersionAndDataCollection covers the two attributes that
+// separate add-ons which otherwise read alike: what a version 2 add-on can still
+// do to a request, and what the add-on said it collects.
+func TestGecko_ManifestVersionAndDataCollection(t *testing.T) {
+	t.Run("a declared collection is not an undeclared one", func(t *testing.T) {
+		got, _ := firefoxFindingWithGrants(t, `{
+			"id": "ext@example-org", "type": "extension", "active": true, "location": "app-profile",
+			"manifestVersion": 2,
+			"userPermissions": {"permissions": ["webRequestBlocking"], "data_collection": ["none"]}
+		}`, `{"ext@example-org": {"data_collection": ["healthInfo"]}}`)
+
+		if got.ManifestVersion != 2 {
+			t.Errorf("manifest_version = %d, want 2: the revision that can still block requests",
+				got.ManifestVersion)
+		}
+		// The vocabulary is left open. Firefox adds a category per release, and a
+		// closed set would fail a whole browser on the next one.
+		want := "healthInfo,none"
+		if strings.Join(got.DataCollection, ",") != want {
+			t.Errorf("data_collection = %v, want %q", got.DataCollection, want)
+		}
+	})
+
+	t.Run("declaring nothing is left empty rather than spelled", func(t *testing.T) {
+		got, _ := firefoxFinding(t, `{
+			"id": "ext@example-org", "type": "extension", "active": true, "location": "app-profile",
+			"manifestVersion": 3,
+			"userPermissions": {"permissions": ["storage"]}
+		}`)
+
+		if got.ManifestVersion != 3 {
+			t.Errorf("manifest_version = %d, want 3", got.ManifestVersion)
+		}
+		// An empty list and a list holding "none" are different answers: one add-on
+		// declared it collects nothing, the other declared nothing at all.
+		if len(got.DataCollection) != 0 {
+			t.Errorf("data_collection = %v, want none", got.DataCollection)
+		}
+	})
+
+	t.Run("a record that does not say", func(t *testing.T) {
+		got, _ := firefoxFinding(t, `{
+			"id": "ext@example-org", "type": "extension", "active": true, "location": "app-profile"
+		}`)
+		if got.ManifestVersion != 0 {
+			t.Errorf("manifest_version = %d, want 0", got.ManifestVersion)
+		}
+	})
+}
+
 // TestGecko_OverlongIdentityFailsTheBrowser pins the one string that is never
 // shortened. A truncated identity is a different extension, and dropping it under
 // a status that claims a complete list would retire the real one's stored row.

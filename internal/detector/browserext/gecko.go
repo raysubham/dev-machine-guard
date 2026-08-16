@@ -55,6 +55,11 @@ var geckoBuiltinScopes = map[string]bool{
 // scope is an ordinary profile install and nothing else distinguishes it.
 const geckoPolicySource = "enterprise-policy"
 
+// The browser keeps its own bookkeeping in the same list as the add-on's
+// permissions, under this prefix. It sits on every add-on on the machine and
+// says nothing about what any of them can do.
+const geckoInternalPrefPrefix = "internal:"
+
 // Signing states, as the database numbers them. An unsigned add-on that is
 // enabled is the headline security signal on this engine.
 var geckoSignedStates = map[int]string{
@@ -269,6 +274,10 @@ type geckoAddon struct {
 	SignedState  *int   `json:"signedState"`
 	Visible      *bool  `json:"visible"`
 	Hidden       *bool  `json:"hidden"`
+	// Version 2 can hold blocking request interception, which version 3 removed.
+	// The two content blockers on a machine can differ here while looking
+	// otherwise identical.
+	ManifestVersion int `json:"manifestVersion"`
 
 	DefaultLocale struct {
 		Name string `json:"name"`
@@ -277,11 +286,59 @@ type geckoAddon struct {
 	UserPermissions struct {
 		Permissions []string `json:"permissions"`
 		Origins     []string `json:"origins"`
+		// What the add-on declared it collects. A list holding "none" says it
+		// collects nothing, which is a different answer from an empty list, where
+		// it declared nothing at all. The record also carries a top-level
+		// dataCollectionPermissions, which reads null even for add-ons that
+		// declared a value: the granted answer is this one.
+		DataCollection []string `json:"data_collection"`
 	} `json:"userPermissions"`
 
 	InstallTelemetryInfo struct {
 		Source string `json:"source"`
 	} `json:"installTelemetryInfo"`
+}
+
+// geckoPrefEntry is one add-on's entry in the per-add-on preferences document,
+// which is where this engine keeps what the user granted at runtime. The add-on
+// database holds only the install-time grant, so an add-on handed a permission
+// on demand reads as never having it if this file goes unread.
+type geckoPrefEntry struct {
+	Permissions    []string `json:"permissions"`
+	Origins        []string `json:"origins"`
+	DataCollection []string `json:"data_collection"`
+}
+
+// geckoRuntimeGrants reads one profile's per-add-on preferences.
+//
+// It can only add attributes: membership came from the add-on database and is
+// already complete, so nothing here fails the browser. A file that is absent is
+// silence rather than a degradation, because the browser writes it when a
+// preference is set and a runtime grant cannot exist without one. A file that is
+// present and unreadable is a real gap and says so.
+func (d *Detector) geckoRuntimeGrants(scan *scanState, dir string, b *browserScan) map[string]geckoPrefEntry {
+	data, missing, reason := scan.readState(
+		filepath.Join(dir, "extension-preferences.json"), maxExtensionsJSONBytes)
+	if reason != "" {
+		b.degrade(reason)
+		return nil
+	}
+	if missing {
+		return nil
+	}
+	var entries map[string]geckoPrefEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		b.degrade(model.BrowserExtReasonParseError)
+		return nil
+	}
+	return entries
+}
+
+// isGeckoHostPattern reports whether a preference entry names a host rather than
+// an API permission. The file mixes the two in one list: the origins an add-on
+// was granted appear under its permissions as well.
+func isGeckoHostPattern(entry string) bool {
+	return entry == "<all_urls>" || strings.Contains(entry, "://")
 }
 
 // scanGeckoProfile reads one profile's add-on database.
@@ -298,6 +355,11 @@ func (d *Detector) scanGeckoProfile(scan *scanState, dir string, data []byte, b 
 		b.fail(model.BrowserExtReasonParseError)
 		return
 	}
+	// Looked up per add-on rather than iterated, which is what keeps an entry the
+	// database does not list out of the inventory: those are temporary add-ons,
+	// and their entries outlive them. A finding built from one is an alert that
+	// can never clear.
+	grants := d.geckoRuntimeGrants(scan, dir, b)
 	for _, raw := range *db.Addons {
 		var a geckoAddon
 		if err := json.Unmarshal(raw, &a); err != nil {
@@ -339,7 +401,7 @@ func (d *Detector) scanGeckoProfile(scan *scanState, dir string, data []byte, b 
 			continue
 		}
 
-		occ, ok := d.geckoOccurrence(a, b)
+		occ, ok := d.geckoOccurrence(a, grants[id], b)
 		if !ok {
 			continue
 		}
@@ -350,8 +412,9 @@ func (d *Detector) scanGeckoProfile(scan *scanState, dir string, data []byte, b 
 	}
 }
 
-// geckoOccurrence turns one add-on record into one occurrence.
-func (d *Detector) geckoOccurrence(a geckoAddon, b *browserScan) (occurrence, bool) {
+// geckoOccurrence turns one add-on record into one occurrence, folding in what
+// the profile's preferences say the user granted since.
+func (d *Detector) geckoOccurrence(a geckoAddon, granted geckoPrefEntry, b *browserScan) (occurrence, bool) {
 	source := model.BrowserExtInstallUnknown
 	if mapped, ok := geckoInstallSources[a.Location]; ok {
 		source = mapped
@@ -363,18 +426,37 @@ func (d *Detector) geckoOccurrence(a geckoAddon, b *browserScan) (occurrence, bo
 	}
 
 	state, disabledBy := geckoEnabledState(a)
-	perms, permsCapped := capPermissionList(a.UserPermissions.Permissions)
-	hosts, hostsCapped := capPermissionList(a.UserPermissions.Origins)
-	if permsCapped || hostsCapped {
+
+	api := a.UserPermissions.Permissions
+	origins := append(a.UserPermissions.Origins, granted.Origins...)
+	for _, entry := range granted.Permissions {
+		switch {
+		case strings.HasPrefix(entry, geckoInternalPrefPrefix):
+		case isGeckoHostPattern(entry):
+			origins = append(origins, entry)
+		default:
+			api = append(api, entry)
+		}
+	}
+	// The categories are left as the browser wrote them. Firefox adds one per
+	// release, and a closed vocabulary would turn the next one into a whole
+	// browser that could not be read.
+	collection := append(a.UserPermissions.DataCollection, granted.DataCollection...)
+
+	perms, permsCapped := capPermissionList(api)
+	hosts, hostsCapped := capPermissionList(origins)
+	dataCollection, collectionCapped := capPermissionList(collection)
+	if permsCapped || hostsCapped || collectionCapped {
 		b.degrade(model.BrowserExtReasonCapped)
 	}
 	return occurrence{
 		enabled:    state,
 		disabledBy: disabledBy,
 		block: model.BrowserExtensionFinding{
-			Name:         capBytes(a.DefaultLocale.Name, maxNameBytes),
-			Version:      capBytes(a.Version, maxVersionBytes),
-			EnabledState: state,
+			Name:            capBytes(a.DefaultLocale.Name, maxNameBytes),
+			Version:         capBytes(a.Version, maxVersionBytes),
+			ManifestVersion: a.ManifestVersion,
+			EnabledState:    state,
 			// The store fields have no counterpart on this engine: there is no
 			// listing state in the database to read.
 			InstallSource:   source,
@@ -382,6 +464,10 @@ func (d *Detector) geckoOccurrence(a geckoAddon, b *browserScan) (occurrence, bo
 			SignedState:     geckoSignedState(a.SignedState),
 			Permissions:     perms,
 			HostPermissions: hosts,
+			// ScriptableHostPermissions is deliberately absent: this engine records
+			// one origins list and draws no line inside it, and an empty list would
+			// claim the add-on injects nowhere.
+			DataCollection: dataCollection,
 		},
 	}, true
 }

@@ -40,19 +40,40 @@ const (
 	locationExternalComponent      = 10
 )
 
-// Disable reasons worth naming, as the browser's own enumeration numbers them.
-// It records a set of them, and only these three change the answer: a set holding
-// the user's own action was the user's doing, one holding a policy reason was the
-// administrator's, and any other non-empty set means the browser disabled the
-// extension for a reason of its own — which is the case worth surfacing, since a
-// store takedown lands here. Bits are appended to that enumeration rather than
-// renumbered, so an unrecognised value deliberately reads as "the browser did it"
-// rather than as a value to interpret.
-const (
-	disableReasonUserAction          = 1 << 0
-	disableReasonPolicyUpdateRequire = 1 << 13
-	disableReasonBlockedByPolicy     = 1 << 15
-)
+// Disable reasons as the browser's own enumeration numbers them, mapped to the
+// actor a console should name. Membership here is recognition: a value absent
+// from the table is a fork's own or a newer release's, and the browser itself
+// collapses those to "unknown" rather than interpreting them. Bits 6, 7, 12, 17
+// and 18 do not exist. The two reasons that mean "we do not know why" are absent
+// deliberately, so they fall to the same answer as an unrecognised value.
+var disableReasonActor = map[int]string{
+	1 << 0:  model.BrowserExtDisabledByUser,    // user action
+	1 << 1:  model.BrowserExtDisabledByBrowser, // permissions increase
+	1 << 2:  model.BrowserExtDisabledByBrowser, // reload
+	1 << 3:  model.BrowserExtDisabledByBrowser, // unsupported requirement
+	1 << 4:  model.BrowserExtDisabledByBrowser, // sideload wipeout
+	1 << 8:  model.BrowserExtDisabledByBrowser, // not verified
+	1 << 9:  model.BrowserExtDisabledByBrowser, // greylist
+	1 << 10: model.BrowserExtDisabledByBrowser, // corrupted
+	1 << 11: model.BrowserExtDisabledByBrowser, // remote install
+	1 << 13: model.BrowserExtDisabledByBrowser, // external extension
+	1 << 14: model.BrowserExtDisabledByPolicy,  // update required by policy
+	// Custodian approval is family supervision rather than administrative
+	// policy: reading it as policy would point a fleet console at an
+	// administrator who did nothing.
+	1 << 15: model.BrowserExtDisabledByBrowser,
+	1 << 16: model.BrowserExtDisabledByPolicy,  // blocked by policy
+	1 << 19: model.BrowserExtDisabledByBrowser, // reinstall
+	// Not allowlisted is the browser's own safety machinery, and it exempts
+	// policy-allowed extensions, so an administrator is the one actor it
+	// cannot be.
+	1 << 20: model.BrowserExtDisabledByBrowser,
+	1 << 21: model.BrowserExtDisabledByBrowser, // keeplist
+	1 << 22: model.BrowserExtDisabledByPolicy,  // store publication required by policy
+	1 << 23: model.BrowserExtDisabledByBrowser, // unsupported manifest version
+	1 << 24: model.BrowserExtDisabledByBrowser, // unsupported developer extension
+	1 << 26: model.BrowserExtDisabledByPolicy,  // blocked by cloud policy check
+}
 
 // scanChromiumRoot reads one Chromium-family data directory and reports whether
 // it held an installation.
@@ -261,7 +282,8 @@ type chromiumEntry struct {
 	State *int `json:"state"`
 	// Relative to the profile's own Extensions directory for a store install,
 	// absolute for an unpacked one. An absolute path is never opened and never
-	// ships.
+	// resolved. It does reach the wire for an unpacked extension, whose load
+	// location is the most useful thing its record holds.
 	Path                  string               `json:"path"`
 	Manifest              *chromiumManifest    `json:"manifest"`
 	FromWebstore          *bool                `json:"from_webstore"`
@@ -286,6 +308,10 @@ type chromiumManifest struct {
 	Version       string `json:"version"`
 	DefaultLocale string `json:"default_locale"`
 	UpdateURL     string `json:"update_url"`
+	// Version 2 can hold blocking request interception, which version 3 removed,
+	// so two extensions doing the same job differ here in what they are able to
+	// do to a page.
+	ManifestVersion int `json:"manifest_version"`
 	// Presence alone is the test: a manifest with either key is a theme or a
 	// legacy packaged app rather than an extension.
 	Theme json.RawMessage `json:"theme"`
@@ -349,10 +375,11 @@ func (d *Detector) chromiumOccurrence(scan *scanState, profileDir, id string, ra
 	manifest := e.Manifest
 	// Only a store install's path is relative, which is what makes it safe to
 	// resolve: it lands inside the browser's own tree. An unpacked extension's
-	// path is an arbitrary user location — this never opens one, and never ships
-	// it either, so nothing about it is read beyond what the preferences recorded.
+	// path is an arbitrary user location, so it is never opened and never
+	// resolved, and nothing about it is read beyond what the preferences recorded.
 	extDir := ""
-	if e.Path != "" && !filepath.IsAbs(e.Path) && !hasParentComponent(e.Path) {
+	unpackedLocation := filepath.IsAbs(e.Path)
+	if e.Path != "" && !unpackedLocation && !hasParentComponent(e.Path) {
 		extDir = filepath.Join(profileDir, "Extensions", filepath.FromSlash(e.Path))
 	}
 	if manifest == nil && extDir != "" {
@@ -377,17 +404,34 @@ func (d *Detector) chromiumOccurrence(scan *scanState, profileDir, id string, ra
 		return occurrence{}, false
 	}
 
-	name, version := "", ""
+	name, version, manifestVersion := "", "", 0
 	if manifest == nil {
-		b.degrade(model.BrowserExtReasonManifestUnavailable)
+		if !unpackedLocation {
+			// An unpacked extension's manifest was never going to be read, so
+			// nothing failed to read: reporting one as degraded would paint the
+			// browser partial on every scan for as long as a developer keeps a
+			// build loaded. Every other route to a nil manifest is a document this
+			// scan could not recover.
+			b.degrade(model.BrowserExtReasonManifestUnavailable)
+		}
 	} else {
 		name = d.resolveExtensionName(scan, extDir, manifest, b)
 		version = manifest.Version
+		manifestVersion = manifest.ManifestVersion
+	}
+
+	// The location an unpacked extension was loaded from is the most useful thing
+	// its record holds, and the only one that survives having no manifest. An
+	// over-long path is left out rather than shortened: half a path names a
+	// directory nobody has.
+	installPath := ""
+	if source == model.BrowserExtInstallUnpacked && len(e.Path) <= maxInstallPathBytes {
+		installPath = e.Path
 	}
 
 	state, disabledBy := chromiumEnabledState(e)
 	listing, violation := storeDisposition(e.CWSInfo)
-	perms, hosts, capped := permissionLists(e.Granted, e.RuntimeGranted, e.WithholdingHostPermissions)
+	perms, hosts, scriptable, capped := permissionLists(e.Granted, e.RuntimeGranted, e.WithholdingHostPermissions)
 	if capped {
 		b.degrade(model.BrowserExtReasonCapped)
 	}
@@ -397,14 +441,20 @@ func (d *Detector) chromiumOccurrence(scan *scanState, profileDir, id string, ra
 		block: model.BrowserExtensionFinding{
 			Name:            capBytes(name, maxNameBytes),
 			Version:         capBytes(version, maxVersionBytes),
+			ManifestVersion: manifestVersion,
 			EnabledState:    state,
 			StoreListing:    listing,
 			StoreViolation:  violation,
 			InstallSource:   source,
+			InstallPath:     installPath,
 			Store:           chromiumStore(manifest, e),
 			Preinstalled:    e.WasInstalledByDefault || e.WasInstalledByOEM,
 			Permissions:     perms,
 			HostPermissions: hosts,
+			// Always answered on this family: the grant records name the
+			// scriptable hosts separately, so an empty list is "injects nowhere"
+			// rather than "cannot tell".
+			ScriptableHostPermissions: &scriptable,
 		},
 	}, true
 }
@@ -412,6 +462,10 @@ func (d *Detector) chromiumOccurrence(scan *scanState, profileDir, id string, ra
 // reducedOccurrence is what a record whose value could not be read produces: an
 // identity, and everything else spelled as unknown rather than left out. A reader
 // requires the two store fields on this family, and "cannot tell" is a value.
+//
+// The scriptable host list is the one field left absent rather than empty. Empty
+// would claim the extension injects nowhere, and no grant record was read to say
+// so.
 func reducedOccurrence() occurrence {
 	return occurrence{
 		enabled: model.BrowserExtStateUnknown,
@@ -497,17 +551,24 @@ func chromiumEnabledState(e chromiumEntry) (state, disabledBy string) {
 	if len(reasons) == 0 {
 		return model.BrowserExtEnabled, ""
 	}
+	actor := ""
 	for _, r := range reasons {
-		if r == disableReasonUserAction {
+		switch disableReasonActor[r] {
+		case model.BrowserExtDisabledByUser:
 			return model.BrowserExtDisabled, model.BrowserExtDisabledByUser
+		case model.BrowserExtDisabledByPolicy:
+			actor = model.BrowserExtDisabledByPolicy
+		case model.BrowserExtDisabledByBrowser:
+			if actor == "" {
+				actor = model.BrowserExtDisabledByBrowser
+			}
 		}
 	}
-	for _, r := range reasons {
-		if r == disableReasonBlockedByPolicy || r == disableReasonPolicyUpdateRequire {
-			return model.BrowserExtDisabled, model.BrowserExtDisabledByPolicy
-		}
+	if actor == "" {
+		// Recognised nothing in the set, so the actor is genuinely not known.
+		return model.BrowserExtDisabled, model.BrowserExtDisabledByUnknown
 	}
-	return model.BrowserExtDisabled, model.BrowserExtDisabledByBrowser
+	return model.BrowserExtDisabled, actor
 }
 
 // parseDisableReasons reads both shapes in the wild: current browsers write a
@@ -656,7 +717,7 @@ func lookupMessage(data []byte, key string) string {
 	return ""
 }
 
-// permissionLists reduces the grant records to the two wire lists.
+// permissionLists reduces the grant records to the three wire lists.
 //
 // Both grant paths are unioned, because either alone misreports what the
 // extension can reach: the up-front set keeps patterns the user has since
@@ -664,24 +725,42 @@ func lookupMessage(data []byte, key string) string {
 // demand. Once the user restricts site access the up-front set stops
 // describing the present, so the hosts then come from the runtime set alone
 // and the two lists part company: API permissions are never withheld.
-func permissionLists(granted, runtime *chromiumPermissions, withholdingHosts bool) (perms, hosts []string, capped bool) {
+//
+// The scriptable list is a subset of the host list and is derived from it after
+// the cap rather than beside it, so a host the cap dropped cannot survive in the
+// stronger list alone. Injecting code into a page is a larger capability than
+// reaching it with a request, and a reader that saw one without the other would
+// have to guess which.
+func permissionLists(granted, runtime *chromiumPermissions, withholdingHosts bool) (perms, hosts, scriptable []string, capped bool) {
 	var api, host []string
+	scriptableSet := map[string]struct{}{}
 	for _, set := range []*chromiumPermissions{granted, runtime} {
 		if set == nil {
 			continue
 		}
 		api = append(api, set.API...)
 		// A withheld host is not a granted host: it sits in granted_permissions
-		// only as a record of what the user later took back.
+		// only as a record of what the user later took back. Neither list carries
+		// it, because a host the extension cannot reach is not one it can inject
+		// into either.
 		if withholdingHosts && set != runtime {
 			continue
 		}
 		host = append(host, set.ExplicitHost...)
 		host = append(host, set.ScriptableHost...)
+		for _, h := range set.ScriptableHost {
+			scriptableSet[h] = struct{}{}
+		}
 	}
 	perms, apiCapped := capPermissionList(api)
 	hosts, hostCapped := capPermissionList(host)
-	return perms, hosts, apiCapped || hostCapped
+	scriptable = []string{}
+	for _, h := range hosts {
+		if _, ok := scriptableSet[h]; ok {
+			scriptable = append(scriptable, h)
+		}
+	}
+	return perms, hosts, scriptable, apiCapped || hostCapped
 }
 
 // capPermissionList sorts, deduplicates and bounds one permission list, reporting
