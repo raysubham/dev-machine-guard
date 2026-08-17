@@ -42,7 +42,7 @@ Detection is cross-platform — binaries are located via `$PATH` lookup and home
 | Codex                 | OpenAI    | `codex`                     | `~/.codex`                      |
 | Gemini CLI            | Google    | `gemini`                    | `~/.gemini`                     |
 | Amazon Q / Kiro CLI   | Amazon    | `kiro-cli`, `kiro`, `q`     | `~/.q`, `~/.kiro`, `~/.aws/q`  |
-| GitHub Copilot CLI    | Microsoft | `copilot`, `gh-copilot`     | `~/.config/github-copilot`      |
+| GitHub Copilot CLI    | Microsoft | `copilot`, `gh-copilot`†    | `~/.config/github-copilot`, `~/.copilot` |
 | Microsoft AI Shell    | Microsoft | `aish`, `ai`                | `~/.aish`                       |
 | Aider                 | OpenSource| `aider`                     | `~/.aider`                      |
 | OpenCode              | OpenSource| `opencode`                  | `~/.config/opencode`            |
@@ -50,6 +50,8 @@ Detection is cross-platform — binaries are located via `$PATH` lookup and home
 | Pi                    | Earendil  | `pi`                        | `~/.pi/agent`                   |
 | Factory Droid         | Factory   | `droid`                     | `~/.factory`                    |
 | Amp                   | Sourcegraph| `amp`                      | `~/.config/amp`                 |
+
+† `gh copilot` launches this same `@github/copilot` CLI, downloading it into gh's own data directory when it isn't already on `$PATH` — so that install never lands on `$PATH`. After the two binary names miss, Copilot is also looked for at `~/.local/share/gh/copilot/copilot`, `~/.local/bin/copilot`, `~/AppData/Local/GitHub CLI/copilot/copilot`, `~/AppData/Local/Microsoft/WinGet/Links/copilot.exe`, `~/AppData/Roaming/npm/copilot.cmd`, and the `gh-copilot` extension directory under both `~/.local/share/gh/extensions` and `~/AppData/Local/GitHub CLI/extensions`. A non-default `$XDG_DATA_HOME` is not followed, and WinGet's hashed `Packages\GitHub.Copilot_<hash>\` payload directory is not globbed — only its `Links` shim.
 
 Pi, Factory Droid and Amp share their binary names with unrelated popular tools, so a `$PATH` hit alone does not report them — each is confirmed from an on-disk artifact (a package manifest, an installer anchor directory, a Homebrew cask root, a winget or pacman package entry), and is searched for in the common global-install prefixes as well as on `$PATH`. Pi and Amp are never executed because macOS Gatekeeper prompts on their binaries; their versions come from disk or are reported as `unknown`.
 
