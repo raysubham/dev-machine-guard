@@ -22,13 +22,6 @@
       "extension_count": 0
     },
     {
-      "browser_id": "brave",
-      "status": "not_present",
-      "reason_code": "",
-      "profile_count": 0,
-      "extension_count": 0
-    },
-    {
       "browser_id": "firefox",
       "status": "scanned",
       "reason_code": "",

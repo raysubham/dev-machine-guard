@@ -39,14 +39,13 @@ const catalogVersion = "1"
 const (
 	browserChrome  = "chrome"
 	browserEdge    = "edge"
-	browserBrave   = "brave"
 	browserFirefox = "firefox"
 )
 
 // engine names the browser family, which decides which parser runs and which
 // engine-specific fields a finding carries. It is a classification and never an
-// identity: Chrome, Edge and Brave are three browsers sharing one family, and
-// grouping is always per (browser, extension). It stays inside this package —
+// identity: Chrome and Edge are two browsers sharing one family, and grouping
+// is always per (browser, extension). It stays inside this package —
 // the value is a pure function of the browser id, so a reader derives it from
 // its own copy of the catalog rather than being sent a second opinion.
 type engine int
@@ -112,22 +111,6 @@ var catalog = []browserSpec{
 		Linux: []string{
 			".config/microsoft-edge",
 			".var/app/com.microsoft.Edge/config/microsoft-edge", // flatpak, unconfirmed
-		},
-	},
-	{
-		ID:      browserBrave,
-		Engine:  engineChromium,
-		Darwin:  []string{"Library/Application Support/BraveSoftware/Brave-Browser"},
-		Windows: []string{"AppData/Local/BraveSoftware/Brave-Browser/User Data"},
-		// The snap packaging is absent deliberately. Its data directory sits under
-		// a `current` link that snapd repoints on every revision, and a path
-		// through a link is refused rather than followed — so carrying it would
-		// report a permanent failure, and take a native install alongside it down
-		// with it. Covering that packaging means enumerating revisions, not adding
-		// a row.
-		Linux: []string{
-			".config/BraveSoftware/Brave-Browser",
-			".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser", // flatpak, unconfirmed
 		},
 	},
 	{

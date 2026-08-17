@@ -11,7 +11,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/model"
 )
 
-// The Chromium family: one parser for Chrome, Edge and Brave, whose data
+// The Chromium family: one parser for Chrome and Edge, whose data
 // directories have the same shape on every desktop platform — a `Local State`
 // file naming the profiles, and one directory per profile holding that profile's
 // preferences.
@@ -622,8 +622,9 @@ func storeDisposition(info *chromiumCWSInfo) (listing, violation string) {
 }
 
 // chromiumStore attributes the extension to a store, as a label and never a URL.
-// A Brave install carries the Chrome Web Store's own update URL because Brave
-// proxies that store, which is the right answer from where the code came from.
+// The label follows the update URL the install itself carries, which is the right
+// answer from where the code came from: an Edge install of an extension published
+// to the Chrome Web Store still points at that store.
 func chromiumStore(manifest *chromiumManifest, e chromiumEntry) string {
 	url := ""
 	if manifest != nil {

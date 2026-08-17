@@ -284,7 +284,7 @@ func TestPretty_BrowserExtensionsTriState(t *testing.T) {
 			name: "a browser that could not be read is shown, not hidden",
 			scan: &model.BrowserExtensionScanInfo{
 				Browsers: []model.BrowserCoverage{{
-					BrowserID:  "brave",
+					BrowserID:  "edge",
 					Status:     model.BrowserCoverageFailed,
 					ReasonCode: model.BrowserExtReasonSymlinkRejected,
 				}},

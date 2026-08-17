@@ -518,7 +518,7 @@ func TestDetect_GuardExemptsTheBrowsersOwnDirectories(t *testing.T) {
 // the bound belongs to that browser's own list, so the browsers on either side of
 // it are answered normally — one browser with too many profiles must not blind the
 // scan to the rest of the machine. The per-browser bound is the reachable one:
-// four browsers cannot fill the whole-run budget.
+// three browsers cannot fill the whole-run budget.
 func TestDetect_CapFailsOnlyTheOverflowingBrowser(t *testing.T) {
 	home := tempHome(t)
 	// One extension for the browser before the cap and one for the browser after
@@ -531,10 +531,13 @@ func TestDetect_CapFailsOnlyTheOverflowingBrowser(t *testing.T) {
 	localState(t, edgeRoot, "Default")
 	securePrefs(t, edgeRoot, "Default", manySettings(maxExtensionsPerBrowser+1))
 
-	braveRoot := filepath.Join(home, ".config", "BraveSoftware", "Brave-Browser")
-	localState(t, braveRoot, "Default")
-	securePrefs(t, braveRoot, "Default",
-		`"`+idB+`": {"location": 1, "manifest": {"name": "Example Notes", "version": "2.0"}}`)
+	// The browser after the cap is on the other engine, which is the stronger
+	// version of the same claim: the bound belongs to one browser's list, not to
+	// the parser family that produced it.
+	ffRoot := firefoxRoot(home)
+	writeFile(t, filepath.Join(ffRoot, "profiles.ini"), "[Profile0]\nIsRelative=1\nPath=abcd1234.default-release\n")
+	geckoAddonJSON(t, filepath.Join(ffRoot, "abcd1234.default-release"),
+		`{"id": "notes@example-org", "type": "extension", "active": true}`)
 
 	info := scanHome(t, home)
 	assertPayloadInvariants(t, info)
@@ -546,11 +549,11 @@ func TestDetect_CapFailsOnlyTheOverflowingBrowser(t *testing.T) {
 	if got.Status != model.BrowserCoverageFailed || got.ReasonCode != model.BrowserExtReasonCapped {
 		t.Errorf("edge: status = %q/%q, want failed and capped", got.Status, got.ReasonCode)
 	}
-	if got := coverageFor(t, info, browserBrave); got.Status != model.BrowserCoverageScanned {
-		t.Errorf("brave: status = %q, want the browser after the cap scanned on its own merits", got.Status)
+	if got := coverageFor(t, info, browserFirefox); got.Status != model.BrowserCoverageScanned {
+		t.Errorf("firefox: status = %q, want the browser after the cap scanned on its own merits", got.Status)
 	}
-	if len(findingsFor(info, browserBrave)) != 1 {
-		t.Errorf("brave findings = %d, want the one installed extension", len(findingsFor(info, browserBrave)))
+	if len(findingsFor(info, browserFirefox)) != 1 {
+		t.Errorf("firefox findings = %d, want the one installed extension", len(findingsFor(info, browserFirefox)))
 	}
 	if !info.Truncated || info.TruncatedReason != model.BrowserExtTruncatedFindingCap {
 		t.Errorf("truncated = %v/%q, want the finding cap", info.Truncated, info.TruncatedReason)

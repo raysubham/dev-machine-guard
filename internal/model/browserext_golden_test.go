@@ -91,9 +91,12 @@ func TestBrowserExtensionScanGolden_CoversTheWholeVocabulary(t *testing.T) {
 		got  map[string]bool
 		want []string
 	}{
+		// BrowserCoverageNotPresent is absent on purpose. The catalog is three
+		// browsers and the other three statuses are each load-bearing here, so a
+		// fourth cannot be shown in one payload. It is covered directly instead,
+		// by the detector's no-installation and no-browsers-at-all cases.
 		{"status", statuses, []string{
-			BrowserCoverageScanned, BrowserCoveragePartial,
-			BrowserCoverageFailed, BrowserCoverageNotPresent,
+			BrowserCoverageScanned, BrowserCoveragePartial, BrowserCoverageFailed,
 		}},
 		{"enabled_state", states, []string{
 			BrowserExtEnabled, BrowserExtDisabled, BrowserExtStateUnknown,
