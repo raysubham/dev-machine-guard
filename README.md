@@ -306,6 +306,7 @@ See [SCAN_COVERAGE.md](SCAN_COVERAGE.md) for the full catalog of supported detec
 | AI Frameworks        | Ollama, LM Studio, LocalAI, Text Generation WebUI                                        |
 | MCP Server Configs   | Claude Desktop, Claude Code, Cursor, Windsurf, Antigravity, Zed, Open Interpreter, Codex, OpenCode |
 | IDE Extensions       | VS Code, Cursor, Windsurf, Antigravity, JetBrains, Eclipse, Xcode, Android Studio        |
+| Browser Extensions   | Google Chrome, Microsoft Edge, Mozilla Firefox                                           |
 | Node.js Packages     | npm, yarn, pnpm, bun (opt-in)                                                            |
 | Homebrew Packages    | Formulae and casks with rich metadata (opt-in)                                            |
 | Python Packages      | pip, poetry, pipenv, uv, conda, rye (opt-in)                                             |
@@ -413,6 +414,7 @@ Dev Machine Guard is a single compiled binary that scans your developer environm
 
 - Installed IDEs, AI tools, and their versions
 - IDE extension/plugin names, publishers, and versions (VS Code, Cursor, Windsurf, Antigravity, JetBrains, Eclipse, Xcode, Android Studio)
+- Browser extension records read from the browsers' own state files (Chrome, Edge, Firefox): identity, enabled state, install source, and granted permissions. Browsing history, cookies, saved passwords, and page content are never opened
 - MCP server configuration (server names and commands only)
 - Node.js, Homebrew, Python, and system package listings (opt-in)
 - Package-manager configuration: effective registry, cooldown policy, and authentication surface across every scope (`.npmrc`, pnpm config, `bunfig.toml`, `.yarnrc`/`.yarnrc.yml`, `pip.conf`)

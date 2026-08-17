@@ -269,14 +269,11 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	// browsers' databases are never opened. A nil result means the phase declined,
 	// which is what a service context or a root caller produces, so the pointer is
 	// passed through untouched.
-	var browserExtensionScan *model.BrowserExtensionScanInfo
-	if featuregate.IsEnabled(featuregate.FeatureBrowserExtensionsScan) {
-		log.StepStart("Inventorying browser extensions")
-		start = time.Now()
-		browserTarget, _ := exec.LoggedInUser()
-		browserExtensionScan = browserext.New(exec).WithSkipper(tccSkipper).Detect(ctx, browserTarget)
-		log.StepDone(time.Since(start))
-	}
+	log.StepStart("Inventorying browser extensions")
+	start = time.Now()
+	browserTarget, _ := exec.LoggedInUser()
+	browserExtensionScan := browserext.New(exec).WithSkipper(tccSkipper).Detect(ctx, browserTarget)
+	log.StepDone(time.Since(start))
 
 	// npm config audit — surface-only inventory of every .npmrc on the host
 	// plus the merged effective view npm itself would resolve. The audit is

@@ -25,10 +25,6 @@ const (
 	FeatureYarnConfigAudit Feature = "yarn-config-audit"
 	FeatureDevicePolicy    Feature = "device-policy"
 	FeatureAgentSkillsScan Feature = "agent-skills-scan"
-	// Gated because the collector and its reader release independently: a reader
-	// that does not know this payload block discards it silently, which reads as
-	// "the feature is live and this machine has no browser extensions".
-	FeatureBrowserExtensionsScan Feature = "browser-extensions-scan"
 )
 
 // enabled lists features safe to ship today. Uncomment a line once its
@@ -42,7 +38,6 @@ var enabled = map[Feature]bool{
 	FeatureYarnConfigAudit: true,
 	FeatureDevicePolicy:    true,
 	FeatureAgentSkillsScan: true,
-	// FeatureBrowserExtensionsScan: true,
 }
 
 var override bool

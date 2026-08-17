@@ -1017,22 +1017,19 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	// service identity: scanning the wrong home would find no browser and report
 	// every one of them missing, which a reader honours by deleting the device's
 	// real inventory. A nil section is that decline, and it must stay nil.
-	var browserExtensionScan *model.BrowserExtensionScanInfo
-	if featuregate.IsEnabled(featuregate.FeatureBrowserExtensionsScan) {
-		phaseCtx, phaseCancel = startPhase(ctx, tracker, "browser_extensions_scan")
-		log.Progress("Inventorying browser extensions...")
-		browserTarget, _ := exec.LoggedInUser()
-		browserExtensionScan = browserext.New(userExec).WithSkipper(tccSkipper).Detect(phaseCtx, browserTarget)
-		if browserExtensionScan == nil {
-			log.Progress("  Skipped: no interactive user to describe")
-		} else {
-			log.Progress("  Found %d browser extensions across %d browsers",
-				len(browserExtensionScan.Findings), len(browserExtensionScan.Browsers))
-		}
-		fmt.Fprintln(os.Stderr)
-		endPhase(phaseCtx, phaseCancel, tracker, log, "browser_extensions_scan")
-		postPhase()
+	phaseCtx, phaseCancel = startPhase(ctx, tracker, "browser_extensions_scan")
+	log.Progress("Inventorying browser extensions...")
+	browserTarget, _ := exec.LoggedInUser()
+	browserExtensionScan := browserext.New(userExec).WithSkipper(tccSkipper).Detect(phaseCtx, browserTarget)
+	if browserExtensionScan == nil {
+		log.Progress("  Skipped: no interactive user to describe")
+	} else {
+		log.Progress("  Found %d browser extensions across %d browsers",
+			len(browserExtensionScan.Findings), len(browserExtensionScan.Browsers))
 	}
+	fmt.Fprintln(os.Stderr)
+	endPhase(phaseCtx, phaseCancel, tracker, log, "browser_extensions_scan")
+	postPhase()
 
 	// npm + pip configuration audits — surface-only inventory of every
 	// .npmrc and pip.conf on the host, plus the merged effective views
