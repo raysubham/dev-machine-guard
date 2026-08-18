@@ -414,7 +414,7 @@ Dev Machine Guard is a single compiled binary that scans your developer environm
 
 - Installed IDEs, AI tools, and their versions
 - IDE extension/plugin names, publishers, and versions (VS Code, Cursor, Windsurf, Antigravity, JetBrains, Eclipse, Xcode, Android Studio)
-- Browser extension records read from the browsers' own state files (Chrome, Edge, Firefox): identity, enabled state, install source, and granted permissions. Browsing history, cookies, saved passwords, and page content are never opened
+- Browser extension records read from the browsers' own state files (Chrome, Edge, Firefox): identity, enabled state, install source, and the permissions the browser currently honours. Browsing history, cookies, saved passwords, and page content are never opened
 - MCP server configuration (server names and commands only)
 - Node.js, Homebrew, Python, and system package listings (opt-in)
 - Package-manager configuration: effective registry, cooldown policy, and authentication surface across every scope (`.npmrc`, pnpm config, `bunfig.toml`, `.yarnrc`/`.yarnrc.yml`, `pip.conf`)

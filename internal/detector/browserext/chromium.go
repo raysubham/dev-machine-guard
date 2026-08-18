@@ -284,18 +284,32 @@ type chromiumEntry struct {
 	// absolute for an unpacked one. An absolute path is never opened and never
 	// resolved. It does reach the wire for an unpacked extension, whose load
 	// location is the most useful thing its record holds.
-	Path                  string               `json:"path"`
-	Manifest              *chromiumManifest    `json:"manifest"`
-	FromWebstore          *bool                `json:"from_webstore"`
-	WasInstalledByDefault bool                 `json:"was_installed_by_default"`
-	WasInstalledByOEM     bool                 `json:"was_installed_by_oem"`
-	Granted               *chromiumPermissions `json:"granted_permissions"`
-	RuntimeGranted        *chromiumPermissions `json:"runtime_granted_permissions"`
-	// Set when the user restricted the extension's site access. The browser
-	// leaves the withheld hosts in granted_permissions as a record of the
-	// original grant, so reading that set alone reports access the extension
-	// does not have. Hosts then come from runtime_granted_permissions alone.
-	// API permissions are never withheld.
+	Path                  string            `json:"path"`
+	Manifest              *chromiumManifest `json:"manifest"`
+	FromWebstore          *bool             `json:"from_webstore"`
+	WasInstalledByDefault bool              `json:"was_installed_by_default"`
+	WasInstalledByOEM     bool              `json:"was_installed_by_oem"`
+	// What the extension holds now, and the only set the wire is built from.
+	// granted_permissions has no field here at all: Chromium defines it as the
+	// maximum the extension has ever held and not had globally revoked, so a
+	// permission a later version stopped asking for, or one handed back through
+	// the permissions API, stays there after the browser stopped honouring it.
+	// Leaving it out also means a browser version that writes the historical
+	// record differently cannot cost us a row we can otherwise read.
+	//
+	// Held raw and decoded on its own so that a permission block in a shape this
+	// parser cannot read costs the permissions rather than the record: the
+	// identity, install source, store disposition and enabled state are all
+	// still there to report.
+	Active json.RawMessage `json:"active_permissions"`
+	// An additional store behind runtime host controls, read only when
+	// withholding is set below. Its patterns can be broader than the extension
+	// ever asked for, so it narrows the request and never widens it.
+	RuntimeGranted json.RawMessage `json:"runtime_granted_permissions"`
+	// Set when the user restricted the extension's site access. The active set
+	// keeps listing every host the extension requested, and the runtime store
+	// records what the user left it, so the hosts the browser honours have to be
+	// worked out from both. API permissions are never withheld.
 	WithholdingHostPermissions bool             `json:"withholding_permissions"`
 	CWSInfo                    *chromiumCWSInfo `json:"cws-info"`
 }
@@ -318,9 +332,9 @@ type chromiumManifest struct {
 	App   json.RawMessage `json:"app"`
 }
 
-// chromiumPermissions is one grant record. The granted sets are preferred over
-// what the manifest declared, because a declaration is a request and these are
-// what the browser actually handed over.
+// chromiumPermissions is one grant record. The active set is read in place of what
+// the manifest declared, because a declaration is a request and this is what the
+// browser is honouring right now.
 type chromiumPermissions struct {
 	API            []string `json:"api"`
 	ExplicitHost   []string `json:"explicit_host"`
@@ -431,9 +445,17 @@ func (d *Detector) chromiumOccurrence(scan *scanState, profileDir, id string, ra
 
 	state, disabledBy := chromiumEnabledState(e)
 	listing, violation := storeDisposition(e.CWSInfo)
-	perms, hosts, scriptable, capped := permissionLists(e.Granted, e.RuntimeGranted, e.WithholdingHostPermissions)
+	perms, hosts, scriptable, capped, permsUnavailable, hostsUnknown := permissionLists(e.Active, e.RuntimeGranted, e.WithholdingHostPermissions)
 	if capped {
 		b.degrade(model.BrowserExtReasonCapped)
+	}
+	// The record is here and the extension is real; one attribute of it could
+	// not be recovered, which is the same shape as a record whose manifest is
+	// missing and carries the same reason.
+	scriptableList := &scriptable
+	if permsUnavailable || hostsUnknown {
+		b.degrade(model.BrowserExtReasonManifestUnavailable)
+		scriptableList = nil
 	}
 	return occurrence{
 		enabled:    state,
@@ -451,10 +473,11 @@ func (d *Detector) chromiumOccurrence(scan *scanState, profileDir, id string, ra
 			Preinstalled:    e.WasInstalledByDefault || e.WasInstalledByOEM,
 			Permissions:     perms,
 			HostPermissions: hosts,
-			// Always answered on this family: the grant records name the
-			// scriptable hosts separately, so an empty list is "injects nowhere"
-			// rather than "cannot tell".
-			ScriptableHostPermissions: &scriptable,
+			// Answered on this family whenever the active set was read: it names
+			// the scriptable hosts separately, so an empty list is "injects
+			// nowhere". With no active set to read there is no answer, and nil
+			// is how the wire says so.
+			ScriptableHostPermissions: scriptableList,
 		},
 	}, true
 }
@@ -720,48 +743,132 @@ func lookupMessage(data []byte, key string) string {
 
 // permissionLists reduces the grant records to the three wire lists.
 //
-// Both grant paths are unioned, because either alone misreports what the
-// extension can reach: the up-front set keeps patterns the user has since
-// withheld, and the runtime set is the only home for what they granted on
-// demand. Once the user restricts site access the up-front set stops
-// describing the present, so the hosts then come from the runtime set alone
-// and the two lists part company: API permissions are never withheld.
+// Only the active set is read. It is what the browser is honouring now, where
+// the granted set is everything the extension has ever held: reading it would
+// report access the extension no longer has, and there is no fallback to it
+// when the active set cannot be read, because a historical grant is not weaker
+// evidence of present access - it is evidence of something else.
+//
+// The runtime store is read only under withholding, and only to work out which
+// of the requested hosts survived it. Explicit and scriptable hosts are matched
+// against their own side of that store, never against each other: the two mean
+// different things to the browser - one is what requests and cookie reads may
+// reach, the other is where content scripts run - and the browser writes a
+// granted origin into both sides whether or not the extension has any content
+// script, so crossing them would invent provenance the extension never declared.
 //
 // The scriptable list is a subset of the host list and is derived from it after
 // the cap rather than beside it, so a host the cap dropped cannot survive in the
 // stronger list alone. Injecting code into a page is a larger capability than
 // reaching it with a request, and a reader that saw one without the other would
 // have to guess which.
-func permissionLists(granted, runtime *chromiumPermissions, withholdingHosts bool) (perms, hosts, scriptable []string, capped bool) {
-	var api, host []string
-	scriptableSet := map[string]struct{}{}
-	for _, set := range []*chromiumPermissions{granted, runtime} {
-		if set == nil {
-			continue
-		}
-		api = append(api, set.API...)
-		// A withheld host is not a granted host: it sits in granted_permissions
-		// only as a record of what the user later took back. Neither list carries
-		// it, because a host the extension cannot reach is not one it can inject
-		// into either.
-		if withholdingHosts && set != runtime {
-			continue
-		}
-		host = append(host, set.ExplicitHost...)
-		host = append(host, set.ScriptableHost...)
-		for _, h := range set.ScriptableHost {
-			scriptableSet[h] = struct{}{}
-		}
+//
+// unavailable reports that there is no active set to read, and hostsUnknown that
+// the runtime store the withheld hosts had to be read from could not be read.
+// Either way the caller emits no evidence for what it could not establish and
+// marks the browser partial: an empty list is the positive claim that the
+// extension holds nothing, and neither of these is that claim.
+func permissionLists(activeRaw, runtimeRaw json.RawMessage, withholdingHosts bool) (perms, hosts, scriptable []string, capped, unavailable, hostsUnknown bool) {
+	active, present, ok := decodePermissions(activeRaw)
+	if !present || !ok {
+		// Empty rather than nil: these two lists are always written, and the
+		// absent answer is carried by the nil scriptable list and the browser's
+		// partial status instead of by a second shape for the same field.
+		return []string{}, []string{}, nil, false, true, false
 	}
-	perms, apiCapped := capPermissionList(api)
-	hosts, hostCapped := capPermissionList(host)
+	explicit, script := active.ExplicitHost, active.ScriptableHost
+	if withholdingHosts {
+		runtime, _, ok := decodePermissions(runtimeRaw)
+		if !ok {
+			// The API permissions are still good: withholding applies to hosts
+			// alone, and they were read from the active set. Only the hosts are
+			// unknown, so only they are left out.
+			perms, apiCapped := capPermissionList(active.API)
+			return perms, []string{}, nil, apiCapped, false, true
+		}
+		explicit = withheldHosts(explicit, runtime.ExplicitHost)
+		script = withheldHosts(script, runtime.ScriptableHost)
+	}
+	scriptableSet := make(map[string]struct{}, len(script))
+	for _, h := range script {
+		scriptableSet[h] = struct{}{}
+	}
+	perms, apiCapped := capPermissionList(active.API)
+	hosts, hostCapped := capPermissionList(append(append([]string{}, explicit...), script...))
 	scriptable = []string{}
 	for _, h := range hosts {
 		if _, ok := scriptableSet[h]; ok {
 			scriptable = append(scriptable, h)
 		}
 	}
-	return perms, hosts, scriptable, apiCapped || hostCapped
+	return perms, hosts, scriptable, apiCapped || hostCapped, false, false
+}
+
+// decodePermissions reads one grant record, reporting whether the browser wrote
+// it at all separately from whether it could be read. A record that was never
+// written is not the same fact as one written in a shape this parser does not
+// know, and the two answers differ: nothing withheld back is a real empty set,
+// while an unreadable store leaves the question open.
+func decodePermissions(raw json.RawMessage) (p chromiumPermissions, present, ok bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return p, false, true
+	}
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return p, true, false
+	}
+	return p, true, true
+}
+
+// withheldHosts keeps the hosts the browser still honours after the user
+// restricted the extension's site access. The browser hands the extension the
+// intersection of what it requested and what the runtime store holds, and the
+// granted origin is written into the runtime store alone - it is never added to
+// the active set - so the answer is drawn from the runtime side.
+//
+// A runtime pattern counts in one of two cases. The request names it exactly, or
+// the request covers the whole web and the pattern is one of the sites it covers:
+// an extension asking for <all_urls> and left one site reaches that one site,
+// which is the common case. Whole-web authority is the same test the ranking
+// applies, so the http and https wildcard pair counts as well as either
+// single-pattern form, and the pair carries no reach over local files, so under
+// it a granted file pattern is not admitted. <all_urls> does cover them.
+//
+// Nothing else counts. Working out whether one pattern covers another in the
+// general case is the browser's own matching logic, and a producer guessing at it
+// would report reach that was never granted, so a mid-width request such as
+// *://*.example.internal/* with a narrower grant under it reports no host at all.
+// That is a false negative, which is the direction this inventory errs in.
+func withheldHosts(requested, runtime []string) []string {
+	if len(runtime) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(requested))
+	everyScheme := false
+	for _, pattern := range requested {
+		if pattern == allURLsPattern {
+			everyScheme = true
+		}
+		set[pattern] = struct{}{}
+	}
+	wholeWeb := hasBroadHosts(requested)
+	out := make([]string, 0, len(runtime))
+	for _, granted := range runtime {
+		_, exact := set[granted]
+		if exact || everyScheme || (wholeWeb && isWebPattern(granted)) {
+			out = append(out, granted)
+		}
+	}
+	return out
+}
+
+// isWebPattern reports whether a host pattern names reach over websites. The
+// scheme is the whole test: what a pattern's host part matches is the browser's
+// business, but a pattern that cannot name an http or https URL is not website
+// reach whatever else it covers.
+func isWebPattern(pattern string) bool {
+	return strings.HasPrefix(pattern, "http://") ||
+		strings.HasPrefix(pattern, "https://") ||
+		strings.HasPrefix(pattern, "*://")
 }
 
 // capPermissionList sorts, deduplicates and bounds one permission list, reporting

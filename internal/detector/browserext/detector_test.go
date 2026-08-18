@@ -195,7 +195,7 @@ func TestDetect_DeclinesWithoutADeveloper(t *testing.T) {
 	home := tempHome(t)
 	// A real installation, so a scan that ran would certainly report findings.
 	localState(t, chromeRoot(home), "Default")
-	securePrefs(t, chromeRoot(home), "Default", `"`+idA+`": {"location": 1, "manifest": {"name": "Example", "version": "1.0"}}`)
+	securePrefs(t, chromeRoot(home), "Default", `"`+idA+`": {"location": 1, "active_permissions": {}, "manifest": {"name": "Example", "version": "1.0"}}`)
 
 	tests := []struct {
 		name     string
@@ -297,7 +297,7 @@ func TestDetect_SymlinksRefuse(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink creation needs a privilege the test host may not hold")
 	}
-	settings := `"` + idA + `": {"location": 1, "manifest": {"name": "Example Elsewhere", "version": "1.0"}}`
+	settings := `"` + idA + `": {"location": 1, "active_permissions": {}, "manifest": {"name": "Example Elsewhere", "version": "1.0"}}`
 
 	tests := []struct {
 		name string
@@ -399,7 +399,7 @@ func TestDetect_OversizeStateFileIsNotParsedFromItsPrefix(t *testing.T) {
 	writeFile(t, filepath.Join(chromeRoot(home), "Local State"),
 		`{"profile": {"info_cache": {"Default": {}}}}`+padding)
 	securePrefs(t, chromeRoot(home), "Default",
-		`"`+idA+`": {"location": 1, "manifest": {"name": "Example", "version": "1.0"}}`)
+		`"`+idA+`": {"location": 1, "active_permissions": {}, "manifest": {"name": "Example", "version": "1.0"}}`)
 
 	info := scanHome(t, home)
 	assertPayloadInvariants(t, info)
@@ -425,7 +425,7 @@ func TestDetect_DeadlineFailsTheRemainingBrowsers(t *testing.T) {
 	home := tempHome(t)
 	localState(t, chromeRoot(home), "Default")
 	securePrefs(t, chromeRoot(home), "Default",
-		`"`+idA+`": {"location": 1, "manifest": {"name": "Example", "version": "1.0"}}`)
+		`"`+idA+`": {"location": 1, "active_permissions": {}, "manifest": {"name": "Example", "version": "1.0"}}`)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -494,7 +494,7 @@ func TestDetect_GuardExemptsTheBrowsersOwnDirectories(t *testing.T) {
 	root := filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
 	localState(t, root, "Default")
 	securePrefs(t, root, "Default",
-		`"`+idA+`": {"location": 1, "manifest": {"name": "Example", "version": "1.0"}}`)
+		`"`+idA+`": {"location": 1, "active_permissions": {}, "manifest": {"name": "Example", "version": "1.0"}}`)
 
 	d := newDetector(model.PlatformDarwin).WithSkipper(tcc.New(home))
 	info := d.Detect(context.Background(), testUser(home))
@@ -525,7 +525,7 @@ func TestDetect_CapFailsOnlyTheOverflowingBrowser(t *testing.T) {
 	// it, with the overflowing browser between them.
 	localState(t, chromeRoot(home), "Default")
 	securePrefs(t, chromeRoot(home), "Default",
-		`"`+idA+`": {"location": 1, "manifest": {"name": "Example", "version": "1.0"}}`)
+		`"`+idA+`": {"location": 1, "active_permissions": {}, "manifest": {"name": "Example", "version": "1.0"}}`)
 
 	edgeRoot := filepath.Join(home, ".config", "microsoft-edge")
 	localState(t, edgeRoot, "Default")
@@ -573,12 +573,12 @@ func TestDetect_FoldsOneExtensionSeenInTwoProfiles(t *testing.T) {
 	securePrefs(t, chromeRoot(home), "Default", `"`+idA+`": {
 		"location": 1, "disable_reasons": [1],
 		"manifest": {"name": "Example Reader", "version": "1.0.0"},
-		"granted_permissions": {"api": ["storage"]}
+		"active_permissions": {"api": ["storage"]}
 	}`)
 	securePrefs(t, chromeRoot(home), "Profile 1", `"`+idA+`": {
 		"location": 1,
 		"manifest": {"name": "Example Reader", "version": "2.0.0"},
-		"granted_permissions": {"api": ["tabs"]}
+		"active_permissions": {"api": ["tabs"]}
 	}`)
 
 	info := scanHome(t, home)
@@ -616,12 +616,12 @@ func TestDetect_GrantedProfileOwnsTheAccessLists(t *testing.T) {
 	securePrefs(t, chromeRoot(home), "Default", `"`+idA+`": {
 		"location": 1, "withholding_permissions": true,
 		"manifest": {"name": "Example Blocker", "version": "1.0.0"},
-		"granted_permissions": {"api": ["storage"], "explicit_host": ["<all_urls>"]}
+		"active_permissions": {"api": ["storage"], "explicit_host": ["<all_urls>"]}
 	}`)
 	securePrefs(t, chromeRoot(home), "Profile 1", `"`+idA+`": {
 		"location": 1,
 		"manifest": {"name": "Example Blocker", "version": "1.0.0"},
-		"granted_permissions": {"api": ["storage"], "explicit_host": ["<all_urls>"]}
+		"active_permissions": {"api": ["storage"], "explicit_host": ["<all_urls>"]}
 	}`)
 
 	got := findingsFor(scanHome(t, home), browserChrome)
@@ -678,6 +678,13 @@ func TestLessOccurrence(t *testing.T) {
 		name:   "one half of the pair is not broad, so count decides",
 		first:  occ("b", model.BrowserExtEnabled, specific, nil),
 		second: occ("a", model.BrowserExtEnabled, []string{"https://*/*"}, nil),
+	}, {
+		// Reading local files is not reading websites, and the browser gates it
+		// behind a per-extension setting of its own, so the profile with three
+		// real sites describes more web access than the one holding it.
+		name:   "file access is not web breadth, so count decides",
+		first:  occ("b", model.BrowserExtEnabled, specific, nil),
+		second: occ("a", model.BrowserExtEnabled, []string{"file://*/*"}, nil),
 	}, {
 		name:   "all disabled: breadth still decides, so a broad grant is reported",
 		first:  occ("b", model.BrowserExtDisabled, []string{"<all_urls>"}, nil),
@@ -739,10 +746,10 @@ func TestDetect_DisabledCauseComesFromADisabledProfile(t *testing.T) {
 	// The first-sorting profile is disabled by the user, the second by the
 	// browser; neither is enabled, so the row is disabled and needs one cause.
 	securePrefs(t, chromeRoot(home), "Default", `"`+idA+`": {
-		"location": 1, "disable_reasons": [1], "manifest": {"name": "Example", "version": "1.0"}
+		"location": 1, "disable_reasons": [1], "active_permissions": {}, "manifest": {"name": "Example", "version": "1.0"}
 	}`)
 	securePrefs(t, chromeRoot(home), "Profile 1", `"`+idA+`": {
-		"location": 1, "disable_reasons": [512], "manifest": {"name": "Example", "version": "1.0"}
+		"location": 1, "disable_reasons": [512], "active_permissions": {}, "manifest": {"name": "Example", "version": "1.0"}
 	}`)
 
 	got := findingsFor(scanHome(t, home), browserChrome)
@@ -760,9 +767,9 @@ func TestDetect_DisabledCauseComesFromADisabledProfile(t *testing.T) {
 func TestDetect_IsDeterministic(t *testing.T) {
 	home := tempHome(t)
 	localState(t, chromeRoot(home), "Default", "Profile 1", "Profile 2")
-	settings := `"` + idA + `": {"location": 1, "manifest": {"name": "A", "version": "1.0"}},` +
-		`"` + idB + `": {"location": 4, "manifest": {"name": "B", "version": "2.0"}},` +
-		`"` + idC + `": {"location": 2, "manifest": {"name": "C", "version": "3.0"}}`
+	settings := `"` + idA + `": {"location": 1, "active_permissions": {}, "manifest": {"name": "A", "version": "1.0"}},` +
+		`"` + idB + `": {"location": 4, "active_permissions": {}, "manifest": {"name": "B", "version": "2.0"}},` +
+		`"` + idC + `": {"location": 2, "active_permissions": {}, "manifest": {"name": "C", "version": "3.0"}}`
 	for _, profile := range []string{"Default", "Profile 1", "Profile 2"} {
 		securePrefs(t, chromeRoot(home), profile, settings)
 	}

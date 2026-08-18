@@ -167,11 +167,20 @@ const (
 // pattern added on one side is a disagreement about what breadth means until it
 // is added on the other. Exact equality, never a judgment call about equivalent
 // patterns, because a host pattern is matched literally.
+//
+// file://*/* is not here. Reach over local files is not reach over websites,
+// and the browser gates it behind a separate setting the user has to turn on
+// per extension, so counting it as web breadth would rank a profile above one
+// that really can read every site.
 var broadHostPatterns = map[string]struct{}{
-	"<all_urls>": {},
-	"*://*/*":    {},
-	"file://*/*": {},
+	allURLsPattern: {},
+	"*://*/*":      {},
 }
+
+// allURLsPattern is the one whole-web form that also reaches schemes other than
+// http and https, local files among them, which matters wherever a rule has to
+// tell website reach from reach of any kind.
+const allURLsPattern = "<all_urls>"
 
 // hasBroadHosts reports whether granted host patterns amount to whole-web reach.
 func hasBroadHosts(hosts []string) bool {

@@ -31,7 +31,7 @@ func manySettings(n int) string {
 			spelled.WriteByte(letters[digit-'0'])
 		}
 		id := strings.Repeat("a", 28) + spelled.String()
-		entries = append(entries, `"`+id+`": {"location": 1, "manifest": {"name": "Example", "version": "1.0"}}`)
+		entries = append(entries, `"`+id+`": {"location": 1, "active_permissions": {}, "manifest": {"name": "Example", "version": "1.0"}}`)
 	}
 	return strings.Join(entries, ",")
 }
@@ -63,11 +63,11 @@ func TestChromium_PrefsResidenceAndMerge(t *testing.T) {
 	root := chromeRoot(home)
 	localState(t, root, "Default")
 	securePrefs(t, root, "Default", `"`+idA+`": {
-		"location": 1, "manifest": {"name": "From Secure", "version": "1.0"}
+		"location": 1, "active_permissions": {}, "manifest": {"name": "From Secure", "version": "1.0"}
 	}`)
 	writeFile(t, filepath.Join(root, "Default", "Preferences"), `{"extensions": {"settings": {
-		"`+idA+`": {"location": 1, "manifest": {"name": "From Plain", "version": "9.9"}},
-		"`+idB+`": {"location": 1, "manifest": {"name": "Only In Plain", "version": "2.0"}}
+		"`+idA+`": {"location": 1, "active_permissions": {}, "manifest": {"name": "From Plain", "version": "9.9"}},
+		"`+idB+`": {"location": 1, "active_permissions": {}, "manifest": {"name": "Only In Plain", "version": "2.0"}}
 	}}}`)
 
 	info := scanHome(t, home)
@@ -85,6 +85,11 @@ func TestChromium_PrefsResidenceAndMerge(t *testing.T) {
 	}
 	if name := byID[idB].Name; name != "Only In Plain" {
 		t.Errorf("name = %q, want the plain file to fill an id the other lacks", name)
+	}
+	// Both records are complete, so nothing here is an attribute this scan failed
+	// to recover and the browser has no reason to report degraded.
+	if got := coverageFor(t, info, browserChrome); got.Status != model.BrowserCoverageScanned {
+		t.Errorf("status = %q/%q, want scanned", got.Status, got.ReasonCode)
 	}
 }
 
@@ -205,7 +210,8 @@ func TestChromium_EnabledState(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, _ := chromeFinding(t, `"`+idA+`": {`+tc.record+`, "manifest": {"name": "Example", "version": "1.0"}}`)
+			got, _ := chromeFinding(t, `"`+idA+`": {`+tc.record+
+				`, "active_permissions": {}, "manifest": {"name": "Example", "version": "1.0"}}`)
 			if got.EnabledState != tc.state {
 				t.Errorf("enabled_state = %q, want %q", got.EnabledState, tc.state)
 			}
@@ -237,7 +243,7 @@ func TestChromium_InstallSource(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got, _ := chromeFinding(t, `"`+idA+`": {"location": `+tc.location+
-				`, "manifest": {"name": "Example", "version": "1.0"}}`)
+				`, "active_permissions": {}, "manifest": {"name": "Example", "version": "1.0"}}`)
 			if got.InstallSource != tc.want {
 				t.Errorf("install_source = %q, want %q", got.InstallSource, tc.want)
 			}
@@ -381,7 +387,7 @@ func TestChromium_StoreDisposition(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, _ := chromeFinding(t, `"`+idA+`": {"location": 1, `+tc.record+
+			got, _ := chromeFinding(t, `"`+idA+`": {"location": 1, "active_permissions": {}, `+tc.record+
 				`, "manifest": {"name": "Example", "version": "1.0"}}`)
 			if got.StoreListing != tc.listing || got.StoreViolation != tc.violation {
 				t.Errorf("store fields = %q/%q, want %q/%q",
@@ -430,7 +436,7 @@ func TestChromium_StoreAttribution(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, _ := chromeFinding(t, `"`+idA+`": {"location": 1, `+tc.record+`}`)
+			got, _ := chromeFinding(t, `"`+idA+`": {"location": 1, "active_permissions": {}, `+tc.record+`}`)
 			if got.Store != tc.want {
 				t.Errorf("store = %q, want %q", got.Store, tc.want)
 			}
@@ -441,92 +447,335 @@ func TestChromium_StoreAttribution(t *testing.T) {
 	}
 }
 
-// TestChromium_Permissions covers the union that makes the list honest. Either
-// grant record alone misreports what the extension can reach: the up-front set
-// keeps patterns the user has since withheld, and the on-demand set is the only
-// home for what they granted later.
+// TestChromium_Permissions covers the one record the wire is built from. The
+// browser keeps three, and only the active set says what the extension holds
+// now: the granted set is everything it has ever held and never had globally
+// revoked, and the runtime store is bookkeeping behind the site-access control.
 func TestChromium_Permissions(t *testing.T) {
-	got, _ := chromeFinding(t, `"`+idA+`": {
-		"location": 1,
-		"manifest": {"name": "Example", "version": "1.0"},
-		"granted_permissions": {
-			"api": ["storage", "tabs"],
-			"explicit_host": ["https://example.internal/*"]
-		},
-		"runtime_granted_permissions": {
-			"api": ["storage", "cookies"],
-			"scriptable_host": ["https://other.internal/*"]
-		}
-	}`)
+	t.Run("the active set is the answer and the other two are not", func(t *testing.T) {
+		got, coverage := chromeFinding(t, `"`+idA+`": {
+			"location": 1,
+			"manifest": {"name": "Example", "version": "1.0"},
+			"active_permissions": {
+				"api": ["storage", "tabs"],
+				"explicit_host": ["https://example.internal/*"]
+			},
+			"granted_permissions": {
+				"api": ["storage", "tabs", "webview"],
+				"explicit_host": ["https://example.internal/*", "https://dropped.internal/*"]
+			},
+			"runtime_granted_permissions": {
+				"api": ["cookies"],
+				"scriptable_host": ["https://other.internal/*"]
+			}
+		}`)
 
-	wantPerms := []string{"cookies", "storage", "tabs"}
-	if strings.Join(got.Permissions, ",") != strings.Join(wantPerms, ",") {
-		t.Errorf("permissions = %v, want %v deduplicated and sorted", got.Permissions, wantPerms)
-	}
-	wantHosts := []string{"https://example.internal/*", "https://other.internal/*"}
-	if strings.Join(got.HostPermissions, ",") != strings.Join(wantHosts, ",") {
-		t.Errorf("host_permissions = %v, want %v", got.HostPermissions, wantHosts)
-	}
+		wantPerms := []string{"storage", "tabs"}
+		if strings.Join(got.Permissions, ",") != strings.Join(wantPerms, ",") {
+			t.Errorf("permissions = %v, want %v: a permission the browser stopped honouring is not one the machine holds",
+				got.Permissions, wantPerms)
+		}
+		wantHosts := []string{"https://example.internal/*"}
+		if strings.Join(got.HostPermissions, ",") != strings.Join(wantHosts, ",") {
+			t.Errorf("host_permissions = %v, want %v", got.HostPermissions, wantHosts)
+		}
+		// Nothing failed to read. The other two records were present and
+		// deliberately not used, which is not a degraded attribute.
+		if coverage.Status != model.BrowserCoverageScanned {
+			t.Errorf("status = %q/%q, want scanned", coverage.Status, coverage.ReasonCode)
+		}
+	})
+
+	// The same divergence arriving the other way: an optional permission the
+	// extension asked for at runtime and later handed back through the
+	// permissions API. The browser removes it from the active set and leaves it
+	// in the granted one for good.
+	t.Run("an optional permission handed back is not reported", func(t *testing.T) {
+		got, _ := chromeFinding(t, `"`+idA+`": {
+			"location": 1,
+			"manifest": {"name": "Example", "version": "1.0"},
+			"active_permissions": {"api": ["storage"]},
+			"granted_permissions": {"api": ["storage", "bookmarks"]},
+			"runtime_granted_permissions": {"api": ["bookmarks"]}
+		}`)
+
+		if slices.Contains(got.Permissions, "bookmarks") {
+			t.Errorf("permissions = %v, want no bookmarks: it is a record of a grant, not a grant",
+				got.Permissions)
+		}
+	})
+
+	// No fallback. A record whose active set could not be read reports nothing
+	// rather than reporting history, because an empty list is the positive claim
+	// that the extension holds nothing and this is not that claim.
+	t.Run("no active set means no permissions and a partial browser", func(t *testing.T) {
+		got, coverage := chromeFinding(t, `"`+idA+`": {
+			"location": 1,
+			"manifest": {"name": "Example", "version": "1.0"},
+			"granted_permissions": {
+				"api": ["storage", "tabs"],
+				"explicit_host": ["<all_urls>"],
+				"scriptable_host": ["<all_urls>"]
+			},
+			"runtime_granted_permissions": {"api": ["cookies"]}
+		}`)
+
+		if len(got.Permissions) != 0 || len(got.HostPermissions) != 0 {
+			t.Errorf("permissions/host_permissions = %v/%v, want neither: history is not present access",
+				got.Permissions, got.HostPermissions)
+		}
+		if got.ScriptableHostPermissions != nil {
+			t.Errorf("scriptable_host_permissions = %v, want absent: an empty list would say it injects nowhere",
+				*got.ScriptableHostPermissions)
+		}
+		// The extension is still reported, so membership stays complete and only
+		// the attribute is missing.
+		if coverage.Status != model.BrowserCoveragePartial ||
+			coverage.ReasonCode != model.BrowserExtReasonManifestUnavailable {
+			t.Errorf("status = %q/%q, want partial and manifest_unavailable",
+				coverage.Status, coverage.ReasonCode)
+		}
+	})
 }
 
-// TestChromium_WithheldHostsAreNotReported covers the one case where the union
-// stops being true. Restricting an extension's site access does not rewrite the
-// up-front grant — the browser sets a flag and moves what survives into the
-// runtime record — so unioning the two reports the access the user took away.
+// TestChromium_WithheldHostsAreNotReported covers the site-access control. The
+// browser does not rewrite the active set when the user restricts a site: it sets
+// a flag, keeps the request as it was, and records the granted origins in the
+// runtime store, so the hosts it honours have to be read from both records.
 func TestChromium_WithheldHostsAreNotReported(t *testing.T) {
-	const granted = `"api": ["storage", "tabs"], "explicit_host": ["*://*/*", "<all_urls>"]`
+	const broadRequest = `"api": ["storage", "tabs"], "explicit_host": ["*://*/*", "<all_urls>", "https://kept.internal/*"]`
 
 	for _, tt := range []struct {
 		name    string
+		active  string
 		entry   string
 		want    []string
 		wantAPI []string
 	}{
 		{
 			// Site access restricted to nothing: the extension holds no host at
-			// all, however much the up-front record still lists.
+			// all, however much the active record still requests.
 			name:    "withheld with nothing granted back reaches no host",
 			entry:   `"withholding_permissions": true, "runtime_granted_permissions": {"api": ["cookies"]}`,
 			want:    nil,
-			wantAPI: []string{"cookies", "storage", "tabs"},
+			wantAPI: []string{"storage", "tabs"},
 		},
 		{
-			// Site access restricted to one site: that site, and not the pattern
-			// it was carved out of.
+			// Site access restricted to one site. The granted origin lives in the
+			// runtime store and is never copied into the active set, so this is
+			// the one place it can be read from.
 			name: "withheld with one site granted back reaches that site",
 			entry: `"withholding_permissions": true, "runtime_granted_permissions": {
-				"api": ["cookies"], "scriptable_host": ["https://kept.internal/*"]
+				"api": ["cookies"], "explicit_host": ["https://kept.internal/*"]
 			}`,
 			want:    []string{"https://kept.internal/*"},
-			wantAPI: []string{"cookies", "storage", "tabs"},
+			wantAPI: []string{"storage", "tabs"},
+		},
+		{
+			// The user may grant a pattern wider than any one site, and the browser
+			// records it as given. It is still bounded by the request, which here is
+			// every site, so what the extension holds is the grant.
+			name: "a grant under a whole-web request is reported as granted",
+			entry: `"withholding_permissions": true, "runtime_granted_permissions": {
+				"explicit_host": ["https://*.internal/*"]
+			}`,
+			want:    []string{"https://*.internal/*"},
+			wantAPI: []string{"storage", "tabs"},
+		},
+		{
+			// The pair is the same whole-web authority as either single wildcard,
+			// and an extension that asks for it that way is left the same site.
+			name:    "the http and https pair is whole-web authority too",
+			active:  `"api": ["storage", "tabs"], "explicit_host": ["http://*/*", "https://*/*"]`,
+			entry:   `"withholding_permissions": true, "runtime_granted_permissions": {"explicit_host": ["https://kept.internal/*"]}`,
+			want:    []string{"https://kept.internal/*"},
+			wantAPI: []string{"storage", "tabs"},
+		},
+		{
+			// A whole-web request carries no reach over local files, so a granted
+			// file pattern under one is not a host this extension holds.
+			name:    "a whole-web request does not admit a granted file pattern",
+			active:  `"api": ["storage", "tabs"], "explicit_host": ["*://*/*"]`,
+			entry:   `"withholding_permissions": true, "runtime_granted_permissions": {"explicit_host": ["file://*/*", "https://kept.internal/*"]}`,
+			want:    []string{"https://kept.internal/*"},
+			wantAPI: []string{"storage", "tabs"},
+		},
+		{
+			// <all_urls> is the one whole-web form that does reach local files, and
+			// the browser's own separate file-access setting is the gate on that,
+			// not this. Nothing else here tells the two forms apart.
+			name:    "an every-scheme request admits a granted file pattern",
+			active:  `"api": ["storage", "tabs"], "explicit_host": ["<all_urls>"]`,
+			entry:   `"withholding_permissions": true, "runtime_granted_permissions": {"explicit_host": ["file://*/*"]}`,
+			want:    []string{"file://*/*"},
+			wantAPI: []string{"storage", "tabs"},
+		},
+		{
+			// Neither pattern is the other and the request is not whole-web, so
+			// whether one covers the other is the browser's matching logic and not
+			// ours to guess. Reported as no host: a false negative, and the
+			// direction to err in.
+			name:    "a partial request with a grant we cannot match reports no host",
+			active:  `"api": ["storage", "tabs"], "explicit_host": ["https://maps.example.internal/*"]`,
+			entry:   `"withholding_permissions": true, "runtime_granted_permissions": {"explicit_host": ["https://*.example.internal/*"]}`,
+			want:    nil,
+			wantAPI: []string{"storage", "tabs"},
 		},
 		{
 			// Every browser that does not write the flag, and every extension
-			// whose access was never restricted.
-			name:    "no flag leaves the union alone",
-			entry:   `"runtime_granted_permissions": {"api": ["cookies"], "scriptable_host": ["https://kept.internal/*"]}`,
+			// whose access was never restricted: the active set stands as it is,
+			// and the runtime store is not read at all.
+			name:    "no flag leaves the active set alone",
+			entry:   `"runtime_granted_permissions": {"api": ["cookies"], "scriptable_host": ["https://elsewhere.internal/*"]}`,
 			want:    []string{"*://*/*", "<all_urls>", "https://kept.internal/*"},
-			wantAPI: []string{"cookies", "storage", "tabs"},
+			wantAPI: []string{"storage", "tabs"},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			active := tt.active
+			if active == "" {
+				active = broadRequest
+			}
 			got, _ := chromeFinding(t, `"`+idA+`": {
 				"location": 1,
 				"manifest": {"name": "Example", "version": "1.0"},
-				"granted_permissions": {`+granted+`},
+				"active_permissions": {`+active+`},
 				`+tt.entry+`
 			}`)
 
 			if strings.Join(got.HostPermissions, ",") != strings.Join(tt.want, ",") {
 				t.Errorf("host_permissions = %v, want %v", got.HostPermissions, tt.want)
 			}
-			// Withholding is about hosts. An API permission disappearing here
-			// means the branch caught the wrong list.
+			// Withholding is about hosts. An API permission moving here means the
+			// branch caught the wrong list.
 			if strings.Join(got.Permissions, ",") != strings.Join(tt.wantAPI, ",") {
 				t.Errorf("permissions = %v, want %v", got.Permissions, tt.wantAPI)
 			}
 		})
 	}
+
+	// The record a real browser writes for the ordinary "on specific sites"
+	// choice, copied from a profile that was put in that state: the request stays
+	// whole-web, the granted origin appears in both runtime buckets even though
+	// the extension has no content script, and the active scriptable list stays
+	// empty. Reporting the granted origin as injectable would be the browser's
+	// bookkeeping read as provenance.
+	t.Run("the shape a browser really writes for one granted site", func(t *testing.T) {
+		got, coverage := chromeFinding(t, `"`+idA+`": {
+			"location": 4,
+			"path": "/home/user/probe",
+			"withholding_permissions": true,
+			"active_permissions": {"api": [], "explicit_host": ["<all_urls>"], "scriptable_host": []},
+			"runtime_granted_permissions": {
+				"api": [],
+				"explicit_host": ["https://example.test/*"],
+				"scriptable_host": ["https://example.test/*"]
+			}
+		}`)
+
+		if strings.Join(got.HostPermissions, ",") != "https://example.test/*" {
+			t.Errorf("host_permissions = %v, want the one granted site", got.HostPermissions)
+		}
+		if got.ScriptableHostPermissions == nil || len(*got.ScriptableHostPermissions) != 0 {
+			t.Errorf("scriptable_host_permissions = %v, want empty: the extension declares no content script",
+				got.ScriptableHostPermissions)
+		}
+		// Both permission records were read, and an unpacked extension having no
+		// manifest is not a failure, so nothing here degrades the browser.
+		if coverage.Status != model.BrowserCoverageScanned {
+			t.Errorf("status = %q, want scanned", coverage.Status)
+		}
+	})
+}
+
+// TestChromium_UnreadablePermissionRecords covers a permission block written in a
+// shape this parser does not know. Each of the three records is decoded on its
+// own, so one of them being unreadable costs what it holds and nothing else.
+func TestChromium_UnreadablePermissionRecords(t *testing.T) {
+	const manifest = `"location": 1, "manifest": {"name": "Example", "version": "1.0"}`
+
+	t.Run("an unreadable active set keeps the rest of the record", func(t *testing.T) {
+		got, coverage := chromeFinding(t, `"`+idA+`": {`+manifest+`,
+			"active_permissions": {"api": "storage"}
+		}`)
+
+		// The point of the case: identity and install facts survive.
+		if got.Name != "Example" || got.Version != "1.0" ||
+			got.InstallSource != model.BrowserExtInstallUser ||
+			got.EnabledState != model.BrowserExtEnabled {
+			t.Errorf("finding = %+v, want the metadata intact", got)
+		}
+		if len(got.Permissions) != 0 || len(got.HostPermissions) != 0 {
+			t.Errorf("permissions/host_permissions = %v/%v, want neither",
+				got.Permissions, got.HostPermissions)
+		}
+		if got.ScriptableHostPermissions != nil {
+			t.Errorf("scriptable_host_permissions = %v, want absent", *got.ScriptableHostPermissions)
+		}
+		if coverage.Status != model.BrowserCoveragePartial ||
+			coverage.ReasonCode != model.BrowserExtReasonManifestUnavailable {
+			t.Errorf("status = %q/%q, want partial and manifest_unavailable",
+				coverage.Status, coverage.ReasonCode)
+		}
+	})
+
+	// Historical state is not read, so its shape cannot matter. This is the whole
+	// reason the field was dropped from the struct rather than parsed and ignored.
+	t.Run("an unreadable granted set changes nothing", func(t *testing.T) {
+		got, coverage := chromeFinding(t, `"`+idA+`": {`+manifest+`,
+			"active_permissions": {"api": ["storage"]},
+			"granted_permissions": ["not", "an", "object"]
+		}`)
+
+		if strings.Join(got.Permissions, ",") != "storage" {
+			t.Errorf("permissions = %v, want storage", got.Permissions)
+		}
+		if coverage.Status != model.BrowserCoverageScanned {
+			t.Errorf("status = %q, want scanned", coverage.Status)
+		}
+	})
+
+	t.Run("an unreadable runtime store is not read without withholding", func(t *testing.T) {
+		got, coverage := chromeFinding(t, `"`+idA+`": {`+manifest+`,
+			"active_permissions": {"api": ["storage"], "explicit_host": ["https://example.internal/*"]},
+			"runtime_granted_permissions": 7
+		}`)
+
+		if strings.Join(got.HostPermissions, ",") != "https://example.internal/*" {
+			t.Errorf("host_permissions = %v, want the active host", got.HostPermissions)
+		}
+		if coverage.Status != model.BrowserCoverageScanned {
+			t.Errorf("status = %q, want scanned: the store was never needed", coverage.Status)
+		}
+	})
+
+	// Under withholding the hosts cannot be worked out without that store, but the
+	// API permissions never went through it.
+	t.Run("an unreadable runtime store under withholding costs the hosts alone", func(t *testing.T) {
+		got, coverage := chromeFinding(t, `"`+idA+`": {`+manifest+`,
+			"withholding_permissions": true,
+			"active_permissions": {"api": ["storage", "tabs"], "explicit_host": ["<all_urls>"]},
+			"runtime_granted_permissions": 7
+		}`)
+
+		if strings.Join(got.Permissions, ",") != "storage,tabs" {
+			t.Errorf("permissions = %v, want storage,tabs", got.Permissions)
+		}
+		if got.Name != "Example" {
+			t.Errorf("name = %q, want the metadata intact", got.Name)
+		}
+		if len(got.HostPermissions) != 0 {
+			t.Errorf("host_permissions = %v, want none: which of them survived is unknown", got.HostPermissions)
+		}
+		if got.ScriptableHostPermissions != nil {
+			t.Errorf("scriptable_host_permissions = %v, want absent", *got.ScriptableHostPermissions)
+		}
+		if coverage.Status != model.BrowserCoveragePartial ||
+			coverage.ReasonCode != model.BrowserExtReasonManifestUnavailable {
+			t.Errorf("status = %q/%q, want partial and manifest_unavailable",
+				coverage.Status, coverage.ReasonCode)
+		}
+	})
 }
 
 // TestChromium_ScriptableHostsAreASubset covers the stronger of the two host
@@ -537,7 +786,7 @@ func TestChromium_ScriptableHostsAreASubset(t *testing.T) {
 		got, _ := chromeFinding(t, `"`+idA+`": {
 			"location": 1,
 			"manifest": {"name": "Example", "version": "1.0"},
-			"granted_permissions": {
+			"active_permissions": {
 				"explicit_host": ["<all_urls>"],
 				"scriptable_host": ["https://example.internal/*"]
 			}
@@ -560,7 +809,7 @@ func TestChromium_ScriptableHostsAreASubset(t *testing.T) {
 		got, _ := chromeFinding(t, `"`+idA+`": {
 			"location": 1,
 			"manifest": {"name": "Example", "version": "1.0"},
-			"granted_permissions": {"explicit_host": ["https://example.internal/*"]}
+			"active_permissions": {"explicit_host": ["https://example.internal/*"]}
 		}`)
 
 		if got.ScriptableHostPermissions == nil || len(*got.ScriptableHostPermissions) != 0 {
@@ -574,7 +823,7 @@ func TestChromium_ScriptableHostsAreASubset(t *testing.T) {
 			"location": 1,
 			"manifest": {"name": "Example", "version": "1.0"},
 			"withholding_permissions": true,
-			"granted_permissions": {"scriptable_host": ["https://taken-back.internal/*"]},
+			"active_permissions": {"scriptable_host": ["https://taken-back.internal/*"]},
 			"runtime_granted_permissions": {"api": ["cookies"]}
 		}`)
 
@@ -588,6 +837,35 @@ func TestChromium_ScriptableHostsAreASubset(t *testing.T) {
 		}
 	})
 
+	// The two buckets mean different things to the browser: one is what requests
+	// and cookie reads may reach, the other is where content scripts run. Under
+	// withholding each is intersected against its own side of the runtime store,
+	// so a runtime host grant cannot invent content-script provenance.
+	t.Run("withholding keeps the two host buckets apart", func(t *testing.T) {
+		got, _ := chromeFinding(t, `"`+idA+`": {
+			"location": 1,
+			"manifest": {"name": "Example", "version": "1.0"},
+			"withholding_permissions": true,
+			"active_permissions": {
+				"explicit_host": ["https://example.internal/*"],
+				"scriptable_host": ["https://example.internal/*"]
+			},
+			"runtime_granted_permissions": {"explicit_host": ["https://example.internal/*"]}
+		}`)
+
+		want := []string{"https://example.internal/*"}
+		if strings.Join(got.HostPermissions, ",") != strings.Join(want, ",") {
+			t.Errorf("host_permissions = %v, want %v: the user left it that site", got.HostPermissions, want)
+		}
+		if got.ScriptableHostPermissions == nil {
+			t.Fatal("scriptable_host_permissions is absent")
+		}
+		if len(*got.ScriptableHostPermissions) != 0 {
+			t.Errorf("scriptable_host_permissions = %v, want none: the runtime store granted the site to requests, not to content scripts",
+				*got.ScriptableHostPermissions)
+		}
+	})
+
 	t.Run("a host the cap drops is absent from both lists", func(t *testing.T) {
 		// Sorts after every filler entry, so the count cap is what removes it.
 		const last = `"https://zz-injectable.internal/*"`
@@ -598,7 +876,7 @@ func TestChromium_ScriptableHostsAreASubset(t *testing.T) {
 		got, coverage := chromeFinding(t, `"`+idA+`": {
 			"location": 1,
 			"manifest": {"name": "Example", "version": "1.0"},
-			"granted_permissions": {
+			"active_permissions": {
 				"explicit_host": [`+strings.Join(filler, ",")+`],
 				"scriptable_host": [`+last+`]
 			}
@@ -636,6 +914,7 @@ func TestChromium_ManifestVersion(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got, _ := chromeFinding(t, `"`+idA+`": {
 				"location": 1,
+				"active_permissions": {},
 				"manifest": {"name": "Example", `+tt.manifest+`}
 			}`)
 			if got.ManifestVersion != tt.want {
@@ -652,7 +931,7 @@ func TestChromium_ManifestVersion(t *testing.T) {
 func TestChromium_OverlongFieldsByClass(t *testing.T) {
 	t.Run("a name is shortened and the browser stays clean", func(t *testing.T) {
 		long := strings.Repeat("N", maxNameBytes+50)
-		got, coverage := chromeFinding(t, `"`+idA+`": {"location": 1, "manifest": {"name": "`+long+`", "version": "1.0"}}`)
+		got, coverage := chromeFinding(t, `"`+idA+`": {"location": 1, "active_permissions": {}, "manifest": {"name": "`+long+`", "version": "1.0"}}`)
 		if len(got.Name) > maxNameBytes {
 			t.Errorf("name is %d bytes, want at most %d", len(got.Name), maxNameBytes)
 		}
@@ -665,7 +944,7 @@ func TestChromium_OverlongFieldsByClass(t *testing.T) {
 		long := "https://" + strings.Repeat("h", maxPermissionBytes) + ".internal/*"
 		got, coverage := chromeFinding(t, `"`+idA+`": {
 			"location": 1, "manifest": {"name": "Example", "version": "1.0"},
-			"granted_permissions": {"explicit_host": ["`+long+`", "https://kept.internal/*"]}
+			"active_permissions": {"explicit_host": ["`+long+`", "https://kept.internal/*"]}
 		}`)
 		want := []string{"https://kept.internal/*"}
 		if strings.Join(got.HostPermissions, ",") != strings.Join(want, ",") {
@@ -686,7 +965,7 @@ func TestChromium_ManifestFallbackAndLocalizedName(t *testing.T) {
 		home := tempHome(t)
 		root := chromeRoot(home)
 		localState(t, root, "Default")
-		securePrefs(t, root, "Default", `"`+idA+`": {"location": 1, "path": "`+idA+`/1.2.3_0"}`)
+		securePrefs(t, root, "Default", `"`+idA+`": {"location": 1, "active_permissions": {}, "path": "`+idA+`/1.2.3_0"}`)
 		writeFile(t, filepath.Join(root, "Default", "Extensions", idA, "1.2.3_0", "manifest.json"),
 			`{"name": "Example From Disk", "version": "1.2.3"}`)
 
@@ -709,7 +988,7 @@ func TestChromium_ManifestFallbackAndLocalizedName(t *testing.T) {
 		root := chromeRoot(home)
 		localState(t, root, "Default")
 		securePrefs(t, root, "Default", `"`+idA+`": {
-			"location": 1, "path": "`+idA+`/1.0_0",
+			"location": 1, "path": "`+idA+`/1.0_0", "active_permissions": {},
 			"manifest": {"name": "__MSG_extName__", "version": "1.0", "default_locale": "en-GB"}
 		}`)
 		// Directory names use underscores rather than a language tag's hyphen,
@@ -727,7 +1006,7 @@ func TestChromium_ManifestFallbackAndLocalizedName(t *testing.T) {
 	})
 
 	t.Run("an unresolvable name keeps its placeholder", func(t *testing.T) {
-		got, _ := chromeFinding(t, `"`+idA+`": {"location": 1, "path": "`+idA+`/1.0_0",
+		got, _ := chromeFinding(t, `"`+idA+`": {"location": 1, "active_permissions": {}, "path": "`+idA+`/1.0_0",
 			"manifest": {"name": "__MSG_extName__", "version": "1.0", "default_locale": "en"}}`)
 		if got.Name != "__MSG_extName__" {
 			t.Errorf("name = %q, want the placeholder kept rather than an empty name", got.Name)
@@ -748,12 +1027,12 @@ func TestChromium_ManifestFallbackAndLocalizedName(t *testing.T) {
 		}{
 			{
 				name:  "the manifest on disk",
-				entry: `"` + idA + `": {"location": 1, "path": "` + idA + `/1.0_0"}`,
+				entry: `"` + idA + `": {"location": 1, "active_permissions": {}, "path": "` + idA + `/1.0_0"}`,
 				plant: []string{"manifest.json", "anything"},
 			},
 			{
 				name: "the message table behind a localized name",
-				entry: `"` + idA + `": {"location": 1, "path": "` + idA + `/1.0_0",
+				entry: `"` + idA + `": {"location": 1, "active_permissions": {}, "path": "` + idA + `/1.0_0",
 					"manifest": {"name": "__MSG_extName__", "version": "1.0", "default_locale": "en"}}`,
 				plant: []string{"_locales", "en", "messages.json", "anything"},
 			},
@@ -797,7 +1076,7 @@ func TestChromium_UnpackedContentIsNeverOpened(t *testing.T) {
 
 	localState(t, chromeRoot(home), "Default")
 	securePrefs(t, chromeRoot(home), "Default",
-		`"`+idA+`": {"location": 4, "path": "`+filepath.ToSlash(unpacked)+`"}`)
+		`"`+idA+`": {"location": 4, "active_permissions": {}, "path": "`+filepath.ToSlash(unpacked)+`"}`)
 
 	info := scanHome(t, home)
 	assertPayloadInvariants(t, info)
@@ -831,7 +1110,7 @@ func TestChromium_UnpackedPathIsOmittedRatherThanShortened(t *testing.T) {
 	long := "/" + strings.Repeat("d", maxInstallPathBytes)
 
 	localState(t, chromeRoot(home), "Default")
-	securePrefs(t, chromeRoot(home), "Default", `"`+idA+`": {"location": 4, "path": "`+long+`"}`)
+	securePrefs(t, chromeRoot(home), "Default", `"`+idA+`": {"location": 4, "active_permissions": {}, "path": "`+long+`"}`)
 
 	info := scanHome(t, home)
 	assertPayloadInvariants(t, info)
@@ -855,7 +1134,7 @@ func TestChromium_UnreadableManifestStillDegrades(t *testing.T) {
 	home := tempHome(t)
 	root := chromeRoot(home)
 	localState(t, root, "Default")
-	securePrefs(t, root, "Default", `"`+idA+`": {"location": 1, "path": "`+idA+`/1.2.3_0"}`)
+	securePrefs(t, root, "Default", `"`+idA+`": {"location": 1, "active_permissions": {}, "path": "`+idA+`/1.2.3_0"}`)
 	writeFile(t, filepath.Join(root, "Default", "Extensions", idA, "1.2.3_0", "manifest.json"),
 		strings.Repeat("{", maxManifestBytes+1))
 
@@ -877,7 +1156,7 @@ func TestChromium_ByteOrderMarkedPrefsStillParse(t *testing.T) {
 	localState(t, root, "Default")
 	const bom = "\uFEFF"
 	writeFile(t, filepath.Join(root, "Default", "Secure Preferences"),
-		bom+`{"extensions": {"settings": {"`+idA+`": {"location": 1, "manifest": {"name": "Example", "version": "1.0"}}}}}`)
+		bom+`{"extensions": {"settings": {"`+idA+`": {"location": 1, "active_permissions": {}, "manifest": {"name": "Example", "version": "1.0"}}}}}`)
 
 	info := scanHome(t, home)
 	assertPayloadInvariants(t, info)
@@ -914,7 +1193,7 @@ func TestChromium_TwoByteEncodingIsReportedRatherThanParsed(t *testing.T) {
 // flag is there so a console can de-emphasize it rather than so this can drop it.
 func TestChromium_PreinstalledIsReportedAndNotHidden(t *testing.T) {
 	got, _ := chromeFinding(t, `"`+idA+`": {
-		"location": 6, "was_installed_by_default": true,
+		"location": 6, "was_installed_by_default": true, "active_permissions": {},
 		"manifest": {"name": "Example Bundled", "version": "1.0"}
 	}`)
 	if !got.Preinstalled {

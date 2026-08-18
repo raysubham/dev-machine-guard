@@ -246,12 +246,14 @@ type BrowserExtensionFinding struct {
 	// gecko only.
 	SignedState string `json:"signed_state,omitempty"`
 
-	// The API permissions and host patterns the browser recorded as granted,
-	// including what the user granted at runtime, rather than what the manifest
-	// asked for. Hosts the user has since withheld are left out, because the
-	// browser has taken them back. An entry too long for its cap is omitted
-	// rather than shortened: these strings are matched, so a shortened one is a
-	// different grant.
+	// The API permissions and host patterns the browser is honouring now, rather
+	// than what the manifest asked for or what the extension has held at some
+	// point. Hosts the user has since withheld are left out, because the browser
+	// has taken them back. An entry too long for its cap is omitted rather than
+	// shortened: these strings are matched, so a shortened one is a different
+	// grant. Empty where the browser's record of present access could not be
+	// read, with the browser reported partial to say so: the producer never
+	// falls back to a record of past access.
 	Permissions     []string `json:"permissions"`
 	HostPermissions []string `json:"host_permissions"`
 
