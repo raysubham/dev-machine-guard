@@ -437,11 +437,9 @@ func printPipAuditSummary(w io.Writer, c *colors, a *model.PipAudit) {
 	fmt.Fprintln(w)
 }
 
-// printBrowserExtensions renders the browser extension inventory in three states,
-// because two of them are easy to confuse and mean opposite things: the phase not
-// having run at all, the phase having run and found nothing, and a list. Each row
-// leads with what a reader acts on — a browser that turned an extension off, or a
-// store that has pulled one the machine still runs.
+// printBrowserExtensions renders the inventory in three states: the phase not having
+// run, the phase having run and found nothing, and a list. The first two mean opposite
+// things and are easy to confuse.
 //
 //nolint:errcheck // terminal output
 func printBrowserExtensions(w io.Writer, c *colors, result *model.ScanResult) {
@@ -473,7 +471,7 @@ func printBrowserExtensions(w io.Writer, c *colors, result *model.ScanResult) {
 			name := f.Name
 			if name == "" {
 				// A finding whose metadata could not be recovered still has an
-				// identity, and that is what a reader needs to look it up.
+				// identity to look it up by.
 				name = f.ExtensionID
 			}
 			fmt.Fprintf(w, "    %-30s %s%-10s %-12s %s%s%s\n",
@@ -481,8 +479,7 @@ func printBrowserExtensions(w io.Writer, c *colors, result *model.ScanResult) {
 				truncate(f.InstallSource, 12), truncate(f.Version, 12), tag, c.reset)
 		}
 	}
-	// Coverage is part of the answer, not a footnote: a browser that could not be
-	// read is why a list is shorter than a user expects.
+	// A browser that could not be read is why a list is shorter than expected.
 	if scan != nil {
 		for _, b := range scan.Browsers {
 			if b.Status == model.BrowserCoverageFailed || b.Status == model.BrowserCoveragePartial {

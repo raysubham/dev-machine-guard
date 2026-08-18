@@ -24,10 +24,9 @@ type Detector struct {
 	exec    executor.Executor
 	skipper *tcc.Skipper
 
-	// serviceSession reports whether this process runs in a context that has no
-	// interactive user behind it. A function field because the answer comes from
-	// the process itself rather than from any value a caller can pass, and a test
-	// has to be able to state it.
+	// serviceSession reports whether this process runs with no interactive user
+	// behind it. A function field because the answer comes from the process rather
+	// than from any value a caller can pass, and a test has to be able to state it.
 	serviceSession func() bool
 }
 
@@ -44,13 +43,11 @@ func (d *Detector) WithSkipper(s *tcc.Skipper) *Detector {
 
 // Detect returns the inventory for one run, for the account named by target.
 //
-// It returns nil — the "did not run" sentinel — when there is no interactive
-// account to describe, and that refusal is load-bearing rather than tidy. Reading
-// a service account's home would find no browser at all and report every browser
-// missing, which is an authoritative answer: a reader would honour it by deleting
-// the device's real inventory. Never an error, and never a panic: a browser that
-// could not be read is a coverage status, and a per-extension failure degrades
-// one finding.
+// It returns nil, the "did not run" sentinel, when there is no interactive account
+// to describe. Reading a service account's home would find no browser at all and
+// report every browser missing, which a reader honours by deleting the device's real
+// inventory. Never an error and never a panic: a browser that could not be read is a
+// coverage status, and a per-extension failure degrades one finding.
 func (d *Detector) Detect(ctx context.Context, target *user.User) (info *model.BrowserExtensionScanInfo) {
 	home, ok := d.resolveTarget(target)
 	if !ok {
@@ -66,20 +63,20 @@ func (d *Detector) Detect(ctx context.Context, target *user.User) (info *model.B
 		Findings:             []model.BrowserExtensionFinding{},
 	}
 	defer func() {
-		// The one sanctioned recover. Each browser's coverage entry and its
-		// findings are committed together, so what survives a panic is a payload
-		// describing the browsers that finished — and a browser missing from the
-		// coverage list was never claimed, so a reader leaves its rows alone.
-		// That is why nothing here has to mark the result incomplete: the section
-		// says less than it would have, not something untrue.
+		// The one sanctioned recover. Each browser's coverage entry and its findings
+		// are committed together, so what survives a panic describes the browsers
+		// that finished, and a browser missing from the coverage list was never
+		// claimed, so a reader leaves its rows alone. Nothing here has to mark the
+		// result incomplete: the section says less than it would have, not something
+		// untrue.
 		_ = recover()
 		info.CollectedAt = time.Now().Unix()
 		info.DurationMs = time.Since(started).Milliseconds()
 	}()
 
-	// The detector's own deadline, inside the phase budget. It bounds the work
-	// this phase chooses to take on; it cannot interrupt a syscall, which is why
-	// every read is built so that it cannot block.
+	// The detector's own deadline, inside the phase budget. It bounds the work this
+	// phase takes on; it cannot interrupt a syscall, which is why every read is built
+	// so that it cannot block.
 	ctx, cancel := context.WithTimeout(ctx, browserExtPhaseBudget)
 	defer cancel()
 
@@ -87,11 +84,9 @@ func (d *Detector) Detect(ctx context.Context, target *user.User) (info *model.B
 	scan := &scanState{
 		info:     info,
 		platform: platform,
-		// Every path is opened through descriptors that follow no symlink. A
-		// link anywhere on the path refuses, which costs a visible gap in one
-		// scan; following one could read somewhere this has no business being,
-		// and skipping it quietly under an authoritative status could delete a
-		// real extension's stored row.
+		// Every path is opened through descriptors that follow no symlink. A link
+		// anywhere on the path refuses, which costs a visible gap in one scan;
+		// following one could read somewhere this has no business being.
 		resolver: safepath.NewNoFollow(home, d.consentGuard(platform, home)),
 	}
 
@@ -115,9 +110,9 @@ func (d *Detector) Detect(ctx context.Context, target *user.User) (info *model.B
 }
 
 // resolveTarget establishes whose browsers this run describes, and refuses every
-// identity that is not a developer at a keyboard. Nothing comes from the
-// environment: the agent commonly runs as a system account, so an inherited home
-// names the service profile.
+// identity that is not a person at a keyboard. Nothing comes from the environment:
+// the agent commonly runs as a system account, so an inherited home names the
+// service profile.
 func (d *Detector) resolveTarget(target *user.User) (string, bool) {
 	if target == nil || target.Username == "" {
 		return "", false
@@ -142,9 +137,9 @@ func (d *Detector) resolveTarget(target *user.User) (string, bool) {
 	return home, true
 }
 
-// Well-known Windows service accounts. A backstop only — the session check above
-// is the predicate that catches a service under a custom account, and localized
-// account names make a name comparison a sieve in either direction.
+// Well-known Windows service accounts. A backstop only: the session check above is
+// the predicate that catches a service under a custom account, and localized account
+// names make a name comparison a sieve in either direction.
 var windowsServiceSIDs = map[string]bool{
 	"S-1-5-18": true, // LocalSystem
 	"S-1-5-19": true, // LocalService
@@ -161,17 +156,17 @@ func isServiceIdentity(platform string, u *user.User) bool {
 	return u.Uid == "0"
 }
 
-// consentGuard is what the resolver asks before it touches a path, answering in
-// this phase's own reason code so a refusal reads like every other one.
+// consentGuard is what the resolver asks before it touches a path, answering in this
+// phase's own reason code so a refusal reads like every other one.
 //
-// The macOS skipper declines ~/Library wholesale, which is right for a walk and
-// wrong for this detector: three of the four browsers keep their data directory
-// under it. So the browsers' own directories are exempt, along with the
-// directories above them that a descent has to pass through — matched against the
-// cleaned path, so "Library/Application Support/Google/Chrome/../Mail" cannot ride
-// the exemption. What is left protected is the one path class this detector does
-// not fix itself: a profile directory named by a browser's own config file, which
-// is a string an attacker can write and must be refused rather than touched.
+// The macOS skipper declines ~/Library wholesale, which is right for a walk and wrong
+// for this detector: the browsers keep their data directories under it. Their own
+// directories are exempt, along with the directories above them a descent passes
+// through, matched against the cleaned path so
+// "Library/Application Support/Google/Chrome/../Mail" cannot ride the exemption. What
+// stays protected is the one path class this detector does not fix itself: a profile
+// directory named by a browser's own config file, which is a string an attacker can
+// write.
 func (d *Detector) consentGuard(platform, home string) safepath.Guard {
 	if d.skipper == nil {
 		return nil
@@ -203,8 +198,8 @@ func atOrUnder(path, dir string) bool {
 	return strings.HasPrefix(path, dir) && len(path) > len(dir) && path[len(dir)] == filepath.Separator
 }
 
-// scanState carries what every browser's scan needs, and the two run-wide facts:
-// the payload being built and whether a bound has already cut it short.
+// scanState carries what every browser's scan needs, plus the payload being built
+// and whether a bound has already cut it short.
 type scanState struct {
 	info     *model.BrowserExtensionScanInfo
 	platform string
@@ -224,14 +219,13 @@ type browserResult struct {
 	findings []model.BrowserExtensionFinding
 }
 
-// commit records one browser's coverage entry and its findings together. They are
-// never appended separately: a finding whose browser has no coverage entry is a
-// payload a reader rejects whole, so the two have to move as one.
+// commit records one browser's coverage entry and its findings together. A finding
+// whose browser has no coverage entry is a payload a reader rejects whole.
 func (s *scanState) commit(browserID string, r browserResult) {
 	if r.status == model.BrowserCoverageFailed || r.status == model.BrowserCoverageNotPresent {
-		// A browser whose membership is not known complete ships nothing. Half a
+		// A browser whose membership is not known complete ships nothing: half a
 		// list under an authoritative status would retire the extensions it left
-		// out, which is the one outcome this design exists to prevent.
+		// out.
 		r.findings = nil
 	}
 	if len(s.info.Findings)+len(r.findings) > maxExtensionsTotal {
@@ -254,9 +248,9 @@ func (s *scanState) commit(browserID string, r browserResult) {
 }
 
 // truncate records that a bound cut something out of the payload. Truncation and
-// incompleteness travel together: the two fields describe one event and a reader
-// validates the pair in both directions. The first cause is kept, because the
-// bound that hit first is the one that shaped the result.
+// incompleteness travel together, because a reader validates the pair in both
+// directions, and the first cause is kept because the bound that hit first shaped
+// the result.
 func (s *scanState) truncate(truncatedReason string) {
 	s.info.Truncated = true
 	if s.info.TruncatedReason == "" {
@@ -265,23 +259,22 @@ func (s *scanState) truncate(truncatedReason string) {
 	s.info.ScanComplete = false
 }
 
-// stop is a bound that ends the run rather than one browser: the total cap and
-// the deadline apply to the payload as a whole, so every browser after this point
-// reports the same cause and ships nothing. A bound on one browser's own list
-// calls truncate instead, which leaves the browsers after it to be scanned
-// normally — a machine with twenty-one profiles in one browser still has a
-// readable answer for the other three.
+// stop is a bound that ends the run rather than one browser: the total cap and the
+// deadline apply to the payload as a whole, so every browser after this point reports
+// the same cause and ships nothing. A bound on one browser's own list calls truncate
+// instead, so a machine with twenty-one profiles in one browser still has a readable
+// answer for the others.
 func (s *scanState) stop(reason, truncatedReason string) {
 	s.stopped = reason
 	s.truncate(truncatedReason)
 }
 
-// scanBrowser runs one browser across every data directory it has on this
-// platform and reduces the result to one coverage status.
+// scanBrowser runs one browser across every data directory it has on this platform
+// and reduces the result to one coverage status.
 //
-// The union of two directories that both exist (a native install and a snap) is
-// the answer, which is why a failure in any existing one fails the whole browser:
-// half a union that read as complete would retire the missing half's rows.
+// The union of two directories that both exist, a native install and a snap, is the
+// answer, which is why a failure in either fails the whole browser: half a union that
+// read as complete would retire the missing half's rows.
 func (d *Detector) scanBrowser(ctx context.Context, scan *scanState, spec browserSpec, roots []string) browserResult {
 	b := &browserScan{occurrences: map[string][]occurrence{}}
 	existing := 0
@@ -324,19 +317,19 @@ func (d *Detector) scanRoot(ctx context.Context, scan *scanState, spec browserSp
 	return d.scanChromiumRoot(ctx, scan, root, b)
 }
 
-// occurrence is one extension as one profile recorded it. Profiles never reach
-// the wire — their names are user-chosen text and per-profile state was not the
-// ask — so they exist only to drive enumeration and this reduction.
+// occurrence is one extension as one profile recorded it. Profiles never reach the
+// wire, since their names are user-chosen text, so they exist only to drive
+// enumeration and this reduction.
 type occurrence struct {
 	// sortKey is the last tiebreak between the occurrences of one extension: the
-	// data directory and then the profile directory. Arbitrary but fixed, which
-	// is what makes two runs over an unchanged machine emit identical findings.
+	// data directory and then the profile directory. Arbitrary but fixed, which is
+	// what makes two runs over an unchanged machine emit identical findings.
 	sortKey    string
 	enabled    string
 	disabledBy string
-	// block is taken whole from the winning occurrence. Never merged field by
-	// field: pairing one profile's version with another's permission set would
-	// describe an extension that exists nowhere.
+	// block is taken whole from the winning occurrence, never merged field by field:
+	// pairing one profile's version with another's permission set would describe an
+	// extension that exists nowhere.
 	block model.BrowserExtensionFinding
 }
 
@@ -346,20 +339,20 @@ type browserScan struct {
 	occurrences map[string][]occurrence
 	profiles    int
 
-	// degraded is the headline reason for a partial status: an attribute this
-	// scan could not recover. The first cause wins — one reason per browser is
-	// what a reader is given, and a list of them is not read by anything.
+	// degraded is the headline reason for a partial status: an attribute this scan
+	// could not recover. The first cause wins, because a reader is given one reason
+	// per browser.
 	degraded string
 
-	// failure is the headline reason for a failed status. Set once, and it stops
-	// this browser: after it, nothing more is claimed about the browser.
+	// failure is the headline reason for a failed status. Set once, and after it
+	// nothing more is claimed about this browser.
 	failure string
 	// truncatedReason is set when failure is a bound being reached rather than a
 	// document that could not be read, so the payload says it was cut.
 	truncatedReason string
 	// payloadWide separates a bound that ends the run from one that ends this
 	// browser: the deadline is shared by everything after it, while a cap on this
-	// browser's own list says nothing about the next browser.
+	// browser's own list says nothing about the next one.
 	payloadWide bool
 }
 
@@ -378,8 +371,8 @@ func (b *browserScan) fail(reason string) {
 }
 
 // failBounded records that a bound on this browser's own list was reached. The
-// browser's membership is not known complete, and the payload says it was cut —
-// but the browsers after it are unaffected and are scanned as usual.
+// browser's membership is not known complete and the payload says it was cut, while
+// the browsers after it are scanned as usual.
 func (b *browserScan) failBounded(reason, truncatedReason string) {
 	if b.failure == "" {
 		b.failure = reason
@@ -387,7 +380,7 @@ func (b *browserScan) failBounded(reason, truncatedReason string) {
 	}
 }
 
-// failPayload records a bound that ends the run — the deadline — so every later
+// failPayload records a bound that ends the run, the deadline, so every later
 // browser reports it too.
 func (b *browserScan) failPayload(reason, truncatedReason string) {
 	if b.failure == "" {
@@ -397,8 +390,8 @@ func (b *browserScan) failPayload(reason, truncatedReason string) {
 }
 
 // add records one occurrence, reporting whether the browser may continue. The
-// per-browser cap fails the browser rather than shortening its list, because the
-// list is read as the complete set.
+// per-browser cap fails the browser rather than shortening its list, because the list
+// is read as the complete set.
 func (b *browserScan) add(id string, occ occurrence) bool {
 	if _, seen := b.occurrences[id]; !seen && len(b.occurrences) >= maxExtensionsPerBrowser {
 		b.failBounded(model.BrowserExtReasonCapped, model.BrowserExtTruncatedFindingCap)
@@ -422,14 +415,13 @@ func stateRank(state string) int {
 	}
 }
 
-// lessOccurrence orders one extension's occurrences so the first one describes
-// access the machine really has. The block is taken whole from the first, so
-// these keys rank whole profiles and never a field.
+// lessOccurrence orders one extension's occurrences so the first describes access the
+// machine really has. The block is taken whole from the first, so these keys rank
+// whole profiles and never a field.
 //
-// State ranks first, by the same rule the union loop uses. That is an
-// invariant rather than a preference: the first occurrence is a maximum by
-// state, so its own state equals the state the loop resolves, and the version,
-// store and permissions under it belong to a profile that really is in it.
+// State ranks first, by the same rule the union loop uses: the first occurrence is a
+// maximum by state, so its own state equals the state the loop resolves and the
+// version, store and permissions under it belong to a profile that really is in it.
 func lessOccurrence(a, b occurrence) bool {
 	if ra, rb := stateRank(a.enabled), stateRank(b.enabled); ra != rb {
 		return ra > rb
@@ -439,9 +431,9 @@ func lessOccurrence(a, b occurrence) bool {
 	if ba, bb := hasBroadHosts(a.block.HostPermissions), hasBroadHosts(b.block.HostPermissions); ba != bb {
 		return ba
 	}
-	// Content scripts come from the manifest and usually match across profiles,
-	// but profiles can sit on different versions. A nil list is nothing read
-	// rather than nothing injected, and ranks as not broad either way.
+	// Content scripts come from the manifest and usually match across profiles, but
+	// profiles can sit on different versions. A nil list is nothing read rather than
+	// nothing injected, and ranks as not broad either way.
 	sa := a.block.ScriptableHostPermissions != nil && hasBroadHosts(*a.block.ScriptableHostPermissions)
 	sb := b.block.ScriptableHostPermissions != nil && hasBroadHosts(*b.block.ScriptableHostPermissions)
 	if sa != sb {
@@ -486,7 +478,7 @@ func (b *browserScan) fold(browserID string) []model.BrowserExtensionFinding {
 				f.EnabledState = model.BrowserExtDisabled
 			}
 		}
-		// The cause follows the resolved state, not the winning occurrence,
+		// The cause follows the resolved state rather than the winning occurrence,
 		// which may well be an enabled one: reading it off that occurrence would
 		// attach an enabled profile's empty cause to a disabled row.
 		f.DisabledBy = ""
@@ -513,10 +505,9 @@ func (b *browserScan) fold(browserID string) []model.BrowserExtensionFinding {
 // readState reads one of a browser's state files through the no-follow resolver.
 //
 // A file that is simply absent is reported as missing rather than as a failure: a
-// browser that has never had a second profile has no second profile's
-// preferences, and that is not a problem to report. Everything else comes back as
-// a reason code, because a decoder's or a library's own message quotes the
-// document it choked on and these documents are the browser's private state.
+// browser that has never had a second profile has no second profile's preferences.
+// Everything else comes back as a reason code, because a library's own message quotes
+// the document it choked on and these documents are the browser's private state.
 func (s *scanState) readState(path string, limit int64) (data []byte, missing bool, reason string) {
 	raw, _, info, truncated, err := s.resolver.Read(path, limit)
 	switch {
@@ -527,28 +518,28 @@ func (s *scanState) readState(path string, limit int64) (data []byte, missing bo
 		return nil, false, refusalReason(err)
 	}
 	if !info.Mode().IsRegular() {
-		// A directory, device or FIFO where a state file belongs. The open
-		// already refused to block on it; reading it would describe something
-		// other than the browser's state.
+		// A directory, device or FIFO where a state file belongs. The open already
+		// refused to block on it, and reading it would describe something other than
+		// the browser's state.
 		return nil, false, model.BrowserExtReasonParseError
 	}
 	if truncated {
 		// The file outgrew its cap. Its prefix is not a shorter version of the
-		// document: it either fails to parse for the wrong reason or, worse,
-		// parses and reports a fraction of the extensions as the whole set.
+		// document: it either fails to parse for the wrong reason or, worse, parses
+		// and reports a fraction of the extensions as the whole set.
 		return nil, false, model.BrowserExtReasonCapped
 	}
 	if hasUTF16BOM(raw) {
-		// These parsers are byte-oriented, so a two-byte encoding decodes to
-		// almost nothing rather than failing, and a profile full of extensions
-		// would read as empty.
+		// These parsers are byte-oriented, so a two-byte encoding decodes to almost
+		// nothing rather than failing and a profile full of extensions would read as
+		// empty.
 		return nil, false, model.BrowserExtReasonUnsupportedEncoding
 	}
 	return stripUTF8BOM(raw), false, ""
 }
 
-// listNames returns at most limit immediate entries of a directory. Names only,
-// so nothing can accidentally descend, and the bound is applied at the read:
+// listNames returns at most limit immediate entries of a directory. Names only, so
+// nothing can accidentally descend, and the bound is applied at the read because
 // these directories are exactly the ones a local process can fill.
 func (s *scanState) listNames(path string, limit int) (names []string, missing bool, reason string) {
 	entries, _, more, err := s.resolver.ReadDirNames(path, limit)
@@ -611,17 +602,16 @@ func hasUTF16BOM(data []byte) bool {
 	return (data[0] == 0xFF && data[1] == 0xFE) || (data[0] == 0xFE && data[1] == 0xFF)
 }
 
-// stripUTF8BOM removes a leading UTF-8 byte order mark. Windows-authored state
-// files carry them, and a BOM in front of a JSON document makes every parser
-// reject the whole thing — a profile full of extensions would report as empty.
+// stripUTF8BOM removes a leading UTF-8 byte order mark. Windows-authored state files
+// carry them, and a BOM in front of a JSON document makes every parser reject the
+// whole thing, so a profile full of extensions would report as empty.
 func stripUTF8BOM(data []byte) []byte {
 	return bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 }
 
-// capBytes shortens a display string to a byte budget at a rune boundary, so a
-// capped value is still valid UTF-8. Only for the fields a human reads: an
-// identity and a permission are matched rather than read, and a shortened one is
-// a different value.
+// capBytes shortens a display string to a byte budget at a rune boundary, so a capped
+// value is still valid UTF-8. Only for the fields a human reads: an identity or a
+// permission is matched rather than read, and a shortened one is a different value.
 func capBytes(s string, limit int) string {
 	if len(s) <= limit {
 		return s

@@ -33,8 +33,8 @@ var phaseBudgets = map[string]time.Duration{
 	"mcp_config_scan":   1 * time.Minute,
 	"agent_skills_scan": 2 * time.Minute, // detector self-caps at 60s; headroom for lock parsing
 	"credentials_scan":  1 * time.Minute, // fixed-path reads plus one bounded child process
-	// Detector self-caps at 60s; headroom for a machine with several browsers and
-	// heavy profiles, whose preference files reach megabytes.
+	// Detector self-caps at 60s; headroom for profiles whose preference files
+	// reach megabytes.
 	"browser_extensions_scan": 2 * time.Minute,
 	"malicious_file_scan":     10 * time.Minute,
 	"brew_scan":               5 * time.Minute,
