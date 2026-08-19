@@ -402,11 +402,12 @@ func (d *Detector) chromiumOccurrence(scan *scanState, profileDir, id string, ra
 
 	name, version, manifestVersion := "", "", 0
 	if manifest == nil {
+		// An unpacked extension's manifest was never going to be read, so nothing
+		// failed to read: degrading over it would paint the browser partial for as
+		// long as a developer keeps a build loaded. That case is the one skipped
+		// here, and every other route to a nil manifest is a document this scan
+		// could not recover.
 		if !unpackedLocation {
-			// An unpacked extension's manifest was never going to be read, so
-			// nothing failed to read: degrading here would paint the browser partial
-			// for as long as a developer keeps a build loaded. Every other route to
-			// a nil manifest is a document this scan could not recover.
 			b.degrade(model.BrowserExtReasonManifestUnavailable)
 		}
 	} else {
