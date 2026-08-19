@@ -211,9 +211,9 @@ func TestGecko_InstallSourceAndExclusions(t *testing.T) {
 }
 
 // TestGecko_SigningStateAndStore covers the engine-specific field pair. An
-// unsigned add-on that is enabled is the headline signal here, and the signature is
-// also all there is to attribute a store by: the download address would be the
-// honest signal and is dropped unread because it can embed a private one.
+// unsigned add-on that is enabled is the headline signal here. Signing proves signature
+// status and not provenance, since a signed add-on may be self-distributed, so every
+// state other than unsigned leaves the store unknown.
 func TestGecko_SigningStateAndStore(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -222,8 +222,8 @@ func TestGecko_SigningStateAndStore(t *testing.T) {
 		store  string
 	}{
 		{name: "unsigned", record: `"signedState": 0`, signed: model.BrowserExtSignedMissing, store: model.BrowserExtStoreNone},
-		{name: "signed", record: `"signedState": 2`, signed: model.BrowserExtSignedSigned, store: model.BrowserExtStoreAMO},
-		{name: "preliminarily signed", record: `"signedState": 1`, signed: model.BrowserExtSignedPreliminary, store: model.BrowserExtStoreAMO},
+		{name: "signed", record: `"signedState": 2`, signed: model.BrowserExtSignedSigned, store: model.BrowserExtStoreUnknown},
+		{name: "preliminarily signed", record: `"signedState": 1`, signed: model.BrowserExtSignedPreliminary, store: model.BrowserExtStoreUnknown},
 		{name: "a broken signature", record: `"signedState": -2`, signed: model.BrowserExtSignedBroken, store: model.BrowserExtStoreUnknown},
 		{name: "an unverifiable chain", record: `"signedState": -1`, signed: model.BrowserExtSignedUnknownChain, store: model.BrowserExtStoreUnknown},
 		{name: "a browser-privileged add-on", record: `"signedState": 4`, signed: model.BrowserExtSignedPrivileged, store: model.BrowserExtStoreUnknown},

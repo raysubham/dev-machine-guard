@@ -493,20 +493,14 @@ func geckoSignedState(signed *int) string {
 	return geckoSignedStates[*signed]
 }
 
-// geckoStore attributes the add-on to a store from its signature alone. The download
-// URL would be the honest signal and is dropped unread because it can embed a private
-// address, so an add-on that is self-hosted but vendor-signed attributes to the public
-// store.
+// geckoStore reports where the add-on came from, which the signature cannot answer.
+// An unsigned add-on is none, because nothing signed it. Everything else is unknown: a
+// signature says the add-on was signed, not that it is distributed from the public
+// store, and a self-hosted add-on is signed too. The download URL would be the honest
+// signal and is dropped unread because it can embed a private address.
 func geckoStore(signed *int) string {
-	if signed == nil {
-		return model.BrowserExtStoreUnknown
-	}
-	switch *signed {
-	case 1, 2:
-		return model.BrowserExtStoreAMO
-	case 0:
+	if signed != nil && *signed == 0 {
 		return model.BrowserExtStoreNone
-	default:
-		return model.BrowserExtStoreUnknown
 	}
+	return model.BrowserExtStoreUnknown
 }
