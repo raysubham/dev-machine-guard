@@ -46,8 +46,8 @@ func (d *Detector) WithSkipper(s *tcc.Skipper) *Detector {
 // It returns nil, the "did not run" sentinel, when there is no interactive account
 // to describe. Reading a service account's home would find no browser at all and
 // report every browser missing, which a reader honours by deleting the device's real
-// inventory. Never an error and never a panic: a browser that could not be read is a
-// coverage status, and a per-extension failure degrades one finding.
+// inventory. Never an error: a browser that could not be read is a coverage status,
+// and a per-extension failure degrades one finding.
 func (d *Detector) Detect(ctx context.Context, target *user.User) (info *model.BrowserExtensionScanInfo) {
 	home, ok := d.resolveTarget(target)
 	if !ok {
@@ -63,13 +63,6 @@ func (d *Detector) Detect(ctx context.Context, target *user.User) (info *model.B
 		Findings:             []model.BrowserExtensionFinding{},
 	}
 	defer func() {
-		// The one sanctioned recover. Each browser's coverage entry and its findings
-		// are committed together, so what survives a panic describes the browsers
-		// that finished, and a browser missing from the coverage list was never
-		// claimed, so a reader leaves its rows alone. Nothing here has to mark the
-		// result incomplete: the section says less than it would have, not something
-		// untrue.
-		_ = recover()
 		info.CollectedAt = time.Now().Unix()
 		info.DurationMs = time.Since(started).Milliseconds()
 	}()

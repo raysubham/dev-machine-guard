@@ -792,3 +792,35 @@ func marshalFindings(t *testing.T, info *model.BrowserExtensionScanInfo) string 
 	}
 	return string(raw)
 }
+
+type panicOnSecondGOOSExecutor struct {
+	executor.Executor
+	calls int
+}
+
+func (e *panicOnSecondGOOSExecutor) GOOS() string {
+	e.calls++
+	if e.calls == 2 {
+		panic("test panic")
+	}
+	return model.PlatformLinux
+}
+
+// TestDetect_PanicPropagates pins the recovery policy: a panic in a detector
+// travels to the one top-level handler that reports it, rather than being
+// swallowed here into a partial payload or a nil section that reads as "this
+// machine has no browsers".
+func TestDetect_PanicPropagates(t *testing.T) {
+	mock := executor.NewMock()
+	mock.SetGOOS(model.PlatformLinux)
+
+	d := New(&panicOnSecondGOOSExecutor{Executor: mock})
+	d.serviceSession = func() bool { return false }
+
+	defer func() {
+		if recover() == nil {
+			t.Error("Detect recovered the panic, want it to propagate")
+		}
+	}()
+	d.Detect(context.Background(), testUser(tempHome(t)))
+}
