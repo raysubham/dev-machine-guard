@@ -38,3 +38,18 @@ func TestScanResult_CredentialScan_OmittedWhenNil(t *testing.T) {
 		t.Errorf("zero ScanResult should omit \"credential_scan\", got: %s", s)
 	}
 }
+
+// TestScanResult_BrowserExtensionScan_OmittedWhenNil guards the same signal for
+// browser extensions, where it carries more weight: a reader reconciles stored
+// per-browser rows against any section it receives, so a section rendered when
+// nobody scanned reads as "this machine has no extensions" and deletes the rows
+// a real scan wrote.
+func TestScanResult_BrowserExtensionScan_OmittedWhenNil(t *testing.T) {
+	b, err := json.Marshal(&ScanResult{})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if s := string(b); strings.Contains(s, `"browser_extension_scan"`) {
+		t.Errorf("zero ScanResult should omit \"browser_extension_scan\", got: %s", s)
+	}
+}

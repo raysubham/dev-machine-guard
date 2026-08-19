@@ -238,3 +238,76 @@ func TestIdeDisplayName(t *testing.T) {
 		}
 	}
 }
+
+// TestPretty_BrowserExtensionsTriState covers the distinction the section exists
+// to draw. "Not scanned" and "None detected" look alike and mean opposite things:
+// one is no information, the other is the machine positively holding nothing.
+func TestPretty_BrowserExtensionsTriState(t *testing.T) {
+	tests := []struct {
+		name    string
+		scan    *model.BrowserExtensionScanInfo
+		want    string
+		notWant string
+	}{
+		{
+			name:    "the phase did not run",
+			scan:    nil,
+			want:    "Not scanned",
+			notWant: "None detected",
+		},
+		{
+			name: "it ran and the machine holds none",
+			scan: &model.BrowserExtensionScanInfo{
+				Browsers: []model.BrowserCoverage{{BrowserID: "chrome", Status: model.BrowserCoverageNotPresent}},
+			},
+			want:    "None detected",
+			notWant: "Not scanned",
+		},
+		{
+			name: "a delisted extension is called out",
+			scan: &model.BrowserExtensionScanInfo{
+				Browsers: []model.BrowserCoverage{{BrowserID: "chrome", Status: model.BrowserCoverageScanned, ExtensionCount: 1}},
+				Findings: []model.BrowserExtensionFinding{{
+					BrowserID:    "chrome",
+					ExtensionID:  "abcdefghijklmnopabcdefghijklmnop",
+					Name:         "Example Screen Capture",
+					Version:      "8.6",
+					EnabledState: model.BrowserExtDisabled,
+					DisabledBy:   model.BrowserExtDisabledByBrowser,
+					StoreListing: model.BrowserExtStoreListingDelisted,
+				}},
+			},
+			want:    "delisted",
+			notWant: "Not scanned",
+		},
+		{
+			name: "a browser that could not be read is shown, not hidden",
+			scan: &model.BrowserExtensionScanInfo{
+				Browsers: []model.BrowserCoverage{{
+					BrowserID:  "edge",
+					Status:     model.BrowserCoverageFailed,
+					ReasonCode: model.BrowserExtReasonSymlinkRejected,
+				}},
+			},
+			want: model.BrowserExtReasonSymlinkRejected,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			_ = Pretty(&buf, &model.ScanResult{BrowserExtensionScan: tc.scan}, "never")
+
+			out := buf.String()
+			if !strings.Contains(out, "BROWSER EXTENSIONS") {
+				t.Fatal("output has no browser extension section")
+			}
+			section := out[strings.Index(out, "BROWSER EXTENSIONS"):]
+			if !strings.Contains(section, tc.want) {
+				t.Errorf("section does not mention %q:\n%s", tc.want, section)
+			}
+			if tc.notWant != "" && strings.Contains(section, tc.notWant) {
+				t.Errorf("section wrongly mentions %q:\n%s", tc.notWant, section)
+			}
+		})
+	}
+}
