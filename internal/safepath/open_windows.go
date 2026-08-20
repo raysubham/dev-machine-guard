@@ -21,7 +21,11 @@ import (
 // resolution and open. The verification runs against the same handle the content is
 // read from, leaving no second window to swap into. There is no consent layer here,
 // so a mismatch prevents reading the wrong file rather than a blocked traversal.
-func openVerified(resolved string, wantDir bool) (*os.File, os.FileInfo, error) {
+//
+// noFollow only changes how a rejected component is reported; a resolver that
+// follows nothing has already refused a reparse point it saw during resolution,
+// and this reports the ones that appear after it.
+func openVerified(resolved string, wantDir, noFollow bool) (*os.File, os.FileInfo, error) {
 	if _, comps := split(resolved); len(comps) == 0 {
 		return nil, nil, refuse(ReasonUnresolved)
 	}
@@ -43,7 +47,7 @@ func openVerified(resolved string, wantDir bool) (*os.File, os.FileInfo, error) 
 		0,
 	)
 	if err != nil {
-		return nil, nil, openErr(err)
+		return nil, nil, openErr(err, noFollow)
 	}
 
 	final, err := finalPath(h)
@@ -97,8 +101,13 @@ func finalPath(h windows.Handle) (string, error) {
 		}
 	}
 	p := windows.UTF16ToString(buf)
-	p = strings.TrimPrefix(p, `\\?\`)
-	return p, nil
+	// A share comes back as \\?\UNC\server\share, whose ordinary spelling is
+	// \\server\share. Trimming the extended-length prefix alone would leave a path
+	// starting with the literal UNC, which matches nothing the caller resolved.
+	if rest, ok := strings.CutPrefix(p, `\\?\UNC\`); ok {
+		return `\\` + rest, nil
+	}
+	return strings.TrimPrefix(p, `\\?\`), nil
 }
 
 // samePath compares the kernel's path for the handle with the path that was
@@ -111,13 +120,16 @@ func samePath(a, b string) bool {
 }
 
 // openErr maps a CreateFile failure to a refusal.
-func openErr(err error) error {
+func openErr(err error, noFollow bool) error {
 	switch err {
 	case windows.ERROR_FILE_NOT_FOUND, windows.ERROR_PATH_NOT_FOUND:
 		return os.ErrNotExist
 	case windows.ERROR_ACCESS_DENIED, windows.ERROR_SHARING_VIOLATION:
 		return refuse(ReasonDenied)
 	case windows.ERROR_CANT_ACCESS_FILE, windows.ERROR_INVALID_REPARSE_DATA:
+		if noFollow {
+			return refuse(ReasonSymlink)
+		}
 		return refuse(ReasonUnresolved)
 	default:
 		return refuse(ReasonDenied)

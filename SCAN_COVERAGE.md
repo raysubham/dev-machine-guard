@@ -42,7 +42,7 @@ Detection is cross-platform — binaries are located via `$PATH` lookup and home
 | Codex                 | OpenAI    | `codex`                     | `~/.codex`                      |
 | Gemini CLI            | Google    | `gemini`                    | `~/.gemini`                     |
 | Amazon Q / Kiro CLI   | Amazon    | `kiro-cli`, `kiro`, `q`     | `~/.q`, `~/.kiro`, `~/.aws/q`  |
-| GitHub Copilot CLI    | Microsoft | `copilot`, `gh-copilot`     | `~/.config/github-copilot`      |
+| GitHub Copilot CLI    | Microsoft | `copilot`, `gh-copilot`†    | `~/.config/github-copilot`, `~/.copilot` |
 | Microsoft AI Shell    | Microsoft | `aish`, `ai`                | `~/.aish`                       |
 | Aider                 | OpenSource| `aider`                     | `~/.aider`                      |
 | OpenCode              | OpenSource| `opencode`                  | `~/.config/opencode`            |
@@ -50,6 +50,8 @@ Detection is cross-platform — binaries are located via `$PATH` lookup and home
 | Pi                    | Earendil  | `pi`                        | `~/.pi/agent`                   |
 | Factory Droid         | Factory   | `droid`                     | `~/.factory`                    |
 | Amp                   | Sourcegraph| `amp`                      | `~/.config/amp`                 |
+
+† `gh copilot` launches this same `@github/copilot` CLI, downloading it into gh's own data directory when it isn't already on `$PATH` — so that install never lands on `$PATH`. After the two binary names miss, Copilot is also looked for at `~/.local/share/gh/copilot/copilot`, `~/.local/bin/copilot`, `~/AppData/Local/GitHub CLI/copilot/copilot`, `~/AppData/Local/Microsoft/WinGet/Links/copilot.exe`, `~/AppData/Roaming/npm/copilot.cmd`, and the `gh-copilot` extension directory under both `~/.local/share/gh/extensions` and `~/AppData/Local/GitHub CLI/extensions`. A non-default `$XDG_DATA_HOME` is not followed, and WinGet's hashed `Packages\GitHub.Copilot_<hash>\` payload directory is not globbed — only its `Links` shim.
 
 Pi, Factory Droid and Amp share their binary names with unrelated popular tools, so a `$PATH` hit alone does not report them — each is confirmed from an on-disk artifact (a package manifest, an installer anchor directory, a Homebrew cask root, a winget or pacman package entry), and is searched for in the common global-install prefixes as well as on `$PATH`. Pi and Amp are never executed because macOS Gatekeeper prompts on their binaries; their versions come from disk or are reported as `unknown`.
 
@@ -144,6 +146,20 @@ Plugins are classified as `bundled`, `marketplace`, or `dropins` based on their 
 ### Xcode Extensions (macOS only)
 
 Discovered via `pluginkit -mAD -p com.apple.dt.Xcode.extension.source-editor`. Returns bundle ID, version, and publisher for Xcode Source Editor extensions.
+
+## Browser Extensions
+
+Extensions are read from the browsers' own state files under the logged-in user's home directory. On Linux, Firefox is also scanned under its snap and flatpak roots, and Edge under its flatpak root. A browser installed anywhere other than the paths below, including under a packaging not listed here or with a custom data directory, is reported as not present.
+
+| Browser        | Engine   | macOS                                          | Windows                                  | Linux                   |
+|----------------|----------|------------------------------------------------|------------------------------------------|-------------------------|
+| Google Chrome  | Chromium | `~/Library/Application Support/Google/Chrome`   | `%LOCALAPPDATA%\Google\Chrome\User Data`  | `~/.config/google-chrome` |
+| Microsoft Edge | Chromium | `~/Library/Application Support/Microsoft Edge`  | `%LOCALAPPDATA%\Microsoft\Edge\User Data` | `~/.config/microsoft-edge` |
+| Mozilla Firefox | Gecko   | `~/Library/Application Support/Firefox`         | `%APPDATA%\Mozilla\Firefox`               | `~/.mozilla/firefox`    |
+
+Per extension, the scan records identity (id, name, version, manifest version), enabled state and why it is disabled, where it was installed from, its store and listing status, signature state, and the permissions the browser is currently honouring for it.
+
+**Privacy: only these state files are read. Browsing history, cookies, saved passwords, page content, and profile names are never collected.** No browser is launched and no extension store is contacted.
 
 ## Node.js Package Scanning (Optional)
 
