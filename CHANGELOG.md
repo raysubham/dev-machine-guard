@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See [VERSIONING.md](VERSIONING.md) for why the version starts at 1.8.1.
 
+## [1.16.0] - 2026-08-20
+
+### Added
+
+- **Credential-location inventory**: a new `credentials_scan` phase reports which developer tools on this machine hold credentials, where, and how well guarded each location is — locations and protection only, never the credential itself. Thirteen sources across cloud (AWS, GCP), source control (SSH keys, git credential store, `.netrc`, GitHub CLI hosts), package registries (`.npmrc`, `.pypirc`), containers (Docker, kubeconfig) and infrastructure (Terraform, Vault). Every location is an exact path rather than a root to walk, every read is byte-capped, and a capped or uninterpretable read is recorded as incomplete rather than clean — so a credential sitting past the cap can never render as "read, empty, complete". Paths come from the OS user record rather than the agent's own environment, which belongs to root or SYSTEM, and every read goes through a new resolver that refuses a symlink leaving the user's roots, checks TCC consent before each syscall, and cannot be hung by a FIFO planted in a credential path. A nil section means the phase did not run; zero findings is the positive assertion that no known location holds one.
+- **OpenCode MCP server configs**: OpenCode keeps servers under a top-level `mcp` key rather than `mcpServers`, accepts the config as both `opencode.json` and `opencode.jsonc`, and documents examples carrying comments and trailing commas — so its servers were invisible to the MCP inventory. Global configs are now read from `~/.config/opencode/opencode.{json,jsonc}`, resolved against the developer's home rather than the service account's, and project configs are found by the existing bounded walk. The secret allowlist is unchanged and still deny-by-default, so OpenCode's `environment` and `headers` blocks are never collected.
+- **Pi, Factory Droid and Amp in the AI agent inventory**: all three already appeared under `agent_skills` but were missing from `ai_agents_and_tools`, so a machine running them looked like a machine that wasn't. They cannot be added by binary name — `pi`, `amp` and `droid` each collide with a popular same-name tool, and because resolution takes the first candidate that exists, a collider winning the `$PATH` race would hide a genuine install elsewhere on the machine. Each agent is now proven from an on-disk artifact instead: an npm or Bun manifest naming the package, the installer's anchor directory, a Homebrew cask root as opposed to the collider's formula root, winget's publisher-qualified package directory, or a pacman file manifest claiming the path — searched across the prefixes a global install actually lands in, including the per-version trees of nvm, fnm, mise, volta and asdf. Amp and Pi skip the `--version` exec, which was measured to make Gatekeeper prompt; their versions come from disk or read `unknown`.
+- **Two new agent-skills roots**: `~/.config/amp/skills` (`amp_user`) and `~/.agent/skills` (`factory_agent_user`) — singular `.agent`, distinct from the `~/.agents` convention.
+- **Copilot CLI installs that never land on PATH**: `gh copilot` downloads the same `@github/copilot` CLI into gh's own data directory, which never reaches `$PATH`, so users who let gh install Copilot for them read as having no Copilot CLI at all. Seven home-relative anchors are now tried after a `LookPath` miss, covering the `gh copilot` download on both platform spellings, the non-root install-script path, the WinGet and npm global shims, and the `gh-copilot` extension. Bare names stay first, so machines that already resolve `copilot` through `$PATH` are unaffected. Two limits are documented in `SCAN_COVERAGE.md` rather than worked around: a non-default `$XDG_DATA_HOME` is not followed, because the scan runs as a root daemon and does not have the user's value, and WinGet's hashed payload directory needs globbing that binary-name resolution does not do, so only its `Links` shim is covered.
+
+### Changed
+
+- **The macOS TCC skipper is wired into AI CLI detection.** The new resolution ladders stat candidates directly instead of descending a walk, so the walk-level skip could not protect them; consent is now checked before every stat and again on every resolved symlink. The pnpm and fnm trees under `~/Library` are exempted, since the coarse `~/Library` skip that is correct for a walk would otherwise drop both macOS channels silently.
+- **CI: release publishing is gated on verification.** A new `publish-release.yml` runs the verification suite as a reusable workflow and publishes the draft release, marking it latest, only if every check passes — signed checksums, Windows Authenticode, macOS notarization — replacing the manual `gh release edit --draft=false --latest` step. Verification now also requires a valid out-of-band Ed25519 `.sha256.sig` for the `x64` and `arm64` `.intunewin` packages, so every distributable artifact is covered. Because those checksums are created outside the repository, a compromised repository alone cannot ship a release that customers' loaders will accept.
+
 ## [1.15.0] - 2026-08-03
 
 ### Added
@@ -326,6 +341,7 @@ First open-source release. The scanning engine was previously an internal enterp
 - Execution log capture and base64 encoding
 - Instance locking to prevent concurrent runs
 
+[1.16.0]: https://github.com/step-security/dev-machine-guard/compare/v1.15.0...v1.16.0
 [1.15.0]: https://github.com/step-security/dev-machine-guard/compare/v1.14.0...v1.15.0
 [1.14.0]: https://github.com/step-security/dev-machine-guard/compare/v1.13.0...v1.14.0
 [1.13.0]: https://github.com/step-security/dev-machine-guard/compare/v1.12.0...v1.13.0
