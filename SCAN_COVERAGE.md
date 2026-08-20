@@ -147,6 +147,20 @@ Plugins are classified as `bundled`, `marketplace`, or `dropins` based on their 
 
 Discovered via `pluginkit -mAD -p com.apple.dt.Xcode.extension.source-editor`. Returns bundle ID, version, and publisher for Xcode Source Editor extensions.
 
+## Browser Extensions
+
+Extensions are read from the browsers' own state files under the logged-in user's home directory. On Linux, Firefox is also scanned under its snap and flatpak roots, and Edge under its flatpak root. A browser installed anywhere other than the paths below, including under a packaging not listed here or with a custom data directory, is reported as not present.
+
+| Browser        | Engine   | macOS                                          | Windows                                  | Linux                   |
+|----------------|----------|------------------------------------------------|------------------------------------------|-------------------------|
+| Google Chrome  | Chromium | `~/Library/Application Support/Google/Chrome`   | `%LOCALAPPDATA%\Google\Chrome\User Data`  | `~/.config/google-chrome` |
+| Microsoft Edge | Chromium | `~/Library/Application Support/Microsoft Edge`  | `%LOCALAPPDATA%\Microsoft\Edge\User Data` | `~/.config/microsoft-edge` |
+| Mozilla Firefox | Gecko   | `~/Library/Application Support/Firefox`         | `%APPDATA%\Mozilla\Firefox`               | `~/.mozilla/firefox`    |
+
+Per extension, the scan records identity (id, name, version, manifest version), enabled state and why it is disabled, where it was installed from, its store and listing status, signature state, and the permissions the browser is currently honouring for it.
+
+**Privacy: only these state files are read. Browsing history, cookies, saved passwords, page content, and profile names are never collected.** No browser is launched and no extension store is contacted.
+
 ## Node.js Package Scanning (Optional)
 
 | Package Manager | Global Packages | Project Packages              |

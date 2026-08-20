@@ -818,6 +818,32 @@ func TestFilterMCPContent_NonOpenCodeUnchanged(t *testing.T) {
 	}
 }
 
+// TestFilterServerFields_RedactsSecretsInKeptFields: command/args/url/serverUrl
+// are the fields we keep (env/headers are dropped outright), but real MCP
+// configs sometimes carry a bearer token or API key inside those kept fields
+// too — e.g. a query-string token on the server URL, or an --api-key flag in
+// args. Those values must still be redacted before upload, not passed through
+// verbatim just because the field name isn't "env" or "headers".
+func TestFilterServerFields_RedactsSecretsInKeptFields(t *testing.T) {
+	det := &MCPDetector{}
+	content := `{"mcpServers":{"pipeboard":{
+		"url":"https://meta-ads.mcp.pipeboard.co/?token=abcdEFGH12345678opaqueTokenValue",
+		"command":"npx",
+		"args":["-y","server","--api-key=abcdEFGH12345678opaqueTokenValue"]
+	}}}`
+
+	filtered, ok := det.filterMCPContent("cursor", "/Users/testuser/.cursor/mcp.json", []byte(content))
+	if !ok {
+		t.Fatalf("expected filtering to succeed")
+	}
+	if strings.Contains(string(filtered), "abcdEFGH12345678opaqueTokenValue") {
+		t.Fatalf("secret leaked into filtered output: %s", filtered)
+	}
+	if !strings.Contains(string(filtered), "token=") || !strings.Contains(string(filtered), "REDACTED") {
+		t.Errorf("expected the url token to be replaced with a redaction placeholder, got: %s", filtered)
+	}
+}
+
 // TestMCPConfigDefinitions_OpenCodeIsPlatformAgnostic: the two OpenCode
 // definitions leave the Windows and Linux fields empty on purpose, so every
 // consumer that walks mcpConfigDefinitions — including the known-user-config

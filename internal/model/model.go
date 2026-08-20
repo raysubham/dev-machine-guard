@@ -43,6 +43,12 @@ type ScanResult struct {
 	// non-nil section with zero findings means it ran and found nothing.
 	CredentialScan *CredentialScanInfo `json:"credential_scan,omitempty"`
 
+	// BrowserExtensionScan is the browser extension inventory. Nil means the
+	// phase did not run — the only "no information" signal a reader has, and the
+	// difference between it and a section carrying zero findings is what keeps a
+	// skipped scan from erasing a device's extensions.
+	BrowserExtensionScan *BrowserExtensionScanInfo `json:"browser_extension_scan,omitempty"`
+
 	Summary Summary `json:"summary"`
 }
 
