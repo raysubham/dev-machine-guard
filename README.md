@@ -58,54 +58,36 @@ The steps below install the binary directly and are intended for **community use
 
 ### Install from release (community)
 
-Release assets are named `stepsecurity-dev-machine-guard-<version>-<os>` (for example, `stepsecurity-dev-machine-guard-1.12.0-darwin`). Rather than hardcoding a version, discover the latest asset dynamically so the command keeps working across releases.
+Download the latest binary for your platform from [GitHub Releases](https://github.com/step-security/dev-machine-guard/releases). Release asset filenames embed the version (for example, `stepsecurity-dev-machine-guard-1.16.0-darwin`), so the snippets below resolve the latest tag first rather than hardcoding a version.
 
-**macOS:**
+**macOS** (universal binary — Apple Silicon and Intel)
 
 ```bash
-# Discover and download the latest macOS (darwin) release asset
-ASSET=$(curl -s https://api.github.com/repos/step-security/dev-machine-guard/releases/latest \
-  | jq -r '.assets[].name | select(test("^stepsecurity-dev-machine-guard-[0-9.]+-darwin$"))')
-
-curl -fL "https://github.com/step-security/dev-machine-guard/releases/latest/download/$ASSET" \
-  -o stepsecurity-dev-machine-guard
+VERSION=$(curl -fsSL https://api.github.com/repos/step-security/dev-machine-guard/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')
+curl -fsSL "https://github.com/step-security/dev-machine-guard/releases/download/v${VERSION}/stepsecurity-dev-machine-guard-${VERSION}-darwin" -o stepsecurity-dev-machine-guard
 chmod +x stepsecurity-dev-machine-guard
 
 # Run the scan
 ./stepsecurity-dev-machine-guard
 ```
 
-To pin a specific version instead, download the matching asset directly:
-
-```bash
-curl -fL https://github.com/step-security/dev-machine-guard/releases/latest/download/stepsecurity-dev-machine-guard-1.12.0-darwin \
-  -o stepsecurity-dev-machine-guard
-chmod +x stepsecurity-dev-machine-guard
-./stepsecurity-dev-machine-guard
-```
-
-**Windows:**
+**Windows** (PowerShell)
 
 ```powershell
-# x64
-Invoke-WebRequest -Uri "https://github.com/step-security/dev-machine-guard/releases/latest/download/stepsecurity-dev-machine-guard_windows_amd64.exe" -OutFile "stepsecurity-dev-machine-guard.exe"
-
-# ARM64
-Invoke-WebRequest -Uri "https://github.com/step-security/dev-machine-guard/releases/latest/download/stepsecurity-dev-machine-guard_windows_arm64.exe" -OutFile "stepsecurity-dev-machine-guard.exe"
+$version = (Invoke-RestMethod https://api.github.com/repos/step-security/dev-machine-guard/releases/latest).tag_name.TrimStart('v')
+$arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
+Invoke-WebRequest -Uri "https://github.com/step-security/dev-machine-guard/releases/download/v$version/stepsecurity-dev-machine-guard-$version-windows_$arch.exe" -OutFile "stepsecurity-dev-machine-guard.exe"
 
 # Run the scan
 .\stepsecurity-dev-machine-guard.exe
 ```
 
-**Linux:**
+**Linux**
 
 ```bash
-# x64
-curl -sSL https://github.com/step-security/dev-machine-guard/releases/latest/download/stepsecurity-dev-machine-guard_linux_amd64 -o stepsecurity-dev-machine-guard
-chmod +x stepsecurity-dev-machine-guard
-
-# ARM64
-curl -sSL https://github.com/step-security/dev-machine-guard/releases/latest/download/stepsecurity-dev-machine-guard_linux_arm64 -o stepsecurity-dev-machine-guard
+VERSION=$(curl -fsSL https://api.github.com/repos/step-security/dev-machine-guard/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')
+ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+curl -fsSL "https://github.com/step-security/dev-machine-guard/releases/download/v${VERSION}/stepsecurity-dev-machine-guard-${VERSION}-linux_${ARCH}" -o stepsecurity-dev-machine-guard
 chmod +x stepsecurity-dev-machine-guard
 
 # Run the scan
