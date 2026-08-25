@@ -42,11 +42,18 @@ Detection is cross-platform — binaries are located via `$PATH` lookup and home
 | Codex                 | OpenAI    | `codex`                     | `~/.codex`                      |
 | Gemini CLI            | Google    | `gemini`                    | `~/.gemini`                     |
 | Amazon Q / Kiro CLI   | Amazon    | `kiro-cli`, `kiro`, `q`     | `~/.q`, `~/.kiro`, `~/.aws/q`  |
-| GitHub Copilot CLI    | Microsoft | `copilot`, `gh-copilot`     | `~/.config/github-copilot`      |
+| GitHub Copilot CLI    | Microsoft | `copilot`, `gh-copilot`†    | `~/.config/github-copilot`, `~/.copilot` |
 | Microsoft AI Shell    | Microsoft | `aish`, `ai`                | `~/.aish`                       |
 | Aider                 | OpenSource| `aider`                     | `~/.aider`                      |
 | OpenCode              | OpenSource| `opencode`                  | `~/.config/opencode`            |
 | Cursor Agent          | Cursor    | `cursor-agent`              | `~/.cursor`                     |
+| Pi                    | Earendil  | `pi`                        | `~/.pi/agent`                   |
+| Factory Droid         | Factory   | `droid`                     | `~/.factory`                    |
+| Amp                   | Sourcegraph| `amp`                      | `~/.config/amp`                 |
+
+† `gh copilot` launches this same `@github/copilot` CLI, downloading it into gh's own data directory when it isn't already on `$PATH` — so that install never lands on `$PATH`. After the two binary names miss, Copilot is also looked for at `~/.local/share/gh/copilot/copilot`, `~/.local/bin/copilot`, `~/AppData/Local/GitHub CLI/copilot/copilot`, `~/AppData/Local/Microsoft/WinGet/Links/copilot.exe`, `~/AppData/Roaming/npm/copilot.cmd`, and the `gh-copilot` extension directory under both `~/.local/share/gh/extensions` and `~/AppData/Local/GitHub CLI/extensions`. A non-default `$XDG_DATA_HOME` is not followed, and WinGet's hashed `Packages\GitHub.Copilot_<hash>\` payload directory is not globbed — only its `Links` shim.
+
+Pi, Factory Droid and Amp share their binary names with unrelated popular tools, so a `$PATH` hit alone does not report them — each is confirmed from an on-disk artifact (a package manifest, an installer anchor directory, a Homebrew cask root, a winget or pacman package entry), and is searched for in the common global-install prefixes as well as on `$PATH`. Pi and Amp are never executed because macOS Gatekeeper prompts on their binaries; their versions come from disk or are reported as `unknown`.
 
 ## General-Purpose AI Agents
 
@@ -76,17 +83,27 @@ Binaries are found via `$PATH` lookup (cross-platform). LM Studio is additionall
 
 On Windows, `~` refers to the user's home directory (`%USERPROFILE%`). Claude Desktop uses a Windows-specific path via `%APPDATA%`.
 
-| Source           | macOS / Linux Path                                               | Windows Path (if different)                    | Vendor    |
-|------------------|------------------------------------------------------------------|------------------------------------------------|-----------|
-| Claude Desktop   | `~/Library/Application Support/Claude/claude_desktop_config.json`| `%APPDATA%/Claude/claude_desktop_config.json`  | Anthropic |
-| Claude Code      | `~/.claude/settings.json`                                        | _(same)_                                       | Anthropic |
-| Claude Code      | `~/.claude.json`                                                 | _(same)_                                       | Anthropic |
-| Cursor           | `~/.cursor/mcp.json`                                             | _(same)_                                       | Cursor    |
-| Windsurf         | `~/.codeium/windsurf/mcp_config.json`                            | _(same)_                                       | Codeium   |
-| Antigravity      | `~/.gemini/antigravity/mcp_config.json`                          | _(same)_                                       | Google    |
-| Zed              | `~/.config/zed/settings.json`                                    | _(same)_                                       | Zed       |
-| Open Interpreter | `~/.config/open-interpreter/config.yaml`                         | _(same)_                                       | OpenSource|
-| Codex            | `~/.codex/config.toml`                                           | _(same)_                                       | OpenAI    |
+| Source             | macOS / Linux Path                                               | Windows Path (if different)                    | Vendor    |
+|--------------------|------------------------------------------------------------------|------------------------------------------------|-----------|
+| Claude Desktop     | `~/Library/Application Support/Claude/claude_desktop_config.json`| `%APPDATA%/Claude/claude_desktop_config.json`  | Anthropic |
+| Claude Code        | `~/.claude/settings.json`                                        | _(same)_                                       | Anthropic |
+| Claude Code        | `~/.claude.json`                                                 | _(same)_                                       | Anthropic |
+| Cursor             | `~/.cursor/mcp.json`                                             | _(same)_                                       | Cursor    |
+| Windsurf           | `~/.codeium/windsurf/mcp_config.json`                            | _(same)_                                       | Codeium   |
+| Antigravity        | `~/.gemini/antigravity/mcp_config.json`                          | _(same)_                                       | Google    |
+| Zed                | `~/.config/zed/settings.json`                                    | _(same)_                                       | Zed       |
+| Open Interpreter   | `~/.config/open-interpreter/config.yaml`                         | _(same)_                                       | OpenSource|
+| Codex              | `~/.codex/config.toml`                                           | _(same)_                                       | OpenAI    |
+| OpenCode           | `~/.config/opencode/opencode.json` (and `.jsonc`)                | _(same)_                                       | OpenCode  |
+| OpenCode (project) | `opencode.json` / `opencode.jsonc` in a project directory        | _(same)_                                       | OpenCode  |
+
+## AI Agent Skills
+
+Dev Machine Guard inventories every installed **agent skill** — a directory containing a `SKILL.md` manifest — across Claude Code, Codex, OpenCode, Cursor, Gemini CLI, GitHub Copilot, Pi, Factory, Amp, the cross-agent `~/.agents` convention, and skills installed via [skills.sh](https://skills.sh). It probes each agent's global, system, project, and plugin skill directories; skills.sh lock files add upstream provenance (joined by symlink-resolved path). Detection is pure filesystem reads (no subprocesses), bounded by a 60-second budget and per-root caps.
+
+**Privacy: only metadata and a single SHA-256 hash of each `SKILL.md` are collected — no other file is ever read, and file contents are never transmitted.** The file census (counts, sizes, timestamps) comes entirely from directory listings and `stat`. For skills installed from a local path, the on-disk source path is never serialized — only the skill's alias.
+
+Per skill, the scan records identity and frontmatter (name, description, version, license, allowed tools), capability flags (load-time shell execution, hooks, plugin manifest, subagent context), a stat-only file census, the `SKILL.md` hash, and — when lock-managed — upstream provenance.
 
 ## IDE Extensions & Plugins
 
@@ -130,6 +147,20 @@ Plugins are classified as `bundled`, `marketplace`, or `dropins` based on their 
 
 Discovered via `pluginkit -mAD -p com.apple.dt.Xcode.extension.source-editor`. Returns bundle ID, version, and publisher for Xcode Source Editor extensions.
 
+## Browser Extensions
+
+Extensions are read from the browsers' own state files under the logged-in user's home directory. On Linux, Firefox is also scanned under its snap and flatpak roots, and Edge under its flatpak root. A browser installed anywhere other than the paths below, including under a packaging not listed here or with a custom data directory, is reported as not present.
+
+| Browser        | Engine   | macOS                                          | Windows                                  | Linux                   |
+|----------------|----------|------------------------------------------------|------------------------------------------|-------------------------|
+| Google Chrome  | Chromium | `~/Library/Application Support/Google/Chrome`   | `%LOCALAPPDATA%\Google\Chrome\User Data`  | `~/.config/google-chrome` |
+| Microsoft Edge | Chromium | `~/Library/Application Support/Microsoft Edge`  | `%LOCALAPPDATA%\Microsoft\Edge\User Data` | `~/.config/microsoft-edge` |
+| Mozilla Firefox | Gecko   | `~/Library/Application Support/Firefox`         | `%APPDATA%\Mozilla\Firefox`               | `~/.mozilla/firefox`    |
+
+Per extension, the scan records identity (id, name, version, manifest version), enabled state and why it is disabled, where it was installed from, its store and listing status, signature state, and the permissions the browser is currently honouring for it.
+
+**Privacy: only these state files are read. Browsing history, cookies, saved passwords, page content, and profile names are never collected.** No browser is launched and no extension store is contacted.
+
 ## Node.js Package Scanning (Optional)
 
 | Package Manager | Global Packages | Project Packages              |
@@ -154,19 +185,33 @@ Homebrew scanning detects installed formulae and casks with rich metadata. Enabl
 
 ## Python Package Scanning (Optional)
 
-Python scanning detects package managers, globally installed packages, and project virtual environments. Enable with `--enable-python-scan`.
+Python scanning detects installed packages and project virtual environments. Enable with `--enable-python-scan`. **No Python interpreter or package manager is executed** — packages are read from on-disk install metadata (`*.dist-info/METADATA` and `*.egg-info/PKG-INFO`, per PEP 376/627), so scanning never triggers a macOS install prompt. (The pre-1.13 command-based path is still available via `--legacy-python-scan` / `use_legacy_python_scan`.)
 
-| Package Manager | Version Detection        | Global Packages              |
-|-----------------|--------------------------|------------------------------|
-| python3         | `python3 --version`      | —                            |
-| pip3            | `pip3 --version`         | `pip3 list --format json`    |
-| poetry          | `poetry --version`       | —                            |
-| pipenv          | `pipenv --version`       | —                            |
-| uv              | `uv --version`           | `uv pip list --format json`  |
-| conda           | `conda --version`        | `conda list --json`          |
-| rye             | `rye --version`          | —                            |
+### Global / system packages
 
-**Project detection:** Discovers `pyproject.toml`, `setup.py`, and `requirements.txt` patterns in search directories.
+Discovered by walking a bounded set of Python **install trees** and recognizing package metadata anywhere beneath them. This is **independent of `search_dirs`**:
+
+- **Frameworks (macOS):** Command Line Tools, Xcode, and python.org (`/Library/Frameworks/Python*.framework/…`). The `/usr/bin/python3` wrapper does not resolve into these, so they are found structurally.
+- **Homebrew:** `/opt/homebrew/lib/python*`, `/opt/homebrew/Cellar/python*`.
+- **System:** `/usr/local/lib/python*`; Linux `/usr/lib/python*`, `/usr/lib64/python*`.
+- **Version managers:** pyenv, asdf, uv, rye, conda/mamba (base + named envs), pipx.
+- **User site:** `~/.local/lib/python*`, and `~/Library/Python/*` on macOS.
+
+### Project virtual environments
+
+Discovered by scanning the **search directories** for virtual environments (`pyvenv.cfg`) and reading each venv's installed metadata. The default search directory is the user's **`$HOME`**; override with `--search-dirs` or the `search_dirs` config key.
+
+### Coverage and limitations
+
+**Covered by default:** global installs in the trees above (regardless of `search_dirs`), and project venvs anywhere under `$HOME` that is not TCC-protected.
+
+**Not covered by default:**
+
+- **TCC-protected user directories** — the project/venv walk skips `~/Documents`, `~/Desktop`, `~/Downloads`, and `~/Library` to avoid macOS permission prompts. (The macOS global user-site `~/Library/Python/*` is the exception: it is scanned as its own explicit global root, so global user-site packages are still covered.) A **project virtual environment** kept under one of these directories is missed unless `include_tcc_protected: true` is set **and** the agent has Full Disk Access (see [macos-tcc-permissions.md](docs/macos-tcc-permissions.md)).
+- **Locations outside `$HOME`** — e.g. `/opt`, `/srv`, `/data`, `/Users/Shared`, or a separate repos volume. Add them via `search_dirs`.
+- **Global interpreters at non-standard prefixes** not under any tree listed above. Add the prefix (or a parent) via `search_dirs`.
+
+The set of global install roots scanned is logged once per scan at info level (full paths at debug), so field logs show exactly where the agent looked.
 
 ## System Package Scanning (Linux)
 

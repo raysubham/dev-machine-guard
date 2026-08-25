@@ -28,12 +28,12 @@ chmod +x stepsecurity-dev-machine-guard
 ./stepsecurity-dev-machine-guard
 ```
 
-**Windows** (PowerShell — signed build)
+**Windows** (PowerShell)
 
 ```powershell
 $version = (Invoke-RestMethod https://api.github.com/repos/step-security/dev-machine-guard/releases/latest).tag_name.TrimStart('v')
 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
-Invoke-WebRequest -Uri "https://github.com/step-security/dev-machine-guard/releases/download/v$version/stepsecurity-dev-machine-guard-$version-windows_${arch}_signed.exe" -OutFile "stepsecurity-dev-machine-guard.exe"
+Invoke-WebRequest -Uri "https://github.com/step-security/dev-machine-guard/releases/download/v$version/stepsecurity-dev-machine-guard-$version-windows_${arch}.exe" -OutFile "stepsecurity-dev-machine-guard.exe"
 .\stepsecurity-dev-machine-guard.exe
 ```
 

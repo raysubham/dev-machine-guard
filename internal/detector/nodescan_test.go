@@ -3,7 +3,9 @@ package detector
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/step-security/dev-machine-guard/internal/executor"
@@ -220,7 +222,7 @@ func TestNodeScanner_ScanPnpmGlobal_Delegated(t *testing.T) {
 func TestNodeScanner_ScanPnpmGlobal_RootGFallback(t *testing.T) {
 	mock := executor.NewMock()
 	mock.SetGOOS("darwin")
-	mock.SetEnv("HOME", "/Users/foo")
+	mock.SetHomeDir("/Users/foo")
 	mock.SetPath("pnpm", "/opt/homebrew/bin/pnpm")
 	mock.SetCommand("11.1.2\n", "", 0, "pnpm", "--version")
 	// pnpm root -g errors on every attempt — both the plain first call AND
@@ -252,39 +254,35 @@ func TestNodeScanner_ScanPnpmGlobal_RootGFallback(t *testing.T) {
 	}
 }
 
-// TestDefaultPnpmBinDir pins pnpm's per-platform global bin-dir layout. macOS
-// uses a /bin subdirectory; Linux and Windows place global binaries directly
-// in PNPM_HOME (no /bin). This asymmetry matches pnpm's own `pnpm setup`.
+// TestDefaultPnpmBinDir pins pnpm's per-platform global bin-dir layout.
+// pnpm v11 places global shims under a /bin subdirectory on macOS, Linux,
+// and Windows alike. This matches pnpm's own `pnpm setup` output: the error
+// it emits names "<PNPM_HOME>/bin" as the dir that must be on PATH.
 func TestDefaultPnpmBinDir(t *testing.T) {
 	tests := []struct {
-		name string
-		goos string
-		envs map[string]string
-		want string
+		name    string
+		goos    string
+		homeDir string            // drives getHomeDir via the mock's CurrentUser
+		envs    map[string]string // LOCALAPPDATA on Windows
+		want    string
 	}{
 		{
-			name: "darwin with HOME → bin subdir",
-			goos: "darwin",
-			envs: map[string]string{"HOME": "/Users/foo"},
-			want: "/Users/foo/Library/pnpm/bin",
+			name:    "darwin → bin subdir under home",
+			goos:    "darwin",
+			homeDir: "/Users/foo",
+			want:    "/Users/foo/Library/pnpm/bin",
 		},
 		{
-			name: "darwin without HOME → empty",
-			goos: "darwin",
-			envs: map[string]string{},
-			want: "",
+			name:    "linux → bin subdir under home",
+			goos:    "linux",
+			homeDir: "/home/foo",
+			want:    "/home/foo/.local/share/pnpm/bin",
 		},
 		{
-			name: "linux with HOME → no bin suffix",
-			goos: "linux",
-			envs: map[string]string{"HOME": "/home/foo"},
-			want: "/home/foo/.local/share/pnpm",
-		},
-		{
-			name: "linux without HOME → empty",
-			goos: "linux",
-			envs: map[string]string{},
-			want: "",
+			name: "windows with LOCALAPPDATA → bin subdir",
+			goos: "windows",
+			envs: map[string]string{"LOCALAPPDATA": `C:\Users\foo\AppData\Local`},
+			want: filepath.Join(`C:\Users\foo\AppData\Local`, "pnpm", "bin"),
 		},
 		{
 			name: "windows without LOCALAPPDATA → empty",
@@ -293,16 +291,19 @@ func TestDefaultPnpmBinDir(t *testing.T) {
 			want: "",
 		},
 		{
-			name: "unrecognized OS → empty",
-			goos: "freebsd",
-			envs: map[string]string{"HOME": "/home/foo"},
-			want: "",
+			name:    "unrecognized OS → empty",
+			goos:    "freebsd",
+			homeDir: "/home/foo",
+			want:    "",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mock := executor.NewMock()
 			mock.SetGOOS(tt.goos)
+			if tt.homeDir != "" {
+				mock.SetHomeDir(tt.homeDir)
+			}
 			for k, v := range tt.envs {
 				mock.SetEnv(k, v)
 			}
@@ -327,8 +328,11 @@ func TestNodeScanner_ScanProject_Windows(t *testing.T) {
 		"npm", "ls", "--json", "--depth=3")
 
 	scanner := newTestScanner(mock)
-	result := scanner.scanProject(context.Background(), `C:\Users\dev\myapp`)
+	result, ok := scanner.scanProject(context.Background(), `C:\Users\dev\myapp`, "npm")
 
+	if !ok {
+		t.Fatal("expected scanProject to emit a result when npm is available")
+	}
 	if result.PackageManager != "npm" {
 		t.Errorf("expected npm, got %s", result.PackageManager)
 	}
@@ -361,8 +365,11 @@ func TestNodeScanner_ScanProject_YarnBerry_Windows(t *testing.T) {
 		"yarn", "info", "--all", "--json")
 
 	scanner := newTestScanner(mock)
-	result := scanner.scanProject(context.Background(), projectDir)
+	result, ok := scanner.scanProject(context.Background(), projectDir, "yarn-berry")
 
+	if !ok {
+		t.Fatal("expected scanProject to emit a result when yarn is available")
+	}
 	if result.PackageManager != "yarn-berry" {
 		t.Errorf("expected yarn-berry, got %s", result.PackageManager)
 	}
@@ -371,6 +378,192 @@ func TestNodeScanner_ScanProject_YarnBerry_Windows(t *testing.T) {
 	}
 	if result.ExitCode != 0 {
 		t.Errorf("expected ExitCode 0, got %d", result.ExitCode)
+	}
+}
+
+// TestNodeScanner_ScanProject_PMNotInPATH covers the empty-payload
+// regression: a package-lock.json project on a Windows device where
+// Node.js isn't deployed (npm absent from PATH). Previously this path
+// discarded the exec.CommandContext ENOENT and shipped a NodeScanResult
+// with empty RawStdoutBase64 — indistinguishable on the backend from a
+// successful scan of an empty project. The fix drops the record entirely:
+// "PM not installed" is a normal configuration state, not an error to
+// report.
+func TestNodeScanner_ScanProject_PMNotInPATH(t *testing.T) {
+	mock := executor.NewMock()
+	mock.SetGOOS("windows")
+	// Note: deliberately do NOT call mock.SetPath("npm", ...) — that's the
+	// condition we're regression-testing.
+	projectDir := `C:\Users\dev\myapp`
+	mock.SetFile(filepath.Join(projectDir, "package-lock.json"), []byte{})
+
+	scanner := newTestScanner(mock)
+	_, ok := scanner.scanProject(context.Background(), projectDir, "npm")
+
+	if ok {
+		t.Error("expected scanProject to return ok=false when PM not on PATH (so no record is emitted)")
+	}
+}
+
+// TestNodeScanner_ScanProjects_DropsRecordsForMissingPM exercises the
+// loop-level contract end-to-end: a device with multiple package.json
+// files but no installed PM should produce zero records, not zero-result
+// records. Mirrors the field-observed scenario the empty-payload fix
+// addresses.
+func TestNodeScanner_ScanProjects_DropsRecordsForMissingPM(t *testing.T) {
+	mock := executor.NewMock()
+	mock.SetGOOS("windows")
+	// Two real package.json files, no npm on PATH.
+	dirA := `C:\Users\dev\a`
+	dirB := `C:\Users\dev\b`
+	mock.SetFile(filepath.Join(dirA, "package.json"), []byte("{}"))
+	mock.SetFile(filepath.Join(dirA, "package-lock.json"), []byte{})
+	mock.SetFile(filepath.Join(dirB, "package.json"), []byte("{}"))
+	mock.SetFile(filepath.Join(dirB, "package-lock.json"), []byte{})
+
+	scanner := newTestScanner(mock)
+	results, _ := scanner.ScanProjects(context.Background(), []string{`C:\Users\dev`}, nil)
+
+	if len(results) != 0 {
+		t.Errorf("expected 0 telemetry records when PM not installed, got %d", len(results))
+	}
+}
+
+// TestNodeScanner_ScanProject_BinaryAvailabilityCached verifies the
+// pmAvailability cache: two scanProject calls for the same PM should
+// trigger exactly one PATH lookup. Important on devices with hundreds
+// of lockfiles — without caching we'd pay a LookPath per project.
+func TestNodeScanner_ScanProject_BinaryAvailabilityCached(t *testing.T) {
+	mock := executor.NewMock()
+	mock.SetGOOS("windows")
+	dirA := `C:\Users\dev\a`
+	dirB := `C:\Users\dev\b`
+	mock.SetFile(filepath.Join(dirA, "package-lock.json"), []byte{})
+	mock.SetFile(filepath.Join(dirB, "package-lock.json"), []byte{})
+
+	scanner := newTestScanner(mock)
+	_, firstOK := scanner.scanProject(context.Background(), dirA, "npm")
+	_, secondOK := scanner.scanProject(context.Background(), dirB, "npm")
+
+	if firstOK || secondOK {
+		t.Errorf("expected both scanProject calls to return ok=false, got firstOK=%v secondOK=%v",
+			firstOK, secondOK)
+	}
+	if got, want := len(scanner.pmAvailability), 1; got != want {
+		t.Errorf("expected exactly %d cached PM lookup after two scans of same PM, got %d", want, got)
+	}
+	if _, ok := scanner.pmAvailability["npm"]; !ok {
+		t.Error("expected pmAvailability to contain entry for npm")
+	}
+}
+
+// TestNodeScanner_ShouldRunAsUser pins the delegation decision. The fix dropped
+// the old IsRoot() requirement: whenever there's a logged-in user on a non-
+// Windows host, package-manager commands run through that user's login shell —
+// in BOTH deployment modes. The non-root row is the LaunchAgent regression:
+// launchd runs the agent as the user with a stripped PATH, and before the fix
+// shouldRunAsUser was false there, so npm/yarn/pnpm fell through to a bare exec
+// and weren't found (exit -1, empty output, version "unknown").
+func TestNodeScanner_ShouldRunAsUser(t *testing.T) {
+	tests := []struct {
+		name         string
+		goos         string
+		isRoot       bool
+		loggedInUser string
+		want         bool
+	}{
+		{"non-root macOS with user (LaunchAgent regression)", "darwin", false, "alice", true},
+		{"root macOS with user (LaunchDaemon)", "darwin", true, "alice", true},
+		{"non-root linux with user", "linux", false, "alice", true},
+		{"no logged-in user", "darwin", false, "", false},
+		{"windows excluded", "windows", false, "alice", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := executor.NewMock()
+			mock.SetGOOS(tc.goos)
+			mock.SetIsRoot(tc.isRoot)
+			scanner := NewNodeScanner(mock, progress.NewLogger(progress.LevelInfo), tc.loggedInUser)
+			if got := scanner.shouldRunAsUser(); got != tc.want {
+				t.Errorf("shouldRunAsUser() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNodeScanner_ScanProject_Delegated_NonRoot is the core LaunchAgent
+// regression: the agent runs as the console user (NOT root) under launchd's
+// stripped PATH. The scanner must still route npm through the user's login
+// shell — the Mock dispatches RunAsUser as `bash -c "<cmd>"` — so an
+// nvm/fnm/homebrew npm is resolved. checkPath (`which npm`), getVersion
+// (`npm --version`) and the scan itself (a cd + single-quoted argv built by
+// platformShellQuote) all flow through that path.
+func TestNodeScanner_ScanProject_Delegated_NonRoot(t *testing.T) {
+	mock := executor.NewMock()
+	mock.SetGOOS("darwin")
+	// Deliberately NOT root — this is the LaunchAgent-as-user deployment that
+	// previously skipped delegation.
+	projectDir := "/Users/testuser/myapp"
+
+	mock.SetCommand("/Users/testuser/.nvm/versions/node/v20.11.0/bin/npm\n", "", 0, "bash", "-c", "which npm")
+	mock.SetCommand("10.9.0\n", "", 0, "bash", "-c", "npm --version")
+	scanCmd := "cd '/Users/testuser/myapp' && 'npm' 'ls' '--json' '--depth=3'"
+	mock.SetCommand(`{"dependencies":{"lodash":{"version":"4.17.21"}}}`, "", 0, "bash", "-c", scanCmd)
+
+	scanner := NewNodeScanner(mock, progress.NewLogger(progress.LevelInfo), "testuser")
+	if !scanner.shouldRunAsUser() {
+		t.Fatal("shouldRunAsUser must be true for a non-root macOS scan with a logged-in user")
+	}
+
+	result, ok := scanner.scanProject(context.Background(), projectDir, "npm")
+	if !ok {
+		t.Fatal("expected scanProject to emit a result (npm resolved via the user's login shell)")
+	}
+	if result.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want 0 — the scan should have run through `bash -c`, not a bare exec", result.ExitCode)
+	}
+	if result.PMVersion != "10.9.0" {
+		t.Errorf("PMVersion = %q, want 10.9.0", result.PMVersion)
+	}
+	decoded, _ := base64.StdEncoding.DecodeString(result.RawStdoutBase64)
+	if len(decoded) == 0 {
+		t.Error("expected non-empty RawStdoutBase64 from the delegated scan")
+	}
+	if result.Error != "" {
+		t.Errorf("Error = %q, want empty on a successful scan", result.Error)
+	}
+}
+
+// TestNodeScanner_ScanProject_Delegated_SurfacesError verifies a delegated
+// failure is captured in the telemetry Error field (and log.Warn'd) rather than
+// reduced to an opaque exit code. When npm IS resolvable but the run itself
+// fails, RunAsUser returns an error carrying the shell's reason; scanProject
+// must fold that into result.Error so the next occurrence is self-explanatory.
+func TestNodeScanner_ScanProject_Delegated_SurfacesError(t *testing.T) {
+	mock := executor.NewMock()
+	mock.SetGOOS("darwin")
+	projectDir := "/Users/testuser/broken"
+
+	mock.SetCommand("/opt/homebrew/bin/npm\n", "", 0, "bash", "-c", "which npm")
+	mock.SetCommand("10.9.0\n", "", 0, "bash", "-c", "npm --version")
+	scanCmd := "cd '/Users/testuser/broken' && 'npm' 'ls' '--json' '--depth=3'"
+	// SetCommandError mirrors what executor.RunAsUser returns when the user
+	// shell exits non-zero — now with the stderr folded into the message.
+	mock.SetCommandError(
+		fmt.Errorf("command exited with code 127: zsh: command not found: npm"),
+		"bash", "-c", scanCmd,
+	)
+
+	scanner := NewNodeScanner(mock, progress.NewLogger(progress.LevelInfo), "testuser")
+	result, ok := scanner.scanProject(context.Background(), projectDir, "npm")
+	if !ok {
+		t.Fatal("expected scanProject to still emit a record when the PM is present but the run fails")
+	}
+	if result.Error == "" {
+		t.Fatal("expected a non-empty Error capturing the failure reason (was the runErr discarded?)")
+	}
+	if !strings.Contains(result.Error, "command not found") {
+		t.Errorf("Error = %q, want it to carry the underlying shell reason", result.Error)
 	}
 }
 

@@ -116,6 +116,80 @@ func TestPretty_PlatformLabels(t *testing.T) {
 	}
 }
 
+// agentSkillsSection slices the AGENT SKILLS block out of the pretty output so
+// assertions cannot false-match the "None detected" lines of other sections.
+func agentSkillsSection(t *testing.T, output string) string {
+	t.Helper()
+	start := strings.Index(output, "AGENT SKILLS")
+	end := strings.Index(output, "IDE EXTENSIONS")
+	if start < 0 || end < start {
+		t.Fatal("output missing AGENT SKILLS / IDE EXTENSIONS headers")
+	}
+	return output[start:end]
+}
+
+func TestPretty_AgentSkillsNotScanned(t *testing.T) {
+	// Nil AgentSkillScan means the scan never ran (feature gate off) — rendered
+	// as "Not scanned", distinct from a completed scan that found nothing.
+	result := &model.ScanResult{
+		ScanTimestamp: 1700000000,
+		Device:        model.Device{Hostname: "test"},
+	}
+
+	var buf bytes.Buffer
+	_ = Pretty(&buf, result, "never")
+
+	section := agentSkillsSection(t, buf.String())
+	if !strings.Contains(section, "Not scanned") {
+		t.Errorf("nil AgentSkillScan must render 'Not scanned', got %q", section)
+	}
+}
+
+func TestPretty_AgentSkillsNoneDetected(t *testing.T) {
+	result := &model.ScanResult{
+		ScanTimestamp:  1700000000,
+		Device:         model.Device{Hostname: "test"},
+		AgentSkillScan: &model.AgentSkillScanInfo{},
+	}
+
+	var buf bytes.Buffer
+	_ = Pretty(&buf, result, "never")
+
+	section := agentSkillsSection(t, buf.String())
+	if !strings.Contains(section, "None detected") {
+		t.Errorf("completed empty scan must render 'None detected', got %q", section)
+	}
+	if strings.Contains(section, "Not scanned") {
+		t.Errorf("completed scan must not render 'Not scanned', got %q", section)
+	}
+}
+
+func TestPretty_AgentSkillsPopulated(t *testing.T) {
+	result := &model.ScanResult{
+		ScanTimestamp:  1700000000,
+		Device:         model.Device{Hostname: "test"},
+		AgentSkillScan: &model.AgentSkillScanInfo{SkillsFound: 1},
+		AgentSkills: []model.AgentSkill{
+			{SkillName: "pdf-tools", Source: "claude_user", Agent: "claude-code", Scope: "global", ManagedBy: "skills.sh"},
+		},
+	}
+
+	var buf bytes.Buffer
+	_ = Pretty(&buf, result, "never")
+
+	section := agentSkillsSection(t, buf.String())
+	for _, want := range []string{"pdf-tools", "claude_user", "[skills.sh]"} {
+		if !strings.Contains(section, want) {
+			t.Errorf("populated skills section missing %q: %q", want, section)
+		}
+	}
+	for _, absent := range []string{"Not scanned", "None detected"} {
+		if strings.Contains(section, absent) {
+			t.Errorf("populated skills section must not contain %q: %q", absent, section)
+		}
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	tests := []struct {
 		input string
@@ -162,5 +236,78 @@ func TestIdeDisplayName(t *testing.T) {
 		if got != expected {
 			t.Errorf("ideDisplayName(%q) = %q, want %q", input, got, expected)
 		}
+	}
+}
+
+// TestPretty_BrowserExtensionsTriState covers the distinction the section exists
+// to draw. "Not scanned" and "None detected" look alike and mean opposite things:
+// one is no information, the other is the machine positively holding nothing.
+func TestPretty_BrowserExtensionsTriState(t *testing.T) {
+	tests := []struct {
+		name    string
+		scan    *model.BrowserExtensionScanInfo
+		want    string
+		notWant string
+	}{
+		{
+			name:    "the phase did not run",
+			scan:    nil,
+			want:    "Not scanned",
+			notWant: "None detected",
+		},
+		{
+			name: "it ran and the machine holds none",
+			scan: &model.BrowserExtensionScanInfo{
+				Browsers: []model.BrowserCoverage{{BrowserID: "chrome", Status: model.BrowserCoverageNotPresent}},
+			},
+			want:    "None detected",
+			notWant: "Not scanned",
+		},
+		{
+			name: "a delisted extension is called out",
+			scan: &model.BrowserExtensionScanInfo{
+				Browsers: []model.BrowserCoverage{{BrowserID: "chrome", Status: model.BrowserCoverageScanned, ExtensionCount: 1}},
+				Findings: []model.BrowserExtensionFinding{{
+					BrowserID:    "chrome",
+					ExtensionID:  "abcdefghijklmnopabcdefghijklmnop",
+					Name:         "Example Screen Capture",
+					Version:      "8.6",
+					EnabledState: model.BrowserExtDisabled,
+					DisabledBy:   model.BrowserExtDisabledByBrowser,
+					StoreListing: model.BrowserExtStoreListingDelisted,
+				}},
+			},
+			want:    "delisted",
+			notWant: "Not scanned",
+		},
+		{
+			name: "a browser that could not be read is shown, not hidden",
+			scan: &model.BrowserExtensionScanInfo{
+				Browsers: []model.BrowserCoverage{{
+					BrowserID:  "edge",
+					Status:     model.BrowserCoverageFailed,
+					ReasonCode: model.BrowserExtReasonSymlinkRejected,
+				}},
+			},
+			want: model.BrowserExtReasonSymlinkRejected,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			_ = Pretty(&buf, &model.ScanResult{BrowserExtensionScan: tc.scan}, "never")
+
+			out := buf.String()
+			if !strings.Contains(out, "BROWSER EXTENSIONS") {
+				t.Fatal("output has no browser extension section")
+			}
+			section := out[strings.Index(out, "BROWSER EXTENSIONS"):]
+			if !strings.Contains(section, tc.want) {
+				t.Errorf("section does not mention %q:\n%s", tc.want, section)
+			}
+			if tc.notWant != "" && strings.Contains(section, tc.notWant) {
+				t.Errorf("section wrongly mentions %q:\n%s", tc.notWant, section)
+			}
+		})
 	}
 }

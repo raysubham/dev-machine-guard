@@ -7,8 +7,12 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/tailscale/hujson"
+
+	"github.com/step-security/dev-machine-guard/internal/aiagents/redact"
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
+	"github.com/step-security/dev-machine-guard/internal/tcc"
 )
 
 type mcpConfigSpec struct {
@@ -29,62 +33,64 @@ var mcpConfigDefinitions = []mcpConfigSpec{
 	{"zed", "~/.config/zed/settings.json", "", "", "Zed"},
 	{"open_interpreter", "~/.config/open-interpreter/config.yaml", "", "", "OpenSource"},
 	{"codex", "~/.codex/config.toml", "", "", "OpenAI"},
+	// VS Code and VS Code-based editors keep user-level MCP servers in
+	// <app-config>/User/mcp.json. These are targeted reads; on macOS the path
+	// is under ~/Library, which the discovery walk deliberately never enters.
+	{"vscode", "~/Library/Application Support/Code/User/mcp.json", "%APPDATA%/Code/User/mcp.json", "~/.config/Code/User/mcp.json", "Microsoft"},
+	{"vscode_insiders", "~/Library/Application Support/Code - Insiders/User/mcp.json", "%APPDATA%/Code - Insiders/User/mcp.json", "~/.config/Code - Insiders/User/mcp.json", "Microsoft"},
+	{"cursor_user", "~/Library/Application Support/Cursor/User/mcp.json", "%APPDATA%/Cursor/User/mcp.json", "~/.config/Cursor/User/mcp.json", "Cursor"},
+	{"windsurf_user", "~/Library/Application Support/Windsurf/User/mcp.json", "%APPDATA%/Windsurf/User/mcp.json", "~/.config/Windsurf/User/mcp.json", "Codeium"},
+	{"vscodium", "~/Library/Application Support/VSCodium/User/mcp.json", "%APPDATA%/VSCodium/User/mcp.json", "~/.config/VSCodium/User/mcp.json", "VSCodium"},
+	// OpenCode uses the same ~/.config/opencode layout on every platform, so the
+	// Windows and Linux fields stay empty and resolveConfigPath expands
+	// ConfigPath against the resolved home. Both spellings are accepted by the
+	// tool, so both are listed.
+	{"opencode", "~/.config/opencode/opencode.json", "", "", "OpenCode"},
+	{"opencode", "~/.config/opencode/opencode.jsonc", "", "", "OpenCode"},
 }
 
 // MCPDetector collects MCP configuration files.
 type MCPDetector struct {
-	exec executor.Executor
+	exec    executor.Executor
+	skipper *tcc.Skipper
 }
 
 func NewMCPDetector(exec executor.Executor) *MCPDetector {
 	return &MCPDetector{exec: exec}
 }
 
-// Detect finds MCP configs. If enterprise is true, includes base64-encoded content.
-// Returns community-mode MCPConfig structs (enterprise mode uses MCPConfigEnterprise separately).
-func (d *MCPDetector) Detect(_ context.Context, userIdentity string, enterprise bool) []model.MCPConfig {
+// WithSkipper attaches a TCC skipper so the discovery walk skips
+// macOS-protected directories. A nil skipper is a no-op. Returns the detector
+// for chaining.
+func (d *MCPDetector) WithSkipper(s *tcc.Skipper) *MCPDetector {
+	d.skipper = s
+	return d
+}
+
+// Detect returns the MCP config locations found on the host as community-mode
+// MCPConfig structs (path, source, and vendor only). It does not read config
+// content — DetectEnterprise does that. The enterprise parameter is unused and
+// kept only for call-site compatibility.
+func (d *MCPDetector) Detect(_ context.Context, userIdentity string, searchDirs []string, enterprise bool) []model.MCPConfig {
 	homeDir := getHomeDir(d.exec)
 	var results []model.MCPConfig
-
-	for _, spec := range mcpConfigDefinitions {
-		configPath := d.resolveConfigPath(spec, homeDir)
-
-		if !d.exec.FileExists(configPath) {
-			continue
-		}
-
+	for _, loc := range d.allConfigLocations(homeDir, searchDirs) {
 		results = append(results, model.MCPConfig{
-			ConfigSource: spec.SourceName,
-			ConfigPath:   configPath,
-			Vendor:       spec.Vendor,
+			ConfigSource: loc.SourceName,
+			ConfigPath:   loc.ConfigPath,
+			Vendor:       loc.Vendor,
 		})
 	}
-
-	// Discover project-level .mcp.json files from known project paths
-	for _, projectMCP := range d.discoverProjectMCPConfigs(homeDir) {
-		results = append(results, model.MCPConfig{
-			ConfigSource: projectMCP.SourceName,
-			ConfigPath:   projectMCP.ConfigPath,
-			Vendor:       projectMCP.Vendor,
-		})
-	}
-
 	return results
 }
 
 // DetectEnterprise returns enterprise-mode MCP configs with base64 content.
-func (d *MCPDetector) DetectEnterprise(_ context.Context) []model.MCPConfigEnterprise {
+func (d *MCPDetector) DetectEnterprise(_ context.Context, searchDirs []string) []model.MCPConfigEnterprise {
 	homeDir := getHomeDir(d.exec)
 	var results []model.MCPConfigEnterprise
 
-	for _, spec := range mcpConfigDefinitions {
-		configPath := d.resolveConfigPath(spec, homeDir)
-
-		if !d.exec.FileExists(configPath) {
-			continue
-		}
-
-		content, err := d.exec.ReadFile(configPath)
+	for _, loc := range d.allConfigLocations(homeDir, searchDirs) {
+		content, err := d.exec.ReadFile(loc.ConfigPath)
 		if err != nil || len(content) == 0 {
 			continue
 		}
@@ -93,34 +99,14 @@ func (d *MCPDetector) DetectEnterprise(_ context.Context) []model.MCPConfigEnter
 		// If filtering fails (non-JSON, parse error, etc.), omit content
 		// to avoid leaking secrets like env vars and auth headers.
 		var contentBase64 string
-		if filtered, ok := d.filterMCPContent(spec.SourceName, configPath, content); ok {
+		if filtered, ok := d.filterMCPContent(loc.SourceName, loc.ConfigPath, content); ok {
 			contentBase64 = base64.StdEncoding.EncodeToString(filtered)
 		}
 
 		results = append(results, model.MCPConfigEnterprise{
-			ConfigSource:        spec.SourceName,
-			ConfigPath:          configPath,
-			Vendor:              spec.Vendor,
-			ConfigContentBase64: contentBase64,
-		})
-	}
-
-	// Discover project-level .mcp.json files from known project paths
-	for _, projectMCP := range d.discoverProjectMCPConfigs(homeDir) {
-		content, err := d.exec.ReadFile(projectMCP.ConfigPath)
-		if err != nil || len(content) == 0 {
-			continue
-		}
-
-		var contentBase64 string
-		if filtered, ok := d.filterMCPContent(projectMCP.SourceName, projectMCP.ConfigPath, content); ok {
-			contentBase64 = base64.StdEncoding.EncodeToString(filtered)
-		}
-
-		results = append(results, model.MCPConfigEnterprise{
-			ConfigSource:        projectMCP.SourceName,
-			ConfigPath:          projectMCP.ConfigPath,
-			Vendor:              projectMCP.Vendor,
+			ConfigSource:        loc.SourceName,
+			ConfigPath:          loc.ConfigPath,
+			Vendor:              loc.Vendor,
 			ConfigContentBase64: contentBase64,
 		})
 	}
@@ -128,27 +114,14 @@ func (d *MCPDetector) DetectEnterprise(_ context.Context) []model.MCPConfigEnter
 	return results
 }
 
-// discoverProjectMCPConfigs finds project-level .mcp.json files by reading project paths
-// from ~/.claude.json's "projects" section.
-func (d *MCPDetector) discoverProjectMCPConfigs(homeDir string) []mcpConfigSpec {
-	claudeJSONPath := expandTilde("~/.claude.json", homeDir)
-
-	content, err := d.exec.ReadFile(claudeJSONPath)
-	if err != nil || len(content) == 0 {
-		return nil
-	}
-
-	var parsed struct {
-		Projects map[string]json.RawMessage `json:"projects"`
-	}
-	if err := json.Unmarshal(content, &parsed); err != nil || len(parsed.Projects) == 0 {
-		return nil
-	}
-
+// discoverProjectMCPConfigs finds project-level .mcp.json files in the roots
+// from Claude Code's project registry (~/.claude.json). Project-root discovery
+// is shared with the skills detector via discoverClaudeProjects.
+func (d *MCPDetector) discoverProjectMCPConfigs() []mcpConfigSpec {
 	var specs []mcpConfigSpec
 	seen := make(map[string]bool)
 
-	for projectPath := range parsed.Projects {
+	for _, projectPath := range discoverClaudeProjects(d.exec) {
 		mcpPath := filepath.Join(projectPath, ".mcp.json")
 		if seen[mcpPath] {
 			continue
@@ -184,7 +157,7 @@ func (d *MCPDetector) resolveConfigPath(spec mcpConfigSpec, homeDir string) stri
 // Returns the filtered content and true on success, or nil and false if
 // filtering failed (to avoid leaking secrets from raw fallback).
 func (d *MCPDetector) filterMCPContent(sourceName, configPath string, content []byte) ([]byte, bool) {
-	if !strings.HasSuffix(configPath, ".json") {
+	if !strings.HasSuffix(configPath, ".json") && !strings.HasSuffix(configPath, ".jsonc") {
 		return nil, false // Non-JSON formats cannot be safely filtered
 	}
 
@@ -193,6 +166,19 @@ func (d *MCPDetector) filterMCPContent(sourceName, configPath string, content []
 	// Strip JSONC comments for Zed
 	if sourceName == "zed" {
 		jsonInput = stripJSONCComments(jsonInput)
+	}
+
+	// OpenCode accepts JSONC under either spelling, and its own documented
+	// examples carry trailing commas as well as comments. stripJSONCComments
+	// removes the comments but leaves the commas, which json.Unmarshal then
+	// rejects — dropping the content and losing the servers. hujson handles
+	// both, and is already this repo's front door for real-world JSONC.
+	if isOpenCodeConfigPath(configPath) {
+		standard, err := hujson.Standardize(jsonInput)
+		if err != nil {
+			return nil, false
+		}
+		jsonInput = standard
 	}
 
 	var raw map[string]json.RawMessage
@@ -212,7 +198,20 @@ func (d *MCPDetector) filterMCPContent(sourceName, configPath string, content []
 	return out, true
 }
 
-// extractMCPServers extracts mcpServers/context_servers/servers, keeping only command/args/serverUrl/url.
+// isOpenCodeConfigPath reports whether a path is an OpenCode config, in either
+// spelling. It tests the basename rather than the whole path on purpose: a
+// substring test would relabel an ordinary .mcp.json as OpenCode merely because
+// some ancestor directory is named "opencode" — a checkout of the tool itself,
+// say — while claiming nothing the basename does not already name.
+func isOpenCodeConfigPath(configPath string) bool {
+	switch strings.ToLower(filepath.Base(configPath)) {
+	case "opencode.json", "opencode.jsonc":
+		return true
+	}
+	return false
+}
+
+// extractMCPServers extracts mcpServers/context_servers/servers/mcp, keeping only command/args/serverUrl/url.
 // Also handles Claude Code's project-scoped mcpServers nested under projects → <path> → mcpServers.
 func (d *MCPDetector) extractMCPServers(raw map[string]json.RawMessage) map[string]any {
 	result := make(map[string]any)
@@ -232,6 +231,21 @@ func (d *MCPDetector) extractMCPServers(raw map[string]json.RawMessage) map[stri
 	if servers, ok := raw["servers"]; ok {
 		result["servers"] = filterServerFields(servers)
 		found = true
+	}
+	// Try mcp (OpenCode), entries tagged local or remote. The vendor's own key
+	// is preserved on the wire: this pipeline filters fields, it never rewrites
+	// another vendor's schema into mcpServers.
+	//
+	// Unlike the keys above, "mcp" is an ordinary enough word to show up as a
+	// scalar flag in a config that keeps its real servers elsewhere. Emitting a
+	// null for it would make the backend reject the whole document and drop the
+	// valid mcpServers sitting beside it, so a value that isn't a map of servers
+	// is skipped rather than emitted empty.
+	if servers, ok := raw["mcp"]; ok {
+		if filtered := filterServerFields(servers); filtered != nil {
+			result["mcp"] = filtered
+			found = true
+		}
 	}
 	// Try project-scoped mcpServers (Claude Code ~/.claude.json)
 	// Structure: { "projects": { "<path>": { "mcpServers": { ... } } } }
@@ -275,7 +289,12 @@ func filterProjectScopedMCPServers(projectsRaw json.RawMessage) map[string]any {
 	return filtered
 }
 
-// filterServerFields keeps only command, args, serverUrl, url from each server entry.
+// filterServerFields keeps only command, args, serverUrl, url from each server
+// entry. env and headers are dropped outright since those are the fields
+// vendors document for credentials. But command/args/url/serverUrl are
+// real-world credential locations too (a bearer token or API key in a query
+// string, an --api-key flag baked into args), so the kept values still pass
+// through redact.Value before being uploaded.
 func filterServerFields(serversRaw json.RawMessage) map[string]any {
 	var servers map[string]map[string]any
 	if err := json.Unmarshal(serversRaw, &servers); err != nil {
@@ -289,7 +308,7 @@ func filterServerFields(serversRaw json.RawMessage) map[string]any {
 		filtered := make(map[string]any)
 		for k, v := range serverConfig {
 			if allowedKeys[k] {
-				filtered[k] = v
+				filtered[k] = redact.Value(v)
 			}
 		}
 		result[name] = filtered

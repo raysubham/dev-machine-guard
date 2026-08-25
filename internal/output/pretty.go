@@ -58,6 +58,7 @@ func Pretty(w io.Writer, result *model.ScanResult, colorMode string) error {
 	fmt.Fprintf(w, "    %-24s %s%d%s\n", "IDEs & Desktop Apps", c.green, result.Summary.IDEInstallationsCount, c.reset)
 	fmt.Fprintf(w, "    %-24s %s%d%s\n", "IDE Extensions", c.green, result.Summary.IDEExtensionsCount, c.reset)
 	fmt.Fprintf(w, "    %-24s %s%d%s\n", "MCP Servers", c.green, result.Summary.MCPConfigsCount, c.reset)
+	fmt.Fprintf(w, "    %-24s %s%d%s\n", "Agent Skills", c.green, result.Summary.AgentSkillsCount, c.reset)
 	if len(result.NodePkgManagers) > 0 {
 		fmt.Fprintf(w, "    %-24s %s%d%s\n", "Node.js Projects", c.green, result.Summary.NodeProjectsCount, c.reset)
 	}
@@ -124,6 +125,29 @@ func Pretty(w io.Writer, result *model.ScanResult, colorMode string) error {
 	}
 	fmt.Fprintln(w)
 
+	// AGENT SKILLS
+	printSectionHeader(w, c, "AGENT SKILLS", result.Summary.AgentSkillsCount)
+	if result.AgentSkillScan == nil {
+		// Distinguish "scan didn't run" (feature gate off — nil scan info) from
+		// "scanned, found nothing" ("None detected" below).
+		fmt.Fprintf(w, "    %sNot scanned%s\n", c.dim, c.reset)
+	} else if len(result.AgentSkills) > 0 {
+		for _, s := range result.AgentSkills {
+			tag := ""
+			if s.ManagedBy != "" {
+				tag = " [" + s.ManagedBy + "]"
+			}
+			if n := len(s.SymlinkSources); n > 0 {
+				tag += fmt.Sprintf(" [+%d linked]", n)
+			}
+			fmt.Fprintf(w, "    %-24s %s%-18s %-11s %s%s%s\n",
+				truncate(s.SkillName, 24), c.dim, truncate(s.Source, 18), truncate(s.Agent, 11), s.Scope, tag, c.reset)
+		}
+	} else {
+		fmt.Fprintf(w, "    %sNone detected%s\n", c.dim, c.reset)
+	}
+	fmt.Fprintln(w)
+
 	// IDE EXTENSIONS
 	printSectionHeader(w, c, "IDE EXTENSIONS", result.Summary.IDEExtensionsCount)
 	if len(result.IDEExtensions) > 0 {
@@ -149,6 +173,9 @@ func Pretty(w io.Writer, result *model.ScanResult, colorMode string) error {
 		fmt.Fprintf(w, "    %sNone detected%s\n", c.dim, c.reset)
 	}
 	fmt.Fprintln(w)
+
+	// BROWSER EXTENSIONS
+	printBrowserExtensions(w, c, result)
 
 	// NODE.JS PACKAGE MANAGERS (only if npm scan was enabled)
 	if len(result.NodePkgManagers) > 0 {
@@ -281,7 +308,92 @@ func Pretty(w io.Writer, result *model.ScanResult, colorMode string) error {
 		printPipAuditSummary(w, c, result.PipAudit)
 	}
 
+	// PNPM CONFIG AUDIT (compact summary; deep view via --pnpmrc)
+	if result.PnpmAudit != nil {
+		printPnpmAuditSummary(w, c, result.PnpmAudit)
+	}
+
+	// BUN CONFIG AUDIT (compact summary; deep view via --bunfig)
+	if result.BunAudit != nil {
+		printBunAuditSummary(w, c, result.BunAudit)
+	}
+
+	// YARN CONFIG AUDIT (compact summary; deep view via --yarnrc)
+	if result.YarnAudit != nil {
+		printYarnAuditSummary(w, c, result.YarnAudit)
+	}
+
 	return nil
+}
+
+//nolint:errcheck // terminal output
+func printYarnAuditSummary(w io.Writer, c *colors, a *model.YarnAudit) {
+	fmt.Fprintf(w, "  %s%sYARN CONFIG AUDIT%s\n", c.purple, c.bold, c.reset)
+	if a.Available {
+		flavor := a.Flavor
+		if flavor == "" {
+			flavor = "unknown"
+		}
+		fmt.Fprintf(w, "    %syarn:%s %s (%s) @ %s\n", c.dim, c.reset, a.YarnVersion, flavor, a.YarnPath)
+	} else {
+		fmt.Fprintf(w, "    %syarn:%s not found in PATH\n", c.dim, c.reset)
+	}
+	existing := 0
+	classic, berry := 0, 0
+	for _, f := range a.Files {
+		if f.Exists {
+			existing++
+		}
+		switch f.Flavor {
+		case "berry":
+			berry++
+		case "classic":
+			classic++
+		}
+	}
+	fmt.Fprintf(w, "    %sfiles:%s %d discovered (%d classic / %d berry), %d present  (+%d .npmrc side-channel)\n",
+		c.dim, c.reset, len(a.Files), classic, berry, existing, len(a.NPMRCFiles))
+	fmt.Fprintf(w, "    %srun --yarnrc for the deep view%s\n", c.dim, c.reset)
+	fmt.Fprintln(w)
+}
+
+//nolint:errcheck // terminal output
+func printBunAuditSummary(w io.Writer, c *colors, a *model.BunAudit) {
+	fmt.Fprintf(w, "  %s%sBUN CONFIG AUDIT%s\n", c.purple, c.bold, c.reset)
+	if a.Available {
+		fmt.Fprintf(w, "    %sbun:%s %s @ %s\n", c.dim, c.reset, a.BunVersion, a.BunPath)
+	} else {
+		fmt.Fprintf(w, "    %sbun:%s not found in PATH\n", c.dim, c.reset)
+	}
+	existing := 0
+	for _, f := range a.Files {
+		if f.Exists {
+			existing++
+		}
+	}
+	fmt.Fprintf(w, "    %sfiles:%s %d bunfig.toml discovered, %d present  (+%d .npmrc side-channel)\n",
+		c.dim, c.reset, len(a.Files), existing, len(a.NPMRCFiles))
+	fmt.Fprintf(w, "    %srun --bunfig for the deep view%s\n", c.dim, c.reset)
+	fmt.Fprintln(w)
+}
+
+//nolint:errcheck // terminal output
+func printPnpmAuditSummary(w io.Writer, c *colors, a *model.PnpmAudit) {
+	fmt.Fprintf(w, "  %s%sPNPM CONFIG AUDIT%s\n", c.purple, c.bold, c.reset)
+	if a.Available {
+		fmt.Fprintf(w, "    %spnpm:%s %s @ %s\n", c.dim, c.reset, a.PnpmVersion, a.PnpmPath)
+	} else {
+		fmt.Fprintf(w, "    %spnpm:%s not found in PATH\n", c.dim, c.reset)
+	}
+	existing := 0
+	for _, f := range a.Files {
+		if f.Exists {
+			existing++
+		}
+	}
+	fmt.Fprintf(w, "    %sfiles:%s %d discovered, %d present\n", c.dim, c.reset, len(a.Files), existing)
+	fmt.Fprintf(w, "    %srun --pnpmrc for the deep view%s\n", c.dim, c.reset)
+	fmt.Fprintln(w)
 }
 
 //nolint:errcheck // terminal output
@@ -325,7 +437,59 @@ func printPipAuditSummary(w io.Writer, c *colors, a *model.PipAudit) {
 	fmt.Fprintln(w)
 }
 
+// printBrowserExtensions renders the inventory in three states: the phase not having
+// run, the phase having run and found nothing, and a list. The first two mean opposite
+// things and are easy to confuse.
+//
 //nolint:errcheck // terminal output
+func printBrowserExtensions(w io.Writer, c *colors, result *model.ScanResult) {
+	scan := result.BrowserExtensionScan
+	count := 0
+	if scan != nil {
+		count = len(scan.Findings)
+	}
+	printSectionHeader(w, c, "BROWSER EXTENSIONS", count)
+
+	switch {
+	case scan == nil:
+		fmt.Fprintf(w, "    %sNot scanned%s\n", c.dim, c.reset)
+	case count == 0:
+		fmt.Fprintf(w, "    %sNone detected%s\n", c.dim, c.reset)
+	default:
+		for _, f := range scan.Findings {
+			tag := ""
+			if f.EnabledState != model.BrowserExtEnabled {
+				tag = " [" + f.EnabledState
+				if f.DisabledBy != "" {
+					tag += " by " + f.DisabledBy
+				}
+				tag += "]"
+			}
+			if f.StoreListing == model.BrowserExtStoreListingDelisted {
+				tag += " [delisted]"
+			}
+			name := f.Name
+			if name == "" {
+				// A finding whose metadata could not be recovered still has an
+				// identity to look it up by.
+				name = f.ExtensionID
+			}
+			fmt.Fprintf(w, "    %-30s %s%-10s %-12s %s%s%s\n",
+				truncate(name, 30), c.dim, truncate(f.BrowserID, 10),
+				truncate(f.InstallSource, 12), truncate(f.Version, 12), tag, c.reset)
+		}
+	}
+	// A browser that could not be read is why a list is shorter than expected.
+	if scan != nil {
+		for _, b := range scan.Browsers {
+			if b.Status == model.BrowserCoverageFailed || b.Status == model.BrowserCoveragePartial {
+				fmt.Fprintf(w, "    %s%s: %s (%s)%s\n", c.dim, b.BrowserID, b.Status, b.ReasonCode, c.reset)
+			}
+		}
+	}
+	fmt.Fprintln(w)
+}
+
 func printSectionHeader(w io.Writer, c *colors, title string, count int) {
 	padding := 35 - len(title)
 	if padding < 1 {

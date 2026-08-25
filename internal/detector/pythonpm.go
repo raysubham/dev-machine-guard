@@ -7,8 +7,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/step-security/dev-machine-guard/internal/execguard"
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
+	"github.com/step-security/dev-machine-guard/internal/progress"
+	"github.com/step-security/dev-machine-guard/internal/versionmeta"
 )
 
 var pythonPackageManagers = []pmSpec{
@@ -24,10 +27,20 @@ var pythonPackageManagers = []pmSpec{
 // PythonPMDetector detects installed Python package managers.
 type PythonPMDetector struct {
 	exec executor.Executor
+	log  *progress.Logger
 }
 
 func NewPythonPMDetector(exec executor.Executor) *PythonPMDetector {
-	return &PythonPMDetector{exec: exec}
+	return &PythonPMDetector{exec: exec, log: progress.NewNoop()}
+}
+
+// WithLogger injects a logger (used to surface exec fallbacks when metadata
+// version resolution misses). Chainable, mirrors configaudit's WithSkipper.
+func (d *PythonPMDetector) WithLogger(log *progress.Logger) *PythonPMDetector {
+	if log != nil {
+		d.log = log
+	}
+	return d
 }
 
 func (d *PythonPMDetector) DetectManagers(ctx context.Context) []model.PkgManager {
@@ -45,11 +58,22 @@ func (d *PythonPMDetector) DetectManagers(ctx context.Context) []model.PkgManage
 		}
 
 		version := "unknown"
-		stdout, _, _, err := d.exec.RunWithTimeout(ctx, 10*time.Second, pm.Binary, pm.VersionCmd)
-		if err == nil {
-			v := parsePythonVersion(pm.Name, stdout)
-			if v != "" {
-				version = v
+		// Static-first, exec-last (AGENTS.md §3.4): Homebrew/pipx-style
+		// layouts carry the version in the install path.
+		if v := versionmeta.FromBinary(ctx, d.exec, path); v != "" {
+			version = v
+		} else if !execguard.SafeToExec(ctx, d.exec, path) {
+			d.log.Warn("skipping %s version probe: quarantined and rejected by Gatekeeper", path)
+		} else {
+			// Run the exact absolute path the guard assessed, not the bare
+			// name — a PATH re-resolution at exec time could pick a
+			// different (unassessed) binary.
+			d.log.Progress("exec fallback: running %s %s (no metadata version source)", path, pm.VersionCmd)
+			stdout, _, _, err := d.exec.RunWithTimeout(ctx, 10*time.Second, path, pm.VersionCmd)
+			if err == nil {
+				if v := parsePythonVersion(pm.Name, stdout); v != "" {
+					version = v
+				}
 			}
 		}
 

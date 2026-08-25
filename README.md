@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <b>Scan your dev machine for AI agents, MCP servers, IDE extensions, and suspicious packages — in seconds.</b>
+  <b>Scan your dev machine for AI agents, MCP servers, IDE extensions, suspicious files, and risky package-manager configs — in seconds.</b>
 </p>
 
 ## Why Dev Machine Guard?
@@ -38,6 +38,8 @@ Developer machines are the new attack surface. They hold high-value assets — G
 | AI agent & tool inventory   |           |        Yes        |
 | MCP server config audit     |           |        Yes        |
 | Package scanning (Node.js, Homebrew, Python, system) |  |  Yes  |
+| Package-manager config audit (registry, cooldown, auth) |  |  Yes  |
+| Suspicious file / IOC detection |       |        Yes        |
 | Cross-platform (macOS, Windows, Linux) | Yes | Yes        |
 | Device posture & compliance |    Yes    |                   |
 | Malware / virus detection   |    Yes    |                   |
@@ -50,9 +52,13 @@ Developer machines are the new attack surface. They hold high-value assets — G
 
 ## Quick Start
 
-### Install from release (recommended)
+The steps below install the binary directly and are intended for **community users** evaluating Dev Machine Guard on a single machine.
 
-Download the latest binary for your platform from [GitHub Releases](https://github.com/step-security/dev-machine-guard/releases). Release asset filenames include the version, so the snippets below resolve the latest tag first.
+**Enterprise customers should not install the binary manually.** Deploy Dev Machine Guard across your fleet using the loader script through your MDM or EDR tooling. See the [Installation Script documentation](https://docs.stepsecurity.io/developer-machines/installation-script) for the supported, auto-updating deployment flow.
+
+### Install from release (community)
+
+Download the latest binary for your platform from [GitHub Releases](https://github.com/step-security/dev-machine-guard/releases). Release asset filenames embed the version (for example, `stepsecurity-dev-machine-guard-1.16.0-darwin`), so the snippets below resolve the latest tag first rather than hardcoding a version.
 
 **macOS** (universal binary — Apple Silicon and Intel)
 
@@ -60,15 +66,19 @@ Download the latest binary for your platform from [GitHub Releases](https://gith
 VERSION=$(curl -fsSL https://api.github.com/repos/step-security/dev-machine-guard/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')
 curl -fsSL "https://github.com/step-security/dev-machine-guard/releases/download/v${VERSION}/stepsecurity-dev-machine-guard-${VERSION}-darwin" -o stepsecurity-dev-machine-guard
 chmod +x stepsecurity-dev-machine-guard
+
+# Run the scan
 ./stepsecurity-dev-machine-guard
 ```
 
-**Windows** (PowerShell — signed build)
+**Windows** (PowerShell)
 
 ```powershell
 $version = (Invoke-RestMethod https://api.github.com/repos/step-security/dev-machine-guard/releases/latest).tag_name.TrimStart('v')
 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
-Invoke-WebRequest -Uri "https://github.com/step-security/dev-machine-guard/releases/download/v$version/stepsecurity-dev-machine-guard-$version-windows_${arch}_signed.exe" -OutFile "stepsecurity-dev-machine-guard.exe"
+Invoke-WebRequest -Uri "https://github.com/step-security/dev-machine-guard/releases/download/v$version/stepsecurity-dev-machine-guard-$version-windows_$arch.exe" -OutFile "stepsecurity-dev-machine-guard.exe"
+
+# Run the scan
 .\stepsecurity-dev-machine-guard.exe
 ```
 
@@ -79,6 +89,8 @@ VERSION=$(curl -fsSL https://api.github.com/repos/step-security/dev-machine-guar
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 curl -fsSL "https://github.com/step-security/dev-machine-guard/releases/download/v${VERSION}/stepsecurity-dev-machine-guard-${VERSION}-linux_${ARCH}" -o stepsecurity-dev-machine-guard
 chmod +x stepsecurity-dev-machine-guard
+
+# Run the scan
 ./stepsecurity-dev-machine-guard
 ```
 
@@ -93,7 +105,7 @@ make build
 ./stepsecurity-dev-machine-guard
 ```
 
-Requires Go 1.24+. The binary has zero external dependencies.
+Requires Go 1.26+. The binary has zero external dependencies.
 
 ## Usage
 
@@ -134,6 +146,7 @@ stepsecurity-dev-machine-guard [COMMAND] [OPTIONS]
 | `--include-bundled-plugins`  | Include bundled/platform IDE plugins in output                |
 | `--log-level=LEVEL`          | Log level: `error` \| `warn` \| `info` \| `debug`             |
 | `--verbose`                  | Shortcut for `--log-level=debug`                              |
+| `--force-scan`               | Bypass the server-driven run gate and scan now (enterprise)   |
 | `--color=WHEN`               | Color mode: `auto` \| `always` \| `never` (default: `auto`)   |
 | `-v`, `--version`            | Show version                                                  |
 | `-h`, `--help`               | Show help                                                     |
@@ -183,6 +196,10 @@ count=$(./stepsecurity-dev-machine-guard --json | jq '.summary.mcp_configs_count
 
 # Enterprise: one-time telemetry upload
 ./stepsecurity-dev-machine-guard send-telemetry
+
+# Enterprise: scan even when the dashboard-managed scan cadence says "not due"
+# (equivalent env var: STEPSEC_FORCE_SCAN=1; disable gating: STEPSEC_DISABLE_RUN_GATE=1)
+./stepsecurity-dev-machine-guard send-telemetry --force-scan
 
 # Enterprise: remove scheduled scanning
 ./stepsecurity-dev-machine-guard uninstall
@@ -266,15 +283,38 @@ See [SCAN_COVERAGE.md](SCAN_COVERAGE.md) for the full catalog of supported detec
 | Category             | Examples                                                                                 |
 | -------------------- | ---------------------------------------------------------------------------------------- |
 | IDEs & Desktop Apps  | VS Code, Cursor, Windsurf, Antigravity, Zed, Claude, Copilot, JetBrains suite (13 IDEs), Eclipse, Android Studio |
-| AI CLI Tools         | Claude Code, Codex, Gemini CLI, Kiro, GitHub Copilot CLI, Aider, OpenCode, Cursor Agent  |
+| AI CLI Tools         | Claude Code, Codex, Gemini CLI, Kiro, GitHub Copilot CLI, Aider, OpenCode, Cursor Agent, Pi, Factory Droid, Amp |
 | AI Agents            | Claude Cowork, OpenClaw, ClawdBot, GPT-Engineer                                          |
 | AI Frameworks        | Ollama, LM Studio, LocalAI, Text Generation WebUI                                        |
-| MCP Server Configs   | Claude Desktop, Claude Code, Cursor, Windsurf, Antigravity, Zed, Open Interpreter, Codex |
+| MCP Server Configs   | Claude Desktop, Claude Code, Cursor, Windsurf, Antigravity, Zed, Open Interpreter, Codex, OpenCode |
 | IDE Extensions       | VS Code, Cursor, Windsurf, Antigravity, JetBrains, Eclipse, Xcode, Android Studio        |
+| Browser Extensions   | Google Chrome, Microsoft Edge, Mozilla Firefox                                           |
 | Node.js Packages     | npm, yarn, pnpm, bun (opt-in)                                                            |
 | Homebrew Packages    | Formulae and casks with rich metadata (opt-in)                                            |
 | Python Packages      | pip, poetry, pipenv, uv, conda, rye (opt-in)                                             |
 | System Packages      | rpm, dpkg, pacman, apk, snap, flatpak (Linux)                                            |
+| Package Configs      | npm (`.npmrc`), pnpm, bun (`bunfig.toml`), yarn classic & berry (`.yarnrc`/`.yarnrc.yml`), pip (`pip.conf`) — effective registry, cooldown policy, and auth surface across every scope |
+| Suspicious Files     | Malicious-file IOCs from StepSecurity-maintained rules — e.g. `binding.gyp` that runs during `npm install`, and editor/AI-tool config files that auto-execute on project open |
+
+## Package Configs & Suspicious Files
+
+Beyond inventorying *what* is installed, Dev Machine Guard inspects *how* each machine is configured to pull packages, and *whether* any files associated with known attacks are present.
+
+### Package-manager config auditing
+
+Compromised packages most often reach a machine because that machine resolves directly from a public registry with no cooldown window against freshly published versions. Dev Machine Guard audits the package-manager configuration on each machine across every scope (project, user, and global) and resolves three things per package manager:
+
+- **Effective registry** — the registry packages actually resolve from, accounting for configuration precedence, so you can confirm machines route through StepSecurity Secure Registry or an internal artifact manager rather than straight to the public registry.
+- **Cooldown policy** — whether a cooldown window against newly published packages is in effect.
+- **Authentication surface** — what credentials are configured against the registry.
+
+Configuration is read from `.npmrc` (npm), pnpm config, `bunfig.toml` (bun), `.yarnrc` / `.yarnrc.yml` (yarn classic and berry), and `pip.conf` (pip). In enterprise mode this rolls up into the **Package Configs** view in the dashboard, where you can spot machines that are unprotected or pointed at the wrong registry.
+
+### Suspicious file detection
+
+Some supply chain attacks plant files that trigger code execution outside the package lifecycle scripts most tools watch — for example a malicious `binding.gyp` that runs during `npm install`, or an editor configuration file that runs when a project is opened. Dev Machine Guard ships a rules-engine scanner that flags these files as IOCs and wires the results into scan telemetry. The detector streams one file at a time, so scan memory stays bounded regardless of repository size.
+
+The detection rules are authored and maintained by StepSecurity, so the feature works out of the box with nothing to configure. As new attack techniques are identified, the rule set is updated centrally and your machines are evaluated against the new rules automatically. In enterprise mode, flagged files surface in the **Suspicious Files** view with a confidence level and attribution to the associated attack campaign.
 
 ## Output Formats
 
@@ -294,7 +334,7 @@ See [SCAN_COVERAGE.md](SCAN_COVERAGE.md) for the full catalog of supported detec
 ./stepsecurity-dev-machine-guard --json
 ```
 
-See [examples/sample-output.json](examples/sample-output.json) for the full schema, or [Reading Scan Results](docs/reading-scan-results.md) for the schema reference.
+See [examples/sample-output.json](examples/sample-output.json) for the full schema, or [Reading Scan Results](docs/reading-scan-results.md) for the schema reference. Recent scans also emit package-manager configuration inventory and `pnpm_audit` / `bun_audit` / `yarn_audit` results on the wire payload.
 
 ### HTML Report
 
@@ -316,6 +356,8 @@ See [examples/sample-output.json](examples/sample-output.json) for the full sche
 | Pretty / JSON / HTML output   |       Yes        |    Yes     |
 | Package scanning (Node.js, Homebrew, Python) | Opt-in | Default on |
 | System package scanning (Linux) |    Yes     |    Yes     |
+| Package-manager config auditing |    Yes     |    Yes     |
+| Suspicious file detection     |       Yes        |    Yes     |
 | Interactive configuration     |       Yes        |    Yes     |
 | Centralized dashboard         |                  |    Yes     |
 | Policy enforcement & alerting |                  |    Yes     |
@@ -354,8 +396,11 @@ Dev Machine Guard is a single compiled binary that scans your developer environm
 
 - Installed IDEs, AI tools, and their versions
 - IDE extension/plugin names, publishers, and versions (VS Code, Cursor, Windsurf, Antigravity, JetBrains, Eclipse, Xcode, Android Studio)
+- Browser extension records read from the browsers' own state files (Chrome, Edge, Firefox): identity, enabled state, install source, and the permissions the browser currently honours. Browsing history, cookies, saved passwords, and page content are never opened
 - MCP server configuration (server names and commands only)
 - Node.js, Homebrew, Python, and system package listings (opt-in)
+- Package-manager configuration: effective registry, cooldown policy, and authentication surface across every scope (`.npmrc`, pnpm config, `bunfig.toml`, `.yarnrc`/`.yarnrc.yml`, `pip.conf`)
+- Suspicious files flagged by StepSecurity-maintained malicious-file rules (path and matched rule only — file contents are not collected)
 
 Detection uses platform-specific methods: `/Applications/` and `Info.plist` on macOS, `%LOCALAPPDATA%`/`%PROGRAMFILES%` and Windows Registry on Windows, `/opt`/`/usr/share`/`.desktop` files on Linux, and `$PATH` lookups on all platforms.
 
@@ -428,6 +473,8 @@ Dev Machine Guard fills the gap by inventorying what is actually running in your
 - **Package scanning** (Node.js, Homebrew, Python) is opt-in in community mode and results are basic (package manager detection and package/project lists). Full dependency tree analysis is available in enterprise mode.
 - **MCP config auditing** shows which tools have MCP configs (source, vendor, and config path) but does not display config file contents in community mode. Enterprise mode sends filtered config data (server names and commands only, no secrets) to the dashboard.
 - **System package scanning** (rpm, dpkg, pacman, apk, snap, flatpak) is Linux-only.
+- **Package-manager config auditing** reports the effective registry, cooldown status, and authentication surface from configuration files; it reflects configuration as written and does not intercept package installs at runtime.
+- **Suspicious file detection** flags files that match StepSecurity-maintained rules and records the path and matched rule. It does not collect or transmit file contents. Confidence levels and attack-campaign attribution surface in the enterprise dashboard.
 
 ## Roadmap
 
@@ -454,6 +501,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [Changelog](CHANGELOG.md)
 - [Scan Coverage](SCAN_COVERAGE.md) — full catalog of detections
 - [Release Process](docs/release-process.md) — how releases are signed and verified
+- [Deploying via SCCM](docs/deploying-via-sccm.md) — Windows fleet rollout via Microsoft Configuration Manager (signed MSI, no PowerShell)
+- [macOS TCC Permissions](docs/macos-tcc-permissions.md) — how the agent handles Documents/Downloads/Mail TCC dirs, PPPC profile for MDM-pushed Full Disk Access, and the `include_tcc_protected` config field
 - [Versioning](VERSIONING.md) — why the version starts at 1.8.1
 - [Security Policy](SECURITY.md) — reporting vulnerabilities
 - [Code of Conduct](CODE_OF_CONDUCT.md)

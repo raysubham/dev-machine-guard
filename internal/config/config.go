@@ -11,45 +11,152 @@ import (
 
 // Default placeholders (replaced by backend for enterprise installation scripts).
 var (
-	CustomerID         = "{{CUSTOMER_ID}}"
-	APIEndpoint        = "{{API_ENDPOINT}}"
-	APIKey             = "{{API_KEY}}"
-	ScanFrequencyHours = "{{SCAN_FREQUENCY_HOURS}}"
-	SearchDirs         []string
-	EnableNPMScan      *bool  // nil=auto
-	EnableBrewScan     *bool  // nil=auto
-	EnablePythonScan   *bool  // nil=auto
-	ColorMode          string // "" means auto
-	OutputFormat       string // "" means default (pretty)
-	HTMLOutputFile     string // "" means not set
-	LogLevel           string // "" means default (info); one of error/warn/info/debug
+	CustomerID          = "{{CUSTOMER_ID}}"
+	APIEndpoint         = "{{API_ENDPOINT}}"
+	APIKey              = "{{API_KEY}}" //#nosec G101 -- build-time placeholder substituted by the backend installer; the literal is not a real credential.
+	ScanFrequencyHours  = "{{SCAN_FREQUENCY_HOURS}}"
+	SearchDirs          []string
+	EnableNPMScan       *bool  // nil=auto
+	EnableBrewScan      *bool  // nil=auto
+	EnablePythonScan    *bool  // nil=auto
+	IncludeTCCProtected *bool  // nil or false = skip macOS TCC-protected dirs (default); true = walk them. The scan as a whole runs in both cases; only reads inside the TCC-protected subtrees themselves (Documents, Mail, etc.) need the agent to have Full Disk Access (PPPC or manual grant) — without that, those walks return EACCES per entry while the rest of the scan completes normally. See docs/macos-tcc-permissions.md.
+	ColorMode           string // "" means auto
+	OutputFormat        string // "" means default (pretty)
+	HTMLOutputFile      string // "" means not set
+	LogLevel            string // "" means default (info); one of error/warn/info/debug
+	InstallDir          string // "" means default (~/.stepsecurity); non-empty makes the agent put all its files (logs, hook errors, future state) under this directory. Bootstrap config.json itself stays at the legacy location. Per-run opt-out is the CLI flag --install-dir=. Resolution: --install-dir flag > STEPSECURITY_HOME env > this field > default — see internal/paths.
+	// UseLegacyPackageScan, when true, disables the scan-state delta-upload
+	// optimization for npm and Python project scans — every run re-uploads
+	// the full snapshot as in pre-1.13 agents.
+	//
+	// Defaults to true: the delta protocol is gated OFF until the agent-api
+	// side ships. Set use_legacy_package_scan=false in config.json (or
+	// STEPSEC_ENABLE_SCAN_STATE=1) to opt back in. STEPSEC_DISABLE_SCAN_STATE=1
+	// always forces legacy.
+	UseLegacyPackageScan = true
+
+	// UseLegacyNodeScan, when true, reverts Node.js package discovery to the
+	// command-based path (`npm ls` / `yarn list` / `pnpm ls` / `bun pm ls`,
+	// shipped as raw output for the backend to parse). Defaults to false: Node
+	// packages are read from on-disk lockfiles (and node_modules as a fallback)
+	// with no package-manager subprocess. Set use_legacy_node_scan=true in
+	// config.json (or --legacy-node-scan) to opt back into the command path.
+	//
+	// Independent of UseLegacyPackageScan above (which gates the delta-upload
+	// optimization, not the disk-vs-command source).
+	UseLegacyNodeScan = false
+
+	// UseLegacyPythonScan, when true, reverts Python package discovery to the
+	// command-based path (`pip list` per venv and `pip3`/`conda`/`uv list`
+	// for globals). Defaults to false: Python packages are read from on-disk
+	// install metadata (*.dist-info/METADATA, *.egg-info/PKG-INFO) with no
+	// package-manager subprocess. Set use_legacy_python_scan=true in
+	// config.json (or --legacy-python-scan) to opt back into the pip path.
+	UseLegacyPythonScan = false
 )
+
+// MaxExecutionDuration is the whole-process execution-watchdog limit
+// (STEPSEC_MAX_EXECUTION_DURATION). Persisted into config.json at install time
+// so scheduler-fired runs (launchd/systemd/schtasks) — which invoke the binary
+// directly and never inherit the loader-exported env var — resolve the same
+// value the loader configured. "" means fall back to the binary's built-in
+// default (4h). Declared in its own var block (not the placeholder group
+// above) because it carries no build-time {{...}} placeholder. See
+// telemetry.ExecutionDeadline.
+var MaxExecutionDuration string
 
 // ConfigFile is the JSON structure persisted to ~/.stepsecurity/config.json.
 type ConfigFile struct {
-	CustomerID         string   `json:"customer_id,omitempty"`
-	APIEndpoint        string   `json:"api_endpoint,omitempty"`
-	APIKey             string   `json:"api_key,omitempty"`
-	ScanFrequencyHours string   `json:"scan_frequency_hours,omitempty"`
-	SearchDirs         []string `json:"search_dirs,omitempty"`
-	EnableNPMScan      *bool    `json:"enable_npm_scan,omitempty"`
-	EnableBrewScan     *bool    `json:"enable_brew_scan,omitempty"`
-	EnablePythonScan   *bool    `json:"enable_python_scan,omitempty"`
-	ColorMode          string   `json:"color_mode,omitempty"`
-	OutputFormat       string   `json:"output_format,omitempty"`
-	HTMLOutputFile     string   `json:"html_output_file,omitempty"`
-	LogLevel           string   `json:"log_level,omitempty"`
+	CustomerID           string   `json:"customer_id,omitempty"`
+	APIEndpoint          string   `json:"api_endpoint,omitempty"`
+	APIKey               string   `json:"api_key,omitempty"`
+	ScanFrequencyHours   string   `json:"scan_frequency_hours,omitempty"`
+	SearchDirs           []string `json:"search_dirs,omitempty"`
+	EnableNPMScan        *bool    `json:"enable_npm_scan,omitempty"`
+	EnableBrewScan       *bool    `json:"enable_brew_scan,omitempty"`
+	EnablePythonScan     *bool    `json:"enable_python_scan,omitempty"`
+	IncludeTCCProtected  *bool    `json:"include_tcc_protected,omitempty"`
+	ColorMode            string   `json:"color_mode,omitempty"`
+	OutputFormat         string   `json:"output_format,omitempty"`
+	HTMLOutputFile       string   `json:"html_output_file,omitempty"`
+	LogLevel             string   `json:"log_level,omitempty"`
+	InstallDir           string   `json:"install_dir,omitempty"`
+	MaxExecutionDuration string   `json:"max_execution_duration,omitempty"`
+	UseLegacyPackageScan *bool    `json:"use_legacy_package_scan,omitempty"`
+	UseLegacyNodeScan    *bool    `json:"use_legacy_node_scan,omitempty"`
+	UseLegacyPythonScan  *bool    `json:"use_legacy_python_scan,omitempty"`
 }
 
-// configDir returns ~/.stepsecurity.
-func configDir() string {
+// userConfigDir returns ~/.stepsecurity — the per-user config location.
+// Used by community installs and by enterprise installs done via a
+// developer's own login (not via MSI/SCCM).
+func userConfigDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".stepsecurity")
 }
 
-// ConfigFilePath returns the path to the config file.
+// machineConfigDir returns the machine-wide config dir on Windows (and ""
+// elsewhere). Defined in config_windows.go / config_other.go.
+//
+// On Windows, MSI custom actions run as SYSTEM and the scheduled task runs
+// as the logged-in user — the two never share a $HOME, so config has to
+// live somewhere both can read. C:\ProgramData is that place.
+
+// readConfigDir returns the directory we should READ config from.
+// Prefers machine-wide if a config exists there (so an MSI-deployed install
+// is visible even when the scanner runs as an unprivileged user).
+func readConfigDir() string {
+	if mcd := machineConfigDir(); mcd != "" {
+		if _, err := os.Stat(filepath.Join(mcd, "config.json")); err == nil {
+			return mcd
+		}
+	}
+	return userConfigDir()
+}
+
+// writeConfigDir returns the directory we should WRITE config to.
+// Elevated/admin/SYSTEM context → machine-wide (Windows only). Otherwise
+// per-user. This is what makes `configure` invoked from an MSI custom
+// action put the config where the scheduled task can later read it.
+func writeConfigDir() string {
+	if isElevated() {
+		if mcd := machineConfigDir(); mcd != "" {
+			return mcd
+		}
+	}
+	return userConfigDir()
+}
+
+// ConfigFilePath returns the path to the config file (read-preferred).
 func ConfigFilePath() string {
-	return filepath.Join(configDir(), "config.json")
+	return filepath.Join(readConfigDir(), "config.json")
+}
+
+// WriteConfigFilePath returns the path config would be written to under
+// the current process's privilege level. Surfaced so `configure show` /
+// install messages can name the exact file the next save will touch.
+func WriteConfigFilePath() string {
+	return filepath.Join(writeConfigDir(), "config.json")
+}
+
+// LegacyDirName is the basename of the per-user agent directory under
+// $HOME. config.json always lives here so the agent can bootstrap;
+// other files (logs, hook errors, the binary) may be relocated via the
+// resolved install dir — see internal/paths.
+const LegacyDirName = ".stepsecurity"
+
+// LegacyDir returns the per-user agent directory (~/.stepsecurity), used
+// as the reference point for the install-dir migration warning in main:
+// if the operator has moved the install dir but this directory still
+// holds diagnostic files, the agent surfaces a heads-up. Returns "" when
+// $HOME can't be resolved.
+//
+// Distinct from ConfigFilePath / WriteConfigFilePath above: those follow
+// the machine-vs-user resolution that lets MSI-deployed installs share
+// config with a scheduled task running as a logged-in user. LegacyDir is
+// always per-user, regardless of elevation.
+func LegacyDir() string {
+	return userConfigDir()
 }
 
 // Load reads the config file and applies values to the package-level variables.
@@ -69,7 +176,7 @@ func Load() {
 		CustomerID = cfg.CustomerID
 	}
 	if cfg.APIEndpoint != "" && isPlaceholder(APIEndpoint) {
-		APIEndpoint = cfg.APIEndpoint
+		APIEndpoint = NormalizeAPIEndpoint(cfg.APIEndpoint)
 	}
 	if cfg.APIKey != "" && isPlaceholder(APIKey) {
 		APIKey = cfg.APIKey
@@ -89,6 +196,9 @@ func Load() {
 	if cfg.EnablePythonScan != nil && EnablePythonScan == nil {
 		EnablePythonScan = cfg.EnablePythonScan
 	}
+	if cfg.IncludeTCCProtected != nil && IncludeTCCProtected == nil {
+		IncludeTCCProtected = cfg.IncludeTCCProtected
+	}
 	if cfg.ColorMode != "" && ColorMode == "" {
 		ColorMode = cfg.ColorMode
 	}
@@ -100,6 +210,21 @@ func Load() {
 	}
 	if cfg.LogLevel != "" && LogLevel == "" {
 		LogLevel = cfg.LogLevel
+	}
+	if cfg.InstallDir != "" && InstallDir == "" {
+		InstallDir = cfg.InstallDir
+	}
+	if cfg.MaxExecutionDuration != "" && MaxExecutionDuration == "" {
+		MaxExecutionDuration = cfg.MaxExecutionDuration
+	}
+	if cfg.UseLegacyPackageScan != nil {
+		UseLegacyPackageScan = *cfg.UseLegacyPackageScan
+	}
+	if cfg.UseLegacyNodeScan != nil {
+		UseLegacyNodeScan = *cfg.UseLegacyNodeScan
+	}
+	if cfg.UseLegacyPythonScan != nil {
+		UseLegacyPythonScan = *cfg.UseLegacyPythonScan
 	}
 }
 
@@ -125,6 +250,10 @@ func RunConfigure() error {
 	existing.APIEndpoint = promptValue(reader, "API Endpoint", existing.APIEndpoint)
 	existing.APIKey = promptSecret(reader, "API Key", existing.APIKey)
 	existing.ScanFrequencyHours = promptValue(reader, "Scan Frequency (hours)", existing.ScanFrequencyHours)
+	// Whole-process execution watchdog. A Go duration string ("2h", "30m"),
+	// "off"/"0" to disable, or blank for the built-in 4h default. See
+	// telemetry.ExecutionDeadline.
+	existing.MaxExecutionDuration = promptValue(reader, "Max Execution Duration (e.g. 2h, 30m; 'off' to disable; blank = default 4h)", existing.MaxExecutionDuration)
 
 	// Search dirs
 	currentDirs := ""
@@ -208,6 +337,23 @@ func RunConfigure() error {
 		existing.EnablePythonScan = nil
 	}
 
+	// Include macOS TCC-protected dirs (Documents, Downloads, ~/Library/Mail,
+	// …). Default is to skip them so the agent never triggers permission
+	// prompts; opt in only after granting Full Disk Access (PPPC profile or
+	// System Settings). See docs/macos-tcc-permissions.md. Stored only when
+	// enabled — anything but "true" clears it back to the default skip.
+	currentTCC := "false"
+	if existing.IncludeTCCProtected != nil && *existing.IncludeTCCProtected {
+		currentTCC = "true"
+	}
+	tccInput := promptValue(reader, "Scan macOS TCC-protected dirs — Documents, Downloads, … (true/false)", currentTCC)
+	if strings.EqualFold(strings.TrimSpace(tccInput), "true") {
+		v := true
+		existing.IncludeTCCProtected = &v
+	} else {
+		existing.IncludeTCCProtected = nil
+	}
+
 	// Color mode
 	currentColor := existing.ColorMode
 	if currentColor == "" {
@@ -254,6 +400,15 @@ func RunConfigure() error {
 	default:
 		existing.LogLevel = "info"
 	}
+
+	// Install directory override (empty = ~/.stepsecurity). All
+	// non-bootstrap files live under this directory: agent.log,
+	// agent.error.log (+ .prev rotation), ai-agent-hook-errors.jsonl,
+	// and the binary itself when placed via the loader script.
+	// Bootstrap config.json keeps living at the legacy ~/.stepsecurity
+	// path so the agent can always find it. To temporarily override
+	// for one run, pass --install-dir=PATH or set $STEPSECURITY_HOME.
+	existing.InstallDir = promptValue(reader, "Install Directory (blank = default)", existing.InstallDir)
 
 	// Save
 	if err := save(existing); err != nil {
@@ -317,9 +472,36 @@ func loadExisting() *ConfigFile {
 	return &cfg
 }
 
+// NormalizeAPIEndpoint strips trailing slashes and surrounding whitespace
+// from an API endpoint URL. Every callsite in the agent composes URLs as
+// fmt.Sprintf("%s/v1/...", APIEndpoint, ...) — a trailing slash on the
+// configured value would compose to "//v1/..." and some gateways respond
+// with 403/500 instead of normalizing. Normalising once at the config
+// boundary keeps every consumer simple.
+func NormalizeAPIEndpoint(s string) string {
+	return strings.TrimRight(strings.TrimSpace(s), "/")
+}
+
 func save(cfg *ConfigFile) error {
-	dir := configDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	cfg.APIEndpoint = NormalizeAPIEndpoint(cfg.APIEndpoint)
+	dir := writeConfigDir()
+
+	// File-mode bits below ARE meaningful on POSIX (per-user community installs
+	// on macOS/Linux); on Windows they're ignored by the OS — access is
+	// controlled exclusively by ACLs. We set the mode for POSIX correctness
+	// and harden Windows access separately via hardenMachineConfigACL below.
+	dirMode := os.FileMode(0o700)
+	fileMode := os.FileMode(0o600)
+	machineWide := isElevated() && machineConfigDir() != "" && dir == machineConfigDir()
+	if machineWide {
+		// Machine-wide install: the scheduled task fires under a less-privileged
+		// logged-in user account (see schtasks.go's /ru INTERACTIVE), so the
+		// file must be READABLE by that user — but should not be writable by
+		// non-admins. hardenMachineConfigACL handles the Windows-specific ACL.
+		dirMode = 0o755
+		fileMode = 0o644
+	}
+	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return err
 	}
 
@@ -328,7 +510,22 @@ func save(cfg *ConfigFile) error {
 		return err
 	}
 
-	return os.WriteFile(ConfigFilePath(), data, 0o600)
+	configPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(configPath, data, fileMode); err != nil {
+		return err
+	}
+
+	if machineWide {
+		// Best-effort ACL hardening. Failure does not block the install — the
+		// config is still functional, just inheriting default ProgramData ACLs.
+		// Note: api_key persists in plaintext on disk. On multi-user dev
+		// machines this is a known tradeoff, documented in deploying-via-sccm.md.
+		// Customers needing stronger isolation should use the --from-file
+		// bootstrap pattern and lock down the bootstrap file separately.
+		_ = hardenMachineConfigACL(configPath)
+	}
+
+	return nil
 }
 
 // ShowConfigure prints the current configuration to stdout.
@@ -340,16 +537,21 @@ func ShowConfigure() {
 	fmt.Printf("  %-24s %s\n", "API Endpoint:", displayValue(cfg.APIEndpoint))
 	fmt.Printf("  %-24s %s\n", "API Key:", maskSecret(cfg.APIKey))
 	fmt.Printf("  %-24s %s\n", "Scan Frequency:", displayFrequency(cfg.ScanFrequencyHours))
+	fmt.Printf("  %-24s %s\n", "Max Execution Duration:", displayMaxExecution(cfg.MaxExecutionDuration))
 	fmt.Printf("  %-24s %s\n", "Search Directories:", displayDirs(cfg.SearchDirs))
 	fmt.Printf("  %-24s %s\n", "Enable NPM Scan:", displayBoolScan(cfg.EnableNPMScan))
+	fmt.Printf("  %-24s %s\n", "Legacy Node Scan:", displayBoolScan(cfg.UseLegacyNodeScan))
 	fmt.Printf("  %-24s %s\n", "Enable Brew Scan:", displayBoolScan(cfg.EnableBrewScan))
 	fmt.Printf("  %-24s %s\n", "Enable Python Scan:", displayBoolScan(cfg.EnablePythonScan))
+	fmt.Printf("  %-24s %s\n", "Legacy Python Scan:", displayBoolScan(cfg.UseLegacyPythonScan))
+	fmt.Printf("  %-24s %s\n", "Scan TCC-Protected Dirs:", displayTCC(cfg.IncludeTCCProtected))
 	fmt.Printf("  %-24s %s\n", "Color Mode:", displayColorMode(cfg.ColorMode))
 	fmt.Printf("  %-24s %s\n", "Output Format:", displayOutputFormat(cfg.OutputFormat))
 	if cfg.OutputFormat == "html" {
 		fmt.Printf("  %-24s %s\n", "HTML Output File:", displayValue(cfg.HTMLOutputFile))
 	}
 	fmt.Printf("  %-24s %s\n", "Log Level:", displayLogLevel(cfg.LogLevel))
+	fmt.Printf("  %-24s %s\n", "Install Directory:", displayInstallDir(cfg.InstallDir))
 }
 
 func displayValue(v string) string {
@@ -422,6 +624,145 @@ func displayLogLevel(level string) string {
 	}
 }
 
+func displayInstallDir(v string) string {
+	if v == "" {
+		return "~/.stepsecurity (default)"
+	}
+	return v
+}
+
+// displayMaxExecution renders the execution-watchdog setting. Empty falls back
+// to the built-in 4h default; "0"/"off" disables the watchdog; any other value
+// is a Go duration string echoed as-is (validated at run time by
+// telemetry.ExecutionDeadline).
+func displayMaxExecution(v string) string {
+	switch v {
+	case "":
+		return "4h (default)"
+	case "0", "off":
+		return "off (watchdog disabled)"
+	default:
+		return v
+	}
+}
+
+// displayTCC renders the macOS TCC opt-in. nil/false both mean the default
+// (skip TCC-protected dirs to avoid permission prompts); true means scan them.
+func displayTCC(v *bool) string {
+	if v != nil && *v {
+		return "true (scanning TCC-protected dirs)"
+	}
+	return "false (default — TCC-protected dirs skipped)"
+}
+
 func isPlaceholder(v string) bool {
 	return strings.Contains(v, "{{")
+}
+
+// NonInteractiveOptions captures every input the non-interactive configure
+// path accepts. Populated by main.go from cli.Config plus the DMG_API_KEY
+// env var fallback. Empty fields preserve the existing on-disk value
+// (merge semantics — same as the interactive prompt's "press Enter to keep").
+type NonInteractiveOptions struct {
+	FromFile      string   // path to a complete ConfigFile JSON; wins over inline values
+	CustomerID    string   // --customer-id
+	APIEndpoint   string   // --api-endpoint
+	APIKey        string   // --api-key (or DMG_API_KEY env)
+	ScanFrequency string   // --scan-frequency (hours, as string)
+	SearchDirs    []string // --search-dirs (re-used from scan flag; empty = unchanged)
+}
+
+// HasAny reports whether the caller supplied any inline value. Used by
+// main.go to decide whether `configure` was invoked non-interactively
+// even without the explicit --non-interactive flag (e.g. an MSI that only
+// passes --from-file).
+func (o NonInteractiveOptions) HasAny() bool {
+	return o.FromFile != "" ||
+		o.CustomerID != "" ||
+		o.APIEndpoint != "" ||
+		o.APIKey != "" ||
+		o.ScanFrequency != "" ||
+		len(o.SearchDirs) > 0
+}
+
+// RunConfigureNonInteractive applies the supplied options to the existing
+// on-disk config and saves. Designed for MSI custom actions, CI, and any
+// orchestrator that can't drive stdin prompts. Always writes to
+// writeConfigDir() — so an MSI running as SYSTEM lands config under
+// C:\ProgramData\StepSecurity where the scheduled task (running as the
+// logged-in user) can read it.
+func RunConfigureNonInteractive(opts NonInteractiveOptions) error {
+	existing := loadExisting()
+
+	// --from-file: replace base. Inline flags still override individual
+	// fields below, so customers can ship a base config via the file and
+	// inject the per-tenant API key via an env var on the command line.
+	if opts.FromFile != "" {
+		data, err := os.ReadFile(opts.FromFile)
+		if err != nil {
+			return fmt.Errorf("reading --from-file %q: %w", opts.FromFile, err)
+		}
+		var fromFile ConfigFile
+		if err := json.Unmarshal(data, &fromFile); err != nil {
+			return fmt.Errorf("parsing --from-file %q: %w", opts.FromFile, err)
+		}
+		existing = &fromFile
+	}
+
+	if opts.CustomerID != "" {
+		existing.CustomerID = opts.CustomerID
+	}
+	if opts.APIEndpoint != "" {
+		existing.APIEndpoint = opts.APIEndpoint
+	}
+	if opts.APIKey != "" {
+		existing.APIKey = opts.APIKey
+	}
+	if opts.ScanFrequency != "" {
+		existing.ScanFrequencyHours = opts.ScanFrequency
+	}
+	if len(opts.SearchDirs) > 0 {
+		existing.SearchDirs = opts.SearchDirs
+	}
+
+	// Validation: an MSI deploy with no creds is almost certainly a bug.
+	// Fail loud so the MSI transaction rolls back instead of silently
+	// installing a half-configured agent.
+	if existing.APIKey == "" {
+		return fmt.Errorf("api_key is required (pass --api-key, --from-file, or DMG_API_KEY env var)")
+	}
+	if existing.CustomerID == "" {
+		return fmt.Errorf("customer_id is required (pass --customer-id or --from-file)")
+	}
+	if existing.APIEndpoint == "" {
+		return fmt.Errorf("api_endpoint is required (pass --api-endpoint or --from-file)")
+	}
+
+	if err := save(existing); err != nil {
+		return fmt.Errorf("saving configuration: %w", err)
+	}
+
+	fmt.Printf("Configuration saved to %s\n", WriteConfigFilePath())
+	return nil
+}
+
+// PersistMaxExecutionDuration records the STEPSEC_MAX_EXECUTION_DURATION value
+// the loader exported into config.json at install time. Scheduler-fired runs
+// (launchd/systemd/schtasks) invoke the binary directly and never inherit the
+// loader's exported env var, so without this they fall back to the built-in 4h
+// default regardless of the loader's MAX_EXECUTION_DURATION_HOURS. Persisting
+// it lets telemetry.ExecutionDeadline pick it up on every scheduled run.
+// Read-modify-write so the loader-written customer_id/api_key/etc. survive.
+// No-op when value is empty (a direct binary install with no loader-configured
+// value keeps the built-in default).
+func PersistMaxExecutionDuration(value string) error {
+	if value == "" {
+		return nil
+	}
+	existing := loadExisting()
+	if existing.MaxExecutionDuration == value {
+		return nil
+	}
+	existing.MaxExecutionDuration = value
+	return save(existing)
 }

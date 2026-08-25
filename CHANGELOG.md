@@ -7,6 +7,188 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See [VERSIONING.md](VERSIONING.md) for why the version starts at 1.8.1.
 
+## [1.16.0] - 2026-08-20
+
+### Added
+
+- **Credential-location inventory**: a new `credentials_scan` phase reports which developer tools on this machine hold credentials, where, and how well guarded each location is — locations and protection only, never the credential itself. Thirteen sources across cloud (AWS, GCP), source control (SSH keys, git credential store, `.netrc`, GitHub CLI hosts), package registries (`.npmrc`, `.pypirc`), containers (Docker, kubeconfig) and infrastructure (Terraform, Vault). Every location is an exact path rather than a root to walk, every read is byte-capped, and a capped or uninterpretable read is recorded as incomplete rather than clean — so a credential sitting past the cap can never render as "read, empty, complete". Paths come from the OS user record rather than the agent's own environment, which belongs to root or SYSTEM, and every read goes through a new resolver that refuses a symlink leaving the user's roots, checks TCC consent before each syscall, and cannot be hung by a FIFO planted in a credential path. A nil section means the phase did not run; zero findings is the positive assertion that no known location holds one.
+- **OpenCode MCP server configs**: OpenCode keeps servers under a top-level `mcp` key rather than `mcpServers`, accepts the config as both `opencode.json` and `opencode.jsonc`, and documents examples carrying comments and trailing commas — so its servers were invisible to the MCP inventory. Global configs are now read from `~/.config/opencode/opencode.{json,jsonc}`, resolved against the developer's home rather than the service account's, and project configs are found by the existing bounded walk. The secret allowlist is unchanged and still deny-by-default, so OpenCode's `environment` and `headers` blocks are never collected.
+- **Pi, Factory Droid and Amp in the AI agent inventory**: all three already appeared under `agent_skills` but were missing from `ai_agents_and_tools`, so a machine running them looked like a machine that wasn't. They cannot be added by binary name — `pi`, `amp` and `droid` each collide with a popular same-name tool, and because resolution takes the first candidate that exists, a collider winning the `$PATH` race would hide a genuine install elsewhere on the machine. Each agent is now proven from an on-disk artifact instead: an npm or Bun manifest naming the package, the installer's anchor directory, a Homebrew cask root as opposed to the collider's formula root, winget's publisher-qualified package directory, or a pacman file manifest claiming the path — searched across the prefixes a global install actually lands in, including the per-version trees of nvm, fnm, mise, volta and asdf. Amp and Pi skip the `--version` exec, which was measured to make Gatekeeper prompt; their versions come from disk or read `unknown`.
+- **Two new agent-skills roots**: `~/.config/amp/skills` (`amp_user`) and `~/.agent/skills` (`factory_agent_user`) — singular `.agent`, distinct from the `~/.agents` convention.
+- **Copilot CLI installs that never land on PATH**: `gh copilot` downloads the same `@github/copilot` CLI into gh's own data directory, which never reaches `$PATH`, so users who let gh install Copilot for them read as having no Copilot CLI at all. Seven home-relative anchors are now tried after a `LookPath` miss, covering the `gh copilot` download on both platform spellings, the non-root install-script path, the WinGet and npm global shims, and the `gh-copilot` extension. Bare names stay first, so machines that already resolve `copilot` through `$PATH` are unaffected. Two limits are documented in `SCAN_COVERAGE.md` rather than worked around: a non-default `$XDG_DATA_HOME` is not followed, because the scan runs as a root daemon and does not have the user's value, and WinGet's hashed payload directory needs globbing that binary-name resolution does not do, so only its `Links` shim is covered.
+
+### Changed
+
+- **The macOS TCC skipper is wired into AI CLI detection.** The new resolution ladders stat candidates directly instead of descending a walk, so the walk-level skip could not protect them; consent is now checked before every stat and again on every resolved symlink. The pnpm and fnm trees under `~/Library` are exempted, since the coarse `~/Library` skip that is correct for a walk would otherwise drop both macOS channels silently.
+- **CI: release publishing is gated on verification.** A new `publish-release.yml` runs the verification suite as a reusable workflow and publishes the draft release, marking it latest, only if every check passes — signed checksums, Windows Authenticode, macOS notarization — replacing the manual `gh release edit --draft=false --latest` step. Verification now also requires a valid out-of-band Ed25519 `.sha256.sig` for the `x64` and `arm64` `.intunewin` packages, so every distributable artifact is covered. Because those checksums are created outside the repository, a compromised repository alone cannot ship a release that customers' loaders will accept.
+
+## [1.15.0] - 2026-08-03
+
+### Added
+
+- **Server-driven scan cadence (run gating)**: on every invocation the agent asks the backend's new `run-directive` endpoint whether a full scan is due and exits quietly when it isn't, with no run-status row, no phases, and a single log line. The scan frequency lives in the StepSecurity dashboard (per tenant, minutes granularity, with a temporary override that auto-reverts at a set time and a per-device "re-scan now" request), so fleets deployed via an external MDM (for example JAMF's hourly cadence) get their real cadence from the backend with no MDM scheduling changes. Run gating is controlled entirely from the backend: the agent always makes the check-in call, and the backend decides. It is gated by a per-environment backend flag so it can be enabled for one environment at a time; while the flag is off the backend answers "scan" every time and the agent behaves exactly as before. Once enabled, gating applies to every device (a 4-hour default when a tenant has not set its own cadence). Any check-in failure fails open to a scan (with a cached-interval fallback so offline machines don't scan every wakeup), and an invocation that lands while another scan is running backs off quietly instead of reporting a failed run. Bypass for debugging: `--force-scan` / `STEPSEC_FORCE_SCAN=1`; per-device kill switch: `STEPSEC_DISABLE_RUN_GATE=1`.
+- **npm secure-registry device policy**: a new `package_config#npm` enforcement lane converges a StepSecurity-owned block in the console user's `~/.npmrc` so npm — and the pnpm, yarn v1, and bun tools that read the same file — resolve packages through the tenant's secure registry. Because the agent may touch a user-controlled home as root (macOS LaunchDaemon), every file operation goes through `os.Root` with explicit symlink-chain resolution, post-open identity re-checks, and metadata changes on open handles rather than by path. The INI classifier mirrors npm's own key/value parsing and fails closed on the forms it cannot safely reason about (sections, bare CRs, `key[]=` array-append on a managed key, coercible quoted keys). Writes are transactional with snapshot rollback and bounded, identity-checked backups; the lane runs unconditionally but stays dormant until the backend returns a `package_config` policy — an absent policy is a no-op, never a wipe.
+- **VS Code private marketplace URL enforcement**: an optional `extensions.gallery.serviceUrl` is written into user-scope `settings.json` beside `extensions.allowed` in a single atomic multi-key write. The agent owns both keys: a set is authoritative, removal is ownership-gated so a user-configured value is never deleted, and drift, convergence, selective clear, and post-write rollback all cover both. An allowlist-only policy writes byte-identically to before.
+- **MDM verify-only enforcement channel**: device policy now selects an enforcement channel per cycle for both the IDE-extension and npm lanes. `dmg` (or empty) is the existing write-and-verify path; `mdm` is verify-only — the agent reads the OS-managed VS Code policy (Windows registry, macOS managed-preferences plist, `/etc/vscode/policy.json`) or the effective `~/.npmrc` and reports what it observed, never writing, patching, or clearing, because an external MDM owns the policy. Compliance reports carry the observed values plus the canonical channel the cycle actually ran, so the backend can diff like-for-like. Unknown channels fail safe to the write path. The npm reader never returns or logs a token, hash, or fingerprint, and reports an observed plaintext `http://` registry as drift evidence rather than discarding the most security-relevant signal the channel exists to catch.
+
+### Changed
+
+- **Device policy ownership is tracked in one locked state file**: every category now records what the agent has written in `device-policy-state.json` keyed by (category, target), replacing the npm lane's separate per-uid store. Lost updates are prevented by a cross-process advisory lock (`flock` on POSIX, `LockFileEx` on Windows) held only for the read-modify-write, instead of by splitting the file. Acquisition fails closed — a lock that cannot be taken fails the operation and the next cycle retries — with a single waiver for filesystems that do not implement locking at all, where no peer can hold a lock either. An unreadable state file is no longer treated as absent: a present-but-unreadable file returns an error rather than letting one category's clear silently drop another's ownership record.
+- **Run-config device policy is keyed by setting id**: the policy payload is now a settings map (setting id → compiled value) instead of a bare `extensions.allowed` object plus a sibling `gallery_service_url` field, and the hash covers the whole map. Enforce and clear are driven entirely by the map and the recorded ownership with no per-key special-casing, so a new managed setting needs no agent change. This is a breaking run-config wire change (pre-GA) and requires the backend to emit the settings-map shape.
+- **Managed `settings.json` writes preserve a leading UTF-8 BOM**, which PowerShell 5.1's `Set-Content -Encoding UTF8` and editors set to `utf8bom` emit. Previously a seeded file carrying one parsed as invalid and stayed permanently unenforceable.
+
+### Fixed
+
+- **Homebrew installed outside PATH is now detected**: the brew executable is resolved from the standard install locations (`/opt/homebrew`, `/usr/local`, `/home/linuxbrew`) when it is not on PATH, and the version is read from the Homebrew git repo metadata instead of by shelling out to `brew --version`. Detection and formula/cask listing now work for scans run without the user's interactive PATH.
+- **Credential masking in malformed multi-`@` index URLs**: `redactCredsInValue` split userinfo at the first `@`, so a value with several `user:pass@host` runs concatenated before the real host (a mangled pip index-url, in one real case carrying a live PAT) shipped the trailing credential verbatim into effective-config telemetry. Userinfo is now taken up to the *last* `@` within the URL authority, and a userinfo run that itself contains an extra `@` is masked whole.
+- **Device policy clears report a removal only when something was removed.** An unassigned device announced "cleared managed block" on every cycle forever, which read in fleet logs as a device being remediated repeatedly when it had been clean for weeks.
+
+## [1.14.0] - 2026-07-17
+
+### Added
+
+- **AI agent skills inventory**: a new scanner discovers AI agent "skills" across the machine — walking home directories and both registered and unregistered project trees, recognizing a broader set of executable script types (`has_code`), collapsing symlink shadows, honoring macOS TCC-protected directories, and hardened against partial or hostile inputs. Claude Code plugin trees are intentionally excluded from skills discovery.
+- **Gatekeeper pre-exec guard (macOS)**: before any version-probe exec fallback, the agent checks the resolved binary (and its containing directory) for the `com.apple.quarantine` attribute; quarantined binaries are then assessed silently with `spctl --assess --type execute`, and Gatekeeper-rejected ones are skipped (version reported as `unknown`) instead of executed. This removes the main scan-triggered path to the macOS "could not verify … free of malware" dialog for tools whose install layout carries no readable version metadata. It is not a blanket guarantee: the assessment covers the launched binary itself, so a Gatekeeper-accepted binary that loads a separately quarantined, un-notarized plugin at runtime could still prompt — metadata-first resolution (which avoids the exec entirely) remains the primary defense. Unquarantined binaries (e.g. Homebrew formulae) are unaffected.
+
+### Changed
+
+- **Metadata-first version detection**: tool version probes (AI CLIs, AI agents, AI frameworks, Node and Python package managers) now resolve versions from on-disk metadata — npm `package.json` manifests, `<tool>/versions/<v>` install layouts, Homebrew Cellar/Caskroom paths, and macOS app bundles — before falling back to executing `<tool> --version`. Executing third-party binaries could trigger macOS Gatekeeper "could not verify" popups when a tool ships un-notarized native code (e.g. cursor-agent's `merkle-tree-napi.darwin-arm64.node`); the exec fallback is unchanged, so tools without metadata are still detected exactly as before. Each remaining exec fallback is logged to stderr (`exec fallback: running <binary> ...`) so rollouts can track which tools still get executed.
+- **MCP configuration discovery broadened**: MCP server configs are now recognized by filename in addition to known locations, with VS Code support, a vendor heuristic for unrecognized clients, and de-duplication on Windows.
+- **Python package discovery via filesystem walk**: installed Python packages are now discovered by walking the filesystem and recognizing on-disk install layouts (complementing 1.13.0's `dist-info` reading); root-run scans resolve the console user's home directory instead of root's.
+- **Claude Desktop reclassification**: Claude Desktop is no longer reported as an IDE; it is captured as a cowork agent only.
+
+### Fixed
+
+- **Downloaded execution logs**: upload-intent log lines are now included in the execution logs available for download.
+
+## [1.13.0] - 2026-07-08
+
+### Added
+
+- **Device policy enforcement**: the agent now applies device policy profiles fetched from run-config, including OS-native enforcement of a VS Code extension allowlist. Policy identity is target-aware (category + target) and on-device state is keyed by category; state files written by a newer schema version are rejected. Generally available and enabled by default for all enterprise customers.
+- **Classic Visual Studio detection**: scans now discover classic Visual Studio installs and their extensions.
+- **Disk-based package scanning**: npm packages are discovered by parsing lockfiles and Python packages by reading `dist-info` metadata on disk, so package inventory no longer depends solely on invoking the package manager.
+- **Run-on-login scheduling and scheduler diagnostics**: scans can be scheduled to run on login, Windows Task Scheduler history is enabled, and a new scheduler-info subsystem reports cross-platform scheduling state for troubleshooting.
+- **Last-run heartbeat**: a `last-run.json` heartbeat is written at the start of telemetry send, and this run's loader-script logs are included in telemetry.
+- **Scan-state delta upload protocol**: infrastructure to upload only package add/remove deltas between runs (opt-in; disabled by default).
+
+### Changed
+
+- **Legacy package scan remains the default**: the scan-state delta protocol is gated off by default; `use_legacy_package_scan` controls the legacy full-inventory path.
+- **schtasks frequencies of 24h+ now use a DAILY schedule** instead of a minute-interval trigger.
+- **Go toolchain bumped to 1.26.**
+- **Lock-acquisition contention** is now logged and reported at info level.
+
+### Fixed
+
+- **Node package-manager version resolution**: PM versions are resolved via default install paths, and `NodeScanner.pmAvailability` access is guarded by a mutex.
+- **Scan cap and delta gating**: disk-discovered packages now count toward the scan cap, and delta upload is gated on a resolved PM version.
+- **Lock failures** are no longer assumed to indicate contention.
+- **IDE policy under SYSTEM**: the installer no longer enforces IDE policy inline when running as SYSTEM.
+- **Device policy source**: policy is fetched from run-config; the removed effective-policy endpoint is no longer called.
+- **scan-state persistence**: scan-state is written to the `--telemetry-out` path when specified.
+
+## [1.12.0] - 2026-06-09
+
+### Added
+
+- **Malicious-file detection**: new rules-engine scanner that flags suspicious files as IOCs and wires the results into scan telemetry. The detector streams one file at a time to keep scan memory bounded regardless of repository size.
+- **pnpm configuration inventory**: scans now surface the contents of pnpm configuration.
+- **bun configuration inventory**: scans now surface `bunfig.toml` configuration.
+- **yarn configuration inventory**: scans now surface both yarn classic and yarn berry configuration.
+
+### Changed
+
+- **pnpm/bun/yarn audits enabled by default**: the agent now runs all three audits on every scan and emits `pnpm_audit`, `bun_audit`, and `yarn_audit` on the wire payload (gated via rc-config feature gates).
+- **npm and pip rc-config scanning enabled by default**.
+- **macOS service management**: the agent now uses `launchctl bootstrap`/`bootout` instead of the deprecated `load`/`unload`.
+
+### Fixed
+
+- **pnpm path resolution**: corrected pnpm path handling on both Linux and Windows.
+- **Package-manager resolution under launchd**: package managers are now resolved correctly under the LaunchAgent's stripped `PATH`.
+- **Shell quoting in `RunAsUser`**: command and argument quoting is now handled correctly when executing as the target user.
+- **Windows empty payloads**: empty payloads are handled gracefully when npm is not present.
+- **launchd failures surfaced**: `bootstrap`/`bootout` failures are now reported instead of silently swallowed.
+- **brew raw scan output**: raw scan output is now synthesized from the rich brew data.
+
+## [1.11.7] - 2026-05-31
+
+### Added
+
+- **Antigravity IDE detection**: scans now recognize the Antigravity editor.
+- **Bounded scan execution**: scans are now capped by a global deadline (60m default; override via `STEPSEC_MAX_SCAN_DURATION`, or `0` to disable) plus per-phase deadlines, so a single stuck phase no longer hangs the whole run. Subprocesses are killed by process group on cancel, preventing forked grandchildren (Electron `--version`, npm/yarn/pnpm `ls`) from blocking on inherited file descriptors.
+- **Log tail in heartbeat**: heartbeats now carry a gzipped+base64 tail of recent stderr (throttled), and log capture uses a bounded ring buffer to cap memory on long runs, surfacing where a scan is stuck.
+
+### Fixed
+
+- **`api_endpoint` trailing slash**: configured `api_endpoint` values are now normalized to strip trailing slashes at the config boundary, avoiding malformed `//v1/...` URLs that some gateways reject with 403/500.
+- **pip detection triggering CLT install dialog**: pip detection no longer invokes a command that could pop the macOS Command Line Tools install dialog.
+- **macOS IDE pop-ups and stuck processes**: macOS scans are further hardened against IDE permission pop-ups and processes that never exit.
+- **Execution-watchdog limit via config**: the execution-watchdog limit is now delivered through `config.json`.
+
+## [1.11.6] - 2026-05-27
+
+### Fixed
+
+- **macOS Tahoe Media Library prompt**: the project walker now skips `~/Library` wholesale instead of curating individual TCC-protected subpaths. This prevents new TCC prompts (e.g. `kTCCServiceMediaLibrary` from `~/Library/Application Support/com.apple.avfoundation/`) from firing after each macOS release adds Apple-managed subtrees behind new TCC services. Targeted detectors that read specific files under `~/Library` (JetBrains plugins, Claude desktop MCP config, pip global config) keep working unchanged.
+
+## [1.11.5] - 2026-05-27
+
+### Added
+
+- **macOS TCC-protected directory skipping**: scanners now skip TCC-protected paths (Photos, Media Library, App Management, etc.) by default when running under launchd, avoiding spurious permission prompts and noisy denials. Hits are logged so operators can see which paths were skipped.
+- **PPPC configuration guide**: new docs explain how to grant the agent the necessary TCC permissions via a PPPC profile for environments that want full coverage.
+- **`verify-msi.ps1` script**: client-side PowerShell script for verifying the integrity and Authenticode signature of distributed MSI artifacts.
+
+### Fixed
+
+- **Empty `--install-dir` rejected**: install/uninstall commands now reject an empty `--install-dir` value instead of silently falling back to a default, preventing accidental installs to the wrong location.
+- **`install_dir` config field is authoritative**: the configured `install_dir` is now treated as the source of truth across install/uninstall paths, resolving inconsistencies when the field disagreed with runtime defaults.
+
+## [1.11.4] - 2026-05-26
+
+### Added
+
+- **Authenticode-signed Windows binaries and MSIs**: release artifacts are now signed via Azure Trusted Signing, so installs no longer trip SmartScreen/EDR unsigned-binary heuristics on Windows.
+- **Feature gate for selective scanning**: new feature-gate mechanism allows disabling or enabling individual scanners at runtime, giving operators a way to scope what a deployment reports without rebuilding.
+- **Invocation method + in-flight status reporting**: telemetry now records how the agent was invoked (launchd / systemd / scheduled task / interactive) and emits structured per-phase status info while a scan is running.
+- **`$HOME` expansion in configured paths**: path-style config values now expand `$HOME` (and `~`) consistently across platforms.
+
+### Fixed
+
+- **Windows console window flashes during scheduled scans**: the scheduled task no longer pops a visible console window on each run.
+- **Telemetry post-phase is non-blocking**: post-phase telemetry submission can no longer stall scan completion if the backend is slow or unreachable; sandbox invocation tests added to cover the path.
+- **Canonicalised `$HOME`/`~` expansion**: path expansion now goes through `filepath.Join` so the resulting paths are normalised across `/`-vs-`\` and trailing-separator edge cases.
+
+### Changed
+
+- **Per-phase telemetry sub-progress incl. upload phase**: progress reporting now tracks sub-progress within each phase and adds an explicit upload phase, giving the dashboard finer-grained visibility into long-running scans.
+- **CI: on-demand test-binary + MSI workflow** added so non-release builds can be produced from a PR without cutting a tag.
+- **CI: msi-smoke workflow hardened** following StepSecurity best-practice review.
+
+## [1.11.3] - 2026-05-21
+
+### Added
+
+- **AI agent hook state polling**: agents periodically check the StepSecurity backend for desired hook enable/disable state and reconcile local installation to match. Silent no-op in community mode; failures are logged but never crash the scanner.
+- **Static machine resource info in device payload**: each scan now reports CPU model and count, total RAM, and disk capacity for the scanned host, giving the dashboard a clearer picture of the endpoint context.
+- **Configurable install directory + persistent stderr logs**: new `--install-dir` flag (and matching env var/config field) relocates all non-bootstrap agent state, and stderr is now captured to a rotated `agent.error.log` under the install dir so MDM/service deployments have durable diagnostics (#88).
+
+### Fixed
+
+- **Auto-update signing**: fixed a signing regression in the previous 1.11.2 release that prevented auto-update from working. v1.11.2 has been removed; install or upgrade to 1.11.3 directly.
+- **Windows scheduled task user context**: the scheduled task now runs under the logged-in user via `/ru INTERACTIVE` instead of `SYSTEM`, so the scanner can read `HKCU`, `%USERPROFILE%`, and the user's `PATH` — fixing a class of missed detections for tools installed in user scope.
+- **Windows agent log directory permissions**: `C:\ProgramData\StepSecurity` now grants `BUILTIN\Users` Modify rights so the scheduled task (running as the logged-in user) can append to `agent.log` instead of failing with Access Denied.
+- **AI agent hook command path on Windows**: hook entries written into agent config files now use forward-slash paths, avoiding Windows shell quoting issues that could prevent the hook from firing.
+- **pnpm v11 global scan regression**: globally installed pnpm packages were missing from the npm scan output on pnpm v11; detection logic updated for the new layout.
+- **Linux/macOS lock contention race**: an edge case where the singleton-lock check could misidentify the console user on systems with no active interactive session is fixed.
+
+### Changed
+
+- **CI: gosec SAST scan** added to the workflow set, with a corresponding badge in the README.
+- **CI: cross-platform build + vet/fmt/tidy** checks added to the Tests workflow, surfacing platform-specific compile errors at PR time instead of at release time.
+
 ## [1.11.1] - 2026-05-05
 
 ### Added
@@ -159,6 +341,16 @@ First open-source release. The scanning engine was previously an internal enterp
 - Execution log capture and base64 encoding
 - Instance locking to prevent concurrent runs
 
+[1.16.0]: https://github.com/step-security/dev-machine-guard/compare/v1.15.0...v1.16.0
+[1.15.0]: https://github.com/step-security/dev-machine-guard/compare/v1.14.0...v1.15.0
+[1.14.0]: https://github.com/step-security/dev-machine-guard/compare/v1.13.0...v1.14.0
+[1.13.0]: https://github.com/step-security/dev-machine-guard/compare/v1.12.0...v1.13.0
+[1.12.0]: https://github.com/step-security/dev-machine-guard/compare/v1.11.7...v1.12.0
+[1.11.7]: https://github.com/step-security/dev-machine-guard/compare/v1.11.6...v1.11.7
+[1.11.6]: https://github.com/step-security/dev-machine-guard/compare/v1.11.5...v1.11.6
+[1.11.5]: https://github.com/step-security/dev-machine-guard/compare/v1.11.4...v1.11.5
+[1.11.4]: https://github.com/step-security/dev-machine-guard/compare/v1.11.3...v1.11.4
+[1.11.3]: https://github.com/step-security/dev-machine-guard/compare/v1.11.1...v1.11.3
 [1.11.1]: https://github.com/step-security/dev-machine-guard/compare/v1.11.0...v1.11.1
 [1.11.0]: https://github.com/step-security/dev-machine-guard/compare/v1.10.2...v1.11.0
 [1.10.2]: https://github.com/step-security/dev-machine-guard/compare/v1.10.1...v1.10.2

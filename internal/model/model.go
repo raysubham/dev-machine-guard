@@ -28,7 +28,28 @@ type ScanResult struct {
 	FlatpakPackages   []SystemPackage `json:"flatpak_packages"`
 	NPMRCAudit        *NPMRCAudit     `json:"npmrc_audit,omitempty"`
 	PipAudit          *PipAudit       `json:"pip_audit,omitempty"`
-	Summary           Summary         `json:"summary"`
+	PnpmAudit         *PnpmAudit      `json:"pnpm_audit,omitempty"`
+	BunAudit          *BunAudit       `json:"bun_audit,omitempty"`
+	YarnAudit         *YarnAudit      `json:"yarn_audit,omitempty"`
+
+	// AgentSkills is the flat list of discovered AI agent skills. AgentSkillScan
+	// is the phase summary; its non-nil presence is the "scan ran" sentinel (a
+	// nil section must never cause the backend to delete skill state).
+	AgentSkills    []AgentSkill        `json:"agent_skills,omitempty"`
+	AgentSkillScan *AgentSkillScanInfo `json:"agent_skill_scan,omitempty"`
+
+	// CredentialScan is the credential-location inventory. Nil means the phase
+	// did not run, which is the only "no information" signal a reader has — a
+	// non-nil section with zero findings means it ran and found nothing.
+	CredentialScan *CredentialScanInfo `json:"credential_scan,omitempty"`
+
+	// BrowserExtensionScan is the browser extension inventory. Nil means the
+	// phase did not run — the only "no information" signal a reader has, and the
+	// difference between it and a section carrying zero findings is what keeps a
+	// skipped scan from erasing a device's extensions.
+	BrowserExtensionScan *BrowserExtensionScanInfo `json:"browser_extension_scan,omitempty"`
+
+	Summary Summary `json:"summary"`
 }
 
 type Device struct {
@@ -117,20 +138,77 @@ type Summary struct {
 	SystemPackagesCount   int `json:"system_packages_count"`
 	SnapPackagesCount     int `json:"snap_packages_count"`
 	FlatpakPackagesCount  int `json:"flatpak_packages_count"`
+	AgentSkillsCount      int `json:"agent_skills_count"`
 }
 
-// NodeScanResult holds raw scan output for enterprise telemetry.
-// Used for both global packages and per-project scans.
+// UnchangedProjectRef tells the backend a project is unchanged since the
+// last successful upload. Backend bumps LastSeenAt on every package row
+// whose ProjectPaths contains Path.
+type UnchangedProjectRef struct {
+	Path                    string `json:"path"`
+	ScanOutputHash          string `json:"scan_output_hash"`
+	LastUploadedExecutionID string `json:"last_uploaded_execution_id,omitempty"`
+}
+
+// RemovedProjectRef tells the backend a project has disappeared from disk.
+// Backend drops Path from every matching row's ProjectPaths and bumps
+// RecordUpdatedAt but not LastSeenAt.
+type RemovedProjectRef struct {
+	Path                    string `json:"path"`
+	LastUploadedExecutionID string `json:"last_uploaded_execution_id,omitempty"`
+}
+
+// UnchangedGlobalRef tells the backend a PM's global package set is unchanged.
+// Keyed by PM name (globals are PM-scoped, not path-scoped).
+type UnchangedGlobalRef struct {
+	PackageManager          string `json:"package_manager"`
+	ScanOutputHash          string `json:"scan_output_hash"`
+	LastUploadedExecutionID string `json:"last_uploaded_execution_id,omitempty"`
+}
+
+// NodeScanResult holds one project's (or one global root's) scan output for
+// enterprise telemetry. Used for both global packages and per-project scans.
+//
+// Two mutually-exclusive shapes flow through this struct depending on how the
+// scan was produced:
+//   - Legacy (command) path: RawStdoutBase64 carries the raw `npm ls`/`yarn`/
+//     `pnpm`/`bun` output; the backend parses it into packages on ingest.
+//   - Disk-parse path: Packages is populated directly and RawStdoutBase64 is
+//     left empty. The backend's ParseNodeProjects passes a project through
+//     untouched when RawStdoutBase64 == "", so pre-parsed packages reach
+//     storage with no backend change. Never set both: a non-empty
+//     RawStdoutBase64 makes the backend re-parse and overwrite Packages.
+//
+// JSON tags match agent-api's ddbmodels.NodeProject so the payload
+// deserializes server-side without a schema change.
 type NodeScanResult struct {
-	ProjectPath      string `json:"project_path"`
-	PackageManager   string `json:"package_manager"`
-	PMVersion        string `json:"package_manager_version"`
-	WorkingDirectory string `json:"working_directory"`
-	RawStdoutBase64  string `json:"raw_stdout_base64"`
-	RawStderrBase64  string `json:"raw_stderr_base64"`
-	Error            string `json:"error"`
-	ExitCode         int    `json:"exit_code"`
-	ScanDurationMs   int64  `json:"scan_duration_ms"`
+	ProjectPath      string        `json:"project_path"`
+	PackageManager   string        `json:"package_manager"`
+	PMVersion        string        `json:"package_manager_version"`
+	WorkingDirectory string        `json:"working_directory"`
+	RawStdoutBase64  string        `json:"raw_stdout_base64,omitempty"`
+	RawStderrBase64  string        `json:"raw_stderr_base64,omitempty"`
+	Packages         []NodePackage `json:"packages,omitempty"`
+	PackagesCount    int           `json:"packages_count"`
+	Error            string        `json:"error"`
+	ExitCode         int           `json:"exit_code"`
+	ScanDurationMs   int64         `json:"scan_duration_ms"`
+}
+
+// NodePackage is one installed Node package discovered by disk parsing.
+//
+// Fields are intentionally limited to what the backend persists today
+// (name, version, direct-vs-transitive) — see DeviceNPMPackageUsageInfo. The
+// agent-api NodePackage additionally declares InstallPath and Dependencies,
+// but both are parsed-then-discarded server-side and are omitted here on
+// purpose. JSON tags match ddbmodels.NodePackage.
+type NodePackage struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	// IsDirect marks a top-level dependency (declared in the project's
+	// package.json) versus a transitive one pulled in by another package.
+	// Derived from lockfile structure, not from running the package manager.
+	IsDirect bool `json:"is_direct,omitempty"`
 }
 
 // PackageDetail represents a single package name and version.
@@ -323,6 +401,119 @@ type NPMRCEnvVar struct {
 	ValueSHA256  string `json:"value_sha256,omitempty"`
 }
 
+// PnpmAudit reuses NPMRCFile/NPMRCEnvVar — pnpm reads the same .npmrc syntax
+// as npm. Only the effective view and env list diverge.
+type PnpmAudit struct {
+	Available      bool           `json:"pnpm_available"`
+	PnpmVersion    string         `json:"pnpm_version,omitempty"`
+	PnpmPath       string         `json:"pnpm_path,omitempty"`
+	Files          []NPMRCFile    `json:"files"`
+	Effective      *PnpmEffective `json:"effective,omitempty"`
+	Env            []NPMRCEnvVar  `json:"env"`
+	DiscoveryError string         `json:"discovery_error,omitempty"`
+}
+
+// PnpmEffective mirrors `pnpm config list --json`. SourceByKey is kept on
+// the struct for renderer parity with npm but is typically empty — pnpm
+// doesn't emit per-key source attribution.
+type PnpmEffective struct {
+	SourceByKey map[string]string `json:"source_by_key,omitempty"`
+	Config      map[string]any    `json:"config,omitempty"`
+	Error       string            `json:"error,omitempty"`
+}
+
+// BunAudit has no Effective field — bun has no `config list` equivalent.
+// Consumers render the union of parsed files. NPMRCFiles carries any .npmrc
+// bun would read for auth.
+type BunAudit struct {
+	Available      bool            `json:"bun_available"`
+	BunVersion     string          `json:"bun_version,omitempty"`
+	BunPath        string          `json:"bun_path,omitempty"`
+	Files          []BunConfigFile `json:"files"`
+	NPMRCFiles     []NPMRCFile     `json:"npmrc_files"`
+	Env            []NPMRCEnvVar   `json:"env"`
+	DiscoveryError string          `json:"discovery_error,omitempty"`
+}
+
+// BunConfigFile is a single bunfig.toml. Scope: user | user-xdg | project.
+type BunConfigFile struct {
+	Path        string       `json:"path"`
+	Scope       string       `json:"scope"`
+	Exists      bool         `json:"exists"`
+	Readable    bool         `json:"readable"`
+	SizeBytes   int64        `json:"size_bytes,omitempty"`
+	ModTimeUnix int64        `json:"mtime_unix,omitempty"`
+	Mode        string       `json:"mode,omitempty"`
+	OwnerUID    int          `json:"owner_uid,omitempty"`
+	OwnerName   string       `json:"owner_name,omitempty"`
+	GroupGID    int          `json:"group_gid,omitempty"`
+	GroupName   string       `json:"group_name,omitempty"`
+	SHA256      string       `json:"sha256,omitempty"`
+	SymlinkTo   string       `json:"symlink_target,omitempty"`
+	InGitRepo   bool         `json:"in_git_repo,omitempty"`
+	GitTracked  bool         `json:"git_tracked,omitempty"`
+	Sections    []BunSection `json:"sections,omitempty"`
+	ParseError  string       `json:"parse_error,omitempty"`
+}
+
+// BunSection groups NPMRCEntry by dotted section path (e.g. "install",
+// "install.scopes.@step-security"). Entry LineNum is always 0 — go-toml/v2
+// doesn't cheaply expose per-key positions.
+type BunSection struct {
+	Name    string       `json:"name"`
+	Entries []NPMRCEntry `json:"entries"`
+}
+
+// YarnAudit covers both classic (v1.x, .yarnrc) and berry (v2+, .yarnrc.yml).
+// Top-level Flavor reflects the binary's major; per-file Flavor reflects the
+// file's own syntax — the renderer flags mismatches.
+type YarnAudit struct {
+	Available      bool             `json:"yarn_available"`
+	YarnVersion    string           `json:"yarn_version,omitempty"`
+	YarnPath       string           `json:"yarn_path,omitempty"`
+	Flavor         string           `json:"flavor,omitempty"` // "classic" | "berry" | "unknown"
+	Files          []YarnConfigFile `json:"files"`
+	NPMRCFiles     []NPMRCFile      `json:"npmrc_files"` // auth side-channel
+	Env            []NPMRCEnvVar    `json:"env"`
+	DiscoveryError string           `json:"discovery_error,omitempty"`
+}
+
+// YarnConfigFile is a discovered .yarnrc (classic) or .yarnrc.yml (berry).
+type YarnConfigFile struct {
+	Path        string      `json:"path"`
+	Scope       string      `json:"scope"`  // "user" | "project"
+	Flavor      string      `json:"flavor"` // "classic" | "berry"
+	Exists      bool        `json:"exists"`
+	Readable    bool        `json:"readable"`
+	SizeBytes   int64       `json:"size_bytes,omitempty"`
+	ModTimeUnix int64       `json:"mtime_unix,omitempty"`
+	Mode        string      `json:"mode,omitempty"`
+	OwnerUID    int         `json:"owner_uid,omitempty"`
+	OwnerName   string      `json:"owner_name,omitempty"`
+	GroupGID    int         `json:"group_gid,omitempty"`
+	GroupName   string      `json:"group_name,omitempty"`
+	SHA256      string      `json:"sha256,omitempty"`
+	SymlinkTo   string      `json:"symlink_target,omitempty"`
+	InGitRepo   bool        `json:"in_git_repo,omitempty"`
+	GitTracked  bool        `json:"git_tracked,omitempty"`
+	Entries     []YarnEntry `json:"entries,omitempty"`
+	ParseError  string      `json:"parse_error,omitempty"`
+}
+
+// YarnEntry is a parsed key/value from either flavor. Berry nested maps
+// flatten to dotted keys (e.g. `npmScopes.@step-security.npmAuthToken`) so
+// the same slice carries both flavors.
+type YarnEntry struct {
+	Key          string   `json:"key"`
+	DisplayValue string   `json:"display_value"`
+	LineNum      int      `json:"line_num,omitempty"`
+	IsAuth       bool     `json:"is_auth,omitempty"`
+	IsEnvRef     bool     `json:"is_env_ref,omitempty"`
+	EnvRefVars   []string `json:"env_ref_vars,omitempty"`
+	ValueSHA256  string   `json:"value_sha256,omitempty"`
+	Quoted       bool     `json:"quoted,omitempty"`
+}
+
 // --- pip configuration audit -------------------------------------------------
 //
 // Mirrors NPMRCAudit but reflects pip-specific realities: real INI
@@ -427,4 +618,166 @@ type PipNetrcStatus struct {
 	Path   string `json:"path"`
 	Exists bool   `json:"exists"`
 	Mode   string `json:"mode,omitempty"` // empty on Windows
+}
+
+// --- Malicious-file detection (rule_scan) ---
+//
+// These types are the agent → backend wire contract for the malicious-file
+// detection engine (internal/detector/rules). They are emitted on the
+// telemetry Payload as the additive `rule_scan` field. The agent never sends
+// file content: a finding is a path, a whole-file hash, per-condition
+// booleans, and file metadata.
+
+// RuleScan is the top-level result of one malicious-file scan. It carries the
+// scan-level completeness flag, every rule the engine evaluated (even those
+// with zero matches), and the per-rule match results. ScanComplete is false
+// when a global file/time budget cut the walk short, which suppresses backend
+// auto-resolution for the whole run.
+type RuleScan struct {
+	ScanComplete   bool            `json:"scan_complete"`
+	EvaluatedRules []EvaluatedRule `json:"evaluated_rules"`
+	Results        []RuleResult    `json:"results"`
+}
+
+// EvaluatedRule records one rule the engine ran this scan, including rules
+// that matched nothing. Complete is false if the rule hit its per-rule match
+// cap (matches_truncated) or wasn't fully walked. RuleRevision is the opaque
+// revision echoed back for backend audit/drift detection.
+type EvaluatedRule struct {
+	RuleID       string `json:"rule_id"`
+	RuleRevision string `json:"rule_revision,omitempty"`
+	Complete     bool   `json:"complete"`
+}
+
+// RuleResult is one rule that matched at least one file. MatchesTruncated is
+// true when more than the per-rule cap (200) of files matched; the Files
+// slice is capped and the corresponding EvaluatedRule.Complete is false.
+type RuleResult struct {
+	RuleID           string          `json:"rule_id"`
+	RuleRevision     string          `json:"rule_revision,omitempty"`
+	MatchesTruncated bool            `json:"matches_truncated,omitempty"`
+	Files            []RuleFileMatch `json:"files"`
+}
+
+// RuleFileMatch is one candidate file reported for a rule. SizeExceeded is set
+// when the file was larger than the rule's size guard: it is reported but not
+// read, so FileSHA256 and Groups are empty. FileAttrs (Stat-only metadata) is
+// always present.
+type RuleFileMatch struct {
+	Path         string        `json:"path"`
+	MatchedGlob  string        `json:"matched_glob"`
+	FileSHA256   string        `json:"file_sha256,omitempty"`
+	SizeExceeded bool          `json:"size_exceeded,omitempty"`
+	Groups       []GroupResult `json:"groups,omitempty"`
+	FileAttrs    FileAttrs     `json:"file_attrs"`
+}
+
+// GroupResult reports one condition group. FullMatch is true when every
+// condition in the group matched (after applying negation).
+type GroupResult struct {
+	GroupID    string            `json:"group_id"`
+	FullMatch  bool              `json:"full_match"`
+	Conditions []ConditionResult `json:"conditions"`
+}
+
+// ConditionResult reports the boolean outcome of one condition. No matched
+// text is ever captured — only whether the condition matched.
+type ConditionResult struct {
+	ID      string `json:"id"`
+	Kind    string `json:"kind"` // "regex" | "sha256"
+	Matched bool   `json:"matched"`
+}
+
+// FileAttrs is file metadata only, never content. Times are unix seconds UTC,
+// 0 when unavailable on the platform.
+type FileAttrs struct {
+	SizeBytes  int64 `json:"size_bytes"`
+	ModifiedAt int64 `json:"modified_at"` // mtime
+	CreatedAt  int64 `json:"created_at"`  // birth time (best-effort)
+	ChangedAt  int64 `json:"changed_at"`  // ctime
+}
+
+// AgentSkill represents one discovered agent skill: a physical SKILL.md
+// directory, optionally enriched with skills.sh lock provenance. Symlink shadows
+// of the same physical dir are collapsed into one record (the linked roots
+// listed in SymlinkSources). Never carries file content — identity, provenance,
+// hashes, and census counts only.
+type AgentSkill struct {
+	// Identity
+	SkillSlug    string   `json:"skill_slug"`              // directory basename
+	SkillName    string   `json:"skill_name"`              // frontmatter name, else slug
+	Description  string   `json:"description,omitempty"`   // frontmatter description, ≤1024 runes (standard max)
+	Version      string   `json:"version,omitempty"`       // frontmatter version (or metadata.version fallback)
+	License      string   `json:"license,omitempty"`       // standard frontmatter license, ≤128 runes
+	AllowedTools []string `json:"allowed_tools,omitempty"` // normalized from space/comma string or YAML list
+
+	// Behavior/risk flags (frontmatter + body scan)
+	DisableModelInvocation bool   `json:"disable_model_invocation,omitempty"`
+	UserInvocableDisabled  bool   `json:"user_invocable_disabled,omitempty"` // frontmatter user-invocable: false
+	ContextFork            bool   `json:"context_fork,omitempty"`            // context: fork (runs in subagent)
+	ModelOverride          string `json:"model_override,omitempty"`          // frontmatter model
+	HasHooks               bool   `json:"has_hooks,omitempty"`               // hooks key present in frontmatter
+	HasShellInjection      bool   `json:"has_shell_injection,omitempty"`     // body has !`cmd` / ```! load-time exec
+
+	// Attribution
+	Agent  string `json:"agent"`  // "claude-code"|"codex"|"opencode"|"cursor"|"pi"|"factory"|"amp"|"copilot"|"gemini-cli"|"aider"|"shared"
+	Source string `json:"source"` // atomic attribution key. "claude_user"|"claude_project"|
+	//                              // "agents_user"|"agents_project"|"codex_user"|"codex_system"|"codex_admin"|
+	//                              // "opencode_user"|"opencode_project"|"cursor_user"|"cursor_project"|"pi_user"|
+	//                              // "pi_project"|"factory_user"|"factory_project"|"factory_agent_project"|
+	//                              // "factory_agent_user"|"amp_user"|"copilot_user"|"github_project"|
+	//                              // "gemini_user"|"gemini_project"|"aider_project"
+	Scope       string `json:"scope"`                  // "global" | "project" | "system"
+	ProjectPath string `json:"project_path,omitempty"` // project root for project scope
+	PluginName  string `json:"plugin_name,omitempty"`  // owning plugin, from skills.sh lock pluginName
+
+	// Location
+	SkillDirPath   string   `json:"skill_dir_path,omitempty"` // absolute, symlink-resolved dir of the physical skill (the collapse group key)
+	RootRelPath    string   `json:"root_rel_path,omitempty"`  // skill dir relative to its root, forward-slash ("frontend-design", "apps/web/frontend-design")
+	SkillMDPath    string   `json:"skill_md_path,omitempty"`
+	SymlinkSources []string `json:"symlink_sources,omitempty"` // sorted, deduped source labels that symlink to this physical skill dir; every entry is a symlink by definition
+
+	// Content identity
+	SkillMDHash string `json:"skill_md_hash,omitempty"` // hex(sha256(SKILL.md)) — identity/drift key
+
+	// File census (all stat-derived — no file bytes read)
+	FileCount         int   `json:"file_count,omitempty"`
+	CodeFileCount     int   `json:"code_file_count,omitempty"`
+	SymlinkCount      int   `json:"symlink_count,omitempty"`
+	TotalSizeBytes    int64 `json:"total_size_bytes,omitempty"`
+	HasCode           bool  `json:"has_code,omitempty"`
+	HasPluginManifest bool  `json:"has_plugin_manifest,omitempty"` // .claude-plugin/plugin.json in skill dir
+	LastModified      int64 `json:"last_modified,omitempty"`       // unix, max mtime in dir
+
+	// Frontmatter health
+	HasFrontmatter   bool   `json:"has_frontmatter"`
+	FrontmatterError string `json:"frontmatter_error,omitempty"` // "" | "invalid_yaml" | "missing_name" | "missing_description" | "file_too_large" | "unreadable"
+
+	// skills.sh lock provenance (empty when unmanaged)
+	ManagedBy          string `json:"managed_by,omitempty"`  // "skills.sh" | ""
+	SourceSlug         string `json:"source_slug,omitempty"` // "vercel-labs/agent-skills" (alias only for sourceType=local)
+	SourceType         string `json:"source_type,omitempty"` // "github"|"mintlify"|"huggingface"|"local"|"well-known"
+	SourceURL          string `json:"source_url,omitempty"`
+	Ref                string `json:"ref,omitempty"`                  // branch|tag|sha as recorded
+	SkillPath          string `json:"skill_path,omitempty"`           // subdir within upstream repo
+	UpstreamFolderHash string `json:"upstream_folder_hash,omitempty"` // GitHub tree SHA from lock (NOT sha256)
+	InstalledAt        string `json:"installed_at,omitempty"`         // ISO8601 from lock
+	UpdatedAt          string `json:"updated_at,omitempty"`           // ISO8601 from lock
+	LockFilePath       string `json:"lock_file_path,omitempty"`
+}
+
+// AgentSkillScanInfo summarizes the skills phase. Its presence in the payload
+// is the "scan ran" sentinel: a nil section means the scan did not run (no
+// information), while a non-nil section with zero skills means "scan ran,
+// nothing installed".
+type AgentSkillScanInfo struct {
+	RootsScanned    []string `json:"roots_scanned"` // absolute root paths probed AND existing
+	ProjectsScanned int      `json:"projects_scanned"`
+	LockFilesParsed int      `json:"lock_files_parsed"`
+	SkillsFound     int      `json:"skills_found"`
+	Truncated       bool     `json:"truncated,omitempty"`         // any cap hit (roots/projects/skills/home-walk)
+	Errors          []string `json:"errors,omitempty"`            // bounded: ≤50 entries, each ≤256 chars
+	WalkDirsVisited int      `json:"walk_dirs_visited,omitempty"` // home-walk ReadDir count
+	WalkRootsFound  int      `json:"walk_roots_found,omitempty"`  // project-root candidates the home walk emitted (pre-union)
+	DurationMs      int64    `json:"duration_ms"`
 }

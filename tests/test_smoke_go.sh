@@ -135,6 +135,24 @@ for key in scan_timestamp scan_timestamp_iso agent_version; do
     fi
 done
 
+# The browser extension section is omitted only when the phase declines, which is
+# what a run with no interactive user to describe produces. Emitting it with zero
+# findings is the positive claim that the machine holds no browser extensions, and
+# the backend acts on that by deleting what it has stored - so when the section is
+# there it has to carry the coverage list that says which browsers the claim covers.
+if echo "$JSON_OUTPUT" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+s = d.get('browser_extension_scan')
+if s is not None:
+    assert s['payload_schema_version'] == 1, s.get('payload_schema_version')
+    assert isinstance(s['browsers'], list) and s['browsers'], 'coverage list is empty'
+" 2>/dev/null; then
+    pass "browser_extension_scan is either absent or carries its coverage list"
+else
+    fail "browser_extension_scan is either absent or carries its coverage list"
+fi
+
 # device object fields
 for key in hostname os_version serial_number platform user_identity; do
     if echo "$JSON_OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert '$key' in d['device']" 2>/dev/null; then

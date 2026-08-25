@@ -12,7 +12,7 @@ import (
 func TestPythonPMDetector_FindsPip(t *testing.T) {
 	mock := executor.NewMock()
 	mock.SetPath("pip3", "/usr/local/bin/pip3")
-	mock.SetCommand("pip 24.0 from /usr/lib/python3.12/site-packages/pip (python 3.12)\n", "", 0, "pip3", "--version")
+	mock.SetCommand("pip 24.0 from /usr/lib/python3.12/site-packages/pip (python 3.12)\n", "", 0, "/usr/local/bin/pip3", "--version")
 
 	det := NewPythonPMDetector(mock)
 	results := det.DetectManagers(context.Background())
@@ -34,11 +34,11 @@ func TestPythonPMDetector_FindsPip(t *testing.T) {
 func TestPythonPMDetector_FindsMultiple(t *testing.T) {
 	mock := executor.NewMock()
 	mock.SetPath("python3", "/usr/local/bin/python3")
-	mock.SetCommand("Python 3.12.0\n", "", 0, "python3", "--version")
+	mock.SetCommand("Python 3.12.0\n", "", 0, "/usr/local/bin/python3", "--version")
 	mock.SetPath("pip3", "/usr/local/bin/pip3")
-	mock.SetCommand("pip 24.0 from /usr/lib/python3.12/site-packages/pip (python 3.12)\n", "", 0, "pip3", "--version")
+	mock.SetCommand("pip 24.0 from /usr/lib/python3.12/site-packages/pip (python 3.12)\n", "", 0, "/usr/local/bin/pip3", "--version")
 	mock.SetPath("uv", "/usr/local/bin/uv")
-	mock.SetCommand("uv 0.4.0\n", "", 0, "uv", "--version")
+	mock.SetCommand("uv 0.4.0\n", "", 0, "/usr/local/bin/uv", "--version")
 
 	det := NewPythonPMDetector(mock)
 	results := det.DetectManagers(context.Background())
@@ -111,7 +111,7 @@ func TestPythonProjectDetector_CountProjects(t *testing.T) {
 		filepath.Join(dir, "project2", "venv", "bin", "pip"), "list", "--format", "json")
 
 	det := NewPythonProjectDetector(mock)
-	projects := det.ListProjects([]string{dir})
+	projects, _ := det.ListProjects([]string{dir}, nil)
 
 	if len(projects) != 2 {
 		t.Fatalf("expected 2 venv projects, got %d", len(projects))
@@ -137,7 +137,7 @@ func TestPythonProjectDetector_ArbitraryVenvName(t *testing.T) {
 		filepath.Join(dir, "proj", "myenv", "bin", "pip"), "list", "--format", "json")
 
 	det := NewPythonProjectDetector(mock)
-	projects := det.ListProjects([]string{dir})
+	projects, _ := det.ListProjects([]string{dir}, nil)
 
 	if len(projects) != 1 {
 		t.Fatalf("expected 1 project, got %d", len(projects))
@@ -169,7 +169,7 @@ func TestPythonProjectDetector_MultipleVenvsSameParent(t *testing.T) {
 		filepath.Join(dir, "proj", "venv-b", "bin", "pip"), "list", "--format", "json")
 
 	det := NewPythonProjectDetector(mock)
-	projects := det.ListProjects([]string{dir})
+	projects, _ := det.ListProjects([]string{dir}, nil)
 
 	if len(projects) != 2 {
 		t.Fatalf("expected 2 projects (one per venv), got %d", len(projects))
@@ -197,7 +197,7 @@ func TestPythonProjectDetector_LegacyVenvWithActivate(t *testing.T) {
 		filepath.Join(dir, "proj", "env", "bin", "pip"), "list", "--format", "json")
 
 	det := NewPythonProjectDetector(mock)
-	projects := det.ListProjects([]string{dir})
+	projects, _ := det.ListProjects([]string{dir}, nil)
 
 	if len(projects) != 1 {
 		t.Fatalf("expected 1 project, got %d", len(projects))
@@ -215,7 +215,7 @@ func TestPythonProjectDetector_NotAVenv(t *testing.T) {
 	mock.SetFile(filepath.Join(dir, "fake", "bin", "pip"), []byte(""))
 
 	det := NewPythonProjectDetector(mock)
-	projects := det.ListProjects([]string{dir})
+	projects, _ := det.ListProjects([]string{dir}, nil)
 
 	if len(projects) != 0 {
 		t.Fatalf("expected 0 projects, got %d", len(projects))
@@ -236,7 +236,7 @@ func TestPythonProjectDetector_WindowsLayout(t *testing.T) {
 		filepath.Join(dir, "proj", ".venv", "Scripts", "pip.exe"), "list", "--format", "json")
 
 	det := NewPythonProjectDetector(mock)
-	projects := det.ListProjects([]string{dir})
+	projects, _ := det.ListProjects([]string{dir}, nil)
 
 	if len(projects) != 1 {
 		t.Fatalf("expected 1 project, got %d", len(projects))
@@ -261,7 +261,7 @@ func TestPythonProjectDetector_VenvWithoutPip(t *testing.T) {
 	mock.SetFile(filepath.Join(dir, "proj", ".venv", "pyvenv.cfg"), []byte(""))
 
 	det := NewPythonProjectDetector(mock)
-	projects := det.ListProjects([]string{dir})
+	projects, _ := det.ListProjects([]string{dir}, nil)
 
 	if len(projects) != 1 {
 		t.Fatalf("expected 1 project (venv without pip), got %d", len(projects))
@@ -308,7 +308,7 @@ func TestPythonPMDetector_DetectsUsrBinWhenCLTInstalled(t *testing.T) {
 	mock.SetGOOS("darwin")
 	mock.SetAppleCLTInstalled(true)
 	mock.SetPath("python3", "/usr/bin/python3")
-	mock.SetCommand("Python 3.9.6\n", "", 0, "python3", "--version")
+	mock.SetCommand("Python 3.9.6\n", "", 0, "/usr/bin/python3", "--version")
 
 	det := NewPythonPMDetector(mock)
 	results := det.DetectManagers(context.Background())
@@ -324,7 +324,7 @@ func TestPythonPMDetector_DetectsUsrBinOnLinux(t *testing.T) {
 	mock.SetGOOS("linux")
 	mock.SetAppleCLTInstalled(false) // irrelevant on linux; verify it doesn't gate
 	mock.SetPath("python3", "/usr/bin/python3")
-	mock.SetCommand("Python 3.11.4\n", "", 0, "python3", "--version")
+	mock.SetCommand("Python 3.11.4\n", "", 0, "/usr/bin/python3", "--version")
 
 	det := NewPythonPMDetector(mock)
 	results := det.DetectManagers(context.Background())

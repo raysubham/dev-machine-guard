@@ -7,13 +7,18 @@ import (
 
 	"github.com/step-security/dev-machine-guard/internal/buildinfo"
 	"github.com/step-security/dev-machine-guard/internal/cli"
+	"github.com/step-security/dev-machine-guard/internal/config"
 	"github.com/step-security/dev-machine-guard/internal/detector"
+	"github.com/step-security/dev-machine-guard/internal/detector/browserext"
 	"github.com/step-security/dev-machine-guard/internal/detector/configaudit"
+	"github.com/step-security/dev-machine-guard/internal/detector/credentials"
 	"github.com/step-security/dev-machine-guard/internal/device"
 	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/featuregate"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/output"
 	"github.com/step-security/dev-machine-guard/internal/progress"
+	"github.com/step-security/dev-machine-guard/internal/tcc"
 )
 
 // Run executes a community-mode scan and outputs results.
@@ -28,6 +33,19 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 			log.Warn("search directory %q is not accessible: %v — it will be skipped", d, err)
 		} else if !info.IsDir() {
 			log.Warn("search directory %q is not a directory — it will be skipped", d)
+		}
+	}
+
+	// Build the TCC skipper so directory walks avoid macOS-protected dirs
+	// (Documents, Downloads, ~/Library/Mail, ...) and don't trigger system
+	// permission prompts. Nil when --include-tcc-protected is set; the
+	// skipper's ShouldSkip is nil-safe so downstream callers don't branch.
+	var tccSkipper *tcc.Skipper
+	if tcc.Enabled(cfg.IncludeTCCProtected) {
+		tccSkipper = tcc.New(executor.ResolveHome(exec))
+		if cands := tccSkipper.Candidates(); len(cands) > 0 {
+			log.Warn("macOS TCC: skipping %d protected dirs (Documents, Downloads, ~/Library/Mail, ...) to avoid permission prompts. Pass --include-tcc-protected to scan them.", len(cands))
+			log.Debug("tcc skip list: %v", cands)
 		}
 	}
 
@@ -47,11 +65,11 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	// Detect AI agents and tools
 	log.StepStart("Detecting AI agents and tools")
 	start = time.Now()
-	cliDetector := detector.NewAICLIDetector(exec)
+	cliDetector := detector.NewAICLIDetector(exec).WithLogger(log).WithSkipper(tccSkipper)
 	cliTools := cliDetector.Detect(ctx)
-	agentDetector := detector.NewAgentDetector(exec)
+	agentDetector := detector.NewAgentDetector(exec).WithLogger(log)
 	agents := agentDetector.Detect(ctx, searchDirs)
-	fwDetector := detector.NewFrameworkDetector(exec)
+	fwDetector := detector.NewFrameworkDetector(exec).WithLogger(log)
 	frameworks := fwDetector.Detect(ctx)
 	aiTools := mergeAITools(cliTools, agents, frameworks)
 	log.StepDone(time.Since(start))
@@ -59,8 +77,8 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	// Collect MCP configurations
 	log.StepStart("Collecting MCP configurations")
 	start = time.Now()
-	mcpDetector := detector.NewMCPDetector(exec)
-	mcpConfigs := mcpDetector.Detect(ctx, dev.UserIdentity, false)
+	mcpDetector := detector.NewMCPDetector(exec).WithSkipper(tccSkipper)
+	mcpConfigs := mcpDetector.Detect(ctx, dev.UserIdentity, searchDirs, false)
 	log.StepDone(time.Since(start))
 
 	// Collect IDE extensions
@@ -100,13 +118,17 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	if npmEnabled {
 		log.StepStart("Detecting package managers")
 		start = time.Now()
-		npmDetector := detector.NewNodePMDetector(exec)
+		npmDetector := detector.NewNodePMDetector(exec).WithLogger(log)
 		pkgManagers = npmDetector.DetectManagers(ctx)
 		log.StepDone(time.Since(start))
 
 		log.StepStart("Scanning Node.js projects")
 		start = time.Now()
-		projectDetector := detector.NewNodeProjectDetector(exec)
+		projectDetector := detector.NewNodeProjectDetector(exec).WithSkipper(tccSkipper)
+		if !config.UseLegacyNodeScan {
+			projectDetector = projectDetector.WithDiskScan(
+				detector.NewNodeDistDetector(exec).WithSkipper(tccSkipper).WithLogger(log))
+		}
 		nodeProjects = projectDetector.ListProjects(searchDirs)
 		log.StepDone(time.Since(start))
 	} else {
@@ -188,40 +210,124 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	if pythonEnabled {
 		log.StepStart("Detecting Python package managers")
 		start = time.Now()
-		pyDetector := detector.NewPythonPMDetector(exec)
+		pyDetector := detector.NewPythonPMDetector(exec).WithLogger(log)
 		pythonPkgManagers = pyDetector.DetectManagers(ctx)
 		log.StepDone(time.Since(start))
 
 		log.StepStart("Listing Python packages")
 		start = time.Now()
-		pythonPackages = pyDetector.ListPackages(ctx)
+		if config.UseLegacyPythonScan {
+			pythonPackages = pyDetector.ListPackages(ctx)
+		} else {
+			pythonPackages = detector.NewPythonDistDetector(exec).WithSkipper(tccSkipper).WithLogger(log).ScanGlobalPackages()
+		}
 		log.StepDone(time.Since(start))
 
 		log.StepStart("Scanning Python projects")
 		start = time.Now()
-		pyProjectDetector := detector.NewPythonProjectDetector(exec)
-		pythonProjects = pyProjectDetector.ListProjects(searchDirs)
+		pyProjectDetector := detector.NewPythonProjectDetector(exec).WithSkipper(tccSkipper).WithLogger(log)
+		if !config.UseLegacyPythonScan {
+			pyProjectDetector = pyProjectDetector.WithDiskScan(
+				detector.NewPythonDistDetector(exec).WithSkipper(tccSkipper).WithLogger(log))
+		}
+		pythonProjects, _ = pyProjectDetector.ListProjects(searchDirs, nil)
 		log.StepDone(time.Since(start))
 	} else {
 		log.StepStart("Python package scanning")
 		log.StepSkip("disabled (use --enable-python-scan to enable)")
 	}
 
-	// npm config audit — surface-only inventory of every .npmrc on the host
-	// plus the merged effective view npm itself would resolve. Always on;
-	// the audit is cheap (a few stat calls and at most two npm invocations).
-	log.StepStart("Auditing npm configuration")
+	// AI agent skills inventory — every installed SKILL.md across Claude Code,
+	// Codex, OpenCode, Cursor, and skills.sh-managed roots. Metadata + content
+	// hashes only, never file content. Pure filesystem reads bounded by an
+	// internal 60s budget and per-root caps. Project roots surfaced by the
+	// node/python scanners feed per-project discovery on top of the detector's
+	// own ~/.claude.json registry.
+	var agentSkills []model.AgentSkill
+	var agentSkillScan *model.AgentSkillScanInfo
+	if featuregate.IsEnabled(featuregate.FeatureAgentSkillsScan) {
+		log.StepStart("Collecting AI agent skills")
+		start = time.Now()
+		skillsDetector := detector.NewSkillsDetector(exec).WithSkipper(tccSkipper)
+		agentSkills, agentSkillScan = skillsDetector.Detect(ctx, detector.CollectProjectRoots(nodeProjects, pythonProjects), searchDirs)
+		log.StepDone(time.Since(start))
+	}
+
+	// Credential-location inventory — where this machine's developer tools keep
+	// credentials, and how well guarded each location is. Exact paths only, never a
+	// walk; every read byte-capped; nothing about the credential itself leaves the
+	// detector. A nil result means the phase did not run, which is the only signal a
+	// reader has for that, so the pointer is passed through untouched.
+	log.StepStart("Inventorying credential locations")
 	start = time.Now()
-	loggedInUser, _ := exec.LoggedInUser()
-	npmrcAudit := configaudit.NewNPMRCDetector(exec).Detect(ctx, searchDirs, loggedInUser)
+	credentialScan := credentials.New(exec).WithSkipper(tccSkipper).Detect(ctx)
 	log.StepDone(time.Since(start))
+
+	// Browser extension inventory — which extensions the machine's browsers hold,
+	// whether they are enabled and why not, where they came from, and what they
+	// can touch. The browsers' own state files only: nothing is executed and the
+	// browsers' databases are never opened. A nil result means the phase declined,
+	// which is what a service context or a root caller produces, so the pointer is
+	// passed through untouched.
+	log.StepStart("Inventorying browser extensions")
+	start = time.Now()
+	browserTarget, _ := exec.LoggedInUser()
+	browserExtensionScan := browserext.New(exec).WithSkipper(tccSkipper).Detect(ctx, browserTarget)
+	log.StepDone(time.Since(start))
+
+	// npm config audit — surface-only inventory of every .npmrc on the host
+	// plus the merged effective view npm itself would resolve. The audit is
+	// cheap (a few stat calls and at most two npm invocations) but stays
+	// inert until the feature ships; zero-value structs flow through to the
+	// output so JSON/HTML keep emitting the audit shape.
+	loggedInUser, _ := exec.LoggedInUser()
+	var npmrcAudit model.NPMRCAudit
+	if featuregate.IsEnabled(featuregate.FeatureNPMRCAudit) {
+		log.StepStart("Auditing npm configuration")
+		start = time.Now()
+		npmrcAudit = configaudit.NewNPMRCDetector(exec).WithSkipper(tccSkipper).Detect(ctx, searchDirs, loggedInUser)
+		log.StepDone(time.Since(start))
+	}
 
 	// pip config audit — same shape: every pip.conf / pip.ini discovered,
 	// merged effective view, env-var snapshot, and a fixed finding catalog.
-	log.StepStart("Auditing pip configuration")
-	start = time.Now()
-	pipAudit := configaudit.NewPipConfigDetector(exec).Detect(ctx, loggedInUser)
-	log.StepDone(time.Since(start))
+	var pipAudit model.PipAudit
+	if featuregate.IsEnabled(featuregate.FeaturePipConfigAudit) {
+		log.StepStart("Auditing pip configuration")
+		start = time.Now()
+		pipAudit = configaudit.NewPipConfigDetector(exec).Detect(ctx, loggedInUser)
+		log.StepDone(time.Since(start))
+	}
+
+	// pnpm/bun/yarn config audits — pointers stay nil unless the
+	// corresponding feature gate ran the detector, so JSON `omitempty`
+	// drops the field entirely instead of emitting a zero-valued struct.
+	var pnpmAudit *model.PnpmAudit
+	if featuregate.IsEnabled(featuregate.FeaturePnpmConfigAudit) {
+		log.StepStart("Auditing pnpm configuration")
+		start = time.Now()
+		a := configaudit.NewPnpmDetector(exec).WithSkipper(tccSkipper).Detect(ctx, searchDirs, loggedInUser)
+		pnpmAudit = &a
+		log.StepDone(time.Since(start))
+	}
+
+	var bunAudit *model.BunAudit
+	if featuregate.IsEnabled(featuregate.FeatureBunConfigAudit) {
+		log.StepStart("Auditing bun configuration")
+		start = time.Now()
+		a := configaudit.NewBunDetector(exec).WithSkipper(tccSkipper).WithLogger(log).Detect(ctx, searchDirs, loggedInUser)
+		bunAudit = &a
+		log.StepDone(time.Since(start))
+	}
+
+	var yarnAudit *model.YarnAudit
+	if featuregate.IsEnabled(featuregate.FeatureYarnConfigAudit) {
+		log.StepStart("Auditing yarn configuration")
+		start = time.Now()
+		a := configaudit.NewYarnDetector(exec).WithSkipper(tccSkipper).WithLogger(log).Detect(ctx, searchDirs, loggedInUser)
+		yarnAudit = &a
+		log.StepDone(time.Since(start))
+	}
 
 	// Ensure no nil slices (JSON must emit [] not null)
 	if aiTools == nil {
@@ -293,6 +399,14 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 		FlatpakPackages:   flatpakPackages,
 		NPMRCAudit:        &npmrcAudit,
 		PipAudit:          &pipAudit,
+		PnpmAudit:         pnpmAudit,
+		BunAudit:          bunAudit,
+		YarnAudit:         yarnAudit,
+		AgentSkills:       agentSkills,
+		AgentSkillScan:    agentSkillScan,
+		CredentialScan:    credentialScan,
+
+		BrowserExtensionScan: browserExtensionScan,
 		Summary: model.Summary{
 			AIAgentsAndToolsCount: len(aiTools),
 			IDEInstallationsCount: len(ides),
@@ -305,11 +419,13 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 			SystemPackagesCount:   len(systemPackages),
 			SnapPackagesCount:     len(snapPackages),
 			FlatpakPackagesCount:  len(flatpakPackages),
+			AgentSkillsCount:      len(agentSkills),
 		},
 	}
 
-	log.Debug("scan complete: ais=%d ides=%d extensions=%d mcp=%d node_projects=%d brew_formulae=%d brew_casks=%d python_projects=%d",
-		len(aiTools), len(ides), len(extensions), len(mcpConfigs), len(nodeProjects), len(brewFormulae), len(brewCasks), len(pythonProjects))
+	log.Debug("scan complete: ais=%d ides=%d extensions=%d mcp=%d node_projects=%d brew_formulae=%d brew_casks=%d python_projects=%d agent_skills=%d",
+		len(aiTools), len(ides), len(extensions), len(mcpConfigs), len(nodeProjects), len(brewFormulae), len(brewCasks), len(pythonProjects), len(agentSkills))
+	tccSkipper.LogHits(log.Warn)
 
 	// Output
 	switch cfg.OutputFormat {

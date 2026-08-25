@@ -9,11 +9,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/step-security/dev-machine-guard/internal/buildinfo"
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/progress"
+	"github.com/step-security/dev-machine-guard/internal/tcc"
 )
 
 const defaultMaxProjectScanBytes = 500 * 1024 * 1024 // 500MB total limit
@@ -34,16 +37,100 @@ type NodeScanner struct {
 	exec         executor.Executor
 	log          *progress.Logger
 	loggedInUser string // when non-empty and running as root, commands run as this user
+	skipper      *tcc.Skipper
+	// ProgressHook, when non-nil, is invoked from inside ScanProjects /
+	// ScanGlobalPackages with a short human-readable detail string ("project
+	// 12 of 47", "scanning yarn", ...). Telemetry plumbs this into
+	// PhaseTracker.UpdateDetail so heartbeats surface mid-phase progress.
+	ProgressHook func(detail string)
+	// pmAvailability caches checkPath results per package-manager binary
+	// for the lifetime of the NodeScanner instance. On a device with 700+
+	// lockfiles, the per-project scan path previously paid a PATH lookup
+	// per project; this cache collapses that to one lookup per distinct
+	// PM. A scanner is created once per telemetry run (see
+	// internal/telemetry/telemetry.go), so the cache's effective scope
+	// matches a single scan even though the map isn't reset. Mutex-guarded
+	// because the worker pool in scanProjectsConcurrent reads/writes this
+	// map from multiple goroutines.
+	pmAvailability   map[string]error
+	pmAvailabilityMu sync.Mutex
+	// dist, when non-nil, makes both the per-project and global scans read
+	// packages from disk (lockfiles / node_modules) instead of invoking the
+	// package manager. Attached by the caller based on config.UseLegacyNodeScan.
+	// The cache, ordering, size cap, and concurrency around the scan are
+	// unchanged — only the per-project package source differs.
+	dist *NodeDistDetector
 }
 
 func NewNodeScanner(exec executor.Executor, log *progress.Logger, loggedInUser string) *NodeScanner {
-	return &NodeScanner{exec: exec, log: log, loggedInUser: loggedInUser}
+	return &NodeScanner{
+		exec:           exec,
+		log:            log,
+		loggedInUser:   loggedInUser,
+		pmAvailability: make(map[string]error),
+	}
 }
 
-// shouldRunAsUser returns true when commands should be delegated to the logged-in user.
-// Only applies on Unix — RunAsUser uses sudo which is not available on Windows.
+// WithDiskScan switches package discovery to on-disk parsing via the supplied
+// detector (no `npm ls` / `yarn` / `pnpm` / `bun` subprocess). A nil detector
+// leaves the legacy command path in place. Returns the scanner for chaining.
+func (s *NodeScanner) WithDiskScan(dist *NodeDistDetector) *NodeScanner {
+	s.dist = dist
+	return s
+}
+
+// binaryAvailable returns the cached checkPath result for a package-manager
+// binary, populating the cache on first call. Wraps checkPath so callers in
+// the per-project loop don't pay a LookPath per project on devices that
+// have hundreds of lockfiles for a PM that isn't installed.
+func (s *NodeScanner) binaryAvailable(ctx context.Context, name string) error {
+	s.pmAvailabilityMu.Lock()
+	if err, ok := s.pmAvailability[name]; ok {
+		s.pmAvailabilityMu.Unlock()
+		return err
+	}
+	s.pmAvailabilityMu.Unlock()
+
+	err := s.checkPath(ctx, name)
+	if err != nil {
+		// Logged once per PM (cache miss). "Not on PATH" is a normal
+		// "PM not installed" state — projects using it are silently skipped —
+		// but recording it at Debug makes "device emits no npm data" diagnosable
+		// (send the Debug header) instead of an unexplained absence.
+		s.log.Debug("%s not found in PATH (delegated=%v) — projects using it will be skipped: %v", name, s.shouldRunAsUser(), err)
+	}
+	s.pmAvailabilityMu.Lock()
+	s.pmAvailability[name] = err
+	s.pmAvailabilityMu.Unlock()
+	return err
+}
+
+// WithSkipper attaches a TCC skipper so the discovery walk skips
+// macOS-protected directories. A nil skipper is a no-op.
+func (s *NodeScanner) WithSkipper(skipper *tcc.Skipper) *NodeScanner {
+	s.skipper = skipper
+	return s
+}
+
+func (s *NodeScanner) emitProgress(detail string) {
+	if s.ProgressHook != nil {
+		s.ProgressHook(detail)
+	}
+}
+
+// shouldRunAsUser returns true when package-manager commands should run through
+// the logged-in user's login shell (with rc files sourced for a full PATH)
+// instead of a bare exec. Applies on Unix whenever we have a target user, in
+// both deployment modes:
+//   - root (LaunchDaemon / MDM "Run Script"): RunAsUser sudo's to the console user.
+//   - non-root (LaunchAgent's periodic fire): RunAsUser runs as the current user.
+//
+// launchd hands both a stripped PATH (/usr/bin:/bin:/usr/sbin:/sbin), so a bare
+// exec can't find npm/yarn/pnpm installed via nvm/fnm/homebrew/npm-global —
+// producing exit_code -1, empty output, and version "unknown". Windows is
+// excluded (no sudo / rc-sourcing model).
 func (s *NodeScanner) shouldRunAsUser() bool {
-	return s.exec.GOOS() != model.PlatformWindows && s.exec.IsRoot() && s.loggedInUser != ""
+	return s.exec.GOOS() != model.PlatformWindows && s.loggedInUser != ""
 }
 
 // runCmd runs a command, delegating to the logged-in user when running as root.
@@ -103,20 +190,29 @@ func (s *NodeScanner) checkPath(ctx context.Context, name string) error {
 	return err
 }
 
-// ScanGlobalPackages runs npm/yarn/pnpm list -g and returns raw base64-encoded results.
+// ScanGlobalPackages returns globally-installed packages, one NodeScanResult
+// per package manager. In disk mode it parses each PM's global node_modules;
+// otherwise it runs npm/yarn/pnpm list -g and returns raw base64 output.
 func (s *NodeScanner) ScanGlobalPackages(ctx context.Context) []model.NodeScanResult {
+	if s.dist != nil {
+		return s.scanGlobalPackagesFromDisk()
+	}
+
 	var results []model.NodeScanResult
 
+	s.emitProgress("global: npm")
 	s.log.Progress("  Checking npm global packages...")
 	if r, ok := s.scanNPMGlobal(ctx); ok {
 		results = append(results, r)
 	}
 
+	s.emitProgress("global: yarn")
 	s.log.Progress("  Checking yarn global packages...")
 	if r, ok := s.scanYarnGlobal(ctx); ok {
 		results = append(results, r)
 	}
 
+	s.emitProgress("global: pnpm")
 	s.log.Progress("  Checking pnpm global packages...")
 	if r, ok := s.scanPnpmGlobal(ctx); ok {
 		results = append(results, r)
@@ -125,8 +221,26 @@ func (s *NodeScanner) ScanGlobalPackages(ctx context.Context) []model.NodeScanRe
 	return results
 }
 
+// pmRunError returns a self-explanatory error string for a failed package-
+// manager run, or "" on success. When runErr is non-nil it carries the user
+// shell's stderr (see executor.RunAsUser), so the message names the real cause
+// — "command not found", an npm ELSPROBLEMS line — rather than a bare exit
+// code. The previous static strings ("npm list -g command failed with exit
+// code") discarded both the code and the reason, which is what made the
+// production failures opaque in telemetry.
+func pmRunError(label string, exitCode int, runErr error) string {
+	switch {
+	case runErr != nil:
+		return fmt.Sprintf("%s exec failed: %v", label, runErr)
+	case exitCode != 0:
+		return fmt.Sprintf("%s exited with code %d", label, exitCode)
+	}
+	return ""
+}
+
 func (s *NodeScanner) scanNPMGlobal(ctx context.Context) (model.NodeScanResult, bool) {
 	if err := s.checkPath(ctx, "npm"); err != nil {
+		s.log.Debug("npm not found on PATH — skipping npm global scan: %v", err)
 		return model.NodeScanResult{}, false
 	}
 
@@ -138,13 +252,12 @@ func (s *NodeScanner) scanNPMGlobal(ctx context.Context) (model.NodeScanResult, 
 	}
 
 	start := time.Now()
-	stdout, stderr, exitCode, _ := s.runCmd(ctx, 60*time.Second, "npm", "list", "-g", "--json", "--depth=3")
+	stdout, stderr, exitCode, runErr := s.runCmd(ctx, 60*time.Second, "npm", "list", "-g", "--json", "--depth=3")
 	duration := time.Since(start).Milliseconds()
 
-	errMsg := ""
-	if exitCode != 0 {
-		errMsg = "npm list -g command failed with exit code"
-		s.log.Warn("npm list -g failed (exit_code=%d, %dms) — results may be incomplete", exitCode, duration)
+	errMsg := pmRunError("npm list -g", exitCode, runErr)
+	if errMsg != "" {
+		s.log.Warn("npm global scan failed (%dms): %s — results may be incomplete", duration, errMsg)
 	}
 	s.log.Debug("npm global scan: version=%s prefix=%s exit_code=%d stdout_bytes=%d duration=%dms", version, prefix, exitCode, len(stdout), duration)
 
@@ -163,24 +276,25 @@ func (s *NodeScanner) scanNPMGlobal(ctx context.Context) (model.NodeScanResult, 
 
 func (s *NodeScanner) scanYarnGlobal(ctx context.Context) (model.NodeScanResult, bool) {
 	if err := s.checkPath(ctx, "yarn"); err != nil {
+		s.log.Debug("yarn not found on PATH — skipping yarn global scan: %v", err)
 		return model.NodeScanResult{}, false
 	}
 
 	version := s.getVersion(ctx, "yarn", "--version")
 	globalDir := s.getOutput(ctx, "yarn", "global", "dir")
 	if globalDir == "" {
+		s.log.Debug("yarn found but `yarn global dir` returned empty — skipping yarn global scan")
 		return model.NodeScanResult{}, false
 	}
 
 	start := time.Now()
 	// Run directly in the global dir instead of shell cd (avoids Windows quoting issues).
-	stdout, stderr, exitCode, _ := s.runInDir(ctx, globalDir, 60*time.Second, "yarn", "list", "--json", "--depth=0")
+	stdout, stderr, exitCode, runErr := s.runInDir(ctx, globalDir, 60*time.Second, "yarn", "list", "--json", "--depth=0")
 	duration := time.Since(start).Milliseconds()
 
-	errMsg := ""
-	if exitCode != 0 {
-		errMsg = "yarn global list command failed"
-		s.log.Warn("yarn global list failed (exit_code=%d, %dms) — results may be incomplete", exitCode, duration)
+	errMsg := pmRunError("yarn global list", exitCode, runErr)
+	if errMsg != "" {
+		s.log.Warn("yarn global scan failed (%dms): %s — results may be incomplete", duration, errMsg)
 	}
 	s.log.Debug("yarn global scan: version=%s global_dir=%s exit_code=%d stdout_bytes=%d duration=%dms", version, globalDir, exitCode, len(stdout), duration)
 
@@ -260,10 +374,9 @@ func (s *NodeScanner) scanPnpmGlobal(ctx context.Context) (model.NodeScanResult,
 	}
 	duration := time.Since(start).Milliseconds()
 
-	errMsg := ""
-	if exitCode != 0 {
-		errMsg = "pnpm list -g command failed"
-		s.log.Warn("pnpm list -g failed (exit_code=%d, %dms) — results may be incomplete", exitCode, duration)
+	errMsg := pmRunError("pnpm list -g", exitCode, err)
+	if errMsg != "" {
+		s.log.Warn("pnpm global scan failed (%dms): %s — results may be incomplete", duration, errMsg)
 	}
 	s.log.Debug("pnpm global scan: version=%s global_dir=%s exit_code=%d stdout_bytes=%d duration=%dms err=%v", version, globalDir, exitCode, len(stdout), duration, err)
 
@@ -280,21 +393,23 @@ func (s *NodeScanner) scanPnpmGlobal(ctx context.Context) (model.NodeScanResult,
 	}, true
 }
 
-// defaultPnpmBinDir returns the default pnpm global bin directory for the current OS
-// based on environment variables.
+// defaultPnpmBinDir returns the default pnpm global bin directory for the current OS.
+// The user-home dirs are anchored on getHomeDir (the logged-in console user),
+// not $HOME — under a LaunchDaemon $HOME is /var/root, which would point the
+// fallback at root's home instead of the developer's.
 func defaultPnpmBinDir(exec executor.Executor) string {
 	switch exec.GOOS() {
 	case model.PlatformDarwin:
-		if home := exec.Getenv("HOME"); home != "" {
+		if home := getHomeDir(exec); home != "" {
 			return filepath.Join(home, "Library", "pnpm", "bin")
 		}
 	case model.PlatformLinux:
-		if home := exec.Getenv("HOME"); home != "" {
-			return filepath.Join(home, ".local", "share", "pnpm")
+		if home := getHomeDir(exec); home != "" {
+			return filepath.Join(home, ".local", "share", "pnpm", "bin")
 		}
 	case model.PlatformWindows:
 		if localAppData := exec.Getenv("LOCALAPPDATA"); localAppData != "" {
-			return filepath.Join(localAppData, "pnpm")
+			return filepath.Join(localAppData, "pnpm", "bin")
 		}
 	}
 	return ""
@@ -306,10 +421,17 @@ type projectEntry struct {
 	modTime int64
 }
 
-// ScanProjects finds package.json files, sorts by most recently modified, then scans.
-// Respects the size limit (default 500MB, override via STEPSEC_MAX_NODE_SCAN_BYTES).
-func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string) []model.NodeScanResult {
-	// Phase 1: Discover all package.json files
+// ScanProjects finds package.json files and scans them within the size cap.
+//
+// Ordering: never-before-seen projects (paths absent from knownLastVerified)
+// come first, sorted by mtime descending. Already-known projects follow,
+// sorted by their LastVerifiedAt ascending so the stalest are re-checked
+// first. Pass a nil map for plain mtime-descending order.
+//
+// The second return is every project directory discovered on disk (before
+// the cap), so callers can distinguish "missing from disk" from "dropped by
+// the cap" when comparing against prior state.
+func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string, knownLastVerified map[string]time.Time) (results []model.NodeScanResult, discovered []string) {
 	var projects []projectEntry
 	for _, dir := range searchDirs {
 		s.log.Progress("  Searching in: %s", dir)
@@ -318,6 +440,9 @@ func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string) []m
 				return nil
 			}
 			if entry.IsDir() {
+				if s.skipper.ShouldSkip(path, dir) {
+					return filepath.SkipDir
+				}
 				name := entry.Name()
 				if name == "node_modules" || name == ".git" || name == ".cache" ||
 					strings.HasPrefix(name, ".") {
@@ -332,7 +457,6 @@ func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string) []m
 			if isInsideNodeModules(projectDir) {
 				return nil
 			}
-			// Get modification time for sorting
 			modTime := int64(0)
 			if info, err := entry.Info(); err == nil {
 				modTime = info.ModTime().Unix()
@@ -344,95 +468,283 @@ func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string) []m
 
 	s.log.Debug("node project discovery: found %d package.json files across %d search dir(s)", len(projects), len(searchDirs))
 
-	// Phase 2: Sort by modification time descending (most recent first)
-	sort.Slice(projects, func(i, j int) bool {
-		return projects[i].modTime > projects[j].modTime
-	})
+	discovered = make([]string, 0, len(projects))
+	for _, p := range projects {
+		discovered = append(discovered, p.dir)
+	}
 
-	// Phase 3: Scan in order, respecting limits
+	projects = orderScanProjects(projects, knownLastVerified)
+
+	if len(projects) > maxNodeProjects {
+		s.log.Warn("Node project scan truncated at %d projects (total discovered: %d) — lowest-priority projects were skipped", maxNodeProjects, len(projects))
+		projects = projects[:maxNodeProjects]
+	}
+
+	results = s.scanProjectsConcurrent(ctx, projects)
+
 	maxBytes := getMaxProjectScanBytes()
-	var results []model.NodeScanResult
 	totalSize := int64(0)
-
-	for i, p := range projects {
-		if i >= maxNodeProjects {
-			s.log.Progress("  Reached maximum of %d projects, stopping search", maxNodeProjects)
-			s.log.Warn("Node project scan truncated at %d projects (total discovered: %d) — oldest projects were skipped", maxNodeProjects, len(projects))
-			break
-		}
-		if totalSize > maxBytes {
-			s.log.Warn("Reached data size limit (%d bytes collected, limit: %d bytes)", totalSize, maxBytes)
-			s.log.Warn("Skipping remaining projects (prioritized by most recently modified)")
-			break
-		}
-
-		s.log.Progress("  Found project: %s", p.dir)
-		pm := DetectProjectPM(s.exec, p.dir)
-		s.log.Progress("    Package manager: %s", pm)
-
-		r := s.scanProject(ctx, p.dir)
-		resultSize := int64(len(r.RawStdoutBase64)) + int64(len(r.RawStderrBase64))
-
+	capped := make([]model.NodeScanResult, 0, len(results))
+	for _, r := range results {
+		// Disk-scan results leave RawStdout/Stderr empty and carry the payload
+		// in Packages instead, so count an estimate of that too — otherwise a
+		// monorepo's structured packages bypass the cap entirely.
+		resultSize := int64(len(r.RawStdoutBase64)) + int64(len(r.RawStderrBase64)) + estimatePackagesBytes(r.Packages)
 		if totalSize+resultSize > maxBytes {
 			s.log.Warn("Reached data size limit (%d bytes collected, limit: %d bytes)", totalSize, maxBytes)
 			s.log.Warn("Skipping remaining projects (prioritized by most recently modified)")
 			break
 		}
-
 		totalSize += resultSize
-		results = append(results, r)
+		capped = append(capped, r)
 	}
 
+	return capped, discovered
+}
+
+// estimatePackagesBytes approximates the serialized size of a disk-scan
+// result's structured Packages so ScanProjects' total-size cap can count them.
+// The per-package constant covers JSON field names, quotes, and separators;
+// exactness isn't needed — this only has to keep a pathological monorepo from
+// slipping past the cap when RawStdout/Stderr are empty.
+func estimatePackagesBytes(pkgs []model.NodePackage) int64 {
+	const perPackageOverhead = 40 // {"name":"","version":"","is_direct":true},
+	total := int64(0)
+	for _, p := range pkgs {
+		total += int64(len(p.Name) + len(p.Version) + perPackageOverhead)
+	}
+	return total
+}
+
+// scanProjectsConcurrent returns one NodeScanResult per project in the input
+// order. Cache hits skip the PM CLI entirely; cache misses run through a
+// bounded worker pool. Successful fresh scans are written back to the cache.
+// Projects whose PM isn't installed on the device produce no result (skipped
+// in the returned slice to match the legacy contract).
+func (s *NodeScanner) scanProjectsConcurrent(ctx context.Context, projects []projectEntry) []model.NodeScanResult {
+	cachePath := scanCacheFile(s.exec)
+	cache := loadScanCache(cachePath)
+	bypassCache := s.exec.Getenv("STEPSEC_NODE_SCAN_CACHE_BYPASS") == "1"
+	nowUnix := time.Now().Unix()
+
+	type slot struct {
+		result    model.NodeScanResult
+		pm        string
+		populated bool
+		fromCache bool
+	}
+	slots := make([]slot, len(projects))
+	missIdx := make([]int, 0, len(projects))
+
+	for i, p := range projects {
+		s.emitProgress(fmt.Sprintf("project %d of %d", i+1, len(projects)))
+		pm := DetectProjectPM(s.exec, p.dir)
+		slots[i].pm = pm
+
+		entry, ok := cache.Projects[p.dir]
+		if ok && cacheValidFor(s.exec, entry, p.dir, pm, s.agentVersion(), bypassCache) {
+			s.log.Progress("  Cached: %s (%s)", p.dir, pm)
+			slots[i].result = entry.CachedResult
+			slots[i].populated = true
+			slots[i].fromCache = true
+			continue
+		}
+		missIdx = append(missIdx, i)
+	}
+
+	if len(missIdx) > 0 {
+		jobs := make(chan int, len(missIdx))
+		var wg sync.WaitGroup
+		workers := scanWorkerCount(s.exec)
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for idx := range jobs {
+					p := projects[idx]
+					pm := slots[idx].pm
+					s.log.Progress("  Scanning: %s (%s)", p.dir, pm)
+					r, ok := s.scanProject(ctx, p.dir, pm)
+					if !ok {
+						continue
+					}
+					slots[idx].result = r
+					slots[idx].populated = true
+				}
+			}()
+		}
+		for _, i := range missIdx {
+			jobs <- i
+		}
+		close(jobs)
+		wg.Wait()
+	}
+
+	results := make([]model.NodeScanResult, 0, len(slots))
+	for i, sl := range slots {
+		if !sl.populated {
+			continue
+		}
+		results = append(results, sl.result)
+		if !sl.fromCache && sl.result.ExitCode == 0 {
+			cache.Projects[projects[i].dir] = scanCacheEntry{
+				PackageManager:   sl.pm,
+				LastScanUnix:     nowUnix,
+				PackageJSONMtime: mtimeOr0(s.exec, filepath.Join(projects[i].dir, "package.json")),
+				LockfileMtime:    mtimeOr0(s.exec, lockfileFor(s.exec, projects[i].dir, sl.pm)),
+				NodeModulesMtime: mtimeOr0(s.exec, filepath.Join(projects[i].dir, "node_modules")),
+				AgentVersion:     s.agentVersion(),
+				CachedResult:     sl.result,
+			}
+		}
+	}
+
+	pruneCacheToDiscovered(cache, projects)
+	if err := cache.save(cachePath); err != nil {
+		s.log.Debug("node-scan-cache: save failed (%v) — next run will re-scan everything", err)
+	}
+
+	s.log.Progress("  Scanned %d projects (%d cache hits)", len(missIdx), len(slots)-len(missIdx))
 	return results
 }
 
-func (s *NodeScanner) scanProject(ctx context.Context, projectDir string) model.NodeScanResult {
-	pm := DetectProjectPM(s.exec, projectDir)
-	version := ""
+// pruneCacheToDiscovered drops cache entries for projects not present in the
+// current discovery pass. Bounds the cache file at the device's current
+// project set rather than growing unboundedly across runs.
+func pruneCacheToDiscovered(cache *scanCache, projects []projectEntry) {
+	keep := make(map[string]struct{}, len(projects))
+	for _, p := range projects {
+		keep[p.dir] = struct{}{}
+	}
+	for dir := range cache.Projects {
+		if _, ok := keep[dir]; !ok {
+			delete(cache.Projects, dir)
+		}
+	}
+}
+
+// agentVersion returns the running agent's version, used as a cache key
+// guard so post-upgrade runs always re-scan.
+func (s *NodeScanner) agentVersion() string {
+	return buildinfo.Version
+}
+
+// orderScanProjects sorts discovered projects so that paths absent from
+// knownLastVerified (never-seen projects) come first by mtime descending,
+// then known paths by LastVerifiedAt ascending (stalest first). A nil map
+// degrades to the legacy mtime-descending order.
+func orderScanProjects(projects []projectEntry, knownLastVerified map[string]time.Time) []projectEntry {
+	if len(knownLastVerified) == 0 {
+		sort.Slice(projects, func(i, j int) bool {
+			return projects[i].modTime > projects[j].modTime
+		})
+		return projects
+	}
+
+	unknown := make([]projectEntry, 0, len(projects))
+	known := make([]projectEntry, 0, len(projects))
+	for _, p := range projects {
+		if _, ok := knownLastVerified[p.dir]; ok {
+			known = append(known, p)
+		} else {
+			unknown = append(unknown, p)
+		}
+	}
+	sort.Slice(unknown, func(i, j int) bool {
+		return unknown[i].modTime > unknown[j].modTime
+	})
+	sort.Slice(known, func(i, j int) bool {
+		return knownLastVerified[known[i].dir].Before(knownLastVerified[known[j].dir])
+	})
+	return append(unknown, known...)
+}
+
+// scanProject runs the project's detected package manager in the project
+// directory and returns the raw stdout/stderr as a NodeScanResult. The
+// second return is false when no record should be emitted — currently only
+// the case when the PM binary isn't on PATH, which is a normal "Node not
+// installed on this device" state, not a scan failure. Mirrors the
+// (result, ok) shape of scanNPMGlobal / scanYarnGlobal / scanPnpmGlobal.
+//
+// pm is passed in by the caller (ScanProjects already detects it once for
+// the per-project progress log); we accept it as an argument rather than
+// re-running DetectProjectPM here to avoid duplicating the FileExists /
+// DirExists checks per project and to keep the detected value consistent
+// with what the caller logged.
+func (s *NodeScanner) scanProject(ctx context.Context, projectDir, pm string) (model.NodeScanResult, bool) {
+	if s.dist != nil {
+		return s.scanProjectFromDisk(projectDir, pm)
+	}
 
 	var cmd string
 	var args []string
-
 	switch pm {
 	case "npm":
-		version = s.getVersion(ctx, "npm", "--version")
-		cmd = "npm"
-		args = []string{"ls", "--json", "--depth=3"}
+		cmd, args = "npm", []string{"ls", "--json", "--depth=3"}
 	case "yarn":
-		version = s.getVersion(ctx, "yarn", "--version")
-		cmd = "yarn"
-		args = []string{"list", "--json"}
+		cmd, args = "yarn", []string{"list", "--json"}
 	case "yarn-berry":
-		version = s.getVersion(ctx, "yarn", "--version")
-		cmd = "yarn"
-		args = []string{"info", "--all", "--json"}
+		cmd, args = "yarn", []string{"info", "--all", "--json"}
 	case "pnpm":
-		version = s.getVersion(ctx, "pnpm", "--version")
-		cmd = "pnpm"
-		args = []string{"ls", "--json", "--depth=3"}
+		cmd, args = "pnpm", []string{"ls", "--json", "--depth=3"}
 	case "bun":
-		version = s.getVersion(ctx, "bun", "--version")
-		cmd = "bun"
-		args = []string{"pm", "ls", "--all"}
+		cmd, args = "bun", []string{"pm", "ls", "--all"}
 	default:
+		// "unsupported package manager" is a genuine error state — the
+		// lockfile detector matched something we don't have a scanner for.
+		// Emit so the backend can surface it; this is distinct from the
+		// "PM not installed" case handled below.
 		return model.NodeScanResult{
 			ProjectPath:    projectDir,
 			PackageManager: pm,
 			Error:          "unsupported package manager",
 			ExitCode:       1,
-		}
+		}, true
 	}
+
+	// "PM not installed on this device" is not a scan failure — it's a
+	// normal configuration state (e.g. a Windows machine that hasn't
+	// received the corporate Node.js deployment, scanning vendored
+	// package.json files inside VS Code extensions). Without this guard
+	// the per-project loop fell through to exec.CommandContext, hit ENOENT,
+	// and shipped an empty-RawStdoutBase64 record per project to the
+	// backend. The backend can't tell the difference between "agent
+	// couldn't run npm" and "agent ran npm and got 0 packages", so devices
+	// with hundreds of vendored package.json files dropped off the UI's
+	// "Has npm_packages" view despite the backend running cleanly.
+	//
+	// Symmetric with scanNPMGlobal / scanYarnGlobal / scanPnpmGlobal which
+	// already do this — global scans for missing PMs are dropped from
+	// telemetry rather than emitted as zero-result records.
+	if err := s.binaryAvailable(ctx, cmd); err != nil {
+		return model.NodeScanResult{}, false
+	}
+
+	version := s.getVersion(ctx, cmd, "--version")
 
 	start := time.Now()
 	// Run the package manager command directly in the project directory.
 	// Avoids shell cd + quoting issues on Windows where cmd.exe misinterprets
 	// Go's backslash-escaped quotes in paths.
-	stdout, stderr, exitCode, _ := s.runInDir(ctx, projectDir, 30*time.Second, cmd, args...)
+	stdout, stderr, exitCode, runErr := s.runInDir(ctx, projectDir, 30*time.Second, cmd, args...)
 	duration := time.Since(start).Milliseconds()
 
-	errMsg := ""
-	if exitCode != 0 {
-		errMsg = cmd + " command failed with exit code"
+	// Capture the real failure reason for the case where the PM IS
+	// available but the run still fails (timeout, mid-run exec error,
+	// non-zero exit). Previously runErr was discarded and errMsg was
+	// derived from exitCode alone, making spawn failure mid-run,
+	// context cancellation, and a genuine non-zero exit indistinguishable.
+	// runErr carries the user shell's stderr (see executor.RunAsUser), so the
+	// message names the real cause instead of a bare exit code.
+	errMsg := pmRunError(cmd, exitCode, runErr)
+
+	// Surface the failure in the agent log, not just the telemetry record.
+	// A recurring failure (e.g. npm unreachable under the LaunchAgent's
+	// stripped PATH) previously left both the log and — on the delegated
+	// path, where stderr is unavailable — the telemetry stderr blank, so the
+	// only signal was an opaque exit code.
+	if errMsg != "" {
+		s.log.Warn("node project scan failed: %s (project=%s, exit=%d)", errMsg, projectDir, exitCode)
 	}
 
 	return model.NodeScanResult{
@@ -445,7 +757,68 @@ func (s *NodeScanner) scanProject(ctx context.Context, projectDir string) model.
 		Error:            errMsg,
 		ExitCode:         exitCode,
 		ScanDurationMs:   duration,
+	}, true
+}
+
+// scanProjectFromDisk produces a project's NodeScanResult by parsing on-disk
+// lockfiles / node_modules instead of running the package manager. Unlike the
+// command path it does not require the PM binary to be installed, so a project
+// whose toolchain is absent is still inventoried. RawStdout/Stderr stay empty
+// (the backend reads Packages directly), and PMVersion is omitted — resolving
+// it would mean running the binary we are deliberately not invoking.
+func (s *NodeScanner) scanProjectFromDisk(projectDir, pm string) (model.NodeScanResult, bool) {
+	pkgs := s.dist.ScanProject(projectDir, pm)
+	return model.NodeScanResult{
+		ProjectPath:      projectDir,
+		PackageManager:   pm,
+		WorkingDirectory: projectDir,
+		Packages:         pkgs,
+		PackagesCount:    len(pkgs),
+		ExitCode:         0,
+	}, true
+}
+
+// scanGlobalPackagesFromDisk inventories globally-installed packages from each
+// package manager's global node_modules on disk, returning one NodeScanResult
+// per PM (the delta layer reconciles globals keyed by package manager). Roots
+// for the same PM are merged and de-duplicated. Returns nil when no global
+// roots exist on the host.
+func (s *NodeScanner) scanGlobalPackagesFromDisk() []model.NodeScanResult {
+	roots := NodeGlobalRoots(s.exec)
+	if len(roots) == 0 {
+		s.log.Debug("node global disk scan: no global node_modules roots found")
+		return nil
 	}
+	byPM := make(map[string][]model.NodePackage)
+	var order []string
+	for _, r := range roots {
+		s.emitProgress("global: " + r.pm)
+		if _, seen := byPM[r.pm]; !seen {
+			order = append(order, r.pm)
+		}
+		pkgs := s.dist.ScanGlobalModules(r.dir)
+		if len(pkgs) == 0 {
+			// pnpm (and other store-based managers) symlink the global
+			// node_modules into a content-addressed store the walk can't
+			// traverse, so it comes back empty. The install dir (parent of
+			// node_modules) carries the lockfile + package.json with the full
+			// resolved graph — parse that instead, keyed on the root's PM.
+			pkgs = s.dist.ScanProject(filepath.Dir(r.dir), r.pm)
+		}
+		byPM[r.pm] = append(byPM[r.pm], pkgs...)
+	}
+	results := make([]model.NodeScanResult, 0, len(order))
+	for _, pm := range order {
+		pkgs := dedupSortPackages(byPM[pm])
+		s.log.Debug("node global disk scan: %s -> %d packages", pm, len(pkgs))
+		results = append(results, model.NodeScanResult{
+			PackageManager: pm,
+			Packages:       pkgs,
+			PackagesCount:  len(pkgs),
+			ExitCode:       0,
+		})
+	}
+	return results
 }
 
 func (s *NodeScanner) getVersion(ctx context.Context, binary, flag string) string {

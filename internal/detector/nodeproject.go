@@ -9,17 +9,39 @@ import (
 
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
+	"github.com/step-security/dev-machine-guard/internal/tcc"
 )
 
 const maxNodeProjects = 1000
 
 // NodeProjectDetector scans for Node.js projects.
 type NodeProjectDetector struct {
-	exec executor.Executor
+	exec    executor.Executor
+	skipper *tcc.Skipper
+	// dist, when non-nil, makes per-project package listing read resolved
+	// versions from on-disk lockfiles instead of the declared ranges in
+	// package.json. Attached by the caller based on config.UseLegacyNodeScan.
+	dist *NodeDistDetector
 }
 
 func NewNodeProjectDetector(exec executor.Executor) *NodeProjectDetector {
 	return &NodeProjectDetector{exec: exec}
+}
+
+// WithSkipper attaches a TCC skipper so the walk skips macOS-protected
+// directories. A nil skipper is a no-op. Returns the detector for chaining.
+func (d *NodeProjectDetector) WithSkipper(s *tcc.Skipper) *NodeProjectDetector {
+	d.skipper = s
+	return d
+}
+
+// WithDiskScan switches per-project package listing to disk parsing (resolved
+// name@version from the lockfile / node_modules) via the supplied detector. A
+// nil detector leaves the legacy package.json-range path in place. Returns the
+// detector for chaining.
+func (d *NodeProjectDetector) WithDiskScan(dist *NodeDistDetector) *NodeProjectDetector {
+	d.dist = dist
+	return d
 }
 
 // CountProjects counts the number of Node.js projects found under the given directories.
@@ -47,6 +69,9 @@ func (d *NodeProjectDetector) listInDir(dir string) []model.ProjectInfo {
 			return nil
 		}
 		if entry.IsDir() {
+			if d.skipper.ShouldSkip(path, dir) {
+				return filepath.SkipDir
+			}
 			name := entry.Name()
 			if name == "node_modules" || name == ".git" || name == ".cache" ||
 				strings.HasPrefix(name, ".") {
@@ -64,7 +89,7 @@ func (d *NodeProjectDetector) listInDir(dir string) []model.ProjectInfo {
 			if !hasNodeModules && !isYarnBerryPnP {
 				return nil
 			}
-			pkgs := d.readPackageJSONDeps(path)
+			pkgs := d.projectPackages(projectDir, pm, path)
 			projects = append(projects, model.ProjectInfo{
 				Path:           projectDir,
 				PackageManager: pm,
@@ -77,6 +102,31 @@ func (d *NodeProjectDetector) listInDir(dir string) []model.ProjectInfo {
 		return nil
 	})
 	return projects
+}
+
+// projectPackages returns a project's packages, preferring disk parsing
+// (resolved name@version, full transitive set) when a dist detector is
+// attached, and falling back to the package.json declared ranges otherwise.
+// is_direct is not carried in the community ProjectInfo shape, so it is dropped
+// here; it survives in the enterprise path.
+func (d *NodeProjectDetector) projectPackages(projectDir, pm, packageJSONPath string) []model.PackageDetail {
+	if d.dist != nil {
+		return nodePackagesToDetails(d.dist.ScanProject(projectDir, pm))
+	}
+	return d.readPackageJSONDeps(packageJSONPath)
+}
+
+// nodePackagesToDetails projects the disk-parse result down to the community
+// {name, version} shape.
+func nodePackagesToDetails(pkgs []model.NodePackage) []model.PackageDetail {
+	if len(pkgs) == 0 {
+		return nil
+	}
+	out := make([]model.PackageDetail, len(pkgs))
+	for i, p := range pkgs {
+		out[i] = model.PackageDetail{Name: p.Name, Version: p.Version}
+	}
+	return out
 }
 
 // readPackageJSONDeps reads dependencies + devDependencies from a package.json file.

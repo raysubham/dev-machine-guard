@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -18,12 +21,21 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/cli"
 	"github.com/step-security/dev-machine-guard/internal/config"
 	"github.com/step-security/dev-machine-guard/internal/detector"
+	"github.com/step-security/dev-machine-guard/internal/detector/browserext"
 	"github.com/step-security/dev-machine-guard/internal/detector/configaudit"
+	"github.com/step-security/dev-machine-guard/internal/detector/credentials"
+	"github.com/step-security/dev-machine-guard/internal/detector/rules"
 	"github.com/step-security/dev-machine-guard/internal/device"
 	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/featuregate"
 	"github.com/step-security/dev-machine-guard/internal/lock"
 	"github.com/step-security/dev-machine-guard/internal/model"
+	"github.com/step-security/dev-machine-guard/internal/paths"
 	"github.com/step-security/dev-machine-guard/internal/progress"
+	"github.com/step-security/dev-machine-guard/internal/rungate"
+	"github.com/step-security/dev-machine-guard/internal/schedinfo"
+	"github.com/step-security/dev-machine-guard/internal/state"
+	"github.com/step-security/dev-machine-guard/internal/tcc"
 )
 
 // s3UploadBackoffUnit is multiplied by attempt-number to compute the
@@ -31,37 +43,76 @@ import (
 // can shrink it; production code never mutates it.
 var s3UploadBackoffUnit = 2 * time.Second
 
+// CurrentPayloadSchemaVersion is bumped when the delta-protocol wire shape
+// changes in a way the backend cares about. 0 = legacy agent.
+const CurrentPayloadSchemaVersion = 1
+
 // Payload is the enterprise telemetry JSON structure.
 type Payload struct {
-	CustomerID     string                 `json:"customer_id"`
-	DeviceID       string                 `json:"device_id"`
-	SerialNumber   string                 `json:"serial_number"`
-	UserIdentity   string                 `json:"user_identity"`
-	Hostname       string                 `json:"hostname"`
-	Platform       string                 `json:"platform"`
-	OSVersion      string                 `json:"os_version"`
-	Resources      model.MachineResources `json:"resources"`
-	AgentVersion   string                 `json:"agent_version"`
-	CollectedAt    int64                  `json:"collected_at"`
-	NoUserLoggedIn bool                   `json:"no_user_logged_in"`
+	// PayloadSchemaVersion gates the delta-protocol sibling fields below
+	// (NodeProjectsUnchanged etc.). Zero/absent = legacy snapshot, every
+	// scanned project ships its full body in NodeProjects/PythonProjects.
+	PayloadSchemaVersion int                    `json:"payload_schema_version,omitempty"`
+	CustomerID           string                 `json:"customer_id"`
+	DeviceID             string                 `json:"device_id"`
+	SerialNumber         string                 `json:"serial_number"`
+	UserIdentity         string                 `json:"user_identity"`
+	Hostname             string                 `json:"hostname"`
+	Platform             string                 `json:"platform"`
+	OSVersion            string                 `json:"os_version"`
+	Resources            model.MachineResources `json:"resources"`
+	AgentVersion         string                 `json:"agent_version"`
+	CollectedAt          int64                  `json:"collected_at"`
+	NoUserLoggedIn       bool                   `json:"no_user_logged_in"`
 
-	IDEExtensions        []model.Extension               `json:"ide_extensions"`
-	IDEInstallations     []model.IDE                     `json:"ide_installations"`
-	NodePkgManagers      []model.PkgManager              `json:"node_package_managers"`
-	NodeGlobalPackages   []model.NodeScanResult          `json:"node_global_packages"`
-	NodeProjects         []model.NodeScanResult          `json:"node_projects"`
-	BrewPkgManager       *model.PkgManager               `json:"brew_package_manager,omitempty"`
-	BrewScans            []model.BrewScanResult          `json:"brew_scans"`
-	BrewFormulae         []model.BrewPackage             `json:"brew_formulae,omitempty"`
-	BrewCasks            []model.BrewPackage             `json:"brew_casks,omitempty"`
-	PythonPkgManagers    []model.PkgManager              `json:"python_package_managers"`
-	PythonGlobalPackages []model.PythonScanResult        `json:"python_global_packages"`
-	PythonProjects       []model.ProjectInfo             `json:"python_projects"`
-	SystemPackageScans   []model.SystemPackageScanResult `json:"system_package_scans"`
-	AIAgents             []model.AITool                  `json:"ai_agents"`
-	MCPConfigs           []model.MCPConfigEnterprise     `json:"mcp_configs"`
-	NPMRCAudit           *model.NPMRCAudit               `json:"npmrc_audit,omitempty"`
-	PipAudit             *model.PipAudit                 `json:"pip_audit,omitempty"`
+	// InvocationMethod is "install" when the agent ran from an installed
+	// launchd/systemd/schtasks unit, "one_time" for a manual CLI run.
+	// Duplicated on this struct (also lives on the run-status row) so the
+	// stored telemetry record is self-describing for backfills.
+	InvocationMethod string `json:"invocation_method,omitempty"`
+
+	// StatusInfo carries the final phase completion list and total elapsed
+	// time the agent saw at upload time. Snapshot of the same RunStatusInfo
+	// streamed via the run-status endpoint during the run.
+	StatusInfo *RunStatusInfo `json:"status_info,omitempty"`
+
+	IDEExtensions        []model.Extension        `json:"ide_extensions"`
+	IDEInstallations     []model.IDE              `json:"ide_installations"`
+	NodePkgManagers      []model.PkgManager       `json:"node_package_managers"`
+	NodeGlobalPackages   []model.NodeScanResult   `json:"node_global_packages"`
+	NodeProjects         []model.NodeScanResult   `json:"node_projects"`
+	BrewPkgManager       *model.PkgManager        `json:"brew_package_manager,omitempty"`
+	BrewScans            []model.BrewScanResult   `json:"brew_scans"`
+	BrewFormulae         []model.BrewPackage      `json:"brew_formulae,omitempty"`
+	BrewCasks            []model.BrewPackage      `json:"brew_casks,omitempty"`
+	PythonPkgManagers    []model.PkgManager       `json:"python_package_managers"`
+	PythonGlobalPackages []model.PythonScanResult `json:"python_global_packages"`
+	PythonProjects       []model.ProjectInfo      `json:"python_projects"`
+	// Delta-protocol siblings (PayloadSchemaVersion >= 1). NodeProjects /
+	// NodeGlobalPackages / PythonProjects / PythonGlobalPackages above carry
+	// only the `changed` subset; everything else is here.
+	NodeProjectsUnchanged   []model.UnchangedProjectRef     `json:"node_projects_unchanged,omitempty"`
+	NodeProjectsRemoved     []model.RemovedProjectRef       `json:"node_projects_removed,omitempty"`
+	NodeGlobalsUnchanged    []model.UnchangedGlobalRef      `json:"node_globals_unchanged,omitempty"`
+	PythonProjectsUnchanged []model.UnchangedProjectRef     `json:"python_projects_unchanged,omitempty"`
+	PythonProjectsRemoved   []model.RemovedProjectRef       `json:"python_projects_removed,omitempty"`
+	PythonGlobalsUnchanged  []model.UnchangedGlobalRef      `json:"python_globals_unchanged,omitempty"`
+	SystemPackageScans      []model.SystemPackageScanResult `json:"system_package_scans"`
+	AIAgents                []model.AITool                  `json:"ai_agents"`
+	MCPConfigs              []model.MCPConfigEnterprise     `json:"mcp_configs"`
+	NPMRCAudit              *model.NPMRCAudit               `json:"npmrc_audit,omitempty"`
+	PipAudit                *model.PipAudit                 `json:"pip_audit,omitempty"`
+	RuleScan                *model.RuleScan                 `json:"rule_scan,omitempty"`
+	PnpmAudit               *model.PnpmAudit                `json:"pnpm_audit,omitempty"`
+	BunAudit                *model.BunAudit                 `json:"bun_audit,omitempty"`
+	YarnAudit               *model.YarnAudit                `json:"yarn_audit,omitempty"`
+	AgentSkills             []model.AgentSkill              `json:"agent_skills,omitempty"`
+	AgentSkillScan          *model.AgentSkillScanInfo       `json:"agent_skill_scan,omitempty"`
+	CredentialScan          *model.CredentialScanInfo       `json:"credential_scan,omitempty"`
+	// Nil means the phase did not run, and that is the only signal a reader has
+	// for it: a section carrying zero findings is the positive claim that this
+	// machine's browsers hold no extensions.
+	BrowserExtensionScan *model.BrowserExtensionScanInfo `json:"browser_extension_scan,omitempty"`
 
 	ExecutionLogs      *ExecutionLogs      `json:"execution_logs,omitempty"`
 	PerformanceMetrics *PerformanceMetrics `json:"performance_metrics,omitempty"`
@@ -85,6 +136,7 @@ type PerformanceMetrics struct {
 	PythonGlobalPkgsCount int   `json:"python_global_packages_count"`
 	PythonProjectsCount   int   `json:"python_projects_count"`
 	SystemPackagesCount   int   `json:"system_packages_count"`
+	AgentSkillsCount      int   `json:"agent_skills_count"`
 }
 
 // Run executes enterprise telemetry: scan, build payload, upload to S3.
@@ -97,8 +149,41 @@ type PerformanceMetrics struct {
 //	[scanning] Device ID (Serial): ...
 //	...
 func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err error) {
-	ctx := context.Background()
+	// runCtx is the cancel-only outer context used by the heartbeat
+	// goroutine, the phase-post worker, and the final telemetry upload —
+	// none of which should be subject to the optional scan deadline below.
+	// The deferred cancelRun() is a safety net for early returns (lock
+	// failure, etc.) that bail before the goroutines are even spawned;
+	// double-cancel on the normal path is a no-op.
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+
+	// ctx is the scan body's working context. It carries the optional
+	// global scan deadline so a single hung subprocess (Electron
+	// --version, npm ls on a runaway monorepo) cannot hold the agent
+	// open for the full 24h TTL window. Override via STEPSEC_MAX_SCAN_DURATION
+	// (Go duration syntax: "45m", "2h"). Set to "0" to disable. The
+	// telemetry upload below uses runCtx so partial data still ships when
+	// the deadline trips mid-scan.
+	ctx := runCtx
+	if d := scanDeadlineFromEnv(defaultScanDeadline); d > 0 {
+		var cancelDeadline context.CancelFunc
+		ctx, cancelDeadline = context.WithTimeout(runCtx, d)
+		defer cancelDeadline()
+		log.Debug("scan deadline armed: %s", d)
+	}
+
 	startTime := time.Now()
+
+	// Detect invocation method once at run start: "install" if the platform's
+	// scheduler footprint is on disk, else "one_time". Threaded into every
+	// run-status post and stamped on the final payload.
+	invocationMethod := DetectInvocationMethod(exec, log)
+
+	// Phase tracker accumulates per-analysis-section completions so the
+	// backend can surface in-flight progress on the console. Reads from the
+	// heartbeat goroutine are mutex-guarded inside Snapshot.
+	tracker := NewPhaseTracker()
 
 	// Generate a per-run execution ID up front so failures before device.Gather
 	// can still be attributed. Fall back to a timestamp-derived ID if crypto/rand
@@ -121,9 +206,108 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	var reportedFailed atomic.Bool
 	reportFailedOnce := func(errMsg string) {
 		if reportedFailed.CompareAndSwap(false, true) {
-			reportRunStatus(context.Background(), log, executionID, deviceID, runStatusFailed, errMsg)
+			reportRunStatus(context.Background(), log, executionID, deviceID, runStatusFailed, errMsg, invocationMethod)
 		}
 	}
+
+	// Phase-boundary progress posts run on a dedicated worker so the scan
+	// never blocks on HTTP at a call site. Buffer=1 + drop-oldest send
+	// gives us two properties together:
+	//   - Strict ordering: a single consumer means the backend can never
+	//     see an older snapshot land after a newer one (which would cause
+	//     the console UI to briefly regress on degraded networks).
+	//   - Bounded resources: at most one pending snapshot is queued; a
+	//     slow-network backlog can't grow across the 11+ inline call
+	//     sites. The latest snapshot always wins, which matches what an
+	//     operator watching progress actually cares about.
+	//
+	// Without this, blocking phase posts could add the per-call retry
+	// budget (~6s: 2 attempts × 3s HTTP timeout + 500ms backoff) to each
+	// call site, compounding to over a minute of added scan latency on a
+	// degraded link for purely best-effort progress data.
+	phaseCh := make(chan RunStatusInfo, 1)
+	phaseDone := make(chan struct{})
+	var phaseSendMu sync.Mutex // serialises drain+send so concurrent producers (main scan + heartbeat) don't race
+	go func() {
+		defer close(phaseDone)
+		// process posts one snapshot using a Background-derived ctx with
+		// a bounded per-post timeout. We deliberately do NOT chain off the
+		// scan ctx here: the final phase-boundary post (which is the only
+		// snapshot that includes "telemetry_upload" in phases_completed)
+		// arrives at the worker *after* the function body returns and the
+		// deferred cancelRun() fires. If we shared the scan ctx, that post
+		// would always be cancelled mid-flight and the backend would never
+		// learn the upload completed. The 10s budget covers postProgress's
+		// own internal retry window (2×3s + 500ms backoff) with slack.
+		process := func(snap RunStatusInfo) {
+			postCtx, postCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer postCancel()
+			postProgress(postCtx, log, executionID, deviceID, invocationMethod, snap)
+		}
+		for {
+			select {
+			case snap := <-phaseCh:
+				process(snap)
+			case <-runCtx.Done():
+				// Drain any queued snapshot before exiting. Without this,
+				// a naïve select on the next iteration would 50/50 between
+				// the ready ctx.Done() and the ready phaseCh — dropping
+				// the final post is exactly what the user reports as
+				// "telemetry_upload missing from phases_completed".
+				for {
+					select {
+					case snap := <-phaseCh:
+						process(snap)
+					default:
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	// tailEmitter is bound to the LogCapture initialized further down in
+	// this function. It's declared as a nil pointer here so postPhase can
+	// close over it; logTailEmitter.MaybeAttach is nil-safe, so the brief
+	// window before StartCapture runs (lock acquisition, banner) just
+	// produces snapshots without a log tail.
+	var tailEmitter *logTailEmitter
+
+	// sendSnapshot builds a progress snapshot, lets attach() decide the log
+	// tail, and hands it to the phase-post worker (drop-oldest so the freshest
+	// snapshot always lands).
+	sendSnapshot := func(attach func(*RunStatusInfo)) {
+		snap := tracker.Snapshot()
+		attach(&snap)
+		phaseSendMu.Lock()
+		defer phaseSendMu.Unlock()
+		// Drop any queued (older) snapshot so the freshest one always lands.
+		select {
+		case <-phaseCh:
+		default:
+		}
+		// Always succeeds: buffer=1, just drained, single sender under the mutex.
+		phaseCh <- snap
+	}
+
+	// postPhase is the convergence point for phase-boundary and heartbeat
+	// progress updates. Captured here so the heartbeat goroutine and the
+	// inline phase wrappers share a single call site. The log tail is
+	// throttle-gated (MaybeAttach) so rapid phase boundaries don't each ship one.
+	postPhase := func() { sendSnapshot(tailEmitter.MaybeAttach) }
+
+	// postPhaseFinal is the single post emitted after the telemetry upload
+	// completes. It FORCES a fresh tail (ForceAttach, bypassing the throttle)
+	// so the run-status row's log tail includes the upload's own output and the
+	// completion line — the final lines a throttled MaybeAttach would drop on a
+	// short run.
+	postPhaseFinal := func() { sendSnapshot(tailEmitter.ForceAttach) }
+
+	// postPhaseInitial is the first upsert after device_info. Like postPhaseFinal
+	// it FORCES the log tail (bypassing the 2-min throttle) so the run's opening
+	// lines — loader setup, scheduler_info, device_info — reach the backend
+	// right after device_info, even on a short run or one that fails right after.
+	postPhaseInitial := func() { sendSnapshot(tailEmitter.ForceAttach) }
 
 	// Catch SIGINT / SIGTERM so cancellation (Ctrl+C, launchd stop, kill)
 	// still records a failure row and fires the Slack alert before exit.
@@ -172,6 +356,26 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	capture := StartCapture()
 	defer capture.Finalize()
 
+	// Fold THIS run's loader-script lines into the capture so the run-status log
+	// tail and final payload include the script's setup — binary auto-update,
+	// config write, version checks — under the same row, not just the binary's
+	// own output. The loader appends them to .loader_log; we read and then delete
+	// it, so it's scoped to the current run. Best-effort; see loader_log.go.
+	seedLoaderLog(capture)
+
+	// Echo the run-gate decision into the captured log so a downloaded
+	// execution log shows the gate checked in and allowed this run. The gate
+	// runs before StartCapture (in gateSkipsRun), so its live lines aren't
+	// captured; this one is.
+	if cfg != nil && cfg.GateProceedReason != "" {
+		log.Progress("Run gate: checked scan cadence, proceeding with this scan (%s)", cfg.GateProceedReason)
+	}
+
+	// Bind the throttled log-tail emitter to the live capture so every
+	// subsequent postPhase() can ship a recent stderr slice attached to
+	// status_info on the throttle's cadence. See log_tail_emitter.go.
+	tailEmitter = newLogTailEmitter(capture, logTailHeartbeatInterval)
+
 	// Banner (matches shell script format)
 	fmt.Fprintf(os.Stderr, "==========================================\n")
 	fmt.Fprintf(os.Stderr, "StepSecurity Device Agent v%s\n", buildinfo.Version)
@@ -180,7 +384,16 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	// Acquire lock
 	lk, err := lock.Acquire(exec)
 	if err != nil {
-		log.Debug("lock acquisition failed: %v", err)
+		// Lock acquisition failed — usually another instance already holds it,
+		// but it can also be a permission/IO error creating the lock file; the
+		// underlying err carries the specific cause (including the contention
+		// message when that's it). Surface at info level (not Debug) so it's
+		// visible in agent.log, and report the failed run right here — don't
+		// wait for the deferred handler — so the backend records the failure.
+		// reportFailedOnce is idempotent, so the deferred handler that also
+		// fires on the error return is a no-op.
+		log.Progress("Lock acquisition failed (PID %d): %v — exiting", os.Getpid(), err)
+		reportFailedOnce(fmt.Sprintf("lock acquisition failed: %v", err))
 		return fmt.Errorf("acquiring lock: %w", err)
 	}
 	log.Debug("lock acquired (pid=%d)", os.Getpid())
@@ -190,9 +403,32 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	}()
 	log.Progress("Lock acquired (PID: %d)", os.Getpid())
 
-	// Device info
+	// Scheduler info — first tracked phase. Gathers launchd/schtasks/systemd
+	// state (interval, last/next run, RunAtLoad, last exit, missed runs) for
+	// troubleshooting; see docs/launchd-troubleshooting.md. Best-effort —
+	// schedinfo.Gather uses short per-query timeouts and never errors. Like
+	// device_info it completes before the "started" post (so the first
+	// heartbeat includes it), but postPhase() is intentionally NOT called
+	// here: the backend has no run-status row to upsert into until that post,
+	// so this phase's completion ships in the first postPhase() below.
+	schedCtx, schedCancel := startPhase(ctx, tracker, "scheduler_info")
+	log.Progress("Gathering scheduler information...")
+	schedinfo.Log(schedinfo.Gather(schedCtx, exec), log)
+	// Authoritative trigger for this run (same value uploaded as invocation_method
+	// and shown as the Scheduled/Manual badge in the console) — logged here for
+	// at-a-glance triage in agent.log.
+	if invocationMethod == InvocationInstall {
+		log.Progress("  This run: scheduler-triggered (invocation_method=install)")
+	} else {
+		log.Progress("  This run: manual (invocation_method=one_time)")
+	}
+	endPhase(schedCtx, schedCancel, tracker, log, "scheduler_info")
+
+	// Device info — second tracked phase. Completes before the "started"
+	// post so the first heartbeat already includes it in phases_completed.
+	phaseCtx, phaseCancel := startPhase(ctx, tracker, "device_info")
 	log.Progress("Gathering device information...")
-	dev := device.Gather(ctx, exec)
+	dev := device.Gather(phaseCtx, exec)
 	deviceID = dev.SerialNumber
 	// Single source of truth for "is this a real developer or a daemon
 	// context?" — same predicate the payload uses below, so the warning,
@@ -214,28 +450,105 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	if noUserLoggedIn {
 		log.Warn("no real developer identity (UserIdentity=%q, root=%v) — telemetry will be marked no_user_logged_in", dev.UserIdentity, exec.IsRoot())
 	}
+	endPhase(phaseCtx, phaseCancel, tracker, log, "device_info")
+
+	// Per-device scan state for the delta-upload protocol. Gated OFF by
+	// default (config.UseLegacyPackageScan defaults true) until the agent-api
+	// side ships. Resolution, in order:
+	//   - STEPSEC_DISABLE_SCAN_STATE=1         (env kill switch, always wins)
+	//   - STEPSEC_ENABLE_SCAN_STATE=1          (env test opt-in)
+	//   - config.UseLegacyPackageScan          (persistent, set in config.json)
+	//   - paths.Home() unresolvable            (no place to write the file)
+	// A disabled gate leaves scanState nil and the run behaves as pre-1.13.
+	var scanState *state.State
+	var scanStatePath string
+	var scanStateFullSync bool
+	scanStateDisabled := config.UseLegacyPackageScan
+	if os.Getenv("STEPSEC_ENABLE_SCAN_STATE") == "1" {
+		scanStateDisabled = false
+	}
+	if os.Getenv("STEPSEC_DISABLE_SCAN_STATE") == "1" {
+		scanStateDisabled = true
+	}
+	if !scanStateDisabled {
+		scanStatePath = paths.ScanStateFile()
+		if scanStatePath != "" {
+			loaded, loadErr := state.Load(scanStatePath, buildinfo.Version)
+			if loadErr != nil {
+				log.Debug("scan-state: load fallback (%v) — treating as empty", loadErr)
+			}
+			scanState = loaded
+			scanStateFullSync = scanState.IsFullSyncDue(time.Now(), buildinfo.Version, state.DefaultFullSyncHorizon)
+			log.Debug("scan-state: loaded from %s (npm=%d python=%d full_sync=%v)",
+				scanStatePath, len(scanState.NPMProjects), len(scanState.PythonProjects), scanStateFullSync)
+		}
+	} else if config.UseLegacyPackageScan {
+		log.Debug("scan-state: disabled by config.use_legacy_package_scan; falling back to full-snapshot uploads")
+	}
 
 	// Report "started" now that we have a device_id. Fire-and-forget.
-	reportRunStatus(ctx, log, executionID, deviceID, runStatusStarted, "")
+	reportRunStatus(ctx, log, executionID, deviceID, runStatusStarted, "", invocationMethod)
 
-	// Detect logged-in user for running commands as the real user when root.
-	// Skip "root" — if LoggedInUser() fell back to CurrentUser(), delegating
-	// via sudo -H -u root is pointless and changes PATH/env behavior.
+	// First progress upsert: surfaces device_info completion immediately
+	// without waiting for the 5-minute heartbeat, and FORCE-attaches the log
+	// tail (bypassing the 2-min throttle) so the opening lines — loader setup,
+	// scheduler_info, device_info — reach the backend right after device_info,
+	// even on a short run or one that fails right after. Safe to call after the
+	// "started" post because the backend now has a row to upsert into.
+	postPhaseInitial()
+
+	// Heartbeat goroutine: pushes status_info on a ticker so a long-running
+	// phase (brew on a 200k-package macbook, syspkg on a fat dpkg machine)
+	// still surfaces progress to the console between phase boundaries.
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(runStatusHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				postPhase()
+			}
+		}
+	}()
+	// Shut down both the heartbeat goroutine and the phase-post worker
+	// cleanly on return. Order matters: cancel first so both goroutines
+	// see ctx.Done() and exit, THEN wait for each to close its done
+	// channel. Splitting these into separate `defer` statements would
+	// deadlock — LIFO would block on the waits before cancel fires.
+	defer func() {
+		cancelRun()
+		<-heartbeatDone
+		<-phaseDone
+	}()
+
+	// Detect the logged-in user so package-manager commands run with that
+	// user's PATH/env in both deployment modes: as root (LaunchDaemon / MDM
+	// "Run Script") we sudo to them; as the user (LaunchAgent's periodic fire)
+	// we already are them but still go through their login shell because
+	// launchd hands a stripped PATH either way. Skip "root" — if LoggedInUser()
+	// fell back to CurrentUser() and that is root, there's no user context to
+	// adopt and delegating is pointless.
 	loggedInUsername := ""
 	if u, err := exec.LoggedInUser(); err == nil && u.Username != "root" {
 		loggedInUsername = u.Username
-		log.Debug("logged-in user detected: username=%q home=%q — commands will delegate via sudo", u.Username, u.HomeDir)
+		log.Debug("logged-in user detected: username=%q home=%q — commands will run through the user's login shell", u.Username, u.HomeDir)
 	} else if err != nil {
 		log.Warn("could not detect logged-in user (%v) — package manager commands will run as current user and may return different results", err)
 	} else {
 		log.Debug("LoggedInUser() returned root — not delegating")
 	}
 
-	// Create a user-aware executor that delegates commands to the logged-in user
-	// when running as root. This ensures tools like brew, pip3, npm etc. execute
-	// in the correct user context (many refuse to run as root or return different
-	// results). File-based detectors (IDE, extensions, MCP) use the original exec
-	// since file operations don't need user delegation.
+	// Create a user-aware executor that runs commands through the logged-in
+	// user's login shell (rc files sourced for a full PATH). This ensures tools
+	// like brew, pip3, npm etc. execute in the correct user context — launchd
+	// strips PATH whether the agent runs as root or as the user, and many tools
+	// refuse to run as root or return different results. File-based detectors
+	// (IDE, extensions, MCP) use the original exec since file operations don't
+	// need user delegation.
 	userExec := executor.NewUserAwareExecutor(exec, loggedInUsername)
 
 	// Resolve search dirs
@@ -243,10 +556,23 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	log.Debug("search directories resolved: %v", searchDirs)
 	fmt.Fprintln(os.Stderr)
 
+	// Build a TCC skipper so directory walks avoid macOS-protected dirs and
+	// don't trigger system permission prompts when the agent runs without
+	// Full Disk Access. Nil when --include-tcc-protected is set; ShouldSkip
+	// is nil-safe.
+	var tccSkipper *tcc.Skipper
+	if tcc.Enabled(cfg.IncludeTCCProtected) {
+		tccSkipper = tcc.New(executor.ResolveHome(exec))
+		if cands := tccSkipper.Candidates(); len(cands) > 0 {
+			log.Debug("tcc skip list (%d): %v", len(cands), cands)
+		}
+	}
+
 	// Detect IDEs
+	phaseCtx, phaseCancel = startPhase(ctx, tracker, "ide_scan")
 	log.Progress("Detecting IDE and AI desktop app installations...")
 	ideDetector := detector.NewIDEDetector(exec)
-	ides := ideDetector.Detect(ctx)
+	ides := ideDetector.Detect(phaseCtx)
 	for _, ide := range ides {
 		log.Progress("  Found: %s (%s) v%s at %s", ideDisplayName(ide.IDEType), ide.Vendor, ide.Version, ide.InstallPath)
 	}
@@ -254,15 +580,18 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		log.Progress("  No IDEs or AI desktop apps found")
 	}
 	fmt.Fprintln(os.Stderr)
+	endPhase(phaseCtx, phaseCancel, tracker, log, "ide_scan")
+	postPhase()
 
 	// Collect extensions
+	phaseCtx, phaseCancel = startPhase(ctx, tracker, "extension_scan")
 	log.Progress("Scanning extensions...")
 	extDetector := detector.NewExtensionDetector(exec)
-	extensions := extDetector.Detect(ctx, searchDirs, ides)
+	extensions := extDetector.Detect(phaseCtx, searchDirs, ides)
 
 	// Collect JetBrains plugins
 	jbDetector := detector.NewJetBrainsPluginDetector(exec)
-	jbPlugins := jbDetector.Detect(ctx, ides)
+	jbPlugins := jbDetector.Detect(phaseCtx, ides)
 	extensions = append(extensions, jbPlugins...)
 
 	// On Windows, filter out bundled/platform plugins (e.g., Eclipse's 500+ OSGi
@@ -272,13 +601,18 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	}
 	log.Progress("Found total of %d IDE extensions", len(extensions))
 	fmt.Fprintln(os.Stderr)
+	endPhase(phaseCtx, phaseCancel, tracker, log, "extension_scan")
+	postPhase()
 
-	// Detect AI tools
+	// Detect AI tools — CLI + general agents + frameworks roll up into one
+	// phase since they're all quick discovery passes against the same user
+	// home and exec PATH.
+	phaseCtx, phaseCancel = startPhase(ctx, tracker, "ai_tools_scan")
 	log.Progress("Detecting AI agents and tools...")
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Detecting AI CLI tools...")
-	cliTools := detector.NewAICLIDetector(userExec).Detect(ctx)
+	cliTools := detector.NewAICLIDetector(userExec).WithLogger(log).WithSkipper(tccSkipper).Detect(phaseCtx)
 	for _, t := range cliTools {
 		log.Progress("  Found: %s (%s) v%s at %s", t.Name, t.Vendor, t.Version, t.BinaryPath)
 	}
@@ -288,7 +622,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Detecting general-purpose AI agents...")
-	agents := detector.NewAgentDetector(userExec).Detect(ctx, searchDirs)
+	agents := detector.NewAgentDetector(userExec).WithLogger(log).Detect(phaseCtx, searchDirs)
 	for _, a := range agents {
 		log.Progress("  Found: %s (%s) at %s", a.Name, a.Vendor, a.InstallPath)
 	}
@@ -298,7 +632,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	fmt.Fprintln(os.Stderr)
 
 	log.Progress("Detecting AI frameworks and runtimes...")
-	frameworks := detector.NewFrameworkDetector(userExec).Detect(ctx)
+	frameworks := detector.NewFrameworkDetector(userExec).WithLogger(log).Detect(phaseCtx)
 	for _, f := range frameworks {
 		running := "false"
 		if f.IsRunning != nil && *f.IsRunning {
@@ -312,11 +646,14 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	fmt.Fprintln(os.Stderr)
 
 	allAI := append(append(cliTools, agents...), frameworks...)
+	endPhase(phaseCtx, phaseCancel, tracker, log, "ai_tools_scan")
+	postPhase()
 
 	// MCP configs
+	phaseCtx, phaseCancel = startPhase(ctx, tracker, "mcp_config_scan")
 	log.Progress("Collecting MCP configuration files...")
-	mcpDetector := detector.NewMCPDetector(exec)
-	mcpConfigs := mcpDetector.DetectEnterprise(ctx)
+	mcpDetector := detector.NewMCPDetector(exec).WithSkipper(tccSkipper)
+	mcpConfigs := mcpDetector.DetectEnterprise(phaseCtx, searchDirs)
 	for _, c := range mcpConfigs {
 		log.Progress("  Found: %s config (%s)", c.ConfigSource, c.Vendor)
 	}
@@ -326,6 +663,52 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	log.Debug("scan totals: ides=%d extensions=%d ai_cli=%d agents=%d frameworks=%d mcp_configs=%d",
 		len(ides), len(extensions), len(cliTools), len(agents), len(frameworks), len(mcpConfigs))
 	fmt.Fprintln(os.Stderr)
+	endPhase(phaseCtx, phaseCancel, tracker, log, "mcp_config_scan")
+	postPhase()
+
+	// Malicious-file detection (enterprise only). Rules live only in the
+	// backend: fetched at run start, evaluated against searchDirs. On any
+	// fetch/parse failure the engine scans nothing this run — it never fails
+	// the run. The phase is recorded ONLY when the engine actually runs (rules
+	// were available), so its presence in StatusInfo is the backend's "device
+	// was scanned" signal even on zero matches; when no rules are available we
+	// deliberately do NOT record it. ruleScan stays nil ⇒ omitted from the
+	// Payload ⇒ "not scanned". The explicit IsEnterpriseMode() check is defense
+	// in depth (telemetry.Run is already enterprise-only).
+	var ruleScan *model.RuleScan
+	if config.IsEnterpriseMode() {
+		var rs rules.RuleSet
+		if cfg.RulesFile != "" {
+			// Dev-only offline source; never set in production.
+			rs = rules.LoadFileOrEmpty(cfg.RulesFile, log)
+		} else {
+			fetcher, _ := rules.NewHTTPFetcher(config.APIEndpoint, config.APIKey, nil)
+			rs = rules.FetchOrEmpty(ctx, fetcher, config.CustomerID, deviceID, log)
+		}
+		if len(rs.Rules) == 0 {
+			log.Progress("Malicious-file scan: no detection rules available — skipping")
+		} else {
+			phaseCtx, phaseCancel = startPhase(ctx, tracker, "malicious_file_scan")
+			log.Progress("Scanning for malicious-file indicators (%d detection rule(s))...", len(rs.Rules))
+			// File-based detector: uses the original exec (file reads need no
+			// user delegation), consistent with the IDE/extension/MCP scans.
+			eng := rules.NewEngine(exec, tccSkipper, rules.DefaultCaps(), log)
+			scanStart := time.Now()
+			scan := eng.Scan(phaseCtx, rs, searchDirs)
+			ruleScan = &scan
+
+			matchedFiles := 0
+			for _, r := range scan.Results {
+				matchedFiles += len(r.Files)
+			}
+			log.Progress("  Evaluated %d rule(s): %d file match(es) across %d rule(s) in %s (scan_complete=%v)",
+				len(scan.EvaluatedRules), matchedFiles, len(scan.Results),
+				time.Since(scanStart), scan.ScanComplete)
+			fmt.Fprintln(os.Stderr)
+			endPhase(phaseCtx, phaseCancel, tracker, log, "malicious_file_scan")
+			postPhase()
+		}
+	}
 
 	// Homebrew scanning
 	brewEnabled := true
@@ -338,31 +721,32 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	var brewFormulae, brewCasks []model.BrewPackage
 
 	if brewEnabled {
+		phaseCtx, phaseCancel = startPhase(ctx, tracker, "brew_scan")
 		log.Progress("Detecting Homebrew...")
 		brewDetector := detector.NewBrewDetector(userExec)
-		brewPkgMgr = brewDetector.DetectBrew(ctx)
+		brewPkgMgr = brewDetector.DetectBrew(phaseCtx)
 		log.Debug("brew detection: found=%v", brewPkgMgr != nil)
 		if brewPkgMgr != nil {
 			log.Progress("  Found: Homebrew v%s at %s", brewPkgMgr.Version, brewPkgMgr.Path)
 
 			// Collect rich metadata (pre-parsed packages with desc/license/homepage)
-			brewFormulae = brewDetector.ListFormulaeRich(ctx)
-			brewCasks = brewDetector.ListCasksRich(ctx)
+			brewFormulae = brewDetector.ListFormulaeRich(phaseCtx)
+			brewCasks = brewDetector.ListCasksRich(phaseCtx)
 			log.Progress("  Formulae: %d, Casks: %d (pre-parsed with metadata)", len(brewFormulae), len(brewCasks))
 
-			// Also collect raw scans for backward compatibility with older backends
+			// Also emit raw-format scans for backward compatibility with older backends.
+			// Synthesized from the rich data above — avoids re-invoking `brew list`,
+			// which can crash inside Homebrew on hosts with malformed cask metadata.
 			brewScanner := detector.NewBrewScanner(userExec, log)
-			if r, ok := brewScanner.ScanFormulae(ctx); ok {
-				brewScans = append(brewScans, r)
-			}
-			if r, ok := brewScanner.ScanCasks(ctx); ok {
-				brewScans = append(brewScans, r)
-			}
-			log.Progress("  Raw scans: %d", len(brewScans))
+			brewScans = append(brewScans, brewScanner.FormulaeResult(brewFormulae))
+			brewScans = append(brewScans, brewScanner.CasksResult(brewCasks))
+			log.Progress("  Raw scans: %d (synthesized)", len(brewScans))
 		} else {
 			log.Progress("  Homebrew not found")
 		}
 		fmt.Fprintln(os.Stderr)
+		endPhase(phaseCtx, phaseCancel, tracker, log, "brew_scan")
+		postPhase()
 	} else {
 		log.Progress("Homebrew scanning is DISABLED")
 		fmt.Fprintln(os.Stderr)
@@ -377,11 +761,13 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	var pythonPkgManagers []model.PkgManager
 	var pythonGlobalPkgs []model.PythonScanResult
 	var pythonProjects []model.ProjectInfo
+	var pythonDiscovered []string
 
 	if pythonEnabled {
+		phaseCtx, phaseCancel = startPhase(ctx, tracker, "python_scan")
 		log.Progress("Detecting Python package managers...")
-		pyDetector := detector.NewPythonPMDetector(userExec)
-		pythonPkgManagers = pyDetector.DetectManagers(ctx)
+		pyDetector := detector.NewPythonPMDetector(userExec).WithLogger(log)
+		pythonPkgManagers = pyDetector.DetectManagers(phaseCtx)
 		for _, pm := range pythonPkgManagers {
 			log.Progress("  Found: %s v%s at %s", pm.Name, pm.Version, pm.Path)
 		}
@@ -391,14 +777,35 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 
 		log.Progress("Scanning Python global packages...")
 		pyScanner := detector.NewPythonScanner(userExec, log)
-		pythonGlobalPkgs = pyScanner.ScanGlobalPackages(ctx)
+		// Stream per-PM sub-progress ("scanning pip3" / "scanning conda" /
+		// "scanning uv") into the phase tracker so heartbeats surface where
+		// inside the python phase a slow pip3 list is stuck.
+		pyScanner.ProgressHook = func(detail string) { tracker.UpdateDetail(detail) }
+		if config.UseLegacyPythonScan {
+			pythonGlobalPkgs = pyScanner.ScanGlobalPackages(phaseCtx)
+		} else {
+			pythonGlobalPkgs = pyScanner.ScanGlobalPackagesFromDisk(tccSkipper)
+		}
 		log.Progress("  Found %d Python global package source(s)", len(pythonGlobalPkgs))
 
 		log.Progress("Searching for Python projects...")
-		pyProjectDetector := detector.NewPythonProjectDetector(exec)
-		pythonProjects = pyProjectDetector.ListProjects(searchDirs)
+		pyProjectDetector := detector.NewPythonProjectDetector(exec).WithSkipper(tccSkipper).WithLogger(log)
+		if !config.UseLegacyPythonScan {
+			pyProjectDetector = pyProjectDetector.WithDiskScan(
+				detector.NewPythonDistDetector(exec).WithSkipper(tccSkipper).WithLogger(log))
+		}
+		var knownPython map[string]time.Time
+		if scanState != nil && !scanStateFullSync {
+			knownPython = make(map[string]time.Time, len(scanState.PythonProjects))
+			for path, entry := range scanState.PythonProjects {
+				knownPython[path] = entry.LastVerifiedAt
+			}
+		}
+		pythonProjects, pythonDiscovered = pyProjectDetector.ListProjects(searchDirs, knownPython)
 		log.Progress("  Found %d Python projects", len(pythonProjects))
 		fmt.Fprintln(os.Stderr)
+		endPhase(phaseCtx, phaseCancel, tracker, log, "python_scan")
+		postPhase()
 	} else {
 		log.Progress("Python scanning is DISABLED")
 		fmt.Fprintln(os.Stderr)
@@ -408,14 +815,15 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	var systemPackageScans []model.SystemPackageScanResult
 
 	if exec.GOOS() == model.PlatformLinux {
+		phaseCtx, phaseCancel = startPhase(ctx, tracker, "syspkg_scan")
 		log.Progress("Detecting system packages...")
 		sysPkgDetector := detector.NewSystemPkgDetector(userExec)
 
 		// Primary system PM (rpm, dpkg, pacman, or apk)
-		if pm := sysPkgDetector.Detect(ctx); pm != nil {
+		if pm := sysPkgDetector.Detect(phaseCtx); pm != nil {
 			log.Progress("  Found: %s v%s at %s", pm.Name, pm.Version, pm.Path)
 			start := time.Now()
-			packages := sysPkgDetector.ListPackages(ctx)
+			packages := sysPkgDetector.ListPackages(phaseCtx)
 			duration := time.Since(start).Milliseconds()
 			if packages == nil {
 				packages = []model.SystemPackage{}
@@ -431,16 +839,16 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		}
 
 		// Additional PMs (snap, flatpak) — coexist with system PM
-		for _, mgr := range sysPkgDetector.DetectAdditionalManagers(ctx) {
+		for _, mgr := range sysPkgDetector.DetectAdditionalManagers(phaseCtx) {
 			mgr := mgr
 			log.Progress("  Found: %s v%s at %s", mgr.Name, mgr.Version, mgr.Path)
 			start := time.Now()
 			var packages []model.SystemPackage
 			switch mgr.Name {
 			case "snap":
-				packages = sysPkgDetector.ListSnapPackages(ctx)
+				packages = sysPkgDetector.ListSnapPackages(phaseCtx)
 			case "flatpak":
-				packages = sysPkgDetector.ListFlatpakPackages(ctx)
+				packages = sysPkgDetector.ListFlatpakPackages(phaseCtx)
 			}
 			duration := time.Since(start).Milliseconds()
 			if packages == nil {
@@ -460,6 +868,8 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 			log.Progress("  No system package managers found")
 		}
 		fmt.Fprintln(os.Stderr)
+		endPhase(phaseCtx, phaseCancel, tracker, log, "syspkg_scan")
+		postPhase()
 	} else {
 		log.Progress("System package scanning: skipped (non-Linux)")
 		fmt.Fprintln(os.Stderr)
@@ -474,32 +884,61 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	var pkgManagers []model.PkgManager
 	var globalPkgs []model.NodeScanResult
 	var nodeProjects []model.NodeScanResult
+	var nodeDiscovered []string
 	var nodeScanMs int64
 
 	if npmEnabled {
+		phaseCtx, phaseCancel = startPhase(ctx, tracker, "node_scan")
 		log.Progress("Node.js package scanning is ENABLED")
 
 		log.Progress("Detecting Node.js package managers...")
-		npmDetector := detector.NewNodePMDetector(userExec)
-		pkgManagers = npmDetector.DetectManagers(ctx)
+		npmDetector := detector.NewNodePMDetector(userExec).WithLogger(log)
+		pkgManagers = npmDetector.DetectManagers(phaseCtx)
 		for _, pm := range pkgManagers {
 			log.Progress("  Found: %s v%s at %s", pm.Name, pm.Version, pm.Path)
+		}
+		// Surface the empty-detector case explicitly. Previously this
+		// printed nothing — a long blank between "Detecting Node.js
+		// package managers..." and the next section, hiding the fact that
+		// the per-project scans about to run would all ENOENT and produce
+		// empty stdout records. The warning makes the root cause visible
+		// at the agent level rather than requiring a diff of output.log
+		// against a known-working device.
+		if len(pkgManagers) == 0 {
+			log.Warn("No Node.js package managers found on PATH — project discovery will still run but per-project package listing will be skipped")
 		}
 		fmt.Fprintln(os.Stderr)
 
 		log.Progress("Scanning globally installed packages...")
-		nodeScanner := detector.NewNodeScanner(exec, log, loggedInUsername)
-		globalPkgs = nodeScanner.ScanGlobalPackages(ctx)
+		nodeScanner := detector.NewNodeScanner(exec, log, loggedInUsername).WithSkipper(tccSkipper)
+		if !config.UseLegacyNodeScan {
+			nodeScanner = nodeScanner.WithDiskScan(
+				detector.NewNodeDistDetector(exec).WithSkipper(tccSkipper).WithLogger(log))
+		}
+		// Stream sub-progress so heartbeats show "project 12 of 47" /
+		// "global: yarn" during the long-running node phase. Both
+		// ScanGlobalPackages and ScanProjects share this hook.
+		nodeScanner.ProgressHook = func(detail string) { tracker.UpdateDetail(detail) }
+		globalPkgs = nodeScanner.ScanGlobalPackages(phaseCtx)
 		log.Progress("  Found %d global package location(s)", len(globalPkgs))
 		fmt.Fprintln(os.Stderr)
 
 		log.Progress("Searching for Node.js projects...")
 		scanStart := time.Now()
-		nodeProjects = nodeScanner.ScanProjects(ctx, searchDirs)
+		var knownNPM map[string]time.Time
+		if scanState != nil && !scanStateFullSync {
+			knownNPM = make(map[string]time.Time, len(scanState.NPMProjects))
+			for path, entry := range scanState.NPMProjects {
+				knownNPM[path] = entry.LastVerifiedAt
+			}
+		}
+		nodeProjects, nodeDiscovered = nodeScanner.ScanProjects(phaseCtx, searchDirs, knownNPM)
 		nodeScanMs = time.Since(scanStart).Milliseconds()
 		log.Progress("  Found %d Node.js projects", len(nodeProjects))
 		log.Progress("  Scan duration: %dms", nodeScanMs)
 		fmt.Fprintln(os.Stderr)
+		endPhase(phaseCtx, phaseCancel, tracker, log, "node_scan")
+		postPhase()
 	} else {
 		log.Progress("Node.js package scanning is DISABLED")
 		fmt.Fprintln(os.Stderr)
@@ -527,6 +966,71 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		systemPackageScans = []model.SystemPackageScanResult{}
 	}
 
+	// AI agent skills inventory — every installed SKILL.md (metadata +
+	// content hashes only, never file content). A dedicated phase between MCP
+	// and the config audits. Pure filesystem reads bounded by an internal 60s
+	// budget and per-root caps. The node/python project roots discovered above
+	// feed per-project discovery on top of the detector's own ~/.claude.json
+	// registry. A non-nil scan info always ships (the backend "scan ran"
+	// sentinel), even when zero skills are found.
+	var agentSkills []model.AgentSkill
+	var agentSkillScan *model.AgentSkillScanInfo
+	if featuregate.IsEnabled(featuregate.FeatureAgentSkillsScan) {
+		phaseCtx, phaseCancel = startPhase(ctx, tracker, "agent_skills_scan")
+		log.Progress("Collecting AI agent skills...")
+		// userExec (not exec): match every other user-facing detector so home
+		// resolves to the logged-in user, not the SYSTEM/root profile, under an
+		// unattended enterprise deploy. The wrapper currently passes all read ops
+		// straight through, so this is convention + future-proofing, not a live fix.
+		skillsDetector := detector.NewSkillsDetector(userExec).WithSkipper(tccSkipper)
+		agentSkills, agentSkillScan = skillsDetector.Detect(phaseCtx, collectProjectRoots(nodeProjects, pythonProjects), searchDirs)
+		log.Progress("  Found %d agent skills across %d roots", len(agentSkills), len(agentSkillScan.RootsScanned))
+		fmt.Fprintln(os.Stderr)
+		endPhase(phaseCtx, phaseCancel, tracker, log, "agent_skills_scan")
+		postPhase()
+	}
+
+	// Credential-location inventory — where this machine's developer tools keep
+	// credentials, and how well guarded each location is. Exact paths only, never
+	// a walk; every read byte-capped; nothing about the credential itself leaves
+	// the detector. A non-nil section always ships once the phase has run, because
+	// nil is the only "did not run" signal a reader has and a nil payload must
+	// never be readable as "this machine holds no credentials".
+	//
+	// userExec (not exec): the account whose credentials this describes is the
+	// logged-in developer, not the service profile an unattended deploy runs as.
+	phaseCtx, phaseCancel = startPhase(ctx, tracker, "credentials_scan")
+	log.Progress("Inventorying credential locations...")
+	credentialScan := credentials.New(userExec).WithSkipper(tccSkipper).Detect(phaseCtx)
+	log.Progress("  Found %d credential locations", len(credentialScan.Findings))
+	fmt.Fprintln(os.Stderr)
+	endPhase(phaseCtx, phaseCancel, tracker, log, "credentials_scan")
+	postPhase()
+
+	// Browser extension inventory — which extensions are installed in this
+	// machine's browsers, whether they are enabled and why not, where they came
+	// from, and what they are permitted to touch. The browsers' own state files
+	// and nothing else: no browser is launched, no store is called, and the
+	// browsers' databases (cookies, history, passwords) are never opened.
+	//
+	// The target account is passed explicitly and the phase declines when it is a
+	// service identity: scanning the wrong home would find no browser and report
+	// every one of them missing, which a reader honours by deleting the device's
+	// real inventory. A nil section is that decline, and it must stay nil.
+	phaseCtx, phaseCancel = startPhase(ctx, tracker, "browser_extensions_scan")
+	log.Progress("Inventorying browser extensions...")
+	browserTarget, _ := exec.LoggedInUser()
+	browserExtensionScan := browserext.New(userExec).WithSkipper(tccSkipper).Detect(phaseCtx, browserTarget)
+	if browserExtensionScan == nil {
+		log.Progress("  Skipped: no interactive user to describe")
+	} else {
+		log.Progress("  Found %d browser extensions across %d browsers",
+			len(browserExtensionScan.Findings), len(browserExtensionScan.Browsers))
+	}
+	fmt.Fprintln(os.Stderr)
+	endPhase(phaseCtx, phaseCancel, tracker, log, "browser_extensions_scan")
+	postPhase()
+
 	// npm + pip configuration audits — surface-only inventory of every
 	// .npmrc and pip.conf on the host, plus the merged effective views
 	// each tool would resolve. We use the user-aware executor so npm and
@@ -534,7 +1038,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	// pyenv / asdf / brew installs that root's PATH wouldn't see).
 	log.Progress("Auditing npm configuration...")
 	npmrcLoggedIn, _ := exec.LoggedInUser()
-	npmrcAudit := configaudit.NewNPMRCDetector(userExec).Detect(ctx, searchDirs, npmrcLoggedIn)
+	npmrcAudit := configaudit.NewNPMRCDetector(userExec).WithSkipper(tccSkipper).Detect(ctx, searchDirs, npmrcLoggedIn)
 	log.Progress("  npm available: %v, files discovered: %d", npmrcAudit.Available, len(npmrcAudit.Files))
 	fmt.Fprintln(os.Stderr)
 
@@ -543,41 +1047,130 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	log.Progress("  pip available: %v, files discovered: %d, findings: %d", pipAudit.Available, len(pipAudit.Files), len(pipAudit.Findings))
 	fmt.Fprintln(os.Stderr)
 
-	// Finalize execution logs before building payload
-	execLogsBase64 := capture.Finalize()
+	log.Progress("Auditing pnpm configuration...")
+	pnpmAudit := configaudit.NewPnpmDetector(userExec).WithSkipper(tccSkipper).Detect(ctx, searchDirs, npmrcLoggedIn)
+	log.Progress("  pnpm available: %v, files discovered: %d", pnpmAudit.Available, len(pnpmAudit.Files))
+	fmt.Fprintln(os.Stderr)
+
+	log.Progress("Auditing bun configuration...")
+	bunAudit := configaudit.NewBunDetector(userExec).WithSkipper(tccSkipper).WithLogger(log).Detect(ctx, searchDirs, npmrcLoggedIn)
+	log.Progress("  bun available: %v, files discovered: %d", bunAudit.Available, len(bunAudit.Files))
+	fmt.Fprintln(os.Stderr)
+
+	log.Progress("Auditing yarn configuration...")
+	yarnAudit := configaudit.NewYarnDetector(userExec).WithSkipper(tccSkipper).WithLogger(log).Detect(ctx, searchDirs, npmrcLoggedIn)
+	log.Progress("  yarn available: %v (flavor=%s), files discovered: %d", yarnAudit.Available, yarnAudit.Flavor, len(yarnAudit.Files))
+	fmt.Fprintln(os.Stderr)
+
+	// Snapshot execution logs for the payload WITHOUT stopping capture, so the
+	// upload that follows (and the completion lines) keep being recorded and
+	// can ship in the final run-status log tail via postPhaseFinal below. The
+	// payload itself can't contain the log of its own upload, so this snapshot
+	// is "session so far" by design. The deferred capture.Finalize() does the
+	// real teardown (restores os.Stderr) on return.
+	//
+	// Sync() first so lines logged right before this snapshot (the config-audit
+	// block, ending at the yarn audit) are already in the ring — a fast run
+	// otherwise outruns the async capture tee and truncates this log. The upload
+	// path re-snapshots after the upload-intent lines (see uploadToS3); this drain
+	// also covers the --telemetry-out dev dump below, which skips that re-snapshot.
+	capture.Sync()
+	execLogsBase64 := capture.SnapshotBase64()
 	endTime := time.Now()
+
+	// Snapshot the final progress state right before we serialize. By this
+	// point every analysis phase has been Finish()-ed so PhasesCompleted
+	// holds the full list and CurrentPhase is empty — the upload itself
+	// runs after this snapshot and is intentionally not tracked as a phase.
+	finalStatusInfo := tracker.Snapshot()
+
+	// Partition this run's scan output against state. When delta is enabled
+	// (snap != nil), the payload below routes changed bodies to the legacy
+	// slots and unchanged/removed projects to the new ref slots.
+	snap := buildDeltaSnapshot(
+		scanState, scanStateFullSync,
+		nodeProjects, nodeDiscovered, pythonProjects, pythonDiscovered,
+		globalPkgs, pythonGlobalPkgs,
+	)
+	payloadNodeProjects := nodeProjects
+	payloadNodeGlobals := globalPkgs
+	payloadPythonProjects := pythonProjects
+	payloadPythonGlobals := pythonGlobalPkgs
+	schemaVersion := 0
+	var npmUnchangedRefs []model.UnchangedProjectRef
+	var npmRemovedRefs []model.RemovedProjectRef
+	var npmGlobalsUnchangedRefs []model.UnchangedGlobalRef
+	var pyUnchangedRefs []model.UnchangedProjectRef
+	var pyRemovedRefs []model.RemovedProjectRef
+	var pyGlobalsUnchangedRefs []model.UnchangedGlobalRef
+	if snap != nil {
+		schemaVersion = CurrentPayloadSchemaVersion
+		payloadNodeProjects = snap.npmChanged
+		payloadNodeGlobals = snap.npmGlobalsChanged
+		payloadPythonProjects = snap.pyChanged
+		payloadPythonGlobals = snap.pyGlobalsChanged
+		npmUnchangedRefs = snap.npmUnchanged
+		npmRemovedRefs = snap.npmRemoved
+		npmGlobalsUnchangedRefs = snap.npmGlobalsUnchanged
+		pyUnchangedRefs = snap.pyUnchanged
+		pyRemovedRefs = snap.pyRemoved
+		pyGlobalsUnchangedRefs = snap.pyGlobalsUnchanged
+		log.Debug("delta payload: npm(changed=%d unchanged=%d removed=%d globals_changed=%d globals_unchanged=%d) python(changed=%d unchanged=%d removed=%d globals_changed=%d globals_unchanged=%d) full_sync=%v",
+			len(payloadNodeProjects), len(npmUnchangedRefs), len(npmRemovedRefs), len(payloadNodeGlobals), len(npmGlobalsUnchangedRefs),
+			len(payloadPythonProjects), len(pyUnchangedRefs), len(pyRemovedRefs), len(payloadPythonGlobals), len(pyGlobalsUnchangedRefs),
+			scanStateFullSync)
+	}
 
 	// Build payload
 	payload := &Payload{
-		CustomerID:     config.CustomerID,
-		DeviceID:       dev.SerialNumber,
-		SerialNumber:   dev.SerialNumber,
-		UserIdentity:   dev.UserIdentity,
-		Hostname:       dev.Hostname,
-		Platform:       dev.Platform,
-		OSVersion:      dev.OSVersion,
-		Resources:      dev.Resources,
-		AgentVersion:   buildinfo.Version,
-		CollectedAt:    endTime.Unix(),
-		NoUserLoggedIn: noUserLoggedIn,
+		PayloadSchemaVersion: schemaVersion,
+		CustomerID:           config.CustomerID,
+		DeviceID:             dev.SerialNumber,
+		SerialNumber:         dev.SerialNumber,
+		UserIdentity:         dev.UserIdentity,
+		Hostname:             dev.Hostname,
+		Platform:             dev.Platform,
+		OSVersion:            dev.OSVersion,
+		Resources:            dev.Resources,
+		AgentVersion:         buildinfo.Version,
+		CollectedAt:          endTime.Unix(),
+		NoUserLoggedIn:       noUserLoggedIn,
+
+		InvocationMethod: invocationMethod,
+		StatusInfo:       &finalStatusInfo,
 
 		IDEExtensions:        extensions,
 		IDEInstallations:     ides,
 		NodePkgManagers:      pkgManagers,
-		NodeGlobalPackages:   globalPkgs,
-		NodeProjects:         nodeProjects,
+		NodeGlobalPackages:   payloadNodeGlobals,
+		NodeProjects:         payloadNodeProjects,
 		BrewPkgManager:       brewPkgMgr,
 		BrewScans:            brewScans,
 		BrewFormulae:         brewFormulae,
 		BrewCasks:            brewCasks,
 		PythonPkgManagers:    pythonPkgManagers,
-		PythonGlobalPackages: pythonGlobalPkgs,
-		PythonProjects:       pythonProjects,
-		SystemPackageScans:   systemPackageScans,
-		AIAgents:             allAI,
-		MCPConfigs:           mcpConfigs,
-		NPMRCAudit:           &npmrcAudit,
-		PipAudit:             &pipAudit,
+		PythonGlobalPackages: payloadPythonGlobals,
+		PythonProjects:       payloadPythonProjects,
+
+		NodeProjectsUnchanged:   npmUnchangedRefs,
+		NodeProjectsRemoved:     npmRemovedRefs,
+		NodeGlobalsUnchanged:    npmGlobalsUnchangedRefs,
+		PythonProjectsUnchanged: pyUnchangedRefs,
+		PythonProjectsRemoved:   pyRemovedRefs,
+		PythonGlobalsUnchanged:  pyGlobalsUnchangedRefs,
+		SystemPackageScans:      systemPackageScans,
+		AIAgents:                allAI,
+		MCPConfigs:              mcpConfigs,
+		NPMRCAudit:              &npmrcAudit,
+		PipAudit:                &pipAudit,
+		RuleScan:                ruleScan,
+		PnpmAudit:               &pnpmAudit,
+		BunAudit:                &bunAudit,
+		YarnAudit:               &yarnAudit,
+		AgentSkills:             agentSkills,
+		AgentSkillScan:          agentSkillScan,
+		CredentialScan:          credentialScan,
+		BrowserExtensionScan:    browserExtensionScan,
 
 		ExecutionLogs: &ExecutionLogs{
 			OutputBase64: execLogsBase64,
@@ -597,18 +1190,111 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 			PythonGlobalPkgsCount: len(pythonGlobalPkgs),
 			PythonProjectsCount:   len(pythonProjects),
 			SystemPackagesCount:   totalSystemPackagesCount(systemPackageScans),
+			AgentSkillsCount:      len(agentSkills),
 		},
 	}
 
-	// Upload to S3
+	// Dev-only offline harness: dump the assembled Payload to a local
+	// file and skip the upload + run-status notify entirely. This is exactly
+	// the inner JSON process-uploaded sees after gunzip, so it doubles as a
+	// backend ingestion fixture. Never set in production (zero impact when
+	// the flag/env var is unset).
+	if cfg.TelemetryOutFile != "" {
+		if err := writeTelemetryFile(cfg.TelemetryOutFile, payload); err != nil {
+			log.Error("telemetry-out: %v", err)
+			return err
+		}
+		log.Progress("telemetry written to %s (upload skipped)", cfg.TelemetryOutFile)
+		// Treat a successful local dump as a successful upload for the
+		// purposes of scan-state persistence so dev/stress-test runs
+		// produce comparable second-run behavior to a real upload.
+		if snap != nil {
+			if err := commitDeltaSnapshot(scanState, snap, scanStatePath, executionID, buildinfo.Version); err != nil {
+				log.Warn("scan-state: save failed (%v) — next run will full-sync", err)
+			} else {
+				log.Debug("scan-state: saved %s (telemetry-out mode)", scanStatePath)
+			}
+		}
+		// Same rationale for the run-gate stamp: the dev harness should show
+		// the same second-invocation gating behavior as a real upload.
+		if err := rungate.StampLastFullRun(time.Now()); err != nil {
+			log.Debug("run-gate: could not stamp last full run: %v", err)
+		}
+		return nil
+	}
+
+	// Upload to S3 — tracked as the final phase. The Payload's StatusInfo
+	// above is intentionally snapshotted *before* this phase starts (the
+	// payload can't describe its own upload), so this phase only appears
+	// on the run-status row via heartbeats and the post-upload progress
+	// post below.
+	// Upload deliberately roots on runCtx (no scan deadline) so partial
+	// data still ships when the scan deadline trips earlier. We still
+	// apply the per-phase telemetry_upload budget on top so the upload
+	// itself cannot wedge the agent indefinitely.
+	phaseCtx, phaseCancel = startPhase(runCtx, tracker, "telemetry_upload")
 	log.Progress("Requesting upload URL from backend...")
-	if err := uploadToS3(ctx, log, payload, executionID); err != nil {
+	if err := uploadToS3(phaseCtx, log, payload, executionID, tracker, capture); err != nil {
+		endPhase(phaseCtx, phaseCancel, tracker, log, "telemetry_upload")
+		// Force-attach a final tail capturing the upload-failure output before
+		// returning. The deferred failure report carries no status_info (and so
+		// can't ship a tail itself); this progress upsert lands the tail on the
+		// row, which the subsequent "failed" transition preserves.
+		postPhaseFinal()
 		return fmt.Errorf("uploading telemetry: %w", err)
+	}
+	endPhase(phaseCtx, phaseCancel, tracker, log, "telemetry_upload")
+
+	if snap != nil {
+		if err := commitDeltaSnapshot(scanState, snap, scanStatePath, executionID, buildinfo.Version); err != nil {
+			log.Warn("scan-state: save failed (%v) — next run will full-sync", err)
+		} else {
+			log.Debug("scan-state: saved %s", scanStatePath)
+		}
+	}
+
+	// Record the completed full run for the run gate. Best-effort by
+	// contract: a missing stamp only means the next gated invocation runs.
+	if err := rungate.StampLastFullRun(time.Now()); err != nil {
+		log.Debug("run-gate: could not stamp last full run: %v", err)
 	}
 
 	fmt.Fprintln(os.Stderr)
 	log.Progress("Telemetry collection completed successfully")
+	tccSkipper.LogHits(log.Debug)
+
+	// Final progress post — AFTER the upload and the completion lines above —
+	// with a forced fresh tail (bypassing the throttle) so the run-status row's
+	// log tail includes them. Without this the last lines after the upload are
+	// skipped. Capture is still live; the deferred capture.Finalize() restores
+	// os.Stderr on return, after the phase-post worker has drained this snapshot.
+	postPhaseFinal()
 	return nil
+}
+
+// writeTelemetryFile marshals the assembled Payload to PATH as indented JSON
+// (mode 0600). It backs the dev-only --telemetry-out flow: the file is
+// exactly the inner JSON the backend's process-uploaded sees after gunzip, so
+// it doubles as a backend ingestion fixture.
+func writeTelemetryFile(path string, payload *Payload) error {
+	out, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return fmt.Errorf("telemetry-out: marshal payload: %w", err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		return fmt.Errorf("telemetry-out: write payload: %w", err)
+	}
+	return nil
+}
+
+// decodeBase64OrRaw returns the bytes decoded from a standard base64 string,
+// falling back to the raw string bytes when the input isn't valid base64.
+func decodeBase64OrRaw(s string) []byte {
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return []byte(s)
+	}
+	return decoded
 }
 
 func brewFormulaeCount(scans []model.BrewScanResult) int {
@@ -637,7 +1323,48 @@ func totalSystemPackagesCount(scans []model.SystemPackageScanResult) int {
 	return total
 }
 
-func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, executionID string) error {
+// collectProjectRoots flattens the enterprise node and python project lists
+// into a deduplicated []string of project roots for the skills detector's
+// per-project discovery. NodeScanResult.ProjectPath is already a project root;
+// python ProjectInfo.Path is the venv directory, so it is mapped up to its
+// parent — skills live under <project>/.claude/skills, not <venv>/.claude/skills.
+// Empties are dropped and first occurrence wins. The skills detector re-resolves,
+// re-dedupes and sorts internally, so ordering here is immaterial.
+func collectProjectRoots(nodeProjects []model.NodeScanResult, pythonProjects []model.ProjectInfo) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(p string) {
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	for _, n := range nodeProjects {
+		add(n.ProjectPath)
+	}
+	for _, p := range pythonProjects {
+		// Guard the empty case: filepath.Dir("") == ".", which would inject a bogus
+		// "." root. Non-empty venv paths map up one level to the project root.
+		if p.Path == "" {
+			continue
+		}
+		add(filepath.Dir(p.Path))
+	}
+	return out
+}
+
+func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, executionID string, tracker *PhaseTracker, capture *LogCapture) error {
+	// updateDetail forwards sub-progress to the heartbeat goroutine via the
+	// tracker. Tolerates nil so the function stays callable from tests that
+	// don't supply a tracker.
+	updateDetail := func(detail string) {
+		if tracker != nil {
+			tracker.UpdateDetail(detail)
+		}
+	}
+
+	updateDetail("compressing payload")
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshaling payload: %w", err)
@@ -650,6 +1377,7 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 	if err != nil {
 		return fmt.Errorf("compressing payload: %w", err)
 	}
+	updateDetail("requesting upload URL")
 
 	// Request upload URL
 	reqBody, _ := json.Marshal(map[string]any{
@@ -692,12 +1420,39 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 	// Upload payload to S3 with retry. Content-Type stays application/json to
 	// match the presigned URL's signed headers — the body is gzipped JSON bytes.
 	log.Progress("Uploading telemetry to S3 (%d bytes)...", len(compressedPayload))
+
+	// Re-capture execution logs so the downloadable payload log includes the
+	// upload-intent lines just logged ("Requesting upload URL...", "Uploading
+	// telemetry to S3 (N bytes)..."). These are the last lines before the PUT;
+	// the payload can't record its own PUT result, so capture stops here. Sync()
+	// drains the async capture tee so those lines are already in the buffer when
+	// we snapshot — a fast (disk-scan) run otherwise outruns the tee and the log
+	// cuts off at the previous phase. Best-effort: a re-marshal error keeps the
+	// original body so log capture never blocks the upload. The re-marshalled
+	// body is a hair larger than the N just logged, which is cosmetic.
+	if capture != nil && payload.ExecutionLogs != nil {
+		capture.Sync()
+		payload.ExecutionLogs.OutputBase64 = capture.SnapshotBase64()
+		// The re-snapshot extends the log past the original end time (set at the
+		// pre-upload payload build), so bump EndTime to match the last captured
+		// byte — keeps execution_logs.end_time consistent with the embedded log
+		// instead of trailing it by the upload-prep window.
+		payload.ExecutionLogs.EndTime = time.Now().Unix()
+		if rebuilt, mErr := json.Marshal(payload); mErr == nil {
+			if regz, zErr := gzipBytes(rebuilt); zErr == nil {
+				payloadJSON = rebuilt
+				compressedPayload = regz
+			}
+		}
+	}
+
 	s3Client := &http.Client{Timeout: 10 * time.Minute}
 	const maxRetries = 3
 	backoffUnit := s3UploadBackoffUnit
 	uploaded := false
 	var lastFailure string
 	for attempt := 1; attempt <= maxRetries; attempt++ {
+		updateDetail(fmt.Sprintf("uploading to S3 (attempt %d/%d, %d KiB)", attempt, maxRetries, len(compressedPayload)/1024))
 		uploadStart := time.Now()
 		putReq, reqErr := http.NewRequestWithContext(ctx, http.MethodPut, urlResp.UploadURL, bytes.NewReader(compressedPayload))
 		if reqErr != nil {
@@ -780,6 +1535,7 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 	}
 
 	// Notify backend
+	updateDetail("notifying backend")
 	log.Progress("Notifying backend of upload...")
 	notifyBody, _ := json.Marshal(map[string]string{
 		"s3_key":       urlResp.S3Key,
