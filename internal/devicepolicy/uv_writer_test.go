@@ -28,8 +28,7 @@ func newUVTestWriter(t *testing.T, initial []byte, version string) (*UVWriter, *
 			t.Fatal(err)
 		}
 	}
-	home := newSecureTestHome(t, homeDir)
-	home.targetUser.Username = ""
+	home := newSecureTestHomeAs(t, homeDir, "")
 	mock := executor.NewMock()
 	mock.SetGOOS("linux")
 	if runtime.GOOS == "windows" {
@@ -331,8 +330,7 @@ func (e *uvUserContextExecutor) RunAsUser(_ context.Context, _, command string) 
 func newResolvedUserUVWriter(t *testing.T, userEnv, showSettings string) (*UVWriter, *uvUserContextExecutor, string) {
 	t.Helper()
 	homeDir := t.TempDir()
-	home := newSecureTestHome(t, homeDir)
-	home.targetUser.Username = "alice"
+	home := newSecureTestHomeAs(t, homeDir, "alice")
 	mock := executor.NewMock()
 	mock.SetGOOS("linux")
 	mock.SetUsername("alice")
@@ -508,8 +506,7 @@ func TestUVObservation_AcceptsValidMDMMarkers(t *testing.T) {
 
 func TestNewUVWriter_UserEnvironmentFailureIsError(t *testing.T) {
 	homeDir := t.TempDir()
-	home := newSecureTestHome(t, homeDir)
-	home.targetUser.Username = "alice"
+	home := newSecureTestHomeAs(t, homeDir, "alice")
 	mock := executor.NewMock()
 	mock.SetGOOS("linux")
 	mock.SetHomeDir(homeDir)
@@ -521,8 +518,7 @@ func TestNewUVWriter_UserEnvironmentFailureIsError(t *testing.T) {
 
 func TestNewUVWriter_CanceledContextIsError(t *testing.T) {
 	homeDir := t.TempDir()
-	home := newSecureTestHome(t, homeDir)
-	home.targetUser.Username = "alice"
+	home := newSecureTestHomeAs(t, homeDir, "alice")
 	mock := executor.NewMock()
 	mock.SetGOOS("linux")
 	mock.SetHomeDir(homeDir)
@@ -576,8 +572,7 @@ func TestUVWriter_VersionBoundaryAndPaths(t *testing.T) {
 
 	t.Run("resolved user executor", func(t *testing.T) {
 		homeDir := t.TempDir()
-		home := newSecureTestHome(t, homeDir)
-		home.targetUser.Username = "alice"
+		home := newSecureTestHomeAs(t, homeDir, "alice")
 		mock := executor.NewMock()
 		mock.SetGOOS("darwin")
 		mock.SetHomeDir(homeDir)

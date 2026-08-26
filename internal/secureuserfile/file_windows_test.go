@@ -1,6 +1,6 @@
 //go:build windows
 
-package devicepolicy
+package secureuserfile
 
 import (
 	"os"
@@ -52,12 +52,12 @@ func TestSecureUserFile_CreatedParentsHaveRestrictedACL(t *testing.T) {
 	}
 	current.HomeDir = home
 	normalizeSecureTestUser(t, current)
-	h, err := openSecureUserHome(current)
+	h, err := openHome(current)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
-	if err := h.ensureParent(filepath.Join(".config", "pip", "pip.ini"), 0o700); err != nil {
+	if err := h.EnsureParent(filepath.Join(".config", "tool", "config")); err != nil {
 		t.Fatalf("ensureParent: %v", err)
 	}
 
@@ -69,7 +69,7 @@ func TestSecureUserFile_CreatedParentsHaveRestrictedACL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{filepath.Join(home, ".config"), filepath.Join(home, ".config", "pip")} {
+	for _, path := range []string{filepath.Join(home, ".config"), filepath.Join(home, ".config", "tool")} {
 		descriptor, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
 		if err != nil {
 			t.Fatalf("GetNamedSecurityInfo(%q): %v", path, err)

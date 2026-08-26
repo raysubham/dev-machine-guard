@@ -17,6 +17,7 @@ import (
 
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
+	"github.com/step-security/dev-machine-guard/internal/secureuserfile"
 )
 
 const (
@@ -43,8 +44,8 @@ type UVObservation struct {
 // UVWriter manages the resolved user's uv.toml.
 type UVWriter struct {
 	exec             executor.Executor
-	home             *secureUserHome
-	file             *secureUserFile
+	home             *secureuserfile.Home
+	file             *secureuserfile.File
 	expected         string
 	registryURL      string
 	installed        bool
@@ -55,7 +56,7 @@ type UVWriter struct {
 	purgeBackups    func() error
 }
 
-func NewUVWriter(ctx context.Context, exec executor.Executor, home *secureUserHome, policy PyPIPolicy) (*UVWriter, error) {
+func NewUVWriter(ctx context.Context, exec executor.Executor, home *secureuserfile.Home, policy PyPIPolicy) (*UVWriter, error) {
 	if home == nil {
 		return nil, errors.New("uv: nil secure user home")
 	}
@@ -64,18 +65,18 @@ func NewUVWriter(ctx context.Context, exec executor.Executor, home *secureUserHo
 		return nil, err
 	}
 	userExec := executor.NewUserAwareExecutor(exec, home.Username())
-	path, err := uvUserConfigPath(userExec, home.home)
+	path, err := uvUserConfigPath(userExec, home.Path())
 	if err != nil {
 		return nil, err
 	}
 	if err := executor.UserEnvironmentError(userExec); err != nil {
 		return nil, fmt.Errorf("uv: resolving user environment: %w", err)
 	}
-	relative, err := filepath.Rel(home.home, path)
+	relative, err := filepath.Rel(home.Path(), path)
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
 		return nil, fmt.Errorf("uv: user path is outside resolved home: %w", ErrTargetUnusable)
 	}
-	file, err := home.openStrict(relative, uvBackupPrefix, maxManagedUserFileBytes)
+	file, err := home.Open(relative, uvBackupPrefix, secureuserfile.MaxBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +143,7 @@ func (w *UVWriter) validateExpected(expected string) error {
 func (w *UVWriter) Location() string { return w.file.Location() }
 
 func (w *UVWriter) readCurrent() ([]byte, bool, os.FileMode, error) {
-	present, err := w.file.parentPresent()
+	present, err := w.file.ParentPresent()
 	if err != nil || !present {
 		return nil, false, 0, err
 	}
@@ -164,7 +165,7 @@ func (w *UVWriter) Write(expected string) (string, error) {
 	if w.installed && (!w.versionKnown || !w.versionSupported) {
 		return "", errUVUnsupportedVersion
 	}
-	if err := w.home.ensureParent(w.file.relativePath, 0o700); err != nil {
+	if err := w.home.EnsureParent(w.file.RelativePath()); err != nil {
 		return "", err
 	}
 	current, existed, _, err := w.file.Read()
@@ -796,7 +797,7 @@ func (w *UVWriter) environmentOverride() string {
 		}
 	}
 	if netrc := strings.TrimSpace(w.exec.Getenv("NETRC")); netrc != "" {
-		if !filepath.IsAbs(netrc) || filepath.Clean(netrc) != filepath.Join(w.home.home, ".netrc") {
+		if !filepath.IsAbs(netrc) || filepath.Clean(netrc) != filepath.Join(w.home.Path(), ".netrc") {
 			return "environment"
 		}
 	}
@@ -854,7 +855,7 @@ func (w *UVWriter) probeDirectory(ctx context.Context) (string, error) {
 		_ = os.Remove(dir)
 		return "", fmt.Errorf("uv: opening target-user probe directory: %w", err)
 	}
-	ownerErr := w.home.checkOwner(f, dir, true)
+	ownerErr := w.home.VerifyOwner(f, dir)
 	info, statErr := f.Stat()
 	closeErr := f.Close()
 	if ownerErr != nil || statErr != nil || closeErr != nil || !info.IsDir() || w.exec.GOOS() != model.PlatformWindows && info.Mode().Perm() != 0o700 {

@@ -1,6 +1,6 @@
 //go:build unix
 
-package devicepolicy
+package secureuserfile
 
 import (
 	"errors"
@@ -26,7 +26,7 @@ func secureUserIDs(u *user.User) (int, int, error) {
 	return uid, gid, nil
 }
 
-func applySecureMetadata(h *secureUserHome, f *os.File, mode os.FileMode, _ bool) error {
+func applySecureMetadata(h *Home, f *os.File, mode os.FileMode, _ bool) error {
 	if err := f.Chmod(mode); err != nil {
 		return fmt.Errorf("secure user file: fchmod: %w", err)
 	}
@@ -36,13 +36,13 @@ func applySecureMetadata(h *secureUserHome, f *os.File, mode os.FileMode, _ bool
 	return nil
 }
 
-func checkSecurePlatformOwner(_ *secureUserHome, _ *os.File) error { return nil }
+func checkSecurePlatformOwner(_ *Home, _ *os.File) error { return nil }
 
 func newOwnerReader() ownerReader { return unixOwnerReader{} }
 
 type unixOwnerReader struct{}
 
-func (unixOwnerReader) secure(f *os.File, _ *secureUserHome, want os.FileMode) (bool, error) {
+func (unixOwnerReader) secure(f *os.File, _ *Home, want os.FileMode) (bool, error) {
 	info, err := f.Stat()
 	if err != nil {
 		return false, fmt.Errorf("secure user file: stat metadata: %w", err)

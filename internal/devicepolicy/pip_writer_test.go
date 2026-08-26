@@ -274,14 +274,6 @@ func TestPipWriter_MultiFileFailureRollsBackEarlierFiles(t *testing.T) {
 		}
 	}
 	home := newSecureTestHome(t, homeDir)
-	calls := 0
-	home.randomSuffix = func() (string, error) {
-		calls++
-		if calls == 4 {
-			return "", errors.New("injected second-file temp failure")
-		}
-		return string(rune('a' + calls)), nil
-	}
 	mock := executor.NewMock()
 	mock.SetGOOS("linux")
 	mock.SetUsername("")
@@ -292,17 +284,21 @@ func TestPipWriter_MultiFileFailureRollsBackEarlierFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Write(pipExpected); err == nil {
-		t.Fatal("Write error = nil, want injected second-file failure")
+	if err := os.Remove(legacy); err != nil {
+		t.Fatal(err)
 	}
-	for path, want := range initial {
-		got, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Fatalf("%s after rollback = %q, want %q", path, got, want)
-		}
+	if err := os.Mkdir(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(pipExpected); err == nil {
+		t.Fatal("Write error = nil, want second-file refusal")
+	}
+	got, err := os.ReadFile(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := initial[current]; !bytes.Equal(got, want) {
+		t.Fatalf("current file after rollback = %q, want %q", got, want)
 	}
 }
 

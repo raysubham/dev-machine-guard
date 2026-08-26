@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/step-security/dev-machine-guard/internal/detector/configaudit"
 	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/secureuserfile"
 )
 
 const (
@@ -44,22 +44,22 @@ type PipObservation struct {
 }
 
 type pipManagedFile struct {
-	file    *secureUserFile
+	file    *secureuserfile.File
 	current bool
 }
 
 // PipWriter manages the complete trusted user-tier pip configuration set.
 type PipWriter struct {
 	exec        executor.Executor
-	home        *secureUserHome
+	home        *secureuserfile.Home
 	files       []pipManagedFile
 	invocations [][]string
 	expected    string
 	registryURL string
-	lastWritten []*secureUserFile
+	lastWritten []*secureuserfile.File
 }
 
-func NewPipWriter(ctx context.Context, exec executor.Executor, home *secureUserHome, policy PyPIPolicy) (*PipWriter, error) {
+func NewPipWriter(ctx context.Context, exec executor.Executor, home *secureuserfile.Home, policy PyPIPolicy) (*PipWriter, error) {
 	if home == nil {
 		return nil, errors.New("pip: nil secure user home")
 	}
@@ -73,11 +73,11 @@ func NewPipWriter(ctx context.Context, exec executor.Executor, home *secureUserH
 	}
 	files := make([]pipManagedFile, 0, len(discovery.AllowedUserPaths))
 	for i, path := range discovery.AllowedUserPaths {
-		relative, err := filepath.Rel(home.home, filepath.Clean(path))
+		relative, err := filepath.Rel(home.Path(), filepath.Clean(path))
 		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
 			return nil, fmt.Errorf("pip: discovered user path is outside resolved home: %w", ErrTargetUnusable)
 		}
-		file, err := home.openStrict(relative, pipBackupPrefix, maxManagedUserFileBytes)
+		file, err := home.Open(relative, pipBackupPrefix, secureuserfile.MaxBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -97,7 +97,7 @@ func NewPipWriter(ctx context.Context, exec executor.Executor, home *secureUserH
 }
 
 func renderPipSettings(policy PyPIPolicy) (string, error) {
-	registry, err := parsePolicyRegistryURL(policy.RegistryURL)
+	registry, err := parsePyPIRegistryURL(policy.RegistryURL)
 	if policy.Ecosystem != "pypi" || !canonicalPyPIClients(policy.Clients) || policy.Auth.Scheme != pypiAuthScheme ||
 		err != nil || registry.EscapedPath() != "/python/simple" || policy.Auth.APIKey == "" ||
 		len(policy.Auth.APIKey) > npmrcMaxKeyBytes || policy.deviceID == "" || len(policy.deviceID) > npmrcMaxSerialBytes ||
@@ -166,7 +166,7 @@ func (w *PipWriter) Write(expected string) (string, error) {
 			continue
 		}
 		if !analysis.existed {
-			if err := w.home.ensureParent(managed.file.relativePath, 0o700); err != nil {
+			if err := w.home.EnsureParent(managed.file.RelativePath()); err != nil {
 				return "", w.rollbackWritten(err)
 			}
 		}
@@ -174,14 +174,14 @@ func (w *PipWriter) Write(expected string) (string, error) {
 		if err != nil {
 			return "", w.rollbackWritten(err)
 		}
-		secure, metadataErr := managed.file.MetadataSecure(secureUserFileMode)
+		secure, metadataErr := managed.file.MetadataSecure(secureuserfile.FileMode)
 		if metadataErr != nil && analysis.existed {
 			return "", w.rollbackWritten(metadataErr)
 		}
 		if analysis.existed && bytes.Equal(next, analysis.data) && secure {
 			continue
 		}
-		if err := managed.file.Commit(next, secureUserFileMode); err != nil {
+		if err := managed.file.Commit(next, secureuserfile.FileMode); err != nil {
 			return "", w.rollbackWritten(err)
 		}
 		w.lastWritten = append(w.lastWritten, managed.file)
@@ -253,7 +253,7 @@ func (w *PipWriter) Clear() (bool, error) {
 			if created && len(bytes.TrimSpace(next)) == 0 {
 				err = managed.file.Remove()
 			} else {
-				err = managed.file.Commit(next, secureUserFileMode)
+				err = managed.file.Commit(next, secureuserfile.FileMode)
 			}
 			if err != nil {
 				if firstErr == nil {
@@ -294,7 +294,7 @@ func (w *PipWriter) StaticConverged(expected string) (bool, error) {
 		if !analysis.existed || analysis.markers.dmg == nil || analysis.markers.dmg.body != expected || analysis.activeConflict {
 			return false, nil
 		}
-		secure, err := managed.file.MetadataSecure(secureUserFileMode)
+		secure, err := managed.file.MetadataSecure(secureuserfile.FileMode)
 		if err != nil || !secure {
 			return false, err
 		}
@@ -346,7 +346,7 @@ type pipAnalysis struct {
 	activeConflict bool
 }
 
-func readPipFile(file *secureUserFile) (pipAnalysis, error) {
+func readPipFile(file *secureuserfile.File) (pipAnalysis, error) {
 	parentPresent, err := pipParentPresent(file)
 	if err != nil || !parentPresent {
 		return pipAnalysis{parentPresent: parentPresent}, err
@@ -360,26 +360,8 @@ func readPipFile(file *secureUserFile) (pipAnalysis, error) {
 	return analysis, err
 }
 
-func pipParentPresent(file *secureUserFile) (bool, error) {
-	parent := filepath.Dir(file.relativePath)
-	if parent == "." {
-		return true, nil
-	}
-	current := ""
-	for _, component := range strings.Split(parent, string(filepath.Separator)) {
-		current = filepath.Join(current, component)
-		info, err := file.home.root.Lstat(current)
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-		if err != nil {
-			return false, fmt.Errorf("pip: inspect user config parent: %w", err)
-		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-			return false, fmt.Errorf("pip: user config parent is not a real directory: %w", ErrTargetUnusable)
-		}
-	}
-	return true, nil
+func pipParentPresent(file *secureuserfile.File) (bool, error) {
+	return file.ParentPresent()
 }
 
 func analyzePipConfig(data []byte) (pipAnalysis, error) {
@@ -853,7 +835,7 @@ func (w *PipWriter) observedStaticConverged(expected string) (bool, error) {
 		if !analysis.existed || block == nil || block.body != expected || analysis.activeConflict {
 			return false, nil
 		}
-		secure, err := managed.file.MetadataSecure(secureUserFileMode)
+		secure, err := managed.file.MetadataSecure(secureuserfile.FileMode)
 		if err != nil || !secure {
 			return false, err
 		}
@@ -919,7 +901,7 @@ func (w *PipWriter) environmentOverride() string {
 		if !filepath.IsAbs(netrc) {
 			return "environment"
 		}
-		if filepath.Clean(netrc) != filepath.Join(w.home.home, ".netrc") {
+		if filepath.Clean(netrc) != filepath.Join(w.home.Path(), ".netrc") {
 			return "environment"
 		}
 	}

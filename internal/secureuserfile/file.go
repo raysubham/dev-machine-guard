@@ -1,4 +1,4 @@
-package devicepolicy
+package secureuserfile
 
 import (
 	"bytes"
@@ -18,10 +18,11 @@ import (
 )
 
 const (
-	maxManagedUserFileBytes       = 1 << 20
-	secureUserFileMaxSymlinkDepth = 8
-	secureUserFileMaxBackups      = 3
-	secureUserFileMode            = os.FileMode(0o600)
+	MaxBytes        = 1 << 20
+	FileMode        = os.FileMode(0o600)
+	ParentMode      = os.FileMode(0o700)
+	maxSymlinkDepth = 8
+	maxBackups      = 3
 )
 
 var (
@@ -33,8 +34,8 @@ var (
 	ErrWriteUnverified = errors.New("secure user file: write could not be verified or rolled back")
 )
 
-// secureUserHome pins all managed file operations beneath one resolved user's home.
-type secureUserHome struct {
+// Home pins all managed file operations beneath one resolved user's home.
+type Home struct {
 	targetUser *user.User
 	home       string
 	uid, gid   int
@@ -44,19 +45,18 @@ type secureUserHome struct {
 
 	randomSuffix      func() (string, error)
 	afterParentCreate func(relativePath string)
-	applyMetadata     func(*secureUserHome, *os.File, os.FileMode, bool) error
+	applyMetadata     func(*Home, *os.File, os.FileMode, bool) error
 	getenv            func(string) string
 	logf              func(format string, args ...any)
 }
 
-// secureUserFile owns safe byte and metadata operations for one relative path.
-type secureUserFile struct {
-	home           *secureUserHome
-	relativePath   string
-	backupPrefix   string
-	maxBytes       int64
-	strictMetadata bool
-	pending        *secureFileSnapshot
+// File owns safe byte and metadata operations for one relative path.
+type File struct {
+	home         *Home
+	relativePath string
+	backupPrefix string
+	maxBytes     int64
+	pending      *secureFileSnapshot
 }
 
 type secureFileSnapshot struct {
@@ -73,25 +73,25 @@ type ownerReader interface {
 }
 
 type metadataReader interface {
-	secure(f *os.File, home *secureUserHome, want os.FileMode) (bool, error)
+	secure(f *os.File, home *Home, want os.FileMode) (bool, error)
 }
 
-func newSecureUserHome(exec executor.Executor) (*secureUserHome, error) {
-	if !interactiveSessionOK() {
+func OpenUserHome(exec executor.Executor) (*Home, error) {
+	if exec.IsRoot() && !interactiveSessionOK() {
 		return nil, ErrNoTargetUser
 	}
 	u, err := exec.LoggedInUser()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrNoTargetUser, err)
 	}
-	home, err := openSecureUserHome(u)
+	home, err := openHome(u)
 	if err == nil {
 		home.getenv = executor.NewUserAwareExecutor(exec, u.Username).Getenv
 	}
 	return home, err
 }
 
-func openSecureUserHome(u *user.User) (*secureUserHome, error) {
+func openHome(u *user.User) (*Home, error) {
 	if u == nil || u.HomeDir == "" {
 		return nil, errors.New("secure user file: resolved user has no home directory")
 	}
@@ -109,7 +109,7 @@ func openSecureUserHome(u *user.User) (*secureUserHome, error) {
 		_ = root.Close()
 		return nil, errors.New("secure user file: platform metadata reader unavailable")
 	}
-	return &secureUserHome{
+	return &Home{
 		targetUser:    u,
 		home:          u.HomeDir,
 		uid:           uid,
@@ -123,14 +123,14 @@ func openSecureUserHome(u *user.User) (*secureUserHome, error) {
 	}, nil
 }
 
-func (h *secureUserHome) Username() string {
+func (h *Home) Username() string {
 	if h == nil || h.targetUser == nil {
 		return ""
 	}
 	return h.targetUser.Username
 }
 
-func (h *secureUserHome) Close() error {
+func (h *Home) Close() error {
 	if h == nil || h.root == nil {
 		return nil
 	}
@@ -139,15 +139,8 @@ func (h *secureUserHome) Close() error {
 	return err
 }
 
-func (h *secureUserHome) open(relativePath, backupPrefix string, maxBytes int64) (*secureUserFile, error) {
-	return h.openWithMetadata(relativePath, backupPrefix, maxBytes, false)
-}
-
-func (h *secureUserHome) openStrict(relativePath, backupPrefix string, maxBytes int64) (*secureUserFile, error) {
-	return h.openWithMetadata(relativePath, backupPrefix, maxBytes, true)
-}
-
-func (h *secureUserHome) openWithMetadata(relativePath, backupPrefix string, maxBytes int64, strict bool) (*secureUserFile, error) {
+// Open pins one home-relative file and applies strict platform metadata.
+func (h *Home) Open(relativePath, backupPrefix string, maxBytes int64) (*File, error) {
 	clean, err := cleanSecureRelativePath(relativePath)
 	if err != nil {
 		return nil, err
@@ -155,10 +148,10 @@ func (h *secureUserHome) openWithMetadata(relativePath, backupPrefix string, max
 	if backupPrefix == "" || strings.ContainsAny(backupPrefix, `/\\`) {
 		return nil, fmt.Errorf("secure user file: invalid backup prefix: %w", ErrTargetUnusable)
 	}
-	if maxBytes <= 0 || maxBytes > maxManagedUserFileBytes {
+	if maxBytes <= 0 || maxBytes > MaxBytes {
 		return nil, fmt.Errorf("secure user file: invalid read limit: %w", ErrTargetUnusable)
 	}
-	return &secureUserFile{home: h, relativePath: clean, backupPrefix: backupPrefix, maxBytes: maxBytes, strictMetadata: strict}, nil
+	return &File{home: h, relativePath: clean, backupPrefix: backupPrefix, maxBytes: maxBytes}, nil
 }
 
 func cleanSecureRelativePath(path string) (string, error) {
@@ -186,15 +179,13 @@ func removeCreatedParent(parent *os.Root, component string, created os.FileInfo)
 	return nil
 }
 
-// ensureParent creates missing parent components without ever traversing a symlink.
-func (h *secureUserHome) ensureParent(relativePath string, mode os.FileMode) error {
+// EnsureParent creates missing parent components without traversing symlinks.
+func (h *Home) EnsureParent(relativePath string) error {
 	clean, err := cleanSecureRelativePath(relativePath)
 	if err != nil {
 		return err
 	}
-	if mode.Perm()&0o077 != 0 {
-		return fmt.Errorf("secure user file: parent mode must be private: %w", ErrTargetUnusable)
-	}
+	mode := ParentMode
 	parent := filepath.Dir(clean)
 	if parent == "." {
 		return nil
@@ -249,7 +240,7 @@ func (h *secureUserHome) ensureParent(relativePath string, mode os.FileMode) err
 				return errors.Join(err, removeCreatedParent(current, component, createdInfo))
 			}
 		}
-		if err := h.checkOwner(handle, component, true); err != nil {
+		if err := h.VerifyOwner(handle, component); err != nil {
 			_ = handle.Close()
 			_ = next.Close()
 			if created {
@@ -265,7 +256,7 @@ func (h *secureUserHome) ensureParent(relativePath string, mode os.FileMode) err
 	return nil
 }
 
-func (h *secureUserHome) pinDirectory(parent *os.Root, component string) (*os.Root, *os.File, error) {
+func (h *Home) pinDirectory(parent *os.Root, component string) (*os.Root, *os.File, error) {
 	child, err := parent.OpenRoot(component)
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) {
@@ -293,7 +284,8 @@ func (h *secureUserHome) pinDirectory(parent *os.Root, component string) (*os.Ro
 	return child, handle, nil
 }
 
-func (h *secureUserHome) checkOwner(f *os.File, name string, strictPlatform bool) error {
+// VerifyOwner checks that an opened target belongs to the resolved user.
+func (h *Home) VerifyOwner(f *os.File, name string) error {
 	uid, _, enforced, err := h.owners.ownerUIDGID(f)
 	if err != nil {
 		return fmt.Errorf("secure user file: read owner: %w", err)
@@ -301,29 +293,46 @@ func (h *secureUserHome) checkOwner(f *os.File, name string, strictPlatform bool
 	if enforced && uid != uint32(h.uid) { // #nosec G115 -- uid is parsed from os/user on POSIX
 		return fmt.Errorf("secure user file: %q owned by uid %d, not target user: %w", name, uid, ErrTargetUnusable)
 	}
-	if strictPlatform {
-		if err := checkSecurePlatformOwner(h, f); err != nil {
-			return err
-		}
-	}
-	return nil
+	return checkSecurePlatformOwner(h, f)
 }
 
-func (f *secureUserFile) applyMetadata(file *os.File, mode os.FileMode, directory bool) error {
-	if !enforcePOSIXMetadata && !f.strictMetadata {
-		return nil
-	}
+func (f *File) applyMetadata(file *os.File, mode os.FileMode, directory bool) error {
 	return f.home.applyMetadata(f.home, file, mode, directory)
 }
 
-func (f *secureUserFile) Location() string {
+// Path returns the pinned user's home directory.
+func (h *Home) Path() string {
+	if h == nil {
+		return ""
+	}
+	return h.home
+}
+
+// Getenv reads an environment variable in the resolved user's context.
+func (h *Home) Getenv(name string) string {
+	if h == nil || h.getenv == nil {
+		return ""
+	}
+	return h.getenv(name)
+}
+
+func (f *File) Location() string {
 	if f == nil || f.home == nil {
 		return ""
 	}
 	return filepath.Join(f.home.home, f.relativePath)
 }
 
-func (f *secureUserFile) parentPresent() (bool, error) {
+// RelativePath returns the cleaned path beneath the pinned home.
+func (f *File) RelativePath() string {
+	if f == nil {
+		return ""
+	}
+	return f.relativePath
+}
+
+// ParentPresent reports whether every parent is an existing real directory.
+func (f *File) ParentPresent() (bool, error) {
 	parent := filepath.Dir(f.relativePath)
 	if parent == "." {
 		return true, nil
@@ -345,7 +354,7 @@ func (f *secureUserFile) parentPresent() (bool, error) {
 	return true, nil
 }
 
-func (f *secureUserFile) log(format string, args ...any) {
+func (f *File) log(format string, args ...any) {
 	if f.home.logf != nil {
 		f.home.logf(format, args...)
 	}
@@ -363,11 +372,11 @@ func (rt *secureResolvedTarget) close() {
 	}
 }
 
-func (f *secureUserFile) resolveLeaf() (*secureResolvedTarget, error) {
+func (f *File) resolveLeaf() (*secureResolvedTarget, error) {
 	cur := f.relativePath
 	viaSymlink := false
 	for depth := 0; ; depth++ {
-		if depth > secureUserFileMaxSymlinkDepth {
+		if depth > maxSymlinkDepth {
 			return nil, ErrSymlinkLoop
 		}
 		info, err := f.home.root.Lstat(cur)
@@ -402,7 +411,7 @@ func (f *secureUserFile) resolveLeaf() (*secureResolvedTarget, error) {
 	}
 }
 
-func (f *secureUserFile) pin(rel string) (*secureResolvedTarget, error) {
+func (f *File) pin(rel string) (*secureResolvedTarget, error) {
 	parent := filepath.Dir(rel)
 	base := filepath.Base(rel)
 	if base == "." || base == ".." || strings.ContainsRune(base, filepath.Separator) {
@@ -415,7 +424,7 @@ func (f *secureUserFile) pin(rel string) (*secureResolvedTarget, error) {
 	return &secureResolvedTarget{child: child, base: base, rel: rel}, nil
 }
 
-func (f *secureUserFile) pinParent(parent string) (*os.Root, error) {
+func (f *File) pinParent(parent string) (*os.Root, error) {
 	current, err := f.home.root.OpenRoot(".")
 	if err != nil {
 		return nil, fmt.Errorf("secure user file: pin home: %w", err)
@@ -437,7 +446,7 @@ func (f *secureUserFile) pinParent(parent string) (*os.Root, error) {
 			_ = current.Close()
 			return nil, err
 		}
-		if err := f.home.checkOwner(handle, component, f.strictMetadata); err != nil {
+		if err := f.home.VerifyOwner(handle, component); err != nil {
 			_ = handle.Close()
 			_ = next.Close()
 			_ = current.Close()
@@ -469,7 +478,7 @@ func endsInSeparatorOrDot(target string) bool {
 		(filepath.Separator != '/' && strings.HasSuffix(target, string(filepath.Separator)+"."))
 }
 
-func (f *secureUserFile) Read() ([]byte, bool, os.FileMode, error) {
+func (f *File) Read() ([]byte, bool, os.FileMode, error) {
 	rt, err := f.resolveLeaf()
 	if err != nil {
 		return nil, false, 0, err
@@ -479,7 +488,7 @@ func (f *secureUserFile) Read() ([]byte, bool, os.FileMode, error) {
 }
 
 // MetadataSecure verifies the current leaf's platform permission boundary.
-func (f *secureUserFile) MetadataSecure(want os.FileMode) (bool, error) {
+func (f *File) MetadataSecure(want os.FileMode) (bool, error) {
 	file, err := f.openMetadata()
 	if err != nil || file == nil {
 		return false, err
@@ -488,7 +497,7 @@ func (f *secureUserFile) MetadataSecure(want os.FileMode) (bool, error) {
 	return f.home.metadata.secure(file, f.home, want)
 }
 
-func (f *secureUserFile) openMetadata() (*os.File, error) {
+func (f *File) openMetadata() (*os.File, error) {
 	rt, err := f.resolveLeaf()
 	if err != nil {
 		return nil, err
@@ -515,14 +524,14 @@ func (f *secureUserFile) openMetadata() (*os.File, error) {
 		_ = file.Close()
 		return nil, fmt.Errorf("secure user file: leaf changed during metadata check: %w", ErrTargetUnusable)
 	}
-	if err := f.home.checkOwner(file, rt.base, f.strictMetadata); err != nil {
+	if err := f.home.VerifyOwner(file, rt.base); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
 	return file, nil
 }
 
-func (f *secureUserFile) readCurrent(rt *secureResolvedTarget) ([]byte, bool, os.FileMode, error) {
+func (f *File) readCurrent(rt *secureResolvedTarget) ([]byte, bool, os.FileMode, error) {
 	li, err := rt.child.Lstat(rt.base)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, 0, nil
@@ -546,7 +555,7 @@ func (f *secureUserFile) readCurrent(rt *secureResolvedTarget) ([]byte, bool, os
 	if err != nil || li2.Mode()&fs.ModeSymlink != 0 || !hi.Mode().IsRegular() || !li2.Mode().IsRegular() || !os.SameFile(li2, hi) {
 		return nil, false, 0, fmt.Errorf("secure user file: leaf %q changed during open: %w", rt.base, ErrTargetUnusable)
 	}
-	if err := f.home.checkOwner(file, rt.base, f.strictMetadata); err != nil {
+	if err := f.home.VerifyOwner(file, rt.base); err != nil {
 		return nil, false, 0, err
 	}
 	data, err := io.ReadAll(io.LimitReader(file, f.maxBytes+1))
@@ -559,7 +568,7 @@ func (f *secureUserFile) readCurrent(rt *secureResolvedTarget) ([]byte, bool, os
 	return data, true, hi.Mode().Perm(), nil
 }
 
-func (f *secureUserFile) Commit(data []byte, mode os.FileMode) error {
+func (f *File) Commit(data []byte, mode os.FileMode) error {
 	if mode.Perm()&^os.FileMode(0o600) != 0 {
 		return fmt.Errorf("secure user file: file mode must be no broader than 0600: %w", ErrTargetUnusable)
 	}
@@ -603,7 +612,7 @@ func (f *secureUserFile) Commit(data []byte, mode os.FileMode) error {
 	return nil
 }
 
-func (f *secureUserFile) Remove() error {
+func (f *File) Remove() error {
 	rt, err := f.resolveLeaf()
 	if err != nil {
 		return err
@@ -635,7 +644,7 @@ func (f *secureUserFile) Remove() error {
 	return nil
 }
 
-func (f *secureUserFile) RestoreSnapshot() error {
+func (f *File) RestoreSnapshot() error {
 	if f.pending == nil {
 		return errors.New("secure user file: no snapshot to restore")
 	}
@@ -661,7 +670,7 @@ func (f *secureUserFile) RestoreSnapshot() error {
 	return f.restoreFrom(rt, snap)
 }
 
-func (f *secureUserFile) restoreFrom(rt *secureResolvedTarget, snap *secureFileSnapshot) error {
+func (f *File) restoreFrom(rt *secureResolvedTarget, snap *secureFileSnapshot) error {
 	if !snap.existed {
 		if err := rt.child.Remove(rt.base); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("secure user file: restore remove: %w", err)
@@ -672,7 +681,7 @@ func (f *secureUserFile) restoreFrom(rt *secureResolvedTarget, snap *secureFileS
 	return err
 }
 
-func (f *secureUserFile) afterFailedRollback(rt *secureResolvedTarget, snap *secureFileSnapshot, cause error) error {
+func (f *File) afterFailedRollback(rt *secureResolvedTarget, snap *secureFileSnapshot, cause error) error {
 	if err := f.restoreFrom(rt, snap); err != nil {
 		f.log("secure user file: rollback failed: %v", err)
 		return fmt.Errorf("secure user file: %v: %w", cause, ErrWriteUnverified)
@@ -685,7 +694,7 @@ type secureCommitOutcome struct {
 	renamed   bool
 }
 
-func (f *secureUserFile) commit(rt *secureResolvedTarget, data []byte, mode os.FileMode) (secureCommitOutcome, error) {
+func (f *File) commit(rt *secureResolvedTarget, data []byte, mode os.FileMode) (secureCommitOutcome, error) {
 	tmp, tmpName, err := f.createExclusive(rt, rt.base+".dmg-tmp-", "")
 	if err != nil {
 		return secureCommitOutcome{}, err
@@ -731,14 +740,14 @@ func (f *secureUserFile) commit(rt *secureResolvedTarget, data []byte, mode os.F
 	return secureCommitOutcome{committed: li, renamed: true}, nil
 }
 
-func (f *secureUserFile) createExclusive(rt *secureResolvedTarget, prefix, suffix string) (*os.File, string, error) {
+func (f *File) createExclusive(rt *secureResolvedTarget, prefix, suffix string) (*os.File, string, error) {
 	for range 8 {
 		middle, err := f.home.randomSuffix()
 		if err != nil {
 			return nil, "", fmt.Errorf("secure user file: random suffix: %w", err)
 		}
 		name := prefix + middle + suffix
-		file, err := rt.child.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, secureUserFileMode)
+		file, err := rt.child.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, FileMode)
 		if errors.Is(err, os.ErrExist) {
 			continue
 		}
@@ -750,7 +759,7 @@ func (f *secureUserFile) createExclusive(rt *secureResolvedTarget, prefix, suffi
 	return nil, "", errors.New("secure user file: could not create a unique temporary file")
 }
 
-func (f *secureUserFile) syncDir(rt *secureResolvedTarget) {
+func (f *File) syncDir(rt *secureResolvedTarget) {
 	dir, err := rt.child.Open(".")
 	if err != nil {
 		return
@@ -759,7 +768,7 @@ func (f *secureUserFile) syncDir(rt *secureResolvedTarget) {
 	_ = dir.Close()
 }
 
-func (f *secureUserFile) backup(rt *secureResolvedTarget, data []byte) error {
+func (f *File) backup(rt *secureResolvedTarget, data []byte) error {
 	file, name, err := f.createExclusive(rt, rt.base+f.backupPrefix, ".bak")
 	if err != nil {
 		return err
@@ -769,7 +778,7 @@ func (f *secureUserFile) backup(rt *secureResolvedTarget, data []byte) error {
 		_ = rt.child.Remove(name)
 		return fmt.Errorf("secure user file: write backup: %w", err)
 	}
-	if err := f.applyMetadata(file, secureUserFileMode, false); err != nil {
+	if err := f.applyMetadata(file, FileMode, false); err != nil {
 		_ = file.Close()
 		_ = rt.child.Remove(name)
 		return err
@@ -781,7 +790,7 @@ func (f *secureUserFile) backup(rt *secureResolvedTarget, data []byte) error {
 	return nil
 }
 
-func (f *secureUserFile) rotateBackups(rt *secureResolvedTarget) {
+func (f *File) rotateBackups(rt *secureResolvedTarget) {
 	dir, err := rt.child.Open(".")
 	if err != nil {
 		f.log("secure user file: backup rotation open failed: %v", err)
@@ -794,7 +803,7 @@ func (f *secureUserFile) rotateBackups(rt *secureResolvedTarget) {
 		name  string
 		mtime int64
 	}
-	kept := make([]backupFile, 0, secureUserFileMaxBackups)
+	kept := make([]backupFile, 0, maxBackups)
 	insert := func(item backupFile) {
 		i := sort.Search(len(kept), func(i int) bool { return kept[i].mtime > item.mtime })
 		kept = append(kept, backupFile{})
@@ -818,7 +827,7 @@ func (f *secureUserFile) rotateBackups(rt *secureResolvedTarget) {
 				continue
 			}
 			item := backupFile{name: name, mtime: info.ModTime().UnixNano()}
-			if len(kept) < secureUserFileMaxBackups {
+			if len(kept) < maxBackups {
 				insert(item)
 			} else if item.mtime <= kept[0].mtime {
 				remove(item.name)
@@ -839,7 +848,7 @@ func (f *secureUserFile) rotateBackups(rt *secureResolvedTarget) {
 	}
 }
 
-func (f *secureUserFile) PurgeBackups() error {
+func (f *File) PurgeBackups() error {
 	var rt *secureResolvedTarget
 	var err error
 	if f.pending != nil && f.pending.leaf != "" {
@@ -854,7 +863,7 @@ func (f *secureUserFile) PurgeBackups() error {
 	return f.purgeBackups(rt)
 }
 
-func (f *secureUserFile) purgeBackups(rt *secureResolvedTarget) error {
+func (f *File) purgeBackups(rt *secureResolvedTarget) error {
 	dir, err := rt.child.Open(".")
 	if err != nil {
 		return fmt.Errorf("secure user file: open parent for backup purge: %w", err)

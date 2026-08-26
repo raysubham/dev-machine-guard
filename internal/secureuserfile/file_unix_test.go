@@ -1,6 +1,6 @@
 //go:build unix
 
-package devicepolicy
+package secureuserfile
 
 import (
 	"errors"
@@ -13,6 +13,16 @@ import (
 
 func normalizeSecureTestUser(t *testing.T, _ *user.User) {
 	t.Helper()
+}
+
+type fakeOwner struct {
+	uid, gid uint32
+	enforced bool
+	err      error
+}
+
+func (f fakeOwner) ownerUIDGID(_ *os.File) (uint32, uint32, bool, error) {
+	return f.uid, f.gid, f.enforced, f.err
 }
 
 func TestSecureUserFile_RejectsFIFOAndWrongOwner(t *testing.T) {
@@ -47,7 +57,7 @@ func TestSecureUserFile_RejectsFIFOAndWrongOwner(t *testing.T) {
 		}
 		h := newSecureTestHome(t, home)
 		h.owners = fakeOwner{uid: uint32(h.uid + 1), enforced: true}
-		if err := h.ensureParent(filepath.Join(".config", "pip", "pip.conf"), 0o700); !errors.Is(err, ErrTargetUnusable) {
+		if err := h.EnsureParent(filepath.Join(".config", "tool", "config")); !errors.Is(err, ErrTargetUnusable) {
 			t.Fatalf("ensureParent error = %v, want ErrTargetUnusable", err)
 		}
 	})
@@ -56,17 +66,17 @@ func TestSecureUserFile_RejectsFIFOAndWrongOwner(t *testing.T) {
 func TestSecureUserFile_AppliesTargetOwnership(t *testing.T) {
 	home := t.TempDir()
 	h := newSecureTestHome(t, home)
-	if err := h.ensureParent(filepath.Join(".config", "pip", "pip.conf"), 0o700); err != nil {
+	if err := h.EnsureParent(filepath.Join(".config", "tool", "config")); err != nil {
 		t.Fatalf("ensureParent: %v", err)
 	}
-	f := openSecureTestFile(t, h, filepath.Join(".config", "pip", "pip.conf"))
+	f := openSecureTestFile(t, h, filepath.Join(".config", "tool", "config"))
 	if err := f.Commit([]byte("managed"), 0o600); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 	for _, path := range []string{
 		filepath.Join(home, ".config"),
-		filepath.Join(home, ".config", "pip"),
-		filepath.Join(home, ".config", "pip", "pip.conf"),
+		filepath.Join(home, ".config", "tool"),
+		filepath.Join(home, ".config", "tool", "config"),
 	} {
 		info, err := os.Stat(path)
 		if err != nil {

@@ -2,10 +2,19 @@ package devicepolicy
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net/url"
+	"os"
+	"os/user"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/step-security/dev-machine-guard/internal/executor"
@@ -75,56 +84,180 @@ const (
 )
 
 const (
-	npmrcMaxBytes         = maxManagedUserFileBytes
+	// npmrcMaxBytes caps the file the writer will read, snapshot, back up, or
+	// transform. A pathological multi-megabyte .npmrc must not balloon memory
+	// or the backup set; exceeding it is a structural refusal, not a transform.
+	npmrcMaxBytes = 1 << 20
+	// npmrcMaxRenderedBytes caps the two rendered content lines. Anything past
+	// this is a malformed policy, not a block to write.
 	npmrcMaxRenderedBytes = 4 << 10
-	npmrcMaxKeyBytes      = 256
-	npmrcMaxSerialBytes   = 128
-	npmrcMaxHostBytes     = 253
-	npmrcMaxSymlinkDepth  = secureUserFileMaxSymlinkDepth
-	npmrcMaxBackups       = secureUserFileMaxBackups
-	npmrcFileMode         = secureUserFileMode
+	// npmrcMaxKeyBytes / npmrcMaxSerialBytes bound the two variable-length
+	// fields the renderer accepts.
+	npmrcMaxKeyBytes    = 256
+	npmrcMaxSerialBytes = 128
+	// npmrcMaxHostBytes is the RFC 1123 hostname length ceiling.
+	npmrcMaxHostBytes = 253
+	// npmrcMaxSymlinkDepth bounds the .npmrc symlink chain the resolver will
+	// follow before declaring a loop.
+	npmrcMaxSymlinkDepth = 8
+	// npmrcMaxBackups is the retained backup count beside the resolved leaf.
+	npmrcMaxBackups = 3
+	// npmrcFileMode is the mode every file the writer creates or rewrites lands
+	// with. A token-bearing file is never group/other-readable.
+	npmrcFileMode os.FileMode = 0o600
 )
 
-// NPMRCWriter converges the managed block in one user's ~/.npmrc. Format
-// transforms remain npm-specific; all byte and metadata operations are shared.
+// Structural errors. Every "this target cannot be enforced" condition wraps
+// ErrTargetUnusable so the reconciler can classify the whole class as
+// write_failed regardless of whether a read or a write surfaced it, while a
+// plain permission-denied / transient I/O error (which does not wrap it) stays
+// verification_failed. ErrNoTargetUser is separate: it means there is no
+// enforceable user on this machine state (LocalSystem, a non-interactive
+// Windows session, or root with no resolvable GUI user), which the reconciler
+// reports as policy_not_applied, not write_failed.
+var (
+	ErrTargetUnusable  = errors.New("npmrc: target unusable")
+	ErrNoTargetUser    = errors.New("npmrc: no enforceable target user")
+	ErrAbsoluteSymlink = fmt.Errorf("npmrc: .npmrc is an absolute symlink: %w", ErrTargetUnusable)
+	ErrSymlinkLoop     = fmt.Errorf("npmrc: .npmrc symlink chain too deep: %w", ErrTargetUnusable)
+	ErrDanglingSymlink = fmt.Errorf("npmrc: .npmrc symlink target does not exist: %w", ErrTargetUnusable)
+)
+
+// ErrWriteUnverified means a mutating op landed new bytes it could then neither
+// verify NOR roll back — the post-rename identity re-check failed and the restore
+// to the pre-state also failed. On-disk state is therefore indeterminate (not the
+// clean "write failed, disk untouched" case), which the reconciler classifies as
+// verification_failed rather than write_failed. It deliberately does NOT wrap
+// ErrTargetUnusable, so the write-path classifier routes it to verification_failed.
+var ErrWriteUnverified = errors.New("npmrc: write could not be verified or rolled back")
+
+// NPMRCWriter converges the managed block in one user's ~/.npmrc. It satisfies
+// the Writer interface (Read/Write/Clear/Location) and adds the concrete-type
+// methods the reconciler seams need — Converged, ProbeExpected, RestoreSnapshot
+// — none of which fit the settings.json-shaped interface.
+//
+// Threat model: the agent can run as root (macOS LaunchDaemon) against a home
+// directory the target user controls. A user who can plant symlinks or swap
+// directory entries mid-operation must not be able to steer a root-owned write,
+// a root read, or a token-bearing backup outside their own regular .npmrc. The
+// writer therefore anchors every operation to a directory file descriptor via
+// os.Root, resolves the .npmrc symlink chain explicitly, pins the resolved
+// parent with a second os.Root, re-verifies file identity after every open, and
+// performs all metadata changes on open handles (never by path). It never uses
+// atomicfile, whose predictable, symlink-following backup names are exactly the
+// attack this design closes.
 type NPMRCWriter struct {
-	file *secureUserFile
-	logf func(format string, args ...any)
+	exec       executor.Executor
+	targetUser *user.User
+	home       string
+	uid, gid   int // parsed from targetUser; only meaningful where enforcePOSIXMetadata
+
+	root   *os.Root // directory fd over the target home, held for the writer's lifetime
+	owners ownerReader
+	logf   func(format string, args ...any)
+
+	// pending is the memory-only snapshot captured at the start of the last
+	// mutating op (Write/Clear) and retained on success so a later
+	// RestoreSnapshot can undo it. It is never persisted.
+	pending *pendingSnapshot
 }
 
+// pendingSnapshot is the pre-mutation state one Write or Clear can roll back to.
+type pendingSnapshot struct {
+	existed bool
+	data    []byte
+	mode    os.FileMode
+	// leaf is the resolved leaf path relative to the home root at capture time.
+	// RestoreSnapshot re-resolves and refuses to write if the chain now points
+	// somewhere else.
+	leaf string
+	// committed is the identity (post-rename FileInfo) of the file this writer
+	// last left at the leaf. RestoreSnapshot requires the on-disk leaf to still be
+	// SameFile as this before reverting: a relative path can be unchanged while the
+	// parent directory or the leaf inode was swapped underneath it, and reverting
+	// into that would write stale bytes into someone else's file.
+	committed os.FileInfo
+}
+
+// ownerReader reads the uid/gid owning an open file. enforcePOSIXMetadata
+// platforms return the real owner; elsewhere (Windows, ACL model) enforced is
+// false and the caller skips every ownership decision. Tests inject a fake to
+// exercise wrong-owner branches without root.
+type ownerReader interface {
+	ownerUIDGID(f *os.File) (uid, gid uint32, enforced bool, err error)
+}
+
+// NewNPMRCWriter resolves the console user and opens a directory fd over their
+// home. It returns ErrNoTargetUser when this machine state has no enforceable
+// user (Windows LocalSystem or a non-interactive session, root with no GUI
+// user); any other error is an infrastructure failure (home unresolvable or
+// unopenable). The caller defers Close to release the directory fd.
 func NewNPMRCWriter(exec executor.Executor) (*NPMRCWriter, error) {
-	home, err := newSecureUserHome(exec)
-	if err != nil {
-		return nil, err
+	// On Windows, a write from any identity that is not the interactive user of
+	// an active session would silently land in the wrong profile
+	// (service/RMM account, session 0, runas alternate credentials). Fail
+	// closed to no-target rather than enforce against the wrong .npmrc.
+	if !interactiveSessionOK() {
+		return nil, ErrNoTargetUser
 	}
-	file, err := home.open(".npmrc", ".dmg-", npmrcMaxBytes)
+
+	u, err := exec.LoggedInUser()
 	if err != nil {
-		_ = home.Close()
-		return nil, err
+		// The only error LoggedInUser returns is the darwin-root "no GUI console
+		// user" case; treat the absence of a resolvable user as no-target.
+		return nil, fmt.Errorf("%w: %v", ErrNoTargetUser, err)
 	}
-	return &NPMRCWriter{file: file}, nil
+	if u == nil || u.HomeDir == "" {
+		return nil, fmt.Errorf("npmrc: resolved user has no home directory")
+	}
+
+	root, err := os.OpenRoot(u.HomeDir)
+	if err != nil {
+		return nil, fmt.Errorf("npmrc: open home root %q: %w", u.HomeDir, err)
+	}
+
+	w := &NPMRCWriter{
+		exec:       exec,
+		targetUser: u,
+		home:       u.HomeDir,
+		root:       root,
+		owners:     newOwnerReader(),
+	}
+	if enforcePOSIXMetadata {
+		// Uid/Gid are numeric on POSIX. A parse failure means we cannot chown to
+		// the target user, which defeats the whole point of resolving them.
+		uid, uerr := strconv.Atoi(u.Uid)
+		gid, gerr := strconv.Atoi(u.Gid)
+		if uerr != nil || gerr != nil {
+			_ = root.Close()
+			return nil, fmt.Errorf("npmrc: target user %q has non-numeric uid/gid", u.Username)
+		}
+		w.uid, w.gid = uid, gid
+	}
+	return w, nil
 }
 
+// Close releases the home directory fd. Safe to call more than once.
 func (w *NPMRCWriter) Close() error {
-	if w == nil || w.file == nil {
+	if w == nil || w.root == nil {
 		return nil
 	}
-	return w.file.home.Close()
+	err := w.root.Close()
+	w.root = nil
+	w.pending = nil
+	return err
 }
 
+// Location is a human-readable target description for logs. It never includes
+// file contents or key material.
 func (w *NPMRCWriter) Location() string {
-	if w == nil || w.file == nil {
-		return ""
-	}
-	return w.file.Location() + " [npm secure registry]"
+	return filepath.Join(w.home, ".npmrc") + " [npm secure registry]"
 }
 
-func (w *NPMRCWriter) SetLogf(logf func(format string, args ...any)) {
-	w.logf = logf
-	if w.file != nil {
-		w.file.home.logf = logf
-	}
-}
+// SetLogf installs an optional diagnostic sink for non-fatal events (a missing
+// END marker stripped to EOF, a backup-rotation prune failure, a snapshot
+// restore that aborted). It is never handed file contents or key material.
+func (w *NPMRCWriter) SetLogf(logf func(format string, args ...any)) { w.logf = logf }
 
 func (w *NPMRCWriter) log(format string, args ...any) {
 	if w.logf != nil {
@@ -132,80 +265,761 @@ func (w *NPMRCWriter) log(format string, args ...any) {
 	}
 }
 
-// Read returns the managed block body and whether it is present.
+// ---------------------------------------------------------------------------
+// Symlink-chain resolution
+// ---------------------------------------------------------------------------
+
+// resolvedTarget is the outcome of walking the ~/.npmrc symlink chain: a child
+// os.Root pinned at the resolved leaf's real parent directory plus the leaf's
+// basename within it. Every subsequent operation uses (child, base) so a swap
+// of an ancestor directory after resolution cannot redirect the open or rename
+// — a directory fd references the original directory even if it is later moved.
+type resolvedTarget struct {
+	child      *os.Root // caller closes
+	base       string   // leaf basename within child
+	rel        string   // leaf path relative to the home root (parentDir/base)
+	viaSymlink bool     // the leaf was reached by following at least one link
+	existed    bool     // the leaf exists (Lstat succeeded)
+}
+
+func (rt *resolvedTarget) close() {
+	if rt != nil && rt.child != nil {
+		_ = rt.child.Close()
+	}
+}
+
+// resolveLeaf walks the .npmrc chain relative to the home root and pins the
+// resolved parent. It rejects, before any file open:
+//   - an absolute symlink target (ErrAbsoluteSymlink) — even one pointing back
+//     inside the home; enforcing through an absolute link is out of scope;
+//   - a raw target ending in a path separator or "/." (ErrTargetUnusable),
+//     checked BEFORE cleaning: `.npmrc -> "file/"` fails kernel resolution with
+//     ENOTDIR when `file` is not a directory, so npm never reads it; cleaning
+//     would erase that evidence and let a bogus write report success;
+//   - a chain deeper than npmrcMaxSymlinkDepth (ErrSymlinkLoop);
+//   - a dangling target (ErrDanglingSymlink);
+//   - a chain escaping the home (os.Root refuses; surfaces as ErrTargetUnusable).
+func (w *NPMRCWriter) resolveLeaf() (*resolvedTarget, error) {
+	cur := ".npmrc"
+	viaSymlink := false
+
+	for depth := 0; ; depth++ {
+		if depth > npmrcMaxSymlinkDepth {
+			return nil, ErrSymlinkLoop
+		}
+		fi, err := w.root.Lstat(cur)
+		if errors.Is(err, os.ErrNotExist) {
+			if viaSymlink {
+				// A link resolved to a name that does not exist.
+				return nil, ErrDanglingSymlink
+			}
+			// The plain .npmrc simply does not exist yet.
+			return w.pin(cur, false, false)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("npmrc: lstat %q: %w", cur, err)
+		}
+		if fi.Mode()&fs.ModeSymlink == 0 {
+			// Regular (or other) leaf reached.
+			return w.pin(cur, viaSymlink, true)
+		}
+
+		target, err := w.root.Readlink(cur)
+		if err != nil {
+			return nil, fmt.Errorf("npmrc: readlink %q: %w", cur, err)
+		}
+		if isAbsSymlinkTarget(target) {
+			return nil, ErrAbsoluteSymlink
+		}
+		if endsInSeparatorOrDot(target) {
+			return nil, fmt.Errorf("npmrc: symlink target %q is directory-shaped: %w", target, ErrTargetUnusable)
+		}
+		next := filepath.Clean(filepath.Join(filepath.Dir(cur), target))
+		if next == ".." || strings.HasPrefix(next, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("npmrc: symlink escapes home: %w", ErrTargetUnusable)
+		}
+		cur = next
+		viaSymlink = true
+	}
+}
+
+// pin opens a child os.Root at the resolved leaf's parent directory so every
+// later op is anchored to that directory fd.
+func (w *NPMRCWriter) pin(rel string, viaSymlink, existed bool) (*resolvedTarget, error) {
+	parent := filepath.Dir(rel)
+	base := filepath.Base(rel)
+	if base == "." || base == ".." || strings.ContainsRune(base, filepath.Separator) {
+		return nil, fmt.Errorf("npmrc: resolved leaf %q is not a basename: %w", rel, ErrTargetUnusable)
+	}
+	child, err := w.root.OpenRoot(parent)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			// The parent exists but is unreadable (permissions / transient). That is
+			// not a structural refusal: surface it as a plain error so the reconciler
+			// classifies it verification_failed and retries, rather than the
+			// write_failed reserved for a target that can never be enforced.
+			return nil, fmt.Errorf("npmrc: pin parent %q: %w", parent, err)
+		}
+		// A parent that is itself a symlink escaping the home, or a non-directory
+		// component, lands here: structurally unenforceable.
+		return nil, fmt.Errorf("npmrc: pin parent %q: %w", parent, ErrTargetUnusable)
+	}
+	return &resolvedTarget{child: child, base: base, rel: rel, viaSymlink: viaSymlink, existed: existed}, nil
+}
+
+// isAbsSymlinkTarget reports whether a raw link target is absolute. filepath.IsAbs
+// covers POSIX "/..." and Windows drive/UNC forms; a leading separator is caught
+// explicitly so a POSIX target evaluated on any host is still rejected.
+func isAbsSymlinkTarget(target string) bool {
+	if target == "" {
+		return false
+	}
+	if target[0] == '/' || target[0] == filepath.Separator {
+		return true
+	}
+	return filepath.IsAbs(target)
+}
+
+// endsInSeparatorOrDot reports whether a raw (uncleaned) symlink target is
+// directory-shaped — ending in a separator or in "/." — the GO-2026-4970
+// trigger the resolver refuses before filepath.Clean can erase the evidence.
+func endsInSeparatorOrDot(target string) bool {
+	if target == "" {
+		return false
+	}
+	last := target[len(target)-1]
+	if last == '/' || last == filepath.Separator {
+		return true
+	}
+	if target == "." || strings.HasSuffix(target, "/.") {
+		return true
+	}
+	if filepath.Separator != '/' && strings.HasSuffix(target, string(filepath.Separator)+".") {
+		return true
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// Bounded, identity-checked reads
+// ---------------------------------------------------------------------------
+
+// readCurrent opens the resolved leaf and returns its bytes, existence, and
+// mode. It enforces the full open-identity discipline: a Lstat pre-screen that
+// fast-fails an obvious FIFO/device, an O_NONBLOCK open so a FIFO cannot block
+// the daemon, a post-open regular-file check, a re-Lstat + SameFile identity
+// check to close the resolve→open swap race, an ownership rule (the resolved
+// leaf must be owned by the target user — root-owned included is refused, since
+// this writer always chowns its own output to that user and so never leaves a
+// root-owned leaf behind), and a size cap. An absent file returns
+// (nil, false, 0, nil).
+func (w *NPMRCWriter) readCurrent(rt *resolvedTarget) ([]byte, bool, os.FileMode, error) {
+	li, err := rt.child.Lstat(rt.base)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, 0, nil
+	}
+	if err != nil {
+		return nil, false, 0, fmt.Errorf("npmrc: lstat leaf %q: %w", rt.base, err)
+	}
+	if li.Mode()&fs.ModeSymlink != 0 {
+		// The chain was resolved to a regular leaf; a symlink here means the
+		// entry was swapped after resolution.
+		return nil, false, 0, fmt.Errorf("npmrc: leaf %q became a symlink: %w", rt.base, ErrTargetUnusable)
+	}
+	if !li.Mode().IsRegular() {
+		return nil, false, 0, fmt.Errorf("npmrc: leaf %q is not a regular file: %w", rt.base, ErrTargetUnusable)
+	}
+
+	f, err := rt.child.OpenFile(rt.base, os.O_RDONLY|nonblockOpenFlag(), 0)
+	if err != nil {
+		return nil, false, 0, fmt.Errorf("npmrc: open leaf %q: %w", rt.base, err)
+	}
+	defer f.Close()
+
+	hi, err := f.Stat()
+	if err != nil {
+		return nil, false, 0, fmt.Errorf("npmrc: stat leaf handle: %w", err)
+	}
+	if !hi.Mode().IsRegular() {
+		return nil, false, 0, fmt.Errorf("npmrc: opened leaf %q is not a regular file: %w", rt.base, ErrTargetUnusable)
+	}
+
+	// Re-Lstat through the pinned child and require the same inode: an in-root
+	// symlink swapped in between the pre-screen and the open would have been
+	// followed by os.Root to another file, which this rejects.
+	li2, err := rt.child.Lstat(rt.base)
+	if err != nil {
+		return nil, false, 0, fmt.Errorf("npmrc: re-lstat leaf %q: %w", rt.base, err)
+	}
+	if li2.Mode()&fs.ModeSymlink != 0 || !li2.Mode().IsRegular() || !os.SameFile(li2, hi) {
+		return nil, false, 0, fmt.Errorf("npmrc: leaf %q changed during open: %w", rt.base, ErrTargetUnusable)
+	}
+
+	if err := w.checkOwner(f, rt); err != nil {
+		return nil, false, 0, err
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, npmrcMaxBytes+1))
+	if err != nil {
+		return nil, false, 0, fmt.Errorf("npmrc: read leaf %q: %w", rt.base, err)
+	}
+	if len(data) > npmrcMaxBytes {
+		return nil, false, 0, fmt.Errorf("npmrc: leaf %q exceeds %d bytes: %w", rt.base, npmrcMaxBytes, ErrTargetUnusable)
+	}
+	return data, true, hi.Mode().Perm(), nil
+}
+
+// checkOwner enforces the ownership rule for an existing target: on POSIX the
+// resolved leaf must be owned by the target user, full stop. A leaf owned by
+// anyone else — root included — is refused. A user could otherwise point .npmrc
+// at a root-owned file in their home and have the daemon read it, copy its bytes
+// into a user-readable backup, and rewrite it user-owned, disclosing and mutating
+// a file they could not otherwise touch. And since this writer always chowns its
+// own output to the target user (applyMetadata), a root-owned leaf is never one
+// it left behind, so there is nothing legitimate to tolerate. On Windows
+// (enforced=false) ownership is governed by ACLs and this check is skipped.
+func (w *NPMRCWriter) checkOwner(f *os.File, rt *resolvedTarget) error {
+	uid, _, enforced, err := w.owners.ownerUIDGID(f)
+	if err != nil {
+		return fmt.Errorf("npmrc: read owner: %w", err)
+	}
+	if !enforced {
+		return nil
+	}
+	if uid == uint32(w.uid) { // #nosec G115 -- w.uid is strconv.Atoi of a POSIX uid (os/user), always non-negative and within uint32
+		return nil
+	}
+	return fmt.Errorf("npmrc: leaf %q owned by uid %d, not target user: %w", rt.base, uid, ErrTargetUnusable)
+}
+
+// Read returns the managed block body (canonicalized) and whether it is
+// present. It satisfies the Writer interface; the reconciler uses Converged
+// (not this) for the real idempotency decision.
 func (w *NPMRCWriter) Read() (string, bool, error) {
-	data, existed, _, err := w.file.Read()
-	if err != nil || !existed {
+	rt, err := w.resolveLeaf()
+	if err != nil {
 		return "", false, err
+	}
+	defer rt.close()
+
+	data, existed, _, err := w.readCurrent(rt)
+	if err != nil {
+		return "", false, err
+	}
+	if !existed {
+		return "", false, nil
 	}
 	body, present := extractManagedBody(string(data))
 	return body, present, nil
 }
 
-// Write applies the npm transform, atomically commits it, and verifies the block.
+// ---------------------------------------------------------------------------
+// Write / Clear (the §3 rewrite and clear algorithms)
+// ---------------------------------------------------------------------------
+
+// Write applies the rewrite transform for the given rendered block body and
+// returns the block body read back from disk. The op is transactional: it
+// snapshots the pre-state first, and any failure after the rename self-restores
+// before returning. On success the snapshot is retained for a later
+// RestoreSnapshot.
 func (w *NPMRCWriter) Write(value string) (string, error) {
-	current, _, _, err := w.file.Read()
+	rt, err := w.resolveLeaf()
 	if err != nil {
 		return "", err
 	}
-	next, err := w.rewriteContent(current, value)
+	defer rt.close()
+
+	cur, existed, mode, err := w.readCurrent(rt)
 	if err != nil {
 		return "", err
 	}
-	if err := w.file.Commit(next, npmrcFileMode); err != nil {
+	if !existed {
+		mode = npmrcFileMode
+	}
+
+	next, err := w.rewriteContent(cur, value)
+	if err != nil {
 		return "", err
 	}
-	data, existed, _, err := w.file.Read()
-	if err != nil || !existed {
-		if err == nil {
-			err = errors.New("npmrc: file absent after write")
+
+	snap := &pendingSnapshot{existed: existed, data: cur, mode: mode, leaf: rt.rel}
+	if existed {
+		// Preserve the pre-rewrite file before overwriting it. Best-effort:
+		// backup failure must not block enforcement.
+		if err := w.backup(rt, cur); err != nil {
+			w.log("npmrc: backup of %q failed: %v", rt.base, err)
 		}
-		if restoreErr := w.file.RestoreSnapshot(); restoreErr != nil {
-			return "", fmt.Errorf("npmrc: readback failed and rollback failed (%v): %w", err, ErrWriteUnverified)
+	}
+	out, err := w.commit(rt, next, npmrcFileMode)
+	if err != nil {
+		if out.renamed {
+			// New bytes landed but their identity could not be confirmed. Revert to
+			// the pre-state so an unverified write is never left behind; if that
+			// revert also fails, disk is indeterminate (ErrWriteUnverified).
+			return "", w.afterFailedRollback(rt, snap, err, "commit verification")
 		}
 		return "", err
 	}
-	body, present := extractManagedBody(string(data))
-	if !present {
-		if restoreErr := w.file.RestoreSnapshot(); restoreErr != nil {
-			return "", fmt.Errorf("npmrc: managed block missing after write and rollback failed: %w", ErrWriteUnverified)
-		}
-		return "", errors.New("npmrc: managed block missing after write")
+	snap.committed = out.committed
+
+	body, err := w.readbackBody(rt)
+	if err != nil {
+		// The write landed but readback failed — undo it so disk is not left in an
+		// unverified state (and flag an indeterminate disk if the undo fails too).
+		return "", w.afterFailedRollback(rt, snap, err, "readback")
 	}
+	w.pending = snap
 	return body, nil
 }
 
-// Clear removes the managed block and restores npm settings displaced by this lane.
+// Clear removes the managed block and restores the user's commented-out
+// `registry=` lines. It carries the same transactional and metadata guarantees
+// as Write and never deletes the file. The returned bool reports whether the
+// file actually changed; the two no-op paths below return false.
 func (w *NPMRCWriter) Clear() (bool, error) {
-	current, existed, _, err := w.file.Read()
+	rt, err := w.resolveLeaf()
+	if err != nil {
+		return false, err
+	}
+	defer rt.close()
+
+	cur, existed, mode, err := w.readCurrent(rt)
 	if err != nil {
 		return false, err
 	}
 	if !existed {
-		w.purgeBackups()
+		// Nothing to clear; leave the (absent) file alone. A backup from an earlier
+		// cycle can still hold a managed block, and with the live file gone this is
+		// the only path that ever reaches it — so retry the purge here.
+		w.purgeBackups(rt)
 		return false, nil
 	}
-	next, err := w.clearContent(current)
+
+	next, err := w.clearContent(cur)
 	if err != nil {
 		return false, err
 	}
-	if bytes.Equal(next, current) {
-		w.purgeBackups()
+	if bytes.Equal(next, cur) {
+		// No managed block and no prefixed lines — a no-op that performs no write at
+		// all. Nothing of ours is live, so a backup beside the leaf is residue: either
+		// an earlier purge that could not unlink it, or a block someone removed by
+		// hand. Retry the purge; the clear itself stays a no-op.
+		w.purgeBackups(rt)
 		return false, nil
 	}
-	if err := w.file.Commit(next, npmrcFileMode); err != nil {
+
+	snap := &pendingSnapshot{existed: true, data: cur, mode: mode, leaf: rt.rel}
+	if err := w.backup(rt, cur); err != nil {
+		w.log("npmrc: backup of %q failed: %v", rt.base, err)
+	}
+	out, err := w.commit(rt, next, npmrcFileMode)
+	if err != nil {
+		if out.renamed {
+			// The cleared bytes landed but unverified — revert to the pre-clear state
+			// rather than leave an unverified file; a failed revert leaves disk
+			// indeterminate (ErrWriteUnverified). The backup stays as a recovery aid.
+			return false, w.afterFailedRollback(rt, snap, err, "clear commit verification")
+		}
 		return false, err
 	}
-	w.purgeBackups()
+	snap.committed = out.committed
+	w.pending = snap
+	// The clear succeeded, so every backup beside the leaf is now stale — and the
+	// one taken moments ago holds the very token this clear exists to revoke.
+	// Removing the managed block while leaving a readable copy of it in a sibling
+	// would defeat offboarding, so drop our own backups here. Rollback is
+	// unaffected: RestoreSnapshot reverts from snap's in-memory bytes.
+	w.purgeBackups(rt)
 	return true, nil
 }
 
-func (w *NPMRCWriter) RestoreSnapshot() error { return w.file.RestoreSnapshot() }
-
-func (w *NPMRCWriter) purgeBackups() {
-	if err := w.file.PurgeBackups(); err != nil {
-		w.log("npmrc: backup purge failed: %v", err)
+// RestoreSnapshot reverts the last successful Write/Clear. It re-resolves the
+// chain and refuses to write if the leaf now differs from the snapshot's — either
+// by relative path (the user re-pointed .npmrc) or by identity (the parent or
+// leaf inode was swapped under an unchanged path) — surfacing that as an error the
+// reconciler maps to verification_failed. The snapshot is CONSUMED: a restore is
+// attempted at most once, so a second call cannot re-run against a stale leaf.
+// Calling it with no pending snapshot is an error.
+func (w *NPMRCWriter) RestoreSnapshot() error {
+	if w.pending == nil {
+		return errors.New("npmrc: no snapshot to restore")
 	}
+	snap := w.pending
+	w.pending = nil
+
+	rt, err := w.resolveLeaf()
+	if err != nil {
+		return err
+	}
+	defer rt.close()
+	if rt.rel != snap.leaf {
+		return fmt.Errorf("npmrc: chain moved from %q to %q; refusing to restore: %w", snap.leaf, rt.rel, ErrTargetUnusable)
+	}
+	if err := w.verifyCommitted(rt, snap); err != nil {
+		return err
+	}
+	return w.restoreFrom(rt, snap)
+}
+
+// verifyCommitted confirms the leaf on disk is still the exact file this writer
+// committed (SameFile against the snapshot's recorded identity) before a restore
+// touches it. A relative path can be unchanged while the parent directory or the
+// leaf has been swapped underneath it; reverting into that would write stale bytes
+// into someone else's file. An identity mismatch wraps ErrTargetUnusable.
+func (w *NPMRCWriter) verifyCommitted(rt *resolvedTarget, snap *pendingSnapshot) error {
+	if snap.committed == nil {
+		return nil
+	}
+	li, err := rt.child.Lstat(rt.base)
+	if errors.Is(err, os.ErrNotExist) {
+		if !snap.existed {
+			// We had created the file and it is already gone — the pre-state is
+			// "absent", so there is nothing to revert.
+			return nil
+		}
+		return fmt.Errorf("npmrc: committed leaf %q vanished before restore: %w", rt.base, ErrTargetUnusable)
+	}
+	if err != nil {
+		return fmt.Errorf("npmrc: lstat leaf before restore: %w", err)
+	}
+	if li.Mode()&fs.ModeSymlink != 0 || !li.Mode().IsRegular() || !os.SameFile(li, snap.committed) {
+		return fmt.Errorf("npmrc: leaf %q changed since it was written; refusing to restore: %w", rt.base, ErrTargetUnusable)
+	}
+	return nil
+}
+
+// restoreFrom writes a snapshot's bytes/existence/mode at an already-resolved
+// target. Ownership is not snapshotted: on restore, as on write, the file is
+// chowned to the target user (the file should be target-user-owned, and an
+// arbitrary prior owner cannot be expressed portably anyway).
+func (w *NPMRCWriter) restoreFrom(rt *resolvedTarget, snap *pendingSnapshot) error {
+	if !snap.existed {
+		// The pre-state was "no file": remove what we created.
+		if err := rt.child.Remove(rt.base); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("npmrc: restore-remove %q: %w", rt.base, err)
+		}
+		return nil
+	}
+	_, err := w.commit(rt, snap.data, snap.mode)
+	return err
+}
+
+// afterFailedRollback runs the pre-state restore after a post-rename failure and
+// returns the error to surface. If the restore itself fails, on-disk state is
+// indeterminate — new bytes landed and could not be reverted — so the returned
+// error wraps ErrWriteUnverified (the reconciler reports verification_failed). If
+// the restore succeeds, disk is back to the pre-state and the original cause is
+// surfaced unchanged (a clean write_failed).
+func (w *NPMRCWriter) afterFailedRollback(rt *resolvedTarget, snap *pendingSnapshot, cause error, stage string) error {
+	if rerr := w.restoreFrom(rt, snap); rerr != nil {
+		w.log("npmrc: restore after %s aborted: %v", stage, rerr)
+		return fmt.Errorf("npmrc: %s failed and rollback could not be verified (%v): %w", stage, cause, ErrWriteUnverified)
+	}
+	return cause
+}
+
+// commitOutcome reports what a commit did to disk so a caller can react to a
+// partial failure. renamed is true once the temp has been renamed into place —
+// even if the post-rename identity re-check then failed, meaning new bytes are on
+// disk but unverified. committed is the verified leaf identity on full success
+// (nil on any error).
+type commitOutcome struct {
+	committed os.FileInfo
+	renamed   bool
+}
+
+// commit writes data to a fresh O_CREATE|O_EXCL temp beside the leaf, sets mode
+// and owner on the handle before the rename, renames it into place, then
+// re-verifies identity through the pinned child. On Windows the rename is
+// best-effort replace semantics rather than a POSIX atomic swap. The returned
+// commitOutcome lets Write/Clear tell "failed before the rename, disk untouched"
+// apart from "renamed then failed to verify, disk changed" so they can restore.
+func (w *NPMRCWriter) commit(rt *resolvedTarget, data []byte, mode os.FileMode) (commitOutcome, error) {
+	tmp, tmpName, err := w.createExclusive(rt, rt.base+".dmg-tmp-", "")
+	if err != nil {
+		return commitOutcome{}, err
+	}
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = rt.child.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return commitOutcome{}, fmt.Errorf("npmrc: write temp: %w", err)
+	}
+	if err := w.applyMetadata(tmp, mode); err != nil {
+		_ = tmp.Close()
+		return commitOutcome{}, err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return commitOutcome{}, fmt.Errorf("npmrc: fsync temp: %w", err)
+	}
+	tmpInfo, err := tmp.Stat()
+	if err != nil {
+		_ = tmp.Close()
+		return commitOutcome{}, fmt.Errorf("npmrc: stat temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return commitOutcome{}, fmt.Errorf("npmrc: close temp: %w", err)
+	}
+
+	if err := rt.child.Rename(tmpName, rt.base); err != nil {
+		return commitOutcome{}, fmt.Errorf("npmrc: rename into place: %w", err)
+	}
+	cleanupTmp = false // the temp name no longer exists after a successful rename
+
+	// Re-verify the just-written leaf is the file we renamed. From here the rename
+	// has landed, so a failure reports renamed=true: the caller must restore, not
+	// assume disk is untouched.
+	li, err := rt.child.Lstat(rt.base)
+	if err != nil {
+		return commitOutcome{renamed: true}, fmt.Errorf("npmrc: re-lstat after rename: %w", err)
+	}
+	if li.Mode()&fs.ModeSymlink != 0 || !li.Mode().IsRegular() || !os.SameFile(li, tmpInfo) {
+		return commitOutcome{renamed: true}, fmt.Errorf("npmrc: leaf identity changed across rename: %w", ErrTargetUnusable)
+	}
+	w.syncDir(rt)
+	return commitOutcome{committed: li, renamed: true}, nil
+}
+
+// createExclusive opens a uniquely named file beside the leaf with
+// O_CREATE|O_EXCL — the one open mode os.Root never resolves through a symlink,
+// which is what makes a pre-planted file at the name harmless. The random middle
+// keeps the name unpredictable; prefix and suffix let callers distinguish temp
+// files (`.dmg-tmp-<rand>`) from committed backups (`.dmg-<rand>.bak`).
+func (w *NPMRCWriter) createExclusive(rt *resolvedTarget, prefix, suffix string) (*os.File, string, error) {
+	for attempt := 0; attempt < 8; attempt++ {
+		mid, err := randomSuffix()
+		if err != nil {
+			return nil, "", fmt.Errorf("npmrc: random suffix: %w", err)
+		}
+		name := prefix + mid + suffix
+		f, err := rt.child.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, npmrcFileMode)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return nil, "", fmt.Errorf("npmrc: create %q: %w", name, err)
+		}
+		return f, name, nil
+	}
+	return nil, "", errors.New("npmrc: could not create a unique temp file")
+}
+
+// applyMetadata sets mode and owner on an open handle. Both are POSIX-only:
+// Windows inherits ACLs and asserts no POSIX mode, so this is a no-op there.
+func (w *NPMRCWriter) applyMetadata(f *os.File, mode os.FileMode) error {
+	if !enforcePOSIXMetadata {
+		return nil
+	}
+	if err := f.Chmod(mode); err != nil {
+		return fmt.Errorf("npmrc: fchmod: %w", err)
+	}
+	if err := chownHandle(f, w.uid, w.gid); err != nil {
+		return fmt.Errorf("npmrc: fchown: %w", err)
+	}
+	return nil
+}
+
+// syncDir best-effort fsyncs the resolved parent directory so the rename is
+// durable. A failure here never fails the write.
+func (w *NPMRCWriter) syncDir(rt *resolvedTarget) {
+	d, err := rt.child.Open(".")
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
+}
+
+// readbackBody re-reads the leaf and extracts the managed block body.
+func (w *NPMRCWriter) readbackBody(rt *resolvedTarget) (string, error) {
+	data, existed, _, err := w.readCurrent(rt)
+	if err != nil {
+		return "", err
+	}
+	if !existed {
+		return "", nil
+	}
+	body, _ := extractManagedBody(string(data))
+	return body, nil
+}
+
+// ---------------------------------------------------------------------------
+// Backups
+// ---------------------------------------------------------------------------
+
+// backup copies the pre-rewrite bytes into a uniquely named, 0600,
+// target-user-owned sibling and prunes the set to the newest npmrcMaxBackups.
+// The first backup is the pre-policy file (no token); every later one is
+// token-bearing, so it carries the same 0600/ownership as the live file. The
+// prune is best-effort — a transient extra backup is the same exposure class as
+// the file itself and is not worth failing enforcement over.
+func (w *NPMRCWriter) backup(rt *resolvedTarget, data []byte) error {
+	f, name, err := w.createExclusive(rt, rt.base+".dmg-", ".bak")
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = rt.child.Remove(name)
+		return fmt.Errorf("npmrc: write backup: %w", err)
+	}
+	if err := w.applyMetadata(f, npmrcFileMode); err != nil {
+		_ = f.Close()
+		_ = rt.child.Remove(name)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("npmrc: close backup: %w", err)
+	}
+	w.rotateBackups(rt)
+	return nil
+}
+
+// rotateBackups prunes backups beside the leaf down to the newest npmrcMaxBackups,
+// matching basenames only. Committed backups are "<base>.dmg-<rand>.bak"; in-flight
+// temp files ("<base>.dmg-tmp-<rand>") carry no ".bak" suffix and are excluded.
+//
+// The directory is read in bounded batches and pruning happens as candidates are
+// seen, so a home stuffed with millions of pattern-matching entries cannot force
+// the whole listing into memory: at most one batch plus npmrcMaxBackups names are
+// ever held. Only already-returned entries are removed mid-iteration (the current
+// candidate or one kept from an earlier batch), which is safe for directory
+// enumeration.
+func (w *NPMRCWriter) rotateBackups(rt *resolvedTarget) {
+	d, err := rt.child.Open(".")
+	if err != nil {
+		w.log("npmrc: backup rotation open dir failed: %v", err)
+		return
+	}
+	defer d.Close()
+
+	prefix := rt.base + ".dmg-"
+	tmpPrefix := rt.base + ".dmg-tmp-"
+
+	type backupFile struct {
+		name  string
+		mtime int64
+	}
+	kept := make([]backupFile, 0, npmrcMaxBackups) // ascending mtime; kept[0] is oldest
+	remove := func(name string) {
+		if err := rt.child.Remove(name); err != nil {
+			w.log("npmrc: prune backup %q failed: %v", name, err)
+		}
+	}
+	insert := func(bf backupFile) {
+		i := sort.Search(len(kept), func(i int) bool { return kept[i].mtime > bf.mtime })
+		kept = append(kept, backupFile{})
+		copy(kept[i+1:], kept[i:])
+		kept[i] = bf
+	}
+
+	for {
+		entries, rerr := d.ReadDir(256)
+		for _, e := range entries {
+			name := e.Name()
+			if name == "" || strings.ContainsRune(name, filepath.Separator) {
+				continue
+			}
+			if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".bak") {
+				continue
+			}
+			if strings.HasPrefix(name, tmpPrefix) {
+				continue
+			}
+			li, lerr := rt.child.Lstat(name)
+			if lerr != nil || !li.Mode().IsRegular() {
+				continue
+			}
+			bf := backupFile{name: name, mtime: li.ModTime().UnixNano()}
+			if len(kept) < npmrcMaxBackups {
+				insert(bf)
+				continue
+			}
+			if bf.mtime <= kept[0].mtime {
+				remove(bf.name) // older than everything kept
+				continue
+			}
+			remove(kept[0].name) // evict the oldest kept, then keep this newer one
+			copy(kept, kept[1:])
+			kept = kept[:len(kept)-1]
+			insert(bf)
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			w.log("npmrc: backup rotation readdir failed: %v", rerr)
+			break
+		}
+	}
+}
+
+// purgeBackups removes every committed backup beside the leaf. It runs on every
+// Clear that leaves nothing of ours live: the managed block is gone from the live
+// file, so a sibling still holding a copy of it would keep the revoked token
+// readable and defeat offboarding. Only files WE created are touched — the
+// "<base>.dmg-<rand>.bak" shape rotateBackups maintains — and in-flight temp files
+// are left to their own owners.
+//
+// Failures are logged, never returned, for two reasons. By the time we get here the
+// revocation itself has already happened, so reporting a failed unlink as a failed
+// Clear would call a completed revocation failed; and because the reconciler then
+// re-clears a file that has no block left, every later pass would take the no-op
+// path and fail again — a permanent synthetic failure over a sibling file. The no-op
+// paths call this instead, so an unlink that lost a race with a reader (a mapped or
+// open .bak on Windows) is retried on the next unassignment cycle.
+func (w *NPMRCWriter) purgeBackups(rt *resolvedTarget) {
+	d, err := rt.child.Open(".")
+	if err != nil {
+		w.log("npmrc: backup purge open dir failed: %v", err)
+		return
+	}
+	defer d.Close()
+
+	prefix := rt.base + ".dmg-"
+	tmpPrefix := rt.base + ".dmg-tmp-"
+	for {
+		entries, rerr := d.ReadDir(256)
+		for _, e := range entries {
+			name := e.Name()
+			if name == "" || strings.ContainsRune(name, filepath.Separator) {
+				continue
+			}
+			if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".bak") {
+				continue
+			}
+			if strings.HasPrefix(name, tmpPrefix) {
+				continue
+			}
+			li, lerr := rt.child.Lstat(name)
+			if lerr != nil || !li.Mode().IsRegular() {
+				continue
+			}
+			if err := rt.child.Remove(name); err != nil {
+				w.log("npmrc: purge backup %q failed: %v", name, err)
+			}
+		}
+		if rerr != nil {
+			if !errors.Is(rerr, io.EOF) {
+				w.log("npmrc: backup purge readdir failed: %v", rerr)
+			}
+			break
+		}
+	}
+}
+
+func randomSuffix() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -670,7 +1484,13 @@ func extractManagedBody(content string) (string, bool) {
 // body equal but defeats precedence — so body equality alone would report
 // converged forever without ever re-running the transform.
 func (w *NPMRCWriter) Converged(expected string) (bool, error) {
-	data, existed, mode, err := w.file.Read()
+	rt, err := w.resolveLeaf()
+	if err != nil {
+		return false, err
+	}
+	defer rt.close()
+
+	data, existed, mode, err := w.readCurrent(rt)
 	if err != nil {
 		return false, err
 	}
@@ -787,7 +1607,13 @@ func countMarker(lines []string, marker string) int {
 // rendered content, those keys effective (last-wins) with nothing overriding
 // them, and sane metadata (0600, target-user-owned on POSIX).
 func (w *NPMRCWriter) ProbeExpected(expected string) (bool, string) {
-	data, existed, mode, err := w.file.Read()
+	rt, err := w.resolveLeaf()
+	if err != nil {
+		return false, ""
+	}
+	defer rt.close()
+
+	data, existed, mode, err := w.readCurrent(rt)
 	if err != nil || !existed {
 		return false, ""
 	}
@@ -971,7 +1797,13 @@ func parseExpected(expected string) (registry, tokenKey, tokenVal string, ok boo
 // target user does not own, because another user's file is not this user's
 // effective npm config.
 func (w *NPMRCWriter) ProbeContentNPM(expected string) (bool, map[string]json.RawMessage, error) {
-	data, existed, mode, err := w.file.Read()
+	rt, err := w.resolveLeaf()
+	if err != nil {
+		return false, nil, err
+	}
+	defer rt.close()
+
+	data, existed, mode, err := w.readCurrent(rt)
 	if err != nil {
 		return false, nil, err
 	}
@@ -1253,55 +2085,52 @@ func RenderNPMRCBlock(policy json.RawMessage, serial string) (string, error) {
 	return body, nil
 }
 
-// validateRegistryURL keeps npm's exact /javascript path contract while sharing
-// the common secure-registry URL checks with the PyPI policy parser.
+// validateRegistryURL requires an HTTPS URL with no userinfo, query, fragment,
+// or port; a valid lowercase RFC 1123 host; and an exact `/javascript` path. It
+// returns the host and path used to compose the token key.
 func validateRegistryURL(raw string) (host, path string, err error) {
-	u, err := parsePolicyRegistryURL(raw)
-	if err != nil {
-		return "", "", fmt.Errorf("npmrc: policy %w", err)
+	if raw == "" {
+		return "", "", errors.New("npmrc: policy registry_url is empty")
+	}
+	if hasControlBytes(raw) {
+		return "", "", errors.New("npmrc: policy registry_url contains control characters")
+	}
+	// Reject '#' and '?' in the raw string. url.Parse turns a trailing bare '#'
+	// into an empty Fragment (there is no ForceFragment to catch it the way
+	// ForceQuery catches a bare '?'), so `.../javascript#` would otherwise slip
+	// through the Fragment check below and land verbatim in the rendered
+	// `registry=` line — where an npm INI parser could read '#' as a mid-value
+	// comment and silently fall back to the default registry.
+	if strings.ContainsAny(raw, "#?") {
+		return "", "", errors.New("npmrc: policy registry_url must not contain '#' or '?'")
+	}
+	u, perr := url.Parse(raw)
+	if perr != nil {
+		return "", "", errors.New("npmrc: policy registry_url is not a valid URL")
+	}
+	if u.Scheme != "https" {
+		return "", "", errors.New("npmrc: policy registry_url must be https")
+	}
+	if u.User != nil {
+		return "", "", errors.New("npmrc: policy registry_url must not contain userinfo")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return "", "", errors.New("npmrc: policy registry_url must not contain a query")
+	}
+	if u.Fragment != "" {
+		return "", "", errors.New("npmrc: policy registry_url must not contain a fragment")
+	}
+	if u.Port() != "" {
+		return "", "", errors.New("npmrc: policy registry_url must not contain a port")
+	}
+	host = u.Hostname()
+	if !isValidHost(host) {
+		return "", "", errors.New("npmrc: policy registry_url host is not a valid hostname")
 	}
 	if u.EscapedPath() != "/javascript" {
 		return "", "", errors.New("npmrc: policy registry_url path must be /javascript")
 	}
-	return u.Hostname(), "/javascript", nil
-}
-
-// parsePolicyRegistryURL validates the URL properties shared by compiled npm
-// and PyPI policies. Each caller retains its own exact path check.
-func parsePolicyRegistryURL(raw string) (*url.URL, error) {
-	if raw == "" {
-		return nil, errors.New("registry_url is empty")
-	}
-	if hasControlBytes(raw) {
-		return nil, errors.New("registry_url contains control characters")
-	}
-	// url.Parse does not expose a ForceFragment bit for a trailing bare '#'.
-	if strings.ContainsAny(raw, "#?") {
-		return nil, errors.New("registry_url must not contain '#' or '?'")
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return nil, errors.New("registry_url is not a valid URL")
-	}
-	if u.Scheme != "https" {
-		return nil, errors.New("registry_url must be https")
-	}
-	if u.User != nil {
-		return nil, errors.New("registry_url must not contain userinfo")
-	}
-	if u.RawQuery != "" || u.ForceQuery {
-		return nil, errors.New("registry_url must not contain a query")
-	}
-	if u.Fragment != "" {
-		return nil, errors.New("registry_url must not contain a fragment")
-	}
-	if u.Port() != "" {
-		return nil, errors.New("registry_url must not contain a port")
-	}
-	if !isValidHost(u.Hostname()) {
-		return nil, errors.New("registry_url host is not a valid hostname")
-	}
-	return u, nil
+	return host, "/javascript", nil
 }
 
 // isNPMSafe reports whether every byte is in the unquoted npm-INI-safe alphabet

@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/step-security/dev-machine-guard/internal/secureuserfile"
 )
 
 // enforcementDMG and enforcementMDM are the enforcement channels carried in
@@ -218,7 +220,7 @@ func (r *Reconciler) rollback(prevOnDisk string, prevPresent bool) (state string
 // transient I/O) stays verification_failed. The IDE writer never wraps the
 // sentinel, so this always returns verification_failed for it.
 func classifyReadError(err error) string {
-	if errors.Is(err, ErrTargetUnusable) {
+	if errors.Is(err, ErrTargetUnusable) || errors.Is(err, secureuserfile.ErrTargetUnusable) {
 		return StateWriteFailed
 	}
 	return StateVerificationFailed
@@ -231,7 +233,7 @@ func classifyReadError(err error) string {
 // which is verification_failed, not a clean write failure. The IDE writer never
 // returns that sentinel, so this is always write_failed for it.
 func classifyWriteError(err error) string {
-	if errors.Is(err, ErrWriteUnverified) {
+	if errors.Is(err, ErrWriteUnverified) || errors.Is(err, secureuserfile.ErrWriteUnverified) {
 		return StateVerificationFailed
 	}
 	return StateWriteFailed

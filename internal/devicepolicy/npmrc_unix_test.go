@@ -25,12 +25,21 @@ func (f fakeOwner) ownerUIDGID(_ *os.File) (uint32, uint32, bool, error) {
 
 // newDiskWriter builds a writer anchored at a real tempdir home. Files created
 // there are owned by the test process, so the real ownership reader is used by
-// default; tests needing a foreign owner swap w.file.home.owners.
+// default; tests needing a foreign owner swap w.owners.
 func newDiskWriter(t *testing.T, home string) *NPMRCWriter {
 	t.Helper()
-	h := newSecureTestHome(t, home)
-	file := openSecureTestFile(t, h, ".npmrc")
-	return &NPMRCWriter{file: file}
+	root, err := os.OpenRoot(home)
+	if err != nil {
+		t.Fatalf("OpenRoot(%q): %v", home, err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	return &NPMRCWriter{
+		home:   home,
+		root:   root,
+		owners: newOwnerReader(),
+		uid:    os.Getuid(),
+		gid:    os.Getgid(),
+	}
 }
 
 func npmrcPath(home string) string { return filepath.Join(home, ".npmrc") }
@@ -123,7 +132,7 @@ func TestConverged_RootOwnedRejected(t *testing.T) { // edge 19 (root-owned refu
 	// root-only content into a user-owned backup, so the read fails closed
 	// (ErrTargetUnusable → write_failed) rather than quietly reporting "not
 	// converged".
-	w.file.home.owners = fakeOwner{uid: 0, enforced: true}
+	w.owners = fakeOwner{uid: 0, enforced: true}
 	if _, err := w.Converged(stdBody); !isTargetUnusable(err) {
 		t.Fatalf("root-owned leaf: want ErrTargetUnusable, got %v", err)
 	}
@@ -161,7 +170,7 @@ func TestForeignOwner_ReadRejected(t *testing.T) { // edge 36
 		t.Fatalf("seed: %v", err)
 	}
 	w := newDiskWriter(t, home)
-	w.file.home.owners = fakeOwner{uid: 99999, enforced: true}
+	w.owners = fakeOwner{uid: 99999, enforced: true}
 
 	if _, _, err := w.Read(); !isTargetUnusable(err) {
 		t.Fatalf("Read of foreign-owned file: want ErrTargetUnusable, got %v", err)
@@ -550,7 +559,7 @@ func TestReadCurrent_LeafSwappedToSymlinkRejected(t *testing.T) { // edge 35
 		t.Fatalf("seed elsewhere: %v", err)
 	}
 	w := newDiskWriter(t, home)
-	rt, err := w.file.resolveLeaf()
+	rt, err := w.resolveLeaf()
 	if err != nil {
 		t.Fatalf("resolveLeaf: %v", err)
 	}
@@ -561,7 +570,7 @@ func TestReadCurrent_LeafSwappedToSymlinkRejected(t *testing.T) { // edge 35
 	if err := os.Symlink("elsewhere", npmrcPath(home)); err != nil {
 		t.Fatalf("symlink swap: %v", err)
 	}
-	if _, _, _, err := w.file.readCurrent(rt); !isTargetUnusable(err) {
+	if _, _, _, err := w.readCurrent(rt); !isTargetUnusable(err) {
 		t.Fatalf("swapped-to-symlink leaf: want ErrTargetUnusable, got %v", err)
 	}
 }
@@ -652,7 +661,7 @@ func TestProbeContentNPM_UnreadableIsAnError(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	w := newDiskWriter(t, home)
-	w.file.home.owners = fakeOwner{uid: uint32(os.Getuid() + 1), enforced: true}
+	w.owners = fakeOwner{uid: uint32(os.Getuid() + 1), enforced: true}
 	present, observed, err := w.ProbeContentNPM(stdBody)
 	if !isTargetUnusable(err) {
 		t.Fatalf("a foreign-owned leaf must error with ErrTargetUnusable, got %v", err)

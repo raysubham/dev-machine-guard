@@ -7,9 +7,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/step-security/dev-machine-guard/internal/secureuserfile"
 )
 
 const netrcExpected = "machine registry.stepsecurity.io\nlogin step-security\npassword step_acme-1_uuid::dev:DEVICE-123"
@@ -28,6 +31,7 @@ func newNetrcTestWriter(t *testing.T, initial []byte) (*NetrcWriter, string) {
 	if err != nil {
 		t.Fatalf("NewNetrcWriter: %v", err)
 	}
+	w.lookupEnv = os.Getenv
 	return w, filepath.Join(home, ".netrc")
 }
 
@@ -269,21 +273,13 @@ func TestNetrcWriter_ObservationUsesExactTokenAndNETRCOverride(t *testing.T) {
 }
 
 func TestNetrcWriter_SecurityRefusalsAndPermissionRepair(t *testing.T) {
-	t.Run("wrong owner", func(t *testing.T) {
-		w, _ := newNetrcTestWriter(t, []byte("machine other.example login u password p\n"))
-		w.file.home.owners = netrcFakeOwner{uid: uint32(w.file.home.uid + 1), enforced: true}
-		if _, err := w.Write(netrcExpected); !errors.Is(err, ErrTargetUnusable) {
-			t.Fatalf("Write error = %v, want ErrTargetUnusable", err)
-		}
-	})
-
 	t.Run("non-regular", func(t *testing.T) {
 		w, path := newNetrcTestWriter(t, nil)
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := w.Write(netrcExpected); !errors.Is(err, ErrTargetUnusable) {
-			t.Fatalf("Write error = %v, want ErrTargetUnusable", err)
+		if _, err := w.Write(netrcExpected); !errors.Is(err, secureuserfile.ErrTargetUnusable) {
+			t.Fatalf("Write error = %v, want secureuserfile.ErrTargetUnusable", err)
 		}
 	})
 
@@ -296,22 +292,22 @@ func TestNetrcWriter_SecurityRefusalsAndPermissionRepair(t *testing.T) {
 		if err := os.Symlink(outside, path); err != nil {
 			t.Skipf("symlink unsupported: %v", err)
 		}
-		if _, err := w.Write(netrcExpected); !errors.Is(err, ErrTargetUnusable) {
-			t.Fatalf("Write error = %v, want ErrTargetUnusable", err)
+		if _, err := w.Write(netrcExpected); !errors.Is(err, secureuserfile.ErrTargetUnusable) {
+			t.Fatalf("Write error = %v, want secureuserfile.ErrTargetUnusable", err)
 		}
 	})
 
 	t.Run("oversized", func(t *testing.T) {
 		w, path := newNetrcTestWriter(t, nil)
-		if err := os.WriteFile(path, []byte(strings.Repeat("x", maxManagedUserFileBytes+1)), 0o600); err != nil {
+		if err := os.WriteFile(path, []byte(strings.Repeat("x", secureuserfile.MaxBytes+1)), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := w.Write(netrcExpected); !errors.Is(err, ErrTargetUnusable) {
-			t.Fatalf("Write error = %v, want ErrTargetUnusable", err)
+		if _, err := w.Write(netrcExpected); !errors.Is(err, secureuserfile.ErrTargetUnusable) {
+			t.Fatalf("Write error = %v, want secureuserfile.ErrTargetUnusable", err)
 		}
 	})
 
-	if enforcePOSIXMetadata {
+	if runtime.GOOS != "windows" {
 		t.Run("loose mode repaired", func(t *testing.T) {
 			w, path := newNetrcTestWriter(t, []byte("machine other.example login u password p\n"))
 			if err := os.Chmod(path, 0o644); err != nil {

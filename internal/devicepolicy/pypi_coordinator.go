@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/secureuserfile"
 )
 
 const (
@@ -113,7 +114,7 @@ func (c *PyPICoordinator) Reconcile(ctx context.Context) error {
 	components, err := c.components(ctx, policy)
 	if err != nil {
 		state := StateWriteFailed
-		if errors.Is(err, ErrNoTargetUser) {
+		if errors.Is(err, ErrNoTargetUser) || errors.Is(err, secureuserfile.ErrNoTargetUser) {
 			state = StatePolicyNotApplied
 		}
 		reportErr := c.report(ctx, state, "", effective.Hash, enforcement, nil)
@@ -133,7 +134,7 @@ func (c *PyPICoordinator) Reconcile(ctx context.Context) error {
 func (c *PyPICoordinator) clear(ctx context.Context, effective EffectivePolicy, policy PyPIPolicy) error {
 	components, err := c.components(ctx, policy)
 	if err != nil {
-		if errors.Is(err, ErrNoTargetUser) {
+		if errors.Is(err, ErrNoTargetUser) || errors.Is(err, secureuserfile.ErrNoTargetUser) {
 			return fmt.Errorf("devicepolicy: PyPI clear requires an enforceable target user: %w", err)
 		}
 		return err
@@ -429,7 +430,7 @@ func (c *PyPICoordinator) components(ctx context.Context, policy PyPIPolicy) (*p
 }
 
 func buildPyPIComponents(ctx context.Context, exec executor.Executor, policy PyPIPolicy) (*pypiComponents, error) {
-	home, err := newSecureUserHome(exec)
+	home, err := secureuserfile.OpenUserHome(exec)
 	if err != nil {
 		return nil, err
 	}

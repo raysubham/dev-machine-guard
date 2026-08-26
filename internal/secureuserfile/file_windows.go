@@ -1,6 +1,6 @@
 //go:build windows
 
-package devicepolicy
+package secureuserfile
 
 import (
 	"errors"
@@ -34,7 +34,7 @@ func (windowsOwnerReader) ownerUIDGID(*os.File) (uint32, uint32, bool, error) {
 	return 0, 0, false, nil
 }
 
-func applySecureMetadata(h *secureUserHome, f *os.File, _ os.FileMode, directory bool) error {
+func applySecureMetadata(h *Home, f *os.File, _ os.FileMode, directory bool) error {
 	targetSID, err := windows.StringToSid(h.targetUser.Uid)
 	if err != nil {
 		return fmt.Errorf("secure user file: target SID: %w", err)
@@ -87,7 +87,7 @@ func secureExplicitAccess(sid *windows.SID, permissions windows.ACCESS_MASK, inh
 	}
 }
 
-func (windowsOwnerReader) secure(f *os.File, h *secureUserHome, _ os.FileMode) (bool, error) {
+func (windowsOwnerReader) secure(f *os.File, h *Home, _ os.FileMode) (bool, error) {
 	handle, err := reopenSecurityHandle(f, windows.READ_CONTROL)
 	if err != nil {
 		return false, fmt.Errorf("secure user file: reopen for ACL check: %w", err)
@@ -141,7 +141,7 @@ func (windowsOwnerReader) secure(f *os.File, h *secureUserHome, _ os.FileMode) (
 	return seenTarget && seenSystem, nil
 }
 
-func checkSecurePlatformOwner(h *secureUserHome, f *os.File) error {
+func checkSecurePlatformOwner(h *Home, f *os.File) error {
 	handle, err := reopenSecurityHandle(f, windows.READ_CONTROL)
 	if err != nil {
 		return fmt.Errorf("secure user file: reopen for owner check: %w", err)

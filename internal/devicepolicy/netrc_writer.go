@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/step-security/dev-machine-guard/internal/model"
+	"github.com/step-security/dev-machine-guard/internal/secureuserfile"
 )
 
 const (
@@ -25,19 +26,19 @@ const (
 
 // NetrcWriter owns only the exact registry host entry inside one user's netrc.
 type NetrcWriter struct {
-	file      *secureUserFile
-	alternate *secureUserFile
+	file      *secureuserfile.File
+	alternate *secureuserfile.File
 	host      string
 	token     string
 	expected  string
 	lookupEnv func(string) string
 }
 
-func NewNetrcWriter(home *secureUserHome, policy PyPIPolicy) (*NetrcWriter, error) {
+func NewNetrcWriter(home *secureuserfile.Home, policy PyPIPolicy) (*NetrcWriter, error) {
 	if home == nil {
 		return nil, errors.New("netrc: nil secure user home")
 	}
-	registry, registryErr := parsePolicyRegistryURL(policy.RegistryURL)
+	registry, registryErr := parsePyPIRegistryURL(policy.RegistryURL)
 	host := policy.RegistryHost()
 	token := policy.DeviceToken()
 	if policy.Ecosystem != "pypi" || !canonicalPyPIClients(policy.Clients) || policy.Auth.Scheme != pypiAuthScheme ||
@@ -49,16 +50,16 @@ func NewNetrcWriter(home *secureUserHome, policy PyPIPolicy) (*NetrcWriter, erro
 	}
 	expected := renderNetrcEntry(host, token)
 
-	primary, err := home.openStrict(".netrc", netrcBackupPrefix, maxManagedUserFileBytes)
+	primary, err := home.Open(".netrc", netrcBackupPrefix, secureuserfile.MaxBytes)
 	if err != nil {
 		return nil, err
 	}
-	w := &NetrcWriter{file: primary, host: host, token: token, expected: expected, lookupEnv: home.getenv}
+	w := &NetrcWriter{file: primary, host: host, token: token, expected: expected, lookupEnv: home.Getenv}
 	if runtime.GOOS != model.PlatformWindows {
 		return w, nil
 	}
 
-	alternate, err := home.openStrict("_netrc", netrcBackupPrefix, maxManagedUserFileBytes)
+	alternate, err := home.Open("_netrc", netrcBackupPrefix, secureuserfile.MaxBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +138,7 @@ func (w *NetrcWriter) Write(expected string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := w.file.Commit(next, secureUserFileMode); err != nil {
+	if err := w.file.Commit(next, secureuserfile.FileMode); err != nil {
 		return "", err
 	}
 	readback, present, err := w.Read()
@@ -156,10 +157,10 @@ func (w *NetrcWriter) Write(expected string) (string, error) {
 // Clear removes this lane's block and restores only entries carrying its prefix.
 func (w *NetrcWriter) Clear() (bool, error) {
 	type candidate struct {
-		file     *secureUserFile
+		file     *secureuserfile.File
 		analysis netrcAnalysis
 	}
-	files := []*secureUserFile{w.file}
+	files := []*secureuserfile.File{w.file}
 	if w.alternate != nil {
 		files = append(files, w.alternate)
 	}
@@ -219,7 +220,7 @@ func (w *NetrcWriter) Clear() (bool, error) {
 	if len(bytes.TrimSpace(rest)) == 0 {
 		err = target.file.Remove()
 	} else {
-		err = target.file.Commit(next, secureUserFileMode)
+		err = target.file.Commit(next, secureuserfile.FileMode)
 	}
 	if err != nil {
 		return false, err
@@ -256,7 +257,7 @@ func (w *NetrcWriter) Converged(expected string) (bool, error) {
 	if w.netrcOverrideActive() {
 		return false, nil
 	}
-	return w.file.MetadataSecure(secureUserFileMode)
+	return w.file.MetadataSecure(secureuserfile.FileMode)
 }
 
 // Observation returns only a secret-free credential verdict.
@@ -284,7 +285,7 @@ func (w *NetrcWriter) Observation(expected string) (string, error) {
 	if !entryMatches(entries[0], w.host, "step-security", w.token) || w.netrcOverrideActive() {
 		return authTokenMismatch, nil
 	}
-	secure, err := w.file.MetadataSecure(secureUserFileMode)
+	secure, err := w.file.MetadataSecure(secureuserfile.FileMode)
 	if err != nil {
 		return authTokenUnreadable, err
 	}
@@ -307,7 +308,7 @@ func (w *NetrcWriter) MDMOwned() (bool, error) {
 }
 
 func (w *NetrcWriter) HasMDMMarker() (bool, error) {
-	for _, file := range []*secureUserFile{w.file, w.alternate} {
+	for _, file := range []*secureuserfile.File{w.file, w.alternate} {
 		if file == nil {
 			continue
 		}

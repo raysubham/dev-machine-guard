@@ -79,7 +79,7 @@ func ParsePyPIPolicy(raw json.RawMessage, deviceID string) (PyPIPolicy, error) {
 		return PyPIPolicy{}, err
 	}
 
-	u, err := parsePolicyRegistryURL(policy.RegistryURL)
+	u, err := parsePyPIRegistryURL(policy.RegistryURL)
 	if err != nil {
 		return PyPIPolicy{}, fmt.Errorf("pypi: policy %w", err)
 	}
@@ -93,6 +93,42 @@ func ParsePyPIPolicy(raw json.RawMessage, deviceID string) (PyPIPolicy, error) {
 
 	policy.deviceID = deviceID
 	return policy, nil
+}
+
+func parsePyPIRegistryURL(raw string) (*url.URL, error) {
+	if raw == "" {
+		return nil, errors.New("registry_url is empty")
+	}
+	if hasControlBytes(raw) {
+		return nil, errors.New("registry_url contains control characters")
+	}
+	// url.Parse does not expose a ForceFragment bit for a trailing bare '#'.
+	if strings.ContainsAny(raw, "#?") {
+		return nil, errors.New("registry_url must not contain '#' or '?'")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, errors.New("registry_url is not a valid URL")
+	}
+	if u.Scheme != "https" {
+		return nil, errors.New("registry_url must be https")
+	}
+	if u.User != nil {
+		return nil, errors.New("registry_url must not contain userinfo")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return nil, errors.New("registry_url must not contain a query")
+	}
+	if u.Fragment != "" {
+		return nil, errors.New("registry_url must not contain a fragment")
+	}
+	if u.Port() != "" {
+		return nil, errors.New("registry_url must not contain a port")
+	}
+	if !isValidHost(u.Hostname()) {
+		return nil, errors.New("registry_url host is not a valid hostname")
+	}
+	return u, nil
 }
 
 func canonicalPyPIClients(clients []PyPIClient) bool {
