@@ -57,21 +57,21 @@ func applySecureMetadata(h *Home, f *os.File, _ os.FileMode, directory bool) err
 	if err != nil {
 		return fmt.Errorf("secure user file: build ACL: %w", err)
 	}
-	handle, err := reopenSecurityHandle(f, windows.READ_CONTROL|windows.WRITE_DAC)
+	handle, err := reopenSecurityHandle(f, windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER)
 	if err != nil {
-		return fmt.Errorf("secure user file: reopen for ACL: %w", err)
+		return fmt.Errorf("secure user file: reopen for metadata: %w", err)
 	}
 	defer windows.CloseHandle(handle)
 	if err := windows.SetSecurityInfo(
 		handle,
 		windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		nil,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		targetSID,
 		nil,
 		acl,
 		nil,
 	); err != nil {
-		return fmt.Errorf("secure user file: set ACL: %w", err)
+		return fmt.Errorf("secure user file: set metadata: %w", err)
 	}
 	return nil
 }
