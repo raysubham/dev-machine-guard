@@ -178,6 +178,7 @@ func NewFileFetcher(path string) (*FileFetcher, error) {
 		return nil, errors.New("devicepolicy: local policy exceeds size limit")
 	}
 
+	// #nosec G304 -- path is the operator-selected offline policy file, validated above as a bounded regular file.
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("devicepolicy: open local policy: %w", err)

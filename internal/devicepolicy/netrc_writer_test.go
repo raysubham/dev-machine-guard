@@ -465,6 +465,7 @@ func TestNetrcWriter_MDMOwnershipRequiresExactHostInsideBlock(t *testing.T) {
 
 func TestNetrcWriter_ReadAndMDMMarker(t *testing.T) {
 	w, _ := newNetrcTestWriter(t, []byte(mdmNetrcBegin+"\n"+netrcExpected+"\n"+mdmNetrcEnd+"\n"))
+	hardenSecureTestFile(t, w.file)
 	if present, err := w.HasMDMMarker(); err != nil || !present {
 		t.Fatalf("HasMDMMarker = %v, %v, want true", present, err)
 	}

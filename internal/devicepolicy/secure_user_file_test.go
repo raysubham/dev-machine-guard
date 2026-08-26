@@ -35,6 +35,18 @@ func openSecureTestFile(t *testing.T, h *secureUserHome, relativePath string) *s
 	return f
 }
 
+func hardenSecureTestFile(t *testing.T, f *secureUserFile) {
+	t.Helper()
+	file, err := os.OpenFile(f.Location(), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := f.applyMetadata(file, secureUserFileMode, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPythonWriterBackupPrefixes(t *testing.T) {
 	for name, got := range map[string]string{
 		"netrc": netrcBackupPrefix,
@@ -330,6 +342,10 @@ func TestSecureUserFile_ExclusiveTempCollisionAndAtomicReplace(t *testing.T) {
 	before, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Windows resolves os.Stat file identity lazily from the path.
+	if !os.SameFile(before, before) {
+		t.Fatal("could not capture original file identity")
 	}
 	collision := filepath.Join(home, "config.dmg-tmp-collision")
 	if err := os.WriteFile(collision, []byte("planted"), 0o600); err != nil {

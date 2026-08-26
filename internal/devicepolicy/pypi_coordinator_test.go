@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"os/user"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -597,6 +598,9 @@ func TestPyPICoordinator_StateAndReportRemainSecretFreeAcrossLifecycle(t *testin
 }
 
 func TestBuildPyPIComponents_SharesResolvedUserExecutor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("resolved-user shell wrapping is Unix-only")
+	}
 	current, err := user.Current()
 	if err != nil {
 		t.Fatal(err)

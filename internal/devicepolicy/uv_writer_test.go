@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -31,6 +32,10 @@ func newUVTestWriter(t *testing.T, initial []byte, version string) (*UVWriter, *
 	home.targetUser.Username = ""
 	mock := executor.NewMock()
 	mock.SetGOOS("linux")
+	if runtime.GOOS == "windows" {
+		mock.SetGOOS("windows")
+		mock.SetEnv("APPDATA", filepath.Join(homeDir, ".config"))
+	}
 	mock.SetUsername("")
 	mock.SetHomeDir(homeDir)
 	probeBase := t.TempDir()
@@ -365,6 +370,9 @@ func TestUVWriter_UsesResolvedUserEnvironment(t *testing.T) {
 }
 
 func TestUVObservation_ParsesRealSettingsInTargetUserDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("target-user shell probing is Unix-only")
+	}
 	fixture, err := os.ReadFile(filepath.Join("testdata", "uv-show-settings-0.12.6.txt"))
 	if err != nil {
 		t.Fatal(err)
@@ -589,6 +597,7 @@ func TestUVObservation_UserEnvironmentFailureIsUnknown(t *testing.T) {
 	if _, err := w.Write(uvExpected); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
+	mock.SetGOOS("linux")
 	w.exec = executor.NewUserAwareExecutor(&failedUserEnvironmentExecutor{Executor: mock}, "alice")
 	got, err := w.Observation(context.Background(), uvExpected)
 	if err == nil {

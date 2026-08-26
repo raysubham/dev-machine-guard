@@ -455,6 +455,11 @@ func TestPipWriter_MDMOwnershipRejectsOtherLanes(t *testing.T) {
 func TestPipObservation_MDMManagedStaticConfiguration(t *testing.T) {
 	initial := []byte("[global]\n" + mdmPipBegin + "\n" + pipExpected + "\n" + mdmPipEnd + "\n")
 	w, _, _ := newPipTestWriter(t, initial)
+	for _, managed := range w.files {
+		if managed.current {
+			hardenSecureTestFile(t, managed.file)
+		}
+	}
 	if owned, err := w.MDMOwned(); err != nil || !owned {
 		t.Fatalf("MDMOwned = %v, %v, want true", owned, err)
 	}

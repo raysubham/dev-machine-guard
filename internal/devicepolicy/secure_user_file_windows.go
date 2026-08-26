@@ -166,23 +166,48 @@ func checkSecurePlatformOwner(h *secureUserHome, f *os.File) error {
 }
 
 var (
-	kernel32Reopen                  = windows.NewLazySystemDLL("kernel32.dll")
-	procReOpenFile                  = kernel32Reopen.NewProc("ReOpenFile")
 	wtsapi32                        = windows.NewLazySystemDLL("wtsapi32.dll")
 	procWTSQuerySessionInformationW = wtsapi32.NewProc("WTSQuerySessionInformationW")
 )
 
 func reopenSecurityHandle(f *os.File, access uint32) (windows.Handle, error) {
-	handle, _, callErr := procReOpenFile.Call(
-		f.Fd(),
-		uintptr(access),
-		uintptr(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE),
-		uintptr(windows.FILE_FLAG_BACKUP_SEMANTICS),
-	)
-	if windows.Handle(handle) == windows.InvalidHandle {
-		return windows.InvalidHandle, callErr
+	path, err := windows.UTF16PtrFromString(f.Name())
+	if err != nil {
+		return windows.InvalidHandle, err
 	}
-	return windows.Handle(handle), nil
+	handle, err := windows.CreateFile(
+		path,
+		access|windows.FILE_READ_ATTRIBUTES,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	if err != nil {
+		return windows.InvalidHandle, err
+	}
+	if err := requireSameFileIdentity(windows.Handle(f.Fd()), handle); err != nil {
+		_ = windows.CloseHandle(handle)
+		return windows.InvalidHandle, err
+	}
+	return handle, nil
+}
+
+func requireSameFileIdentity(original, reopened windows.Handle) error {
+	var originalInfo, reopenedInfo windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(original, &originalInfo); err != nil {
+		return fmt.Errorf("inspect original file identity: %w", err)
+	}
+	if err := windows.GetFileInformationByHandle(reopened, &reopenedInfo); err != nil {
+		return fmt.Errorf("inspect reopened file identity: %w", err)
+	}
+	if originalInfo.VolumeSerialNumber != reopenedInfo.VolumeSerialNumber ||
+		originalInfo.FileIndexHigh != reopenedInfo.FileIndexHigh ||
+		originalInfo.FileIndexLow != reopenedInfo.FileIndexLow {
+		return fmt.Errorf("reopened file identity changed: %w", ErrTargetUnusable)
+	}
+	return nil
 }
 
 const (

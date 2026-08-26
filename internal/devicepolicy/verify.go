@@ -44,10 +44,10 @@ const (
 // PyPI component targets are local ownership identities beneath the public
 // package_config/pypi policy. They are never used for fetches or reports.
 const (
-	PyPICredentialOwnershipTarget = "pypi-credential"
+	PyPICredentialOwnershipTarget = "pypi-credential" //#nosec G101 -- public ownership target identifier, not a credential.
 	PyPIPipOwnershipTarget        = "pypi-pip"
 	PyPIUVOwnershipTarget         = "pypi-uv"
-	PyPICredentialOwnershipValue  = "stepsecurity-pypi-credential"
+	PyPICredentialOwnershipValue  = "stepsecurity-pypi-credential" //#nosec G101 -- public ownership marker, not a credential.
 )
 
 // VerifyInput is the result set the verifier reasons over. It is intentionally
