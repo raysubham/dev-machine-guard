@@ -36,18 +36,6 @@ func openSecureTestFile(t *testing.T, h *Home, relativePath string) *File {
 	return f
 }
 
-func hardenSecureTestFile(t *testing.T, f *File) {
-	t.Helper()
-	file, err := os.OpenFile(f.Location(), os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	if err := f.applyMetadata(file, FileMode, false); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestSecureUserFile_CreatesPinnedParentsAndCommits(t *testing.T) {
 	tests := []struct {
 		name string

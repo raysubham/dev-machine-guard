@@ -475,12 +475,3 @@ func TestNetrcWriter_ReadAndMDMMarker(t *testing.T) {
 		t.Fatalf("MDM credential Observation = %q, %v, want match", status, err)
 	}
 }
-
-type netrcFakeOwner struct {
-	uid      uint32
-	enforced bool
-}
-
-func (f netrcFakeOwner) ownerUIDGID(*os.File) (uint32, uint32, bool, error) {
-	return f.uid, 0, f.enforced, nil
-}

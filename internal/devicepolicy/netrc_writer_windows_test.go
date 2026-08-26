@@ -180,9 +180,13 @@ func TestNetrcWriter_WindowsACLRejectsUnexpectedReader(t *testing.T) {
 		t.Fatalf("Converged after secure write = %v, %v, want true", converged, err)
 	}
 
-	targetSID, err := windows.StringToSid(w.file.home.targetUser.Uid)
+	descriptor, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
 	if err != nil {
 		t.Fatal(err)
+	}
+	targetSID, _, err := descriptor.Owner()
+	if err != nil || targetSID == nil {
+		t.Fatalf("target owner: %v", err)
 	}
 	systemSID, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
 	if err != nil {
@@ -193,9 +197,9 @@ func TestNetrcWriter_WindowsACLRejectsUnexpectedReader(t *testing.T) {
 		t.Fatal(err)
 	}
 	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{
-		secureExplicitAccess(targetSID, windows.GENERIC_ALL, windows.NO_INHERITANCE, windows.TRUSTEE_IS_USER),
-		secureExplicitAccess(systemSID, windows.GENERIC_ALL, windows.NO_INHERITANCE, windows.TRUSTEE_IS_WELL_KNOWN_GROUP),
-		secureExplicitAccess(everyoneSID, windows.GENERIC_READ, windows.NO_INHERITANCE, windows.TRUSTEE_IS_WELL_KNOWN_GROUP),
+		netrcTestExplicitAccess(targetSID, windows.GENERIC_ALL, windows.TRUSTEE_IS_USER),
+		netrcTestExplicitAccess(systemSID, windows.GENERIC_ALL, windows.TRUSTEE_IS_WELL_KNOWN_GROUP),
+		netrcTestExplicitAccess(everyoneSID, windows.GENERIC_READ, windows.TRUSTEE_IS_WELL_KNOWN_GROUP),
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -217,5 +221,18 @@ func TestNetrcWriter_WindowsACLRejectsUnexpectedReader(t *testing.T) {
 	}
 	if status, err := w.Observation(netrcExpected); err != nil || status != authTokenMismatch {
 		t.Fatalf("Observation with unexpected reader = %q, %v, want mismatch", status, err)
+	}
+}
+
+func netrcTestExplicitAccess(sid *windows.SID, permissions windows.ACCESS_MASK, trusteeType windows.TRUSTEE_TYPE) windows.EXPLICIT_ACCESS {
+	return windows.EXPLICIT_ACCESS{
+		AccessPermissions: permissions,
+		AccessMode:        windows.GRANT_ACCESS,
+		Inheritance:       windows.NO_INHERITANCE,
+		Trustee: windows.TRUSTEE{
+			TrusteeForm:  windows.TRUSTEE_IS_SID,
+			TrusteeType:  trusteeType,
+			TrusteeValue: windows.TrusteeValueFromSID(sid),
+		},
 	}
 }
