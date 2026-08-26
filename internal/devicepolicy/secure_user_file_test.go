@@ -16,6 +16,7 @@ type secureTestExecutor struct {
 
 func (e secureTestExecutor) LoggedInUser() (*user.User, error) { return e.user, nil }
 func (e secureTestExecutor) IsRoot() bool                      { return false }
+func (e secureTestExecutor) GOOS() string                      { return "test" }
 
 func newSecureTestHome(t *testing.T, home string) *secureuserfile.Home {
 	t.Helper()

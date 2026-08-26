@@ -9,6 +9,8 @@ import (
 	"os/user"
 	"unsafe"
 
+	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/model"
 	"golang.org/x/sys/windows"
 )
 
@@ -217,7 +219,10 @@ const (
 	sidLocalSystem         = "S-1-5-18"
 )
 
-func interactiveSessionOK() bool {
+func interactiveSessionOK(exec executor.Executor) bool {
+	if exec.GOOS() != model.PlatformWindows {
+		return true
+	}
 	tokenSID, err := currentTokenUserSID()
 	if err != nil || tokenSID.String() == sidLocalSystem {
 		return false

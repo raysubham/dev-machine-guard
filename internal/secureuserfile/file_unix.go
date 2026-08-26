@@ -9,13 +9,15 @@ import (
 	"os/user"
 	"strconv"
 	"syscall"
+
+	"github.com/step-security/dev-machine-guard/internal/executor"
 )
 
 const enforcePOSIXMetadata = true
 
 func nonblockOpenFlag() int { return syscall.O_NONBLOCK }
 
-func interactiveSessionOK() bool { return true }
+func interactiveSessionOK(executor.Executor) bool { return true }
 
 func secureUserIDs(u *user.User) (int, int, error) {
 	uid, uidErr := strconv.Atoi(u.Uid)

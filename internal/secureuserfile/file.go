@@ -64,8 +64,15 @@ type secureFileSnapshot struct {
 	existed   bool
 	mode      os.FileMode
 	leaf      string
+	chain     []secureSymlinkHop
 	committed os.FileInfo
 	removed   bool
+}
+
+type secureSymlinkHop struct {
+	path   string
+	target string
+	info   os.FileInfo
 }
 
 type ownerReader interface {
@@ -77,7 +84,11 @@ type metadataReader interface {
 }
 
 func OpenUserHome(exec executor.Executor) (*Home, error) {
-	if exec.IsRoot() && !interactiveSessionOK() {
+	return openUserHome(exec, interactiveSessionOK)
+}
+
+func openUserHome(exec executor.Executor, sessionOK func(executor.Executor) bool) (*Home, error) {
+	if !sessionOK(exec) {
 		return nil, ErrNoTargetUser
 	}
 	u, err := exec.LoggedInUser()
@@ -381,42 +392,59 @@ func (f *File) resolveLeaf() (*secureResolvedTarget, error) {
 }
 
 func (f *File) resolveLeafPath(allowMissingSymlinkTarget bool) (string, error) {
+	rel, _, err := f.resolveLeafPathWithChain(allowMissingSymlinkTarget)
+	return rel, err
+}
+
+func (f *File) resolveLeafPathWithChain(allowMissingSymlinkTarget bool) (string, []secureSymlinkHop, error) {
 	cur := f.relativePath
-	viaSymlink := false
+	var chain []secureSymlinkHop
 	for depth := 0; ; depth++ {
 		if depth > maxSymlinkDepth {
-			return "", ErrSymlinkLoop
+			return "", nil, ErrSymlinkLoop
 		}
 		info, err := f.home.root.Lstat(cur)
 		if errors.Is(err, os.ErrNotExist) {
-			if viaSymlink && !allowMissingSymlinkTarget {
-				return "", ErrDanglingSymlink
+			if len(chain) != 0 && !allowMissingSymlinkTarget {
+				return "", nil, ErrDanglingSymlink
 			}
-			return cur, nil
+			return cur, chain, nil
 		}
 		if err != nil {
-			return "", fmt.Errorf("secure user file: lstat %q: %w", cur, err)
+			return "", nil, fmt.Errorf("secure user file: lstat %q: %w", cur, err)
 		}
 		if info.Mode()&fs.ModeSymlink == 0 {
-			return cur, nil
+			return cur, chain, nil
 		}
 		target, err := f.home.root.Readlink(cur)
 		if err != nil {
-			return "", fmt.Errorf("secure user file: readlink %q: %w", cur, err)
+			return "", nil, fmt.Errorf("secure user file: readlink %q: %w", cur, err)
 		}
 		if isAbsSymlinkTarget(target) {
-			return "", ErrAbsoluteSymlink
+			return "", nil, ErrAbsoluteSymlink
 		}
 		if endsInSeparatorOrDot(target) {
-			return "", fmt.Errorf("secure user file: directory-shaped symlink: %w", ErrTargetUnusable)
+			return "", nil, fmt.Errorf("secure user file: directory-shaped symlink: %w", ErrTargetUnusable)
 		}
+		chain = append(chain, secureSymlinkHop{path: cur, target: target, info: info})
 		next := filepath.Clean(filepath.Join(filepath.Dir(cur), target))
 		if next == ".." || strings.HasPrefix(next, ".."+string(filepath.Separator)) {
-			return "", fmt.Errorf("secure user file: symlink escapes home: %w", ErrTargetUnusable)
+			return "", nil, fmt.Errorf("secure user file: symlink escapes home: %w", ErrTargetUnusable)
 		}
 		cur = next
-		viaSymlink = true
 	}
+}
+
+func sameSymlinkChain(a, b []secureSymlinkHop) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].path != b[i].path || a[i].target != b[i].target || !os.SameFile(a[i].info, b[i].info) {
+			return false
+		}
+	}
+	return true
 }
 
 func (f *File) pin(rel string) (*secureResolvedTarget, error) {
@@ -621,7 +649,11 @@ func (f *File) Commit(data []byte, mode os.FileMode) error {
 }
 
 func (f *File) Remove() error {
-	rt, err := f.resolveLeaf()
+	rel, chain, err := f.resolveLeafPathWithChain(false)
+	if err != nil {
+		return err
+	}
+	rt, err := f.pin(rel)
 	if err != nil {
 		return err
 	}
@@ -631,10 +663,10 @@ func (f *File) Remove() error {
 		return err
 	}
 	if !existed {
-		f.pending = &secureFileSnapshot{leaf: rt.rel}
+		f.pending = &secureFileSnapshot{leaf: rt.rel, chain: chain}
 		return nil
 	}
-	snap := &secureFileSnapshot{data: current, existed: true, mode: mode, leaf: rt.rel}
+	snap := &secureFileSnapshot{data: current, existed: true, mode: mode, leaf: rt.rel, chain: chain}
 	if err := f.backup(rt, current); err != nil {
 		f.log("secure user file: backup of %q failed: %v", rt.base, err)
 	}
@@ -662,9 +694,10 @@ func (f *File) RestoreSnapshot() error {
 	var err error
 	if snap.removed {
 		var rel string
-		rel, err = f.resolveLeafPath(true)
-		if err == nil && rel != snap.leaf {
-			err = fmt.Errorf("secure user file: chain moved from %q to %q: %w", snap.leaf, rel, ErrTargetUnusable)
+		var chain []secureSymlinkHop
+		rel, chain, err = f.resolveLeafPathWithChain(true)
+		if err == nil && (rel != snap.leaf || !sameSymlinkChain(chain, snap.chain)) {
+			err = fmt.Errorf("secure user file: chain changed after removal: %w", ErrTargetUnusable)
 		}
 		if err == nil {
 			rt, err = f.pin(snap.leaf)

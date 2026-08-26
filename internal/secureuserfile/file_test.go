@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/step-security/dev-machine-guard/internal/executor"
 )
 
 func newSecureTestHome(t *testing.T, home string) *Home {
@@ -34,6 +36,18 @@ func openSecureTestFile(t *testing.T, h *Home, relativePath string) *File {
 		t.Fatalf("open(%q): %v", relativePath, err)
 	}
 	return f
+}
+
+func TestOpenUserHome_RejectsNonInteractiveNonRoot(t *testing.T) {
+	mock := executor.NewMock()
+	mock.SetIsRoot(false)
+	home, err := openUserHome(mock, func(executor.Executor) bool { return false })
+	if home != nil {
+		_ = home.Close()
+	}
+	if !errors.Is(err, ErrNoTargetUser) {
+		t.Fatalf("openUserHome error = %v, want ErrNoTargetUser", err)
+	}
 }
 
 func TestSecureUserFile_CreatesPinnedParentsAndCommits(t *testing.T) {
@@ -138,7 +152,7 @@ func TestSecureUserFile_ParentHardeningFailureRemovesNewDirectory(t *testing.T) 
 		t.Fatalf("unsafe created parent remains: %v", err)
 	}
 	if runtime.GOOS == "windows" {
-		return // Azure Run Command runs as SYSTEM; active-session retry is covered by VM validation.
+		return // This retry requires an interactive Windows user.
 	}
 	h.applyMetadata = func(*Home, *os.File, os.FileMode, bool) error { return nil }
 	if err := h.EnsureParent(path); err != nil {
@@ -248,6 +262,31 @@ func TestSecureUserFile_RestoreRemovedSymlinkRejectsChangedChain(t *testing.T) {
 			name: "link removed",
 			mutate: func(t *testing.T, _, link, _ string) {
 				if err := os.Remove(link); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "same target through different chain",
+			mutate: func(t *testing.T, home, link, _ string) {
+				if err := os.Symlink(filepath.Join("credentials", "auth"), filepath.Join(home, "alternate")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(link); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("alternate", link); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "link recreated",
+			mutate: func(t *testing.T, _, link, _ string) {
+				if err := os.Remove(link); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(filepath.Join("credentials", "auth"), link); err != nil {
 					t.Fatal(err)
 				}
 			},
