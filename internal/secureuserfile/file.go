@@ -373,38 +373,46 @@ func (rt *secureResolvedTarget) close() {
 }
 
 func (f *File) resolveLeaf() (*secureResolvedTarget, error) {
+	rel, err := f.resolveLeafPath(false)
+	if err != nil {
+		return nil, err
+	}
+	return f.pin(rel)
+}
+
+func (f *File) resolveLeafPath(allowMissingSymlinkTarget bool) (string, error) {
 	cur := f.relativePath
 	viaSymlink := false
 	for depth := 0; ; depth++ {
 		if depth > maxSymlinkDepth {
-			return nil, ErrSymlinkLoop
+			return "", ErrSymlinkLoop
 		}
 		info, err := f.home.root.Lstat(cur)
 		if errors.Is(err, os.ErrNotExist) {
-			if viaSymlink {
-				return nil, ErrDanglingSymlink
+			if viaSymlink && !allowMissingSymlinkTarget {
+				return "", ErrDanglingSymlink
 			}
-			return f.pin(cur)
+			return cur, nil
 		}
 		if err != nil {
-			return nil, fmt.Errorf("secure user file: lstat %q: %w", cur, err)
+			return "", fmt.Errorf("secure user file: lstat %q: %w", cur, err)
 		}
 		if info.Mode()&fs.ModeSymlink == 0 {
-			return f.pin(cur)
+			return cur, nil
 		}
 		target, err := f.home.root.Readlink(cur)
 		if err != nil {
-			return nil, fmt.Errorf("secure user file: readlink %q: %w", cur, err)
+			return "", fmt.Errorf("secure user file: readlink %q: %w", cur, err)
 		}
 		if isAbsSymlinkTarget(target) {
-			return nil, ErrAbsoluteSymlink
+			return "", ErrAbsoluteSymlink
 		}
 		if endsInSeparatorOrDot(target) {
-			return nil, fmt.Errorf("secure user file: directory-shaped symlink: %w", ErrTargetUnusable)
+			return "", fmt.Errorf("secure user file: directory-shaped symlink: %w", ErrTargetUnusable)
 		}
 		next := filepath.Clean(filepath.Join(filepath.Dir(cur), target))
 		if next == ".." || strings.HasPrefix(next, ".."+string(filepath.Separator)) {
-			return nil, fmt.Errorf("secure user file: symlink escapes home: %w", ErrTargetUnusable)
+			return "", fmt.Errorf("secure user file: symlink escapes home: %w", ErrTargetUnusable)
 		}
 		cur = next
 		viaSymlink = true
@@ -650,14 +658,39 @@ func (f *File) RestoreSnapshot() error {
 	}
 	snap := f.pending
 	f.pending = nil
-	rt, err := f.resolveLeaf()
+	var rt *secureResolvedTarget
+	var err error
+	if snap.removed {
+		var rel string
+		rel, err = f.resolveLeafPath(true)
+		if err == nil && rel != snap.leaf {
+			err = fmt.Errorf("secure user file: chain moved from %q to %q: %w", snap.leaf, rel, ErrTargetUnusable)
+		}
+		if err == nil {
+			rt, err = f.pin(snap.leaf)
+		}
+		if err == nil {
+			if _, lerr := rt.child.Lstat(rt.base); !errors.Is(lerr, os.ErrNotExist) {
+				if lerr != nil {
+					err = fmt.Errorf("secure user file: inspect removed leaf before restore: %w", lerr)
+				} else {
+					err = fmt.Errorf("secure user file: removed leaf was recreated: %w", ErrTargetUnusable)
+				}
+			}
+		}
+	} else {
+		rt, err = f.resolveLeaf()
+		if err == nil && rt.rel != snap.leaf {
+			err = fmt.Errorf("secure user file: chain moved from %q to %q: %w", snap.leaf, rt.rel, ErrTargetUnusable)
+		}
+	}
 	if err != nil {
+		if rt != nil {
+			rt.close()
+		}
 		return err
 	}
 	defer rt.close()
-	if rt.rel != snap.leaf {
-		return fmt.Errorf("secure user file: chain moved from %q to %q: %w", snap.leaf, rt.rel, ErrTargetUnusable)
-	}
 	if snap.committed != nil {
 		li, err := rt.child.Lstat(rt.base)
 		if err == nil && (li.Mode()&fs.ModeSymlink != 0 || !li.Mode().IsRegular() || !os.SameFile(li, snap.committed)) {

@@ -1,6 +1,7 @@
 package secureuserfile
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"os/user"
@@ -177,6 +178,116 @@ func TestSecureUserFile_ParentSwapDuringCreationRejected(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outside, "tool")); !os.IsNotExist(err) {
 		t.Fatalf("escaped parent was modified, stat error = %v", err)
+	}
+}
+
+func TestSecureUserFile_RemoveAndRestoreRelativeSymlinkTarget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("relative symlink setup requires elevated Windows privileges")
+	}
+	home := t.TempDir()
+	if err := os.Mkdir(filepath.Join(home, "credentials"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "credentials", "auth")
+	original := []byte("original credential\n")
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("credentials", "auth"), filepath.Join(home, "credential")); err != nil {
+		t.Fatal(err)
+	}
+
+	file := openSecureTestFile(t, newSecureTestHome(t, home), "credential")
+	if err := file.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.RestoreSnapshot(); err != nil {
+		t.Fatalf("RestoreSnapshot: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("restored bytes = %q, want %q", got, original)
+	}
+}
+
+func TestSecureUserFile_RestoreRemovedSymlinkRejectsChangedChain(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("relative symlink setup requires elevated Windows privileges")
+	}
+	tests := []struct {
+		name   string
+		mutate func(t *testing.T, home, link, target string)
+	}{
+		{
+			name: "retargeted",
+			mutate: func(t *testing.T, home, link, _ string) {
+				other := filepath.Join(home, "credentials", "other")
+				if err := os.WriteFile(other, []byte("other"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(link); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(filepath.Join("credentials", "other"), link); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "leaf recreated",
+			mutate: func(t *testing.T, _, _, target string) {
+				if err := os.WriteFile(target, []byte("replacement"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "escape",
+			mutate: func(t *testing.T, _, link, _ string) {
+				if err := os.Remove(link); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(filepath.Join("..", "outside"), link); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "link removed",
+			mutate: func(t *testing.T, _, link, _ string) {
+				if err := os.Remove(link); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			if err := os.Mkdir(filepath.Join(home, "credentials"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(home, "credentials", "auth")
+			if err := os.WriteFile(target, []byte("original"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			link := filepath.Join(home, "credential")
+			if err := os.Symlink(filepath.Join("credentials", "auth"), link); err != nil {
+				t.Fatal(err)
+			}
+			file := openSecureTestFile(t, newSecureTestHome(t, home), "credential")
+			if err := file.Remove(); err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(t, home, link, target)
+			if err := file.RestoreSnapshot(); !errors.Is(err, ErrTargetUnusable) {
+				t.Fatalf("RestoreSnapshot error = %v, want ErrTargetUnusable", err)
+			}
+		})
 	}
 }
 
