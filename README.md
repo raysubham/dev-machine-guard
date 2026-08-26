@@ -298,7 +298,7 @@ See [SCAN_COVERAGE.md](SCAN_COVERAGE.md) for the full catalog of supported detec
 
 ## Package Configs & Suspicious Files
 
-Beyond inventorying _what_ is installed, Dev Machine Guard inspects _how_ each machine is configured to pull packages, and _whether_ any files associated with known attacks are present.
+Beyond inventorying *what* is installed, Dev Machine Guard inspects *how* each machine is configured to pull packages, and *whether* any files associated with known attacks are present.
 
 ### Package-manager config auditing
 
