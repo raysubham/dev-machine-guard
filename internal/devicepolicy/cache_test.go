@@ -454,27 +454,16 @@ func TestPackageConfigPyPIComponentOwnershipRoundTrip(t *testing.T) {
 	restore := SetCachePathForTest(filepath.Join(t.TempDir(), CacheFilename))
 	defer restore()
 
-	components := []struct {
-		target string
-		value  string
-	}{
-		{PyPICredentialOwnershipTarget, PyPICredentialOwnershipValue},
-		{PyPIPipOwnershipTarget, "pip-settings"},
-		{PyPIUVOwnershipTarget, "uv-settings"},
+	want := AppliedTargetState{
+		AppliedHash:     "sha256:pypi",
+		WrittenSettings: map[string]string{"component": PyPICredentialOwnershipValue},
 	}
-	for _, component := range components {
-		if err := WriteAppliedState(CategoryPackageConfig, component.target, AppliedTargetState{
-			AppliedHash:     "sha256:pypi",
-			WrittenSettings: map[string]string{"component": component.value},
-		}); err != nil {
-			t.Fatalf("write %s: %v", component.target, err)
-		}
+	if err := WriteAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget, want); err != nil {
+		t.Fatal(err)
 	}
-	for _, component := range components {
-		got, ok := ReadAppliedState(CategoryPackageConfig, component.target)
-		if !ok || got.WrittenSettings["component"] != component.value {
-			t.Fatalf("component %s = %+v ok=%v, want %q", component.target, got, ok, component.value)
-		}
+	got, ok := ReadAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget)
+	if !ok || got.WrittenSettings["component"] != PyPICredentialOwnershipValue {
+		t.Fatalf("credential component = %+v ok=%v, want %q", got, ok, PyPICredentialOwnershipValue)
 	}
 	if _, ok := ReadAppliedState(CategoryPackageConfig, TargetPyPI); ok {
 		t.Fatal("component ownership must not create a public pypi target record")

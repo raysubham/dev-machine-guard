@@ -108,35 +108,33 @@ func TestPackageConfigPyPIIdentityRoundTrip(t *testing.T) {
 	}
 }
 
-func TestComplianceReportOmitsEmptyEvaluatedHash(t *testing.T) {
-	raw, err := json.Marshal(ComplianceReport{Category: CategoryPackageConfig, Target: TargetNPM})
-	if err != nil {
-		t.Fatal(err)
+func TestComplianceReportEvaluatedHashJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		hash string
+		want bool
+	}{
+		{"empty omitted", "", false},
+		{"value included", "sha256:pypi", true},
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := fields["evaluated_hash"]; ok {
-		t.Fatalf("empty evaluated_hash must be omitted: %s", raw)
-	}
-}
-
-func TestComplianceReportIncludesEvaluatedHashWhenSet(t *testing.T) {
-	raw, err := json.Marshal(ComplianceReport{
-		Category:      CategoryPackageConfig,
-		Target:        TargetPyPI,
-		EvaluatedHash: "sha256:pypi",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		t.Fatal(err)
-	}
-	if got := string(fields["evaluated_hash"]); got != `"sha256:pypi"` {
-		t.Fatalf("evaluated_hash = %s, want %q", got, "sha256:pypi")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(ComplianceReport{Category: CategoryPackageConfig, Target: TargetPyPI, EvaluatedHash: tc.hash})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &fields); err != nil {
+				t.Fatal(err)
+			}
+			got, present := fields["evaluated_hash"]
+			if present != tc.want {
+				t.Fatalf("evaluated_hash presence = %v, want %v: %s", present, tc.want, raw)
+			}
+			if present && string(got) != `"sha256:pypi"` {
+				t.Fatalf("evaluated_hash = %s, want %q", got, "sha256:pypi")
+			}
+		})
 	}
 }
 

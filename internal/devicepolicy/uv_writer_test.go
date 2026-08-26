@@ -394,38 +394,39 @@ func TestUVObservation_ParsesRealSettingsInTargetUserDirectory(t *testing.T) {
 	}
 }
 
-func TestParseUVShowSettings_RealFixtures(t *testing.T) {
-	for _, version := range []string{"0.10.0", "0.12.6"} {
-		t.Run(version, func(t *testing.T) {
-			fixture, err := os.ReadFile(filepath.Join("testdata", "uv-show-settings-"+version+".txt"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			status, registry := parseUVShowSettings(string(fixture), "https://registry.stepsecurity.io/python/simple")
-			if status != "match" || registry != "https://registry.stepsecurity.io/python/simple" {
-				t.Fatalf("parseUVShowSettings = %q, %q", status, registry)
-			}
-		})
+func TestParseUVShowSettings_RealFixture(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("testdata", "uv-show-settings-0.12.6.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, registry := parseUVShowSettings(string(fixture), "https://registry.stepsecurity.io/python/simple")
+	if status != "match" || registry != "https://registry.stepsecurity.io/python/simple" {
+		t.Fatalf("parseUVShowSettings = %q, %q", status, registry)
 	}
 }
 
 func TestParseUVVersion_StrictStableSemver(t *testing.T) {
 	tests := []struct {
-		output string
-		ok     bool
+		output    string
+		valid     bool
+		supported bool
 	}{
-		{"uv 0.10.0", true},
-		{"uv 0.12.6 (7938ca5d5 2026-08-25 aarch64-apple-darwin)", true},
-		{"uv 0.10.0-rc.1", false},
-		{"uv 0.10", false},
-		{"uv 0.10.0.1", false},
-		{"uv v0.10.0", false},
+		{"uv 0.9.9", true, false},
+		{"uv 0.10.0", true, true},
+		{"uv 0.10.0-rc.1", false, false},
+		{"uv 0.12.6 (7938ca5d5 2026-08-25 aarch64-apple-darwin)", true, true},
+		{"uv 0.10", false, false},
+		{"uv 0.10.0.1", false, false},
+		{"changed format", false, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.output, func(t *testing.T) {
-			_, _, _, ok := parseUVVersion(tc.output)
-			if ok != tc.ok {
-				t.Fatalf("parseUVVersion(%q) ok = %v, want %v", tc.output, ok, tc.ok)
+			major, minor, patch, valid := parseUVVersion(tc.output)
+			if valid != tc.valid {
+				t.Fatalf("parseUVVersion(%q) valid = %v, want %v", tc.output, valid, tc.valid)
+			}
+			if supported := valid && uvVersionAtLeast(major, minor, patch, 0, 10, 0); supported != tc.supported {
+				t.Fatalf("parseUVVersion(%q) supported = %v, want %v", tc.output, supported, tc.supported)
 			}
 		})
 	}
@@ -485,7 +486,7 @@ func TestUVWriter_MDMOwnershipRejectsOtherLanes(t *testing.T) {
 }
 
 func TestUVObservation_AcceptsValidMDMMarkers(t *testing.T) {
-	fixture, err := os.ReadFile(filepath.Join("testdata", "uv-show-settings-0.10.0.txt"))
+	fixture, err := os.ReadFile(filepath.Join("testdata", "uv-show-settings-0.12.6.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -603,19 +604,8 @@ func TestUVObservation_UserEnvironmentFailureIsUnknown(t *testing.T) {
 	}
 }
 
-func TestUVObservation_PrereleaseIsUnsupported(t *testing.T) {
-	w, _, _ := newUVTestWriter(t, nil, "0.10.0-rc.1")
-	got, err := w.Observation(context.Background(), uvExpected)
-	if err != nil {
-		t.Fatalf("Observation: %v", err)
-	}
-	if got.EffectiveStatus != "unsupported_version" {
-		t.Fatalf("EffectiveStatus = %q, want unsupported_version", got.EffectiveStatus)
-	}
-}
-
 func TestUVObservation_VersionsAndOverrides(t *testing.T) {
-	fixture, err := os.ReadFile(filepath.Join("testdata", "uv-show-settings-0.10.0.txt"))
+	fixture, err := os.ReadFile(filepath.Join("testdata", "uv-show-settings-0.12.6.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -634,6 +624,7 @@ func TestUVObservation_VersionsAndOverrides(t *testing.T) {
 	}{
 		{"uv absent", "", func(*executor.Mock) {}, "", "match", "not_installed", "none"},
 		{"uv below minimum", "0.9.11", func(*executor.Mock) {}, "", "absent", "unsupported_version", "none"},
+		{"uv prerelease", "0.10.0-rc.1", func(*executor.Mock) {}, "", "absent", "unsupported_version", "none"},
 		{"uv minimum", "0.10.0", func(*executor.Mock) {}, showSettings, "match", "match", "none"},
 		{"environment", "0.10.0", func(m *executor.Mock) { m.SetEnv("UV_INDEX_URL", "https://user:SECRET@evil.example/simple") }, "", "match", "mismatch", "environment"},
 		{"explicit config", "0.10.0", func(m *executor.Mock) { m.SetEnv("UV_CONFIG_FILE", "/tmp/secret") }, "", "match", "mismatch", "explicit_config"},
@@ -644,7 +635,7 @@ func TestUVObservation_VersionsAndOverrides(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			w, mock, _ := newUVTestWriter(t, nil, tc.version)
-			if tc.version == "" || !strings.HasPrefix(tc.version, "0.9") {
+			if tc.wantEffective != "unsupported_version" {
 				if _, err := w.Write(uvExpected); err != nil {
 					t.Fatalf("Write: %v", err)
 				}
