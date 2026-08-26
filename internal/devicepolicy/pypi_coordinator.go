@@ -234,12 +234,14 @@ func (c *PyPICoordinator) reconcileDMG(ctx context.Context, effective EffectiveP
 		}
 		present, err := component.hasMDMMarker()
 		if err != nil {
-			markerErrs = append(markerErrs, fmt.Errorf("devicepolicy: inspect %s MDM marker: %w", component.name, err))
+			err = fmt.Errorf("devicepolicy: inspect %s MDM marker: %w", component.name, err)
+			component.initErr = errors.Join(component.initErr, err)
+			markerErrs = append(markerErrs, err)
 			continue
 		}
 		managed = managed || present
 	}
-	if managed || len(markerErrs) != 0 {
+	if managed {
 		results := c.observeMDMSelected(ctx, policy, components)
 		credential, pip, uv, observedErr := observations(policy, results)
 		observed, marshalErr := buildPyPIObserved(policy, credential, pip, uv)

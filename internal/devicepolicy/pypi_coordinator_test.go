@@ -453,6 +453,52 @@ func TestPyPICoordinator_UnsupportedUVReportsPolicyNotApplied(t *testing.T) {
 	}
 }
 
+func TestPyPICoordinator_ComponentInspectionFailureDoesNotBlockSibling(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*pypiComponents)
+	}{
+		{
+			name: "initialization failure",
+			configure: func(components *pypiComponents) {
+				components.uv.initErr = errors.New("uv initialization failed")
+			},
+		},
+		{
+			name: "marker inspection failure",
+			configure: func(components *pypiComponents) {
+				components.uv.hasMDMMarker = func() (bool, error) {
+					return false, errors.New("uv marker inspection failed")
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newCoordinatorFixture()
+			coordinator, _, reporter := newTestCoordinator(t, coordinatorPolicy(`["pip","uv"]`, "sha256:H", enforcementDMG), fixture)
+			coordinator.buildComponents = func(_ context.Context, _ executor.Executor, policy PyPIPolicy) (*pypiComponents, error) {
+				components := fixture.components(policy)
+				tc.configure(components)
+				return components, nil
+			}
+
+			if err := coordinator.Reconcile(context.Background()); err == nil {
+				t.Fatal("Reconcile error = nil, want component failure")
+			}
+			if got := strings.Join(fixture.events, ","); got != "credential:write,pip:write" {
+				t.Fatalf("events = %q, want successful sibling enforcement", got)
+			}
+			if !fixture.pip.static || !fixture.pip.present {
+				t.Fatal("successful pip enforcement was suppressed")
+			}
+			if len(reporter.reports) != 1 || reporter.reports[0].State != StateVerificationFailed || reporter.reports[0].AppliedHash != "" {
+				t.Fatalf("reports = %+v", reporter.reports)
+			}
+		})
+	}
+}
+
 func TestPyPICoordinator_PartialSuccessRetainsSiblingAndOmitsAppliedHash(t *testing.T) {
 	fixture := newCoordinatorFixture()
 	fixture.uv.writeErr = errors.New("uv failed")
