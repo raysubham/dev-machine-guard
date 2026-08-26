@@ -38,6 +38,16 @@ const TargetVSCode = "vscode"
 const (
 	CategoryPackageConfig = "package_config"
 	TargetNPM             = "npm"
+	TargetPyPI            = "pypi"
+)
+
+// PyPI component targets are local ownership identities beneath the public
+// package_config/pypi policy. They are never used for fetches or reports.
+const (
+	PyPICredentialOwnershipTarget = "pypi-credential"
+	PyPIPipOwnershipTarget        = "pypi-pip"
+	PyPIUVOwnershipTarget         = "pypi-uv"
+	PyPICredentialOwnershipValue  = "stepsecurity-pypi-credential"
 )
 
 // VerifyInput is the result set the verifier reasons over. It is intentionally

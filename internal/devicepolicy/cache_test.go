@@ -450,6 +450,37 @@ func TestAppliedTargetSingleValueRecordsOneEntry(t *testing.T) {
 	}
 }
 
+func TestPackageConfigPyPIComponentOwnershipRoundTrip(t *testing.T) {
+	restore := SetCachePathForTest(filepath.Join(t.TempDir(), CacheFilename))
+	defer restore()
+
+	components := []struct {
+		target string
+		value  string
+	}{
+		{PyPICredentialOwnershipTarget, PyPICredentialOwnershipValue},
+		{PyPIPipOwnershipTarget, "pip-settings"},
+		{PyPIUVOwnershipTarget, "uv-settings"},
+	}
+	for _, component := range components {
+		if err := WriteAppliedState(CategoryPackageConfig, component.target, AppliedTargetState{
+			AppliedHash:     "sha256:pypi",
+			WrittenSettings: map[string]string{"component": component.value},
+		}); err != nil {
+			t.Fatalf("write %s: %v", component.target, err)
+		}
+	}
+	for _, component := range components {
+		got, ok := ReadAppliedState(CategoryPackageConfig, component.target)
+		if !ok || got.WrittenSettings["component"] != component.value {
+			t.Fatalf("component %s = %+v ok=%v, want %q", component.target, got, ok, component.value)
+		}
+	}
+	if _, ok := ReadAppliedState(CategoryPackageConfig, TargetPyPI); ok {
+		t.Fatal("component ownership must not create a public pypi target record")
+	}
+}
+
 // TestAppliedTargetLegacyWrittenValueReadsAsUnowned pins the no-migrator
 // decision: a state file written before the collapse carries only the retired
 // written_value key, which decodes into no WrittenSettings entry — so the target

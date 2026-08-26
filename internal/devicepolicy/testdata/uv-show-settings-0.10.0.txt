@@ -1,0 +1,195 @@
+GlobalSettings {
+    required_version: None,
+    quiet: 0,
+    verbose: 0,
+    color: Auto,
+    network_settings: NetworkSettings {
+        connectivity: Online,
+        offline: Disabled,
+        native_tls: false,
+        http_proxy: None,
+        https_proxy: None,
+        no_proxy: None,
+        allow_insecure_host: [],
+        read_timeout: 30s,
+        connect_timeout: 10s,
+        retries: 3,
+    },
+    concurrency: Concurrency {
+        downloads: 50,
+        builds: 10,
+        installs: 10,
+    },
+    show_settings: true,
+    preview: Preview {
+        flags: [],
+    },
+    python_preference: Managed,
+    python_downloads: Automatic,
+    no_progress: false,
+    installer_metadata: true,
+}
+CacheSettings {
+    no_cache: false,
+    cache_dir: None,
+}
+PipInstallSettings {
+    package: [
+        "example-package",
+    ],
+    requirements: [],
+    editables: [],
+    constraints: [],
+    overrides: [],
+    excludes: [],
+    build_constraints: [],
+    dry_run: Disabled,
+    constraints_from_workspace: [],
+    overrides_from_workspace: [],
+    excludes_from_workspace: [],
+    build_constraints_from_workspace: [],
+    modifications: Sufficient,
+    refresh: None(
+        Timestamp(
+            SystemTime {
+                tv_sec: 1787723906,
+                tv_nsec: 742247000,
+            },
+        ),
+    ),
+    settings: PipSettings {
+        index_locations: IndexLocations {
+            indexes: [
+                Index {
+                    name: Some(
+                        IndexName(
+                            "step-security",
+                        ),
+                    ),
+                    url: Url(
+                        VerbatimUrl {
+                            url: DisplaySafeUrl {
+                                scheme: "https",
+                                cannot_be_a_base: false,
+                                username: "",
+                                password: None,
+                                host: Some(
+                                    Domain(
+                                        "registry.stepsecurity.io",
+                                    ),
+                                ),
+                                port: None,
+                                path: "/python/simple",
+                                query: None,
+                                fragment: None,
+                            },
+                            given: Some(
+                                "https://registry.stepsecurity.io/python/simple",
+                            ),
+                        },
+                    ),
+                    explicit: false,
+                    default: true,
+                    origin: None,
+                    format: Simple,
+                    publish_url: None,
+                    authenticate: Auto,
+                    ignore_error_codes: None,
+                    cache_control: None,
+                },
+            ],
+            flat_index: [],
+            no_index: false,
+        },
+        python: None,
+        install_mirrors: PythonInstallMirrors {
+            python_install_mirror: None,
+            pypy_install_mirror: None,
+            python_downloads_json_url: None,
+        },
+        system: false,
+        extras: ExtrasSpecification(
+            ExtrasSpecificationInner {
+                include: Some(
+                    [],
+                ),
+                exclude: [],
+                only_extras: false,
+                history: ExtrasSpecificationHistory {
+                    extra: [],
+                    only_extra: [],
+                    no_extra: [],
+                    all_extras: false,
+                    no_default_extras: false,
+                    defaults: List(
+                        [],
+                    ),
+                },
+            },
+        ),
+        groups: [],
+        break_system_packages: false,
+        target: None,
+        prefix: None,
+        index_strategy: FirstIndex,
+        keyring_provider: Disabled,
+        torch_backend: None,
+        build_isolation: Isolate,
+        extra_build_dependencies: ExtraBuildDependencies(
+            {},
+        ),
+        extra_build_variables: ExtraBuildVariables(
+            {},
+        ),
+        build_options: BuildOptions {
+            no_binary: None,
+            no_build: None,
+        },
+        allow_empty_requirements: false,
+        strict: false,
+        dependency_mode: Transitive,
+        resolution: Highest,
+        prerelease: IfNecessaryOrExplicit,
+        fork_strategy: RequiresPython,
+        dependency_metadata: DependencyMetadata(
+            {},
+        ),
+        output_file: None,
+        no_strip_extras: false,
+        no_strip_markers: false,
+        no_annotate: false,
+        no_header: false,
+        custom_compile_command: None,
+        generate_hashes: false,
+        config_setting: ConfigSettings(
+            {},
+        ),
+        config_settings_package: PackageConfigSettings(
+            {},
+        ),
+        python_version: None,
+        python_platform: None,
+        universal: false,
+        exclude_newer: ExcludeNewer {
+            global: None,
+            package: ExcludeNewerPackage(
+                {},
+            ),
+        },
+        no_emit_package: [],
+        emit_index_url: false,
+        emit_find_links: false,
+        emit_build_options: false,
+        emit_marker_expression: false,
+        emit_index_annotation: false,
+        annotation_style: Split,
+        link_mode: Clone,
+        compile_bytecode: false,
+        sources: None,
+        hash_checking: Some(
+            Verify,
+        ),
+        upgrade: None,
+        reinstall: None,
+    },
+}

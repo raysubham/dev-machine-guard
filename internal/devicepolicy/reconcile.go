@@ -37,6 +37,13 @@ type Reconciler struct {
 	Category   string // defaults to ide_extension
 	Target     string // defaults to vscode
 
+	// OwnershipTarget changes only the local state key. Reports still use Target.
+	OwnershipTarget string
+
+	// OwnershipStateValue replaces the rendered single-value ownership payload.
+	// Empty preserves existing IDE and npm behavior.
+	OwnershipStateValue string
+
 	// Probe reports whether a real MDM/admin-managed AllowedExtensions policy
 	// exists at this OS's policy location (registry / policy.json / managed
 	// preferences). Such a policy outranks user settings inside VS Code, so the
@@ -135,18 +142,20 @@ type Reconciler struct {
 // category and target, and takes a cross-process lock so two agent processes
 // reconciling different categories cannot drop each other's record. The
 // writeState/clearState test seams inject persist failures.
-func (r *Reconciler) readState(cat, tgt string) (AppliedTargetState, bool) {
-	return ReadAppliedState(cat, tgt)
+func (r *Reconciler) readState(cat string) (AppliedTargetState, bool) {
+	return ReadAppliedState(cat, r.stateTarget())
 }
 
-func (r *Reconciler) persistState(cat, tgt string, s AppliedTargetState) error {
+func (r *Reconciler) persistState(cat string, s AppliedTargetState) error {
+	tgt := r.stateTarget()
 	if r.writeState != nil {
 		return r.writeState(cat, tgt, s)
 	}
 	return WriteAppliedState(cat, tgt, s)
 }
 
-func (r *Reconciler) dropState(cat, tgt string) error {
+func (r *Reconciler) dropState(cat string) error {
+	tgt := r.stateTarget()
 	if r.clearState != nil {
 		return r.clearState(cat, tgt)
 	}
@@ -253,6 +262,20 @@ func (r *Reconciler) target() string {
 		return r.Target
 	}
 	return TargetVSCode
+}
+
+func (r *Reconciler) stateTarget() string {
+	if r.OwnershipTarget != "" {
+		return r.OwnershipTarget
+	}
+	return r.target()
+}
+
+func (r *Reconciler) stateValue(rendered string) string {
+	if r.OwnershipStateValue != "" {
+		return r.OwnershipStateValue
+	}
+	return rendered
 }
 
 func (r *Reconciler) probe() (bool, string) {
@@ -466,7 +489,7 @@ func (r *Reconciler) handleClear(cat, tgt string) error {
 		return r.handleClearByMarker(cat, tgt)
 	}
 
-	prev, hadPrev := r.readState(cat, tgt)
+	prev, hadPrev := r.readState(cat)
 	if mw, ok := r.Writer.(managedSettingsWriter); ok {
 		return r.clearManaged(cat, tgt, prev, hadPrev, mw)
 	}
@@ -540,7 +563,7 @@ func (r *Reconciler) clearManaged(cat, tgt string, prev AppliedTargetState, hadP
 // failed. An absent entry → no-op (idempotent).
 func (r *Reconciler) dropClearedState(cat, tgt string, hadPrev bool) error {
 	if hadPrev {
-		if err := r.dropState(cat, tgt); err != nil {
+		if err := r.dropState(cat); err != nil {
 			return fmt.Errorf("devicepolicy: clear: update state: %w", err)
 		}
 	}
@@ -566,7 +589,7 @@ func (r *Reconciler) handleClearByMarker(cat, tgt string) error {
 	} else {
 		r.logf("devicepolicy: clear requested but %s holds no managed block; nothing to remove", r.Writer.Location())
 	}
-	if err := r.dropState(cat, tgt); err != nil {
+	if err := r.dropState(cat); err != nil {
 		return fmt.Errorf("devicepolicy: clear: update state: %w", err)
 	}
 	return nil
@@ -662,7 +685,8 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 	ownKey := r.ownershipKey()
 
 	// 2. Read the current value.
-	prev, hadPrev := r.readState(cat, tgt)
+	prev, hadPrev := r.readState(cat)
+	prevWritten := prev.WrittenSettings[ownKey]
 	onDisk, present, err := r.Writer.Read()
 	if err != nil {
 		// Couldn't read to decide idempotency/drift. A structural refusal (the
@@ -686,8 +710,8 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 		_ = r.report(ctx, cat, tgt, state, "")
 		return fmt.Errorf("devicepolicy: enforce: convergence check %s: %w", r.Writer.Location(), cerr)
 	}
-	if converged && prev.AppliedHash == ep.Hash {
-		r.logf("devicepolicy: policy already applied (hash unchanged) — no write")
+	if converged && prev.AppliedHash == ep.Hash && (r.OwnershipStateValue == "" || prevWritten == r.stateValue(newValue)) {
+		r.logf("devicepolicy: policy already applied (hash unchanged) - no write")
 		return r.report(ctx, cat, tgt, StateCompliant, ep.Hash)
 	}
 
@@ -702,9 +726,9 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 	// cycle. Gated on the Converged seam so the settings.json path (body equality)
 	// is byte-identical to before.
 	if converged && r.Converged != nil {
-		if perr := r.persistState(cat, tgt, AppliedTargetState{
+		if perr := r.persistState(cat, AppliedTargetState{
 			AppliedHash:     ep.Hash,
-			WrittenSettings: map[string]string{ownKey: newValue},
+			WrittenSettings: map[string]string{ownKey: r.stateValue(newValue)},
 			FetchedAt:       r.now(),
 		}); perr != nil {
 			r.logf("devicepolicy: could not adopt already-converged state at %s: %v", r.Writer.Location(), perr)
@@ -717,8 +741,13 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 	// it (edited or removed — typically the user hand-editing settings.json).
 	// Enforcement means converging it back; the distinct state lets the
 	// backend surface that it happened.
-	prevWritten := prev.WrittenSettings[ownKey]
 	drifted := hadPrev && prevWritten != "" && (!present || onDisk != prevWritten)
+	if r.OwnershipStateValue != "" {
+		// A fixed marker proves ownership, not content equality. Under the same
+		// desired hash, failed target-specific convergence is drift; a new hash is
+		// a desired-policy transition.
+		drifted = hadPrev && prevWritten != "" && prev.AppliedHash == ep.Hash && !converged
+	}
 	if drifted {
 		r.logf("devicepolicy: %s diverged from the recorded written value → re-applying (drift)", r.Writer.Location())
 	}
@@ -731,7 +760,7 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 	if !hadPrev {
 		probe = AppliedTargetState{FetchedAt: r.now()}
 	}
-	if perr := r.persistState(cat, tgt, probe); perr != nil {
+	if perr := r.persistState(cat, probe); perr != nil {
 		_ = r.report(ctx, cat, tgt, StateWriteFailed, "")
 		return fmt.Errorf("devicepolicy: enforce: ownership state not writable, refusing to write policy: %w", perr)
 	}
@@ -746,14 +775,14 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 	}
 	readbackMatch := rb == newValue
 
-	// Ownership is recorded on EVERY successful write — it means "what the agent
-	// wrote", not "what it verified". On a readback mismatch the write may still
-	// have landed; without a record the next cycle would classify the agent's
-	// own value as drift forever. Value-based ownership self-corrects: the
-	// record only takes effect when the on-disk value actually equals it.
-	if err := r.persistState(cat, tgt, AppliedTargetState{
+	// Ownership is recorded on EVERY successful write. By default it records the
+	// rendered value; a fixed-state marker component records its non-secret
+	// identity instead and delegates exact content checks to Converged. On a
+	// readback mismatch the write may still have landed, so the record is retained
+	// for next-cycle recovery.
+	if err := r.persistState(cat, AppliedTargetState{
 		AppliedHash:     ep.Hash,
-		WrittenSettings: map[string]string{ownKey: newValue},
+		WrittenSettings: map[string]string{ownKey: r.stateValue(newValue)},
 		FetchedAt:       r.now(),
 	}); err != nil {
 		// The write happened but ownership couldn't be recorded — undo it so no
@@ -792,7 +821,7 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 // (a foreign or absent value is never deleted). No setting id is special-cased,
 // so a new managed key rides through with no change here.
 func (r *Reconciler) enforceManaged(ctx context.Context, cat, tgt string, ep EffectivePolicy, desired map[string]string, mw managedSettingsWriter) error {
-	prev, hadPrev := r.readState(cat, tgt)
+	prev, hadPrev := r.readState(cat)
 	owned := ownedKeys(prev, hadPrev)
 
 	// 1. Read every key this cycle may touch: the union of the settings map's keys
@@ -865,7 +894,7 @@ func (r *Reconciler) enforceManaged(ctx context.Context, cat, tgt string, ep Eff
 	if !hadPrev {
 		probe = AppliedTargetState{FetchedAt: r.now()}
 	}
-	if perr := r.persistState(cat, tgt, probe); perr != nil {
+	if perr := r.persistState(cat, probe); perr != nil {
 		_ = r.report(ctx, cat, tgt, StateWriteFailed, "")
 		return fmt.Errorf("devicepolicy: enforce: ownership state not writable, refusing to write policy: %w", perr)
 	}
@@ -901,7 +930,7 @@ func (r *Reconciler) enforceManaged(ctx context.Context, cat, tgt string, ep Eff
 	for key, v := range desired {
 		ownedAfter[key] = v
 	}
-	if err := r.persistState(cat, tgt, AppliedTargetState{
+	if err := r.persistState(cat, AppliedTargetState{
 		AppliedHash:     ep.Hash,
 		WrittenSettings: ownedAfter,
 		FetchedAt:       r.now(),

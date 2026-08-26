@@ -298,7 +298,7 @@ See [SCAN_COVERAGE.md](SCAN_COVERAGE.md) for the full catalog of supported detec
 
 ## Package Configs & Suspicious Files
 
-Beyond inventorying *what* is installed, Dev Machine Guard inspects *how* each machine is configured to pull packages, and *whether* any files associated with known attacks are present.
+Beyond inventorying _what_ is installed, Dev Machine Guard inspects _how_ each machine is configured to pull packages, and _whether_ any files associated with known attacks are present.
 
 ### Package-manager config auditing
 
@@ -309,6 +309,8 @@ Compromised packages most often reach a machine because that machine resolves di
 - **Authentication surface** — what credentials are configured against the registry.
 
 Configuration is read from `.npmrc` (npm), pnpm config, `bunfig.toml` (bun), `.yarnrc` / `.yarnrc.yml` (yarn classic and berry), and `pip.conf` (pip). In enterprise mode this rolls up into the **Package Configs** view in the dashboard, where you can spot machines that are unprotected or pointed at the wrong registry.
+
+Enterprise Device Policy can also set StepSecurity Secure Registry as the sole user-level Python index for pip and uv. It manages only the resolved developer's user configuration and shared StepSecurity `.netrc` entry, keeps pip and uv results independent, and restores owned settings on an explicit policy clear. Project files, virtual environments, system configuration, environment variables, direct URLs, and Poetry are not modified.
 
 ### Suspicious file detection
 

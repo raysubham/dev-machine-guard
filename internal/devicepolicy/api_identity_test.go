@@ -2,6 +2,7 @@ package devicepolicy
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -90,6 +91,52 @@ func TestFetchPackageConfigTargetRoundTrips(t *testing.T) {
 	}
 	if ep.Hash != "sha256:npm" || !ep.present() {
 		t.Fatalf("ep = %+v, want present with hash sha256:npm", ep)
+	}
+}
+
+func TestPackageConfigPyPIIdentityRoundTrip(t *testing.T) {
+	body := `{"policy":{"category":"package_config","target":"pypi","clear":false,` +
+		`"policy":{"ecosystem":"pypi"},"hash":"sha256:pypi","generated_at":"x"}}`
+	f := newPolicyFetchServer(t, CategoryPackageConfig, TargetPyPI, body)
+	ep, err := f.Fetch(context.Background(), "cust", "dev-1", CategoryPackageConfig, TargetPyPI)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if ep.Category != CategoryPackageConfig || ep.Target != TargetPyPI {
+		t.Fatalf("round-trip identity = %q/%q, want %q/%q",
+			ep.Category, ep.Target, CategoryPackageConfig, TargetPyPI)
+	}
+}
+
+func TestComplianceReportOmitsEmptyEvaluatedHash(t *testing.T) {
+	raw, err := json.Marshal(ComplianceReport{Category: CategoryPackageConfig, Target: TargetNPM})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fields["evaluated_hash"]; ok {
+		t.Fatalf("empty evaluated_hash must be omitted: %s", raw)
+	}
+}
+
+func TestComplianceReportIncludesEvaluatedHashWhenSet(t *testing.T) {
+	raw, err := json.Marshal(ComplianceReport{
+		Category:      CategoryPackageConfig,
+		Target:        TargetPyPI,
+		EvaluatedHash: "sha256:pypi",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(fields["evaluated_hash"]); got != `"sha256:pypi"` {
+		t.Fatalf("evaluated_hash = %s, want %q", got, "sha256:pypi")
 	}
 }
 

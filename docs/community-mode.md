@@ -91,7 +91,7 @@ HTML mode generates a self-contained HTML file with a styled report. The report 
 ## Options
 
 | Flag | Description |
-|------|-------------|
+| ------ | ------------- |
 | `--pretty` | Pretty terminal output (this is the default if no format is specified) |
 | `--json` | JSON output to stdout |
 | `--html FILE` | HTML report saved to FILE |
@@ -160,6 +160,18 @@ Runs the scan with all optional package scanning enabled.
 ```
 
 Generates an HTML report while showing progress messages without ANSI color codes (useful when piping stderr to a log file).
+
+---
+
+## Maintainer Offline Device Policy Validation
+
+The hidden `--device-policy-file PATH` flag runs one local `package_config/pypi` reconciliation for pip and uv, then exits. `STEPSECURITY_DEVICE_POLICY_FILE=PATH` is the equivalent environment variable; an explicit flag wins. This path does not require enterprise configuration, make network requests, upload telemetry, or run the community inventory scan. It prints one credential-free aggregate result to stdout.
+
+```bash
+./stepsecurity-dev-machine-guard --device-policy-file ./pypi-policy.json
+```
+
+The file must be the strict local policy envelope used by the Device Policy test plan. Use an explicit `clear:true` envelope to restore DMG-owned pip, uv, and credential settings; scheduler uninstall does not clear Device Policy state.
 
 ---
 

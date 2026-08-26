@@ -106,6 +106,10 @@ type Config struct {
 	// backend's process-uploaded sees after gunzip, so it doubles as a backend
 	// ingestion fixture. Zero production impact when unset.
 	TelemetryOutFile string
+
+	// DevicePolicyFile runs one offline package_config/pypi reconciliation from a
+	// strict local policy envelope. Dev-only and omitted from public help.
+	DevicePolicyFile string
 }
 
 // supportedHookAgents lists the agent names accepted by `hooks --agent <name>` and `_hook <agent> ...`.
@@ -316,6 +320,17 @@ func Parse(args []string) (*Config, error) {
 				return nil, fmt.Errorf("--telemetry-out requires a file path argument")
 			}
 			cfg.TelemetryOutFile = args[i]
+		case strings.HasPrefix(arg, "--device-policy-file="):
+			cfg.DevicePolicyFile = strings.TrimPrefix(arg, "--device-policy-file=")
+			if cfg.DevicePolicyFile == "" {
+				return nil, fmt.Errorf("--device-policy-file requires a non-empty file path argument")
+			}
+		case arg == "--device-policy-file":
+			i++
+			if i >= len(args) || strings.HasPrefix(args[i], "--") {
+				return nil, fmt.Errorf("--device-policy-file requires a file path argument")
+			}
+			cfg.DevicePolicyFile = args[i]
 		case strings.HasPrefix(arg, "--log-level="):
 			level := strings.ToLower(strings.TrimPrefix(arg, "--log-level="))
 			switch level {
@@ -361,6 +376,9 @@ func Parse(args []string) (*Config, error) {
 	}
 	if cfg.TelemetryOutFile == "" {
 		cfg.TelemetryOutFile = os.Getenv("STEPSECURITY_TELEMETRY_OUT")
+	}
+	if cfg.DevicePolicyFile == "" {
+		cfg.DevicePolicyFile = os.Getenv("STEPSECURITY_DEVICE_POLICY_FILE")
 	}
 
 	// --install-dir= (explicit empty) disables file logging by routing

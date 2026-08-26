@@ -120,3 +120,101 @@ func TestUserAwareExecutor_RunInDirQuotesDirAndArgs(t *testing.T) {
 		t.Errorf("stdout = %q, want {\"ok\":true}", stdout)
 	}
 }
+
+type userContextExecutor struct {
+	Executor
+	runAsUser func(context.Context, string, string) (string, error)
+}
+
+func (e *userContextExecutor) RunAsUser(ctx context.Context, username, command string) (string, error) {
+	return e.runAsUser(ctx, username, command)
+}
+
+func TestUserAwareExecutor_GetenvUsesAllowlistedUserSnapshot(t *testing.T) {
+	service := NewMock()
+	service.SetGOOS("linux")
+	service.SetEnv("XDG_CONFIG_HOME", "/service/xdg")
+	inner := &userContextExecutor{
+		Executor: service,
+		runAsUser: func(_ context.Context, _, command string) (string, error) {
+			if !strings.Contains(command, "XDG_CONFIG_HOME") || !strings.Contains(command, "UV_INDEX_URL") {
+				t.Fatalf("environment snapshot command = %q", command)
+			}
+			return "XDG_CONFIG_HOME=/home/alice/.xdg\x00PIP_EXTRA_INDEX_URL=https://pip-extra.example/simple\x00UV_INDEX_URL=https://user.example/simple\x00UV_NO_INDEX=true\x00", nil
+		},
+	}
+	exec := NewUserAwareExecutor(inner, "alice")
+	if got := exec.Getenv("XDG_CONFIG_HOME"); got != "/home/alice/.xdg" {
+		t.Fatalf("XDG_CONFIG_HOME = %q, want resolved user value", got)
+	}
+	if got := exec.Getenv("PIP_EXTRA_INDEX_URL"); got != "https://pip-extra.example/simple" {
+		t.Fatalf("PIP_EXTRA_INDEX_URL = %q, want resolved user value", got)
+	}
+	if got := exec.Getenv("UV_INDEX_URL"); got != "https://user.example/simple" {
+		t.Fatalf("UV_INDEX_URL = %q, want resolved user value", got)
+	}
+	if got := exec.Getenv("UV_NO_INDEX"); got != "true" {
+		t.Fatalf("UV_NO_INDEX = %q, want resolved user value", got)
+	}
+}
+
+func TestUserAwareExecutor_ReportsEnvironmentInspectionFailure(t *testing.T) {
+	service := NewMock()
+	service.SetGOOS("linux")
+	inner := &userContextExecutor{
+		Executor: service,
+		runAsUser: func(context.Context, string, string) (string, error) {
+			return "", context.DeadlineExceeded
+		},
+	}
+	exec := NewUserAwareExecutor(inner, "alice")
+	if got := exec.Getenv("PIP_CONFIG_FILE"); got != "" {
+		t.Fatalf("PIP_CONFIG_FILE = %q, want empty after failed inspection", got)
+	}
+	if err := UserEnvironmentError(exec); err == nil {
+		t.Fatal("UserEnvironmentError() = nil, want inspection failure")
+	}
+}
+
+func TestUserAwareExecutor_LookPathUsesCallerContext(t *testing.T) {
+	service := NewMock()
+	service.SetGOOS("linux")
+	calls := 0
+	inner := &userContextExecutor{
+		Executor: service,
+		runAsUser: func(ctx context.Context, _, _ string) (string, error) {
+			calls++
+			if ctx.Err() != context.Canceled {
+				t.Fatalf("RunAsUser context error = %v, want canceled", ctx.Err())
+			}
+			return "", ctx.Err()
+		},
+	}
+	exec := NewUserAwareExecutor(inner, "alice")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := LookPathWithContext(ctx, exec, "pip"); err == nil {
+		t.Fatal("LookPathWithContext() error = nil, want cancellation")
+	}
+	if calls != 0 {
+		t.Fatalf("RunAsUser calls = %d, want 0 after caller cancellation", calls)
+	}
+}
+
+func TestUserAwareExecutor_LookPathHasDeadline(t *testing.T) {
+	service := NewMock()
+	service.SetGOOS("linux")
+	inner := &userContextExecutor{
+		Executor: service,
+		runAsUser: func(ctx context.Context, _, _ string) (string, error) {
+			if _, ok := ctx.Deadline(); !ok {
+				t.Fatal("LookPath RunAsUser context has no deadline")
+			}
+			return "/usr/bin/uv", nil
+		},
+	}
+	exec := NewUserAwareExecutor(inner, "alice")
+	if _, err := exec.LookPath("uv"); err != nil {
+		t.Fatal(err)
+	}
+}
