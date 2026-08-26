@@ -214,14 +214,6 @@ func main() {
 	log.Debug("cli parsed: command=%q output_format=%q output_format_set=%v color=%s include_bundled=%v",
 		cfg.Command, cfg.OutputFormat, cfg.OutputFormatSet, cfg.ColorMode, cfg.IncludeBundledPlugins)
 
-	if handled, err := runOfflinePyPIIfConfigured(exec, log, cfg.DevicePolicyFile); handled {
-		if err != nil {
-			log.Error("%v", err)
-			os.Exit(1)
-		}
-		return
-	}
-
 	switch cfg.Command {
 	case "configure":
 		// Non-interactive path: any explicit config flag, an explicit
@@ -815,61 +807,6 @@ func runIDEExtensionEnforce(exec executor.Executor, log *progress.Logger) {
 		log.Warn("ide-extension enforce: %v", err)
 		aiagentscli.AppendError("devicepolicy", "enforce_failed", err.Error(), "")
 	}
-}
-
-type localComplianceReporter struct {
-	report *devicepolicy.ComplianceReport
-}
-
-func (r *localComplianceReporter) Report(_ context.Context, _, _ string, report devicepolicy.ComplianceReport) error {
-	r.report = &report
-	return nil
-}
-
-func runOfflinePyPIIfConfigured(exec executor.Executor, log *progress.Logger, policyFile string) (bool, error) {
-	if policyFile == "" {
-		return false, nil
-	}
-	return true, runOfflinePyPIEnforce(exec, log, policyFile)
-}
-
-func runOfflinePyPIEnforce(exec executor.Executor, log *progress.Logger, policyFile string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), devicePolicyEnforceTimeout)
-	defer cancel()
-
-	dev := device.Gather(ctx, exec)
-	if dev.SerialNumber == "" || dev.SerialNumber == "unknown" {
-		return fmt.Errorf("offline PyPI enforce: device serial unresolved")
-	}
-	fetcher, err := devicepolicy.NewFileFetcher(policyFile)
-	if err != nil {
-		return err
-	}
-	reporter := &localComplianceReporter{}
-	coordinator := &devicepolicy.PyPICoordinator{
-		Fetcher:  fetcher,
-		Reporter: reporter,
-		Exec:     exec,
-		DeviceID: dev.SerialNumber,
-		Platform: dev.Platform,
-		Logf:     func(format string, args ...any) { log.Debug(format, args...) },
-	}
-	if err := coordinator.Reconcile(ctx); err != nil {
-		return err
-	}
-	if reporter.report == nil {
-		reporter.report = &devicepolicy.ComplianceReport{
-			Category:     devicepolicy.CategoryPackageConfig,
-			Target:       devicepolicy.TargetPyPI,
-			State:        "cleared",
-			AgentVersion: devicepolicy.AgentVersion(),
-			Platform:     dev.Platform,
-		}
-	}
-	if err := scanJSONEncoder(os.Stdout).Encode(reporter.report); err != nil {
-		return fmt.Errorf("encoding offline PyPI result: %w", err)
-	}
-	return nil
 }
 
 // runPackageConfigEnforce runs npm and PyPI independently after resolving their

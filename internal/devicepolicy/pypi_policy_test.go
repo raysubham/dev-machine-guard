@@ -1,10 +1,7 @@
 package devicepolicy
 
 import (
-	"context"
 	"encoding/json"
-	"os"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -142,99 +139,6 @@ func TestParsePyPIPolicy_Rejections(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestFileFetcher_ParsesStrictLocalPolicy(t *testing.T) {
-	tests := []struct {
-		name    string
-		body    string
-		path    string
-		want    EffectivePolicy
-		wantErr bool
-	}{
-		{
-			name: "valid dmg",
-			body: `{"category":"package_config","target":"pypi","clear":false,"policy":{"ecosystem":"pypi"},"hash":"sha256:dmg","generated_at":"2026-08-26T00:00:00Z","enforcement":"dmg"}`,
-			want: EffectivePolicy{Category: CategoryPackageConfig, Target: TargetPyPI, Policy: []byte(`{"ecosystem":"pypi"}`), Hash: "sha256:dmg", GeneratedAt: "2026-08-26T00:00:00Z", Enforcement: "dmg"},
-		},
-		{
-			name: "valid mdm",
-			body: `{"category":"package_config","target":"pypi","clear":false,"policy":{"ecosystem":"pypi"},"hash":"sha256:mdm","enforcement":"mdm"}`,
-			want: EffectivePolicy{Category: CategoryPackageConfig, Target: TargetPyPI, Policy: []byte(`{"ecosystem":"pypi"}`), Hash: "sha256:mdm", Enforcement: "mdm"},
-		},
-		{
-			name: "valid clear",
-			body: `{"category":"package_config","target":"pypi","clear":true}`,
-			want: EffectivePolicy{Category: CategoryPackageConfig, Target: TargetPyPI, Clear: true},
-		},
-		{name: "wrong category", body: `{"category":"ide_extension","target":"pypi","clear":true}`, wantErr: true},
-		{name: "wrong target", body: `{"category":"package_config","target":"npm","clear":true}`, wantErr: true},
-		{name: "missing hash", body: `{"category":"package_config","target":"pypi","policy":{"ecosystem":"pypi"}}`, wantErr: true},
-		{name: "scalar policy", body: `{"category":"package_config","target":"pypi","policy":"pypi","hash":"sha256:x"}`, wantErr: true},
-		{name: "clear with policy", body: `{"category":"package_config","target":"pypi","clear":true,"policy":null}`, wantErr: true},
-		{name: "unknown field", body: `{"category":"package_config","target":"pypi","clear":true,"extra":true}`, wantErr: true},
-		{name: "duplicate key", body: `{"category":"package_config","category":"package_config","target":"pypi","clear":true}`, wantErr: true},
-		{name: "duplicate nested policy key", body: `{"category":"package_config","target":"pypi","policy":{"ecosystem":"pypi","ecosystem":"pypi"},"hash":"sha256:x"}`, wantErr: true},
-		{name: "trailing json", body: `{"category":"package_config","target":"pypi","clear":true} {}`, wantErr: true},
-		{name: "oversized file", path: "oversized", wantErr: true},
-		{name: "directory", path: "directory", wantErr: true},
-		{name: "nonexistent path", path: "missing", wantErr: true},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			policyPath := writeLocalPyPIPolicy(t, tc.body)
-			switch tc.path {
-			case "oversized":
-				policyPath = writeLocalPyPIPolicy(t, strings.Repeat("x", maxLocalPolicyBytes+1))
-			case "directory":
-				policyPath = t.TempDir()
-			case "missing":
-				policyPath = t.TempDir() + "/missing.json"
-			}
-
-			fetcher, err := NewFileFetcher(policyPath)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("NewFileFetcher() error = nil, want error")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("NewFileFetcher() error = %v", err)
-			}
-			if got := fetcher.policy; !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("NewFileFetcher() policy = %#v, want %#v", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestFileFetcher_RejectsWrongIdentity(t *testing.T) {
-	path := writeLocalPyPIPolicy(t, `{"category":"package_config","target":"pypi","policy":{"ecosystem":"pypi"},"hash":"sha256:x"}`)
-	fetcher, err := NewFileFetcher(path)
-	if err != nil {
-		t.Fatalf("NewFileFetcher() error = %v", err)
-	}
-
-	got, err := fetcher.Fetch(context.Background(), "customer", "device", CategoryPackageConfig, TargetPyPI)
-	if err != nil || !reflect.DeepEqual(got, fetcher.policy) {
-		t.Fatalf("Fetch() = %#v, %v; want %#v, nil", got, err, fetcher.policy)
-	}
-	for _, identity := range [][2]string{{CategoryPackageConfig, TargetNPM}, {CategoryIDEExtension, TargetVSCode}} {
-		if _, err := fetcher.Fetch(context.Background(), "customer", "device", identity[0], identity[1]); err == nil {
-			t.Errorf("Fetch(%q, %q) error = nil, want error", identity[0], identity[1])
-		}
-	}
-}
-
-func writeLocalPyPIPolicy(t *testing.T, body string) string {
-	t.Helper()
-	path := t.TempDir() + "/policy.json"
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatalf("WriteFile(%q): %v", path, err)
-	}
-	return path
 }
 
 func TestSafeObservedRegistryURL(t *testing.T) {

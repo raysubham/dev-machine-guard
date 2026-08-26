@@ -2,13 +2,11 @@ package devicepolicy
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/url"
-	"os"
 	"strings"
 )
 
@@ -146,118 +144,6 @@ func safeObservedRegistryURL(raw string) string {
 		return ""
 	}
 	return raw
-}
-
-const maxLocalPolicyBytes = 1 << 20
-
-type filePolicyEnvelope struct {
-	Category    string          `json:"category"`
-	Target      string          `json:"target"`
-	Clear       bool            `json:"clear"`
-	Policy      json.RawMessage `json:"policy,omitempty"`
-	Hash        string          `json:"hash,omitempty"`
-	GeneratedAt string          `json:"generated_at,omitempty"`
-	Enforcement string          `json:"enforcement,omitempty"`
-}
-
-// FileFetcher serves one validated offline PyPI policy without network access.
-type FileFetcher struct {
-	policy EffectivePolicy
-}
-
-// NewFileFetcher reads and validates one strict package_config/pypi envelope.
-func NewFileFetcher(path string) (*FileFetcher, error) {
-	pathInfo, err := os.Lstat(path)
-	if err != nil {
-		return nil, fmt.Errorf("devicepolicy: stat local policy: %w", err)
-	}
-	if !pathInfo.Mode().IsRegular() {
-		return nil, errors.New("devicepolicy: local policy is not a regular file")
-	}
-	if pathInfo.Size() > maxLocalPolicyBytes {
-		return nil, errors.New("devicepolicy: local policy exceeds size limit")
-	}
-
-	// #nosec G304 -- path is the operator-selected offline policy file, validated above as a bounded regular file.
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("devicepolicy: open local policy: %w", err)
-	}
-	defer file.Close()
-
-	info, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("devicepolicy: stat open local policy: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, errors.New("devicepolicy: open local policy is not a regular file")
-	}
-	if info.Size() > maxLocalPolicyBytes {
-		return nil, errors.New("devicepolicy: local policy exceeds size limit")
-	}
-
-	body, err := io.ReadAll(io.LimitReader(file, maxLocalPolicyBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("devicepolicy: read local policy: %w", err)
-	}
-	if len(body) > maxLocalPolicyBytes {
-		return nil, errors.New("devicepolicy: local policy exceeds size limit")
-	}
-
-	var env filePolicyEnvelope
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&env); err != nil {
-		return nil, fmt.Errorf("devicepolicy: decode local policy: %w", err)
-	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return nil, errors.New("devicepolicy: local policy has trailing JSON")
-		}
-		return nil, fmt.Errorf("devicepolicy: decode trailing local policy data: %w", err)
-	}
-	if err := rejectDuplicateJSONKeys(body); err != nil {
-		return nil, err
-	}
-
-	policy := EffectivePolicy{
-		Category:    strings.TrimSpace(env.Category),
-		Target:      strings.TrimSpace(env.Target),
-		Clear:       env.Clear,
-		Policy:      env.Policy,
-		Hash:        strings.TrimSpace(env.Hash),
-		GeneratedAt: env.GeneratedAt,
-		Enforcement: strings.TrimSpace(env.Enforcement),
-	}
-	if policy.Category != CategoryPackageConfig || policy.Target != TargetPyPI {
-		return nil, errors.New("devicepolicy: local policy must identify package_config/pypi")
-	}
-	if policy.Clear {
-		if len(policy.Policy) != 0 {
-			return nil, errors.New("devicepolicy: clear local policy must not include policy bytes")
-		}
-	} else {
-		if len(policy.Policy) == 0 || policy.Hash == "" {
-			return nil, errors.New("devicepolicy: local policy missing policy object or hash")
-		}
-		if !isJSONObject(policy.Policy) {
-			return nil, errors.New("devicepolicy: local policy is not a JSON object")
-		}
-	}
-
-	return &FileFetcher{policy: policy}, nil
-}
-
-// Fetch returns the offline policy only for its fixed public identity.
-func (f *FileFetcher) Fetch(_ context.Context, _, _, category, target string) (EffectivePolicy, error) {
-	if f == nil {
-		return EffectivePolicy{}, errors.New("devicepolicy: nil file fetcher")
-	}
-	if category != f.policy.Category || target != f.policy.Target {
-		return EffectivePolicy{}, errors.New("devicepolicy: file policy identity does not match request")
-	}
-	return f.policy, nil
 }
 
 func rejectDuplicateJSONKeys(body []byte) error {

@@ -1,11 +1,6 @@
 package cli
 
-import (
-	"io"
-	"os"
-	"strings"
-	"testing"
-)
+import "testing"
 
 func TestParse_RulesFileAndTelemetryOut(t *testing.T) {
 	cfg, err := Parse([]string{"send-telemetry", "--rules-file=/tmp/rules.json", "--telemetry-out=/tmp/out.json"})
@@ -59,81 +54,5 @@ func TestParse_FlagBeatsEnvVar(t *testing.T) {
 	}
 	if cfg.RulesFile != "/flag/rules.json" {
 		t.Errorf("explicit flag should win over env var, got %q", cfg.RulesFile)
-	}
-}
-
-func TestParse_DevicePolicyFileFlagForms(t *testing.T) {
-	t.Setenv("STEPSECURITY_DEVICE_POLICY_FILE", "")
-	tests := []struct {
-		name string
-		args []string
-		want string
-	}{
-		{"separate value", []string{"--device-policy-file", "/tmp/policy.json"}, "/tmp/policy.json"},
-		{"equals value", []string{"--device-policy-file=/tmp/policy.json"}, "/tmp/policy.json"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg, err := Parse(tc.args)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if cfg.DevicePolicyFile != tc.want {
-				t.Errorf("DevicePolicyFile = %q, want %q", cfg.DevicePolicyFile, tc.want)
-			}
-		})
-	}
-}
-
-func TestParse_DevicePolicyFileEnvFallbackAndFlagPrecedence(t *testing.T) {
-	t.Setenv("STEPSECURITY_DEVICE_POLICY_FILE", "/env/policy.json")
-	cfg, err := Parse(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.DevicePolicyFile != "/env/policy.json" {
-		t.Errorf("DevicePolicyFile = %q, want env fallback", cfg.DevicePolicyFile)
-	}
-
-	cfg, err = Parse([]string{"--device-policy-file=/flag/policy.json"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.DevicePolicyFile != "/flag/policy.json" {
-		t.Errorf("DevicePolicyFile = %q, want explicit flag", cfg.DevicePolicyFile)
-	}
-}
-
-func TestParse_DevicePolicyFileMissingValue(t *testing.T) {
-	t.Setenv("STEPSECURITY_DEVICE_POLICY_FILE", "/tmp/from-env.json")
-	for _, args := range [][]string{
-		{"--device-policy-file"},
-		{"--device-policy-file="},
-		{"--device-policy-file", "--json"},
-	} {
-		if _, err := Parse(args); err == nil {
-			t.Errorf("Parse(%v) error = nil, want invalid file path", args)
-		}
-	}
-}
-
-func TestParse_DevicePolicyFileHiddenFromHelp(t *testing.T) {
-	old := os.Stdout
-	file, err := os.CreateTemp(t.TempDir(), "help-*.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stdout = file
-	printHelp()
-	os.Stdout = old
-	if _, err := file.Seek(0, 0); err != nil {
-		t.Fatal(err)
-	}
-	body, err := io.ReadAll(file)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(body), "device-policy-file") {
-		t.Fatalf("hidden flag appeared in help:\n%s", body)
 	}
 }
