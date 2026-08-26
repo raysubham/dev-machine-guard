@@ -17,6 +17,27 @@ import (
 
 const netrcExpected = "machine registry.stepsecurity.io\nlogin step-security\npassword step_acme-1_uuid::dev:DEVICE-123"
 
+func TestNetrcMarkers_Canonical(t *testing.T) {
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"DMG begin", dmgNetrcBegin, "# BEGIN StepSecurity PyPI Secure Registry credential -- managed by dmg"},
+		{"DMG end", dmgNetrcEnd, "# END StepSecurity PyPI Secure Registry credential"},
+		{"MDM begin", mdmNetrcBegin, "# BEGIN StepSecurity PyPI Secure Registry credential -- managed by mdm"},
+		{"MDM end", mdmNetrcEnd, "# END StepSecurity PyPI Secure Registry credential"},
+		{"disabled prefix", dmgNetrcDisabledPrefix, "# [stepsecurity-pypi-credential-dmg] "},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Errorf("marker = %q, want %q", tc.got, tc.want)
+			}
+		})
+	}
+}
+
 func newNetrcTestWriter(t *testing.T, initial []byte) (*NetrcWriter, string) {
 	t.Helper()
 	t.Setenv("NETRC", "")

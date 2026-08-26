@@ -21,12 +21,12 @@ import (
 )
 
 const (
-	dmgUVBegin          = "# BEGIN StepSecurity PyPI Secure Registry uv - managed by dmg"
-	dmgUVEnd            = "# END StepSecurity PyPI Secure Registry uv - managed by dmg"
-	mdmUVBegin          = "# BEGIN StepSecurity PyPI Secure Registry uv - managed by mdm"
-	mdmUVEnd            = "# END StepSecurity PyPI Secure Registry uv - managed by mdm"
-	dmgUVDisabledPrefix = "# [stepsecurity-dmg-uv] "
-	dmgUVCreatedFile    = "# StepSecurity PyPI Secure Registry uv file created by dmg"
+	dmgUVBegin          = "# BEGIN StepSecurity PyPI Secure Registry uv -- managed by dmg"
+	dmgUVEnd            = "# END StepSecurity PyPI Secure Registry uv"
+	mdmUVBegin          = "# BEGIN StepSecurity PyPI Secure Registry uv -- managed by mdm"
+	mdmUVEnd            = "# END StepSecurity PyPI Secure Registry uv"
+	dmgUVDisabledPrefix = "# [stepsecurity-pypi-uv-dmg] "
+	dmgUVCreatedFile    = "# [stepsecurity-pypi-uv-dmg] created=true"
 	uvBackupPrefix      = ".dmg-"
 	uvProbePackage      = "stepsecurity-policy-probe"
 )
@@ -370,12 +370,9 @@ func scanUVMarkers(data []byte) (uvMarkers, error) {
 		switch strings.TrimSpace(line) {
 		case dmgUVBegin:
 			owner, begin = "dmg", true
-		case dmgUVEnd:
-			owner = "dmg"
 		case mdmUVBegin:
 			owner, begin = "mdm", true
-		case mdmUVEnd:
-			owner = "mdm"
+		case dmgUVEnd:
 		case dmgUVCreatedFile:
 			if !active || m.owner != "dmg" || m.created {
 				return m, fmt.Errorf("uv: misplaced or duplicated file marker: %w", ErrTargetUnusable)
@@ -385,13 +382,13 @@ func scanUVMarkers(data []byte) (uvMarkers, error) {
 		default:
 			continue
 		}
-		if m.owner == "" {
-			m.owner = owner
-		}
-		if owner != m.owner {
-			return m, fmt.Errorf("uv: crossed managed owners: %w", ErrTargetUnusable)
-		}
 		if begin {
+			if m.owner == "" {
+				m.owner = owner
+			}
+			if owner != m.owner {
+				return m, fmt.Errorf("uv: crossed managed owners: %w", ErrTargetUnusable)
+			}
 			if active || m.begin != 0 || m.end != 0 {
 				return m, fmt.Errorf("uv: nested or duplicated managed marker: %w", ErrTargetUnusable)
 			}

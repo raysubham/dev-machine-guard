@@ -14,13 +14,13 @@ import (
 )
 
 const (
-	dmgNetrcBegin = "# BEGIN StepSecurity PyPI Secure Registry credential - managed by dmg"
+	dmgNetrcBegin = "# BEGIN StepSecurity PyPI Secure Registry credential -- managed by dmg"
 	dmgNetrcEnd   = "# END StepSecurity PyPI Secure Registry credential"
 
-	mdmNetrcBegin = "# BEGIN StepSecurity PyPI Secure Registry credential - managed by mdm"
+	mdmNetrcBegin = "# BEGIN StepSecurity PyPI Secure Registry credential -- managed by mdm"
 	mdmNetrcEnd   = "# END StepSecurity PyPI Secure Registry credential"
 
-	dmgNetrcDisabledPrefix = "# [stepsecurity-pypi-dmg] "
+	dmgNetrcDisabledPrefix = "# [stepsecurity-pypi-credential-dmg] "
 	netrcBackupPrefix      = ".dmg-"
 )
 

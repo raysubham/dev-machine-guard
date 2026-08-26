@@ -16,6 +16,28 @@ import (
 
 const uvExpected = "index-strategy = \"first-index\"\n\n[[index]]\nname = \"stepsecurity\"\nurl = \"https://registry.stepsecurity.io/python/simple\"\ndefault = true\nauthenticate = \"always\""
 
+func TestUVMarkers_Canonical(t *testing.T) {
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"DMG begin", dmgUVBegin, "# BEGIN StepSecurity PyPI Secure Registry uv -- managed by dmg"},
+		{"DMG end", dmgUVEnd, "# END StepSecurity PyPI Secure Registry uv"},
+		{"MDM begin", mdmUVBegin, "# BEGIN StepSecurity PyPI Secure Registry uv -- managed by mdm"},
+		{"MDM end", mdmUVEnd, "# END StepSecurity PyPI Secure Registry uv"},
+		{"disabled prefix", dmgUVDisabledPrefix, "# [stepsecurity-pypi-uv-dmg] "},
+		{"created file", dmgUVCreatedFile, "# [stepsecurity-pypi-uv-dmg] created=true"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Errorf("marker = %q, want %q", tc.got, tc.want)
+			}
+		})
+	}
+}
+
 func newUVTestWriter(t *testing.T, initial []byte, version string) (*UVWriter, *executor.Mock, string) {
 	t.Helper()
 	homeDir := t.TempDir()
@@ -257,7 +279,7 @@ func TestUVWriter_RefusesMalformedAmbiguousAndMDMContent(t *testing.T) {
 		{"duplicate marker", dmgUVBegin + "\n" + dmgUVEnd + "\n" + dmgUVBegin + "\n" + dmgUVEnd + "\n"},
 		{"reversed marker", dmgUVEnd + "\n" + dmgUVBegin + "\n"},
 		{"nested marker", dmgUVBegin + "\n" + dmgUVBegin + "\n" + dmgUVEnd + "\n" + dmgUVEnd + "\n"},
-		{"crossed owner marker", dmgUVBegin + "\n" + mdmUVEnd + "\n"},
+		{"mixed owner markers", dmgUVBegin + "\n" + mdmUVBegin + "\n" + dmgUVEnd + "\n"},
 		{"incomplete marker", dmgUVBegin + "\nindex-strategy = \"first-index\"\n"},
 		{"overlapping multiline conflict", "index-strategy = \"\"\"first-index\ncontinued\"\"\"\n"},
 		{"MDM marker", mdmUVBegin + "\nindex-strategy = \"first-index\"\n" + mdmUVEnd + "\n"},

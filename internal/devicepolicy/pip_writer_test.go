@@ -14,6 +14,27 @@ import (
 
 const pipExpected = "index-url = https://registry.stepsecurity.io/python/simple\nno-index = false"
 
+func TestPipMarkers_Canonical(t *testing.T) {
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"DMG begin", dmgPipBegin, "# BEGIN StepSecurity PyPI Secure Registry pip -- managed by dmg"},
+		{"DMG end", dmgPipEnd, "# END StepSecurity PyPI Secure Registry pip"},
+		{"MDM begin", mdmPipBegin, "# BEGIN StepSecurity PyPI Secure Registry pip -- managed by mdm"},
+		{"MDM end", mdmPipEnd, "# END StepSecurity PyPI Secure Registry pip"},
+		{"disabled prefix", dmgPipDisabledPrefix, "# [stepsecurity-pypi-pip-dmg] "},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Errorf("marker = %q, want %q", tc.got, tc.want)
+			}
+		})
+	}
+}
+
 func newPipTestWriter(t *testing.T, initial []byte) (*PipWriter, *executor.Mock, string) {
 	t.Helper()
 	homeDir := t.TempDir()
