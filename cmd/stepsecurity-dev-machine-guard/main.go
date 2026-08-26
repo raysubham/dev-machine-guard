@@ -839,22 +839,22 @@ func runPackageConfigEnforce(exec executor.Executor, log *progress.Logger) {
 }
 
 func runPackageConfigLanes(exec executor.Executor, log *progress.Logger, fetcher devicepolicy.Fetcher, reporter devicepolicy.Reporter, customerID, serial, platform string) {
-	lanes := []struct {
-		name string
-		run  func(context.Context, executor.Executor, *progress.Logger, devicepolicy.Fetcher, devicepolicy.Reporter, string, string, string) error
-	}{
-		{"npm", runNPMPackageConfigLane},
-		{"PyPI", runPyPIPackageConfigLane},
+	npmCtx, npmCancel := context.WithTimeout(context.Background(), devicePolicyEnforceTimeout)
+	npmErr := runNPMPackageConfigLane(npmCtx, exec, log, fetcher, reporter, customerID, serial, platform)
+	npmCancel()
+	if npmErr != nil {
+		wrapped := fmt.Errorf("npm package-config enforce: %w", npmErr)
+		log.Warn("%v", wrapped)
+		aiagentscli.AppendError("devicepolicy", "enforce_failed", wrapped.Error(), "")
 	}
-	for _, lane := range lanes {
-		ctx, cancel := context.WithTimeout(context.Background(), devicePolicyEnforceTimeout)
-		err := lane.run(ctx, exec, log, fetcher, reporter, customerID, serial, platform)
-		cancel()
-		if err != nil {
-			wrapped := fmt.Errorf("%s package-config enforce: %w", lane.name, err)
-			log.Warn("%v", wrapped)
-			aiagentscli.AppendError("devicepolicy", "enforce_failed", wrapped.Error(), "")
-		}
+
+	pypiCtx, pypiCancel := context.WithTimeout(context.Background(), devicePolicyEnforceTimeout)
+	pypiErr := runPyPIPackageConfigLane(pypiCtx, exec, log, fetcher, reporter, customerID, serial, platform)
+	pypiCancel()
+	if pypiErr != nil {
+		wrapped := fmt.Errorf("PyPI package-config enforce: %w", pypiErr)
+		log.Warn("%v", wrapped)
+		aiagentscli.AppendError("devicepolicy", "enforce_failed", wrapped.Error(), "")
 	}
 }
 
