@@ -35,6 +35,7 @@ func newSecureTestHomeAs(t *testing.T, home, username string) *secureuserfile.Ho
 	}
 	u.HomeDir = home
 	u.Username = username
+	normalizeSecureTestUser(t, u)
 	h, err := secureuserfile.OpenUserHome(secureTestExecutor{Executor: executor.NewReal(), user: u})
 	if err != nil {
 		t.Fatalf("OpenUserHome: %v", err)
