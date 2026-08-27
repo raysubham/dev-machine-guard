@@ -393,6 +393,28 @@ func TestNetrcWriter_RejectsAmbiguousOrMalformedInput(t *testing.T) {
 	}
 }
 
+func TestScanNetrcMarkers_RejectsDisabledRecordInsideOrAfterManagedBlock(t *testing.T) {
+	encoded := base64.RawURLEncoding.EncodeToString([]byte("machine registry.stepsecurity.io login old password old-secret\n"))
+	dmgRecord := dmgNetrcDisabledPrefix + encoded
+	mdmRecord := mdmNetrcDisabledPrefix + encoded
+	tests := []struct {
+		name string
+		data string
+	}{
+		{"DMG record inside block", dmgNetrcBegin + "\n" + dmgRecord + "\n" + netrcExpected + "\n" + dmgNetrcEnd + "\n"},
+		{"DMG record after block", dmgNetrcBegin + "\n" + netrcExpected + "\n" + dmgNetrcEnd + "\n" + dmgRecord + "\n"},
+		{"MDM record inside block", mdmNetrcBegin + "\n" + mdmRecord + "\n" + netrcExpected + "\n" + mdmNetrcEnd + "\n"},
+		{"MDM record after block", mdmNetrcBegin + "\n" + netrcExpected + "\n" + mdmNetrcEnd + "\n" + mdmRecord + "\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := scanNetrcMarkers([]byte(tc.data)); !errors.Is(err, ErrTargetUnusable) {
+				t.Fatalf("scanNetrcMarkers error = %v, want ErrTargetUnusable", err)
+			}
+		})
+	}
+}
+
 func TestNetrcWriter_RejectsInvalidEncodedOwnershipWithoutMutation(t *testing.T) {
 	encode := func(data string) string {
 		return base64.RawURLEncoding.EncodeToString([]byte(data))
