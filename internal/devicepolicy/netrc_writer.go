@@ -394,9 +394,14 @@ type netrcAnalysis struct {
 type netrcMarkers struct {
 	dmg         *netrcManagedBlock
 	mdmBlock    *netrcManagedBlock
-	dmgDisabled []byte
-	mdmDisabled []byte
+	dmgDisabled *netrcDisabledEntry
+	mdmDisabled *netrcDisabledEntry
 	mdm         bool
+}
+
+type netrcDisabledEntry struct {
+	line    netrcLine
+	decoded []byte
 }
 
 type netrcManagedBlock struct {
@@ -417,9 +422,9 @@ func analyzeNetrc(data []byte, host string) (netrcAnalysis, error) {
 	if err != nil {
 		return netrcAnalysis{}, err
 	}
-	for _, disabled := range [][]byte{markers.dmgDisabled, markers.mdmDisabled} {
-		if len(disabled) != 0 {
-			if err := validateNetrcDisabledEntry(disabled, host); err != nil {
+	for _, disabled := range []*netrcDisabledEntry{markers.dmgDisabled, markers.mdmDisabled} {
+		if disabled != nil {
+			if err := validateNetrcDisabledEntry(disabled.decoded, host); err != nil {
 				return netrcAnalysis{}, err
 			}
 		}
@@ -628,7 +633,7 @@ func scanNetrcMarkers(data []byte) (netrcMarkers, error) {
 	}
 	lines := splitNetrcLines(rest)
 	var begins, ends, mdmBegins, mdmCreated []netrcLine
-	var dmgDisabled, mdmDisabled [][]byte
+	var dmgDisabled, mdmDisabled []netrcDisabledEntry
 	for _, line := range lines {
 		raw := string(rest[line.start:line.contentEnd])
 		text := strings.TrimSpace(raw)
@@ -661,7 +666,7 @@ func scanNetrcMarkers(data []byte) (netrcMarkers, error) {
 			if err != nil {
 				return netrcMarkers{}, err
 			}
-			dmgDisabled = append(dmgDisabled, decoded)
+			dmgDisabled = append(dmgDisabled, netrcDisabledEntry{line: line, decoded: decoded})
 		case strings.HasPrefix(text, mdmNetrcDisabledPrefix):
 			if raw != text {
 				return netrcMarkers{}, fmt.Errorf("netrc: disabled credential entry contains whitespace: %w", ErrTargetUnusable)
@@ -670,7 +675,7 @@ func scanNetrcMarkers(data []byte) (netrcMarkers, error) {
 			if err != nil {
 				return netrcMarkers{}, err
 			}
-			mdmDisabled = append(mdmDisabled, decoded)
+			mdmDisabled = append(mdmDisabled, netrcDisabledEntry{line: line, decoded: decoded})
 		}
 	}
 	if len(begins) > 1 || len(mdmBegins) > 1 || len(ends) > 1 || len(mdmCreated) > 1 || len(dmgDisabled) > 1 || len(mdmDisabled) > 1 ||
@@ -684,24 +689,26 @@ func scanNetrcMarkers(data []byte) (netrcMarkers, error) {
 		return netrcMarkers{}, nil
 	}
 	if len(begins) == 1 {
-		if len(ends) != 1 || begins[0].start >= ends[0].start || len(mdmCreated) != 0 || len(mdmDisabled) != 0 {
+		if len(ends) != 1 || begins[0].start >= ends[0].start || len(mdmCreated) != 0 || len(mdmDisabled) != 0 ||
+			(len(dmgDisabled) == 1 && dmgDisabled[0].line.start >= begins[0].start) {
 			return netrcMarkers{}, fmt.Errorf("netrc: malformed or crossed-lane managed ownership: %w", ErrTargetUnusable)
 		}
 		block, err := netrcMarkerBlock(rest, begins[0], ends[0])
 		markers := netrcMarkers{dmg: block}
 		if len(dmgDisabled) == 1 {
-			markers.dmgDisabled = dmgDisabled[0]
+			markers.dmgDisabled = &dmgDisabled[0]
 		}
 		return markers, err
 	}
 	if len(ends) != 1 || mdmBegins[0].start >= ends[0].start || len(dmgDisabled) != 0 ||
+		(len(mdmDisabled) == 1 && mdmDisabled[0].line.start >= mdmBegins[0].start) ||
 		(len(mdmCreated) == 1 && (mdmCreated[0].start <= mdmBegins[0].start || mdmCreated[0].start >= ends[0].start)) {
 		return netrcMarkers{}, fmt.Errorf("netrc: malformed or crossed-lane managed ownership: %w", ErrTargetUnusable)
 	}
 	block, err := netrcMarkerBlock(rest, mdmBegins[0], ends[0])
 	markers := netrcMarkers{mdm: true, mdmBlock: block}
 	if len(mdmDisabled) == 1 {
-		markers.mdmDisabled = mdmDisabled[0]
+		markers.mdmDisabled = &mdmDisabled[0]
 	}
 	return markers, err
 }
