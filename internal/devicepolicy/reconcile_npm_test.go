@@ -154,6 +154,9 @@ func TestNPMEnforceRendersBlockAndWrites(t *testing.T) {
 	if got.AppliedHash != "sha256:N" {
 		t.Fatalf("applied_hash = %q, want sha256:N", got.AppliedHash)
 	}
+	if got.EvaluatedHash != "sha256:N" {
+		t.Fatalf("evaluated_hash = %q, want sha256:N", got.EvaluatedHash)
+	}
 	// Ownership recorded in the one shared state file, under this category/target.
 	if st.writes == 0 {
 		t.Fatal("ownership must be recorded in the state file")
@@ -373,7 +376,7 @@ func TestNPMClearByMarkerAlwaysClearsAndDrops(t *testing.T) {
 				st.seed(t, CategoryPackageConfig, TargetNPM, *tc.seed)
 			}
 			w := &fakeWriter{value: "a-managed-block", present: true}
-			ep := EffectivePolicy{Category: CategoryPackageConfig, Target: TargetNPM, Clear: true}
+			ep := EffectivePolicy{Category: CategoryPackageConfig, Target: TargetNPM, Clear: true, Hash: "sha256:CLEAR"}
 			r, rep := newNPMRec(t, ep, w, st)
 			if err := r.Reconcile(context.Background()); err != nil {
 				t.Fatalf("Reconcile: %v", err)
@@ -464,8 +467,12 @@ func TestNPMWriteErrorClassification(t *testing.T) {
 			if len(w.writes) != 1 {
 				t.Fatalf("Write should have been attempted once, got %v", w.writes)
 			}
-			if got := lastReport(t, rep); got.State != tc.state {
+			got := lastReport(t, rep)
+			if got.State != tc.state {
 				t.Fatalf("state = %q, want %q", got.State, tc.state)
+			}
+			if got.EvaluatedHash != "sha256:N" {
+				t.Fatalf("evaluated_hash = %q, want sha256:N", got.EvaluatedHash)
 			}
 		})
 	}
@@ -520,8 +527,32 @@ func TestNPMWriterInitErrClassification(t *testing.T) {
 					t.Fatalf("report[%d] identity = %q/%q, want package_config/npm",
 						i, rep.reports[i].Category, rep.reports[i].Target)
 				}
+				if rep.reports[i].EvaluatedHash != tc.ep.Hash {
+					t.Fatalf("report[%d] evaluated_hash = %q, want %q", i, rep.reports[i].EvaluatedHash, tc.ep.Hash)
+				}
 			}
 		})
+	}
+}
+
+func TestNPMAbsentPolicyDoesNotReport(t *testing.T) {
+	r, rep := newNPMRec(t, EffectivePolicy{}, &fakeWriter{}, newNPMStore(t))
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(rep.reports) != 0 {
+		t.Fatalf("absent policy must not report, got %+v", rep.reports)
+	}
+}
+
+func TestNPMFetchFailureDoesNotReport(t *testing.T) {
+	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), &fakeWriter{}, newNPMStore(t))
+	r.Fetcher = &fakeFetcher{err: errors.New("fetch failed")}
+	if err := r.Reconcile(context.Background()); err == nil {
+		t.Fatal("fetch failure must surface")
+	}
+	if len(rep.reports) != 0 {
+		t.Fatalf("fetch failure must not report, got %+v", rep.reports)
 	}
 }
 
@@ -693,6 +724,9 @@ func TestNPMMDMChannelVerifiesAndNeverWrites(t *testing.T) {
 	// The agent applied nothing, so it must claim nothing.
 	if rec.AppliedHash != "" {
 		t.Fatalf("applied_hash = %q, want empty in mdm mode", rec.AppliedHash)
+	}
+	if rec.EvaluatedHash != "sha256:N" {
+		t.Fatalf("evaluated_hash = %q, want sha256:N", rec.EvaluatedHash)
 	}
 	var observed map[string]json.RawMessage
 	if err := json.Unmarshal(rec.Observed, &observed); err != nil {
@@ -889,8 +923,12 @@ func TestIDEMDMChannelKeepsItsDefaultProbe(t *testing.T) {
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if got := lastReport(t, rep).State; got != StatePolicyNotApplied && got != StateMDMManaged {
-		t.Fatalf("state = %q, want the OS probe's verdict (policy_not_applied or mdm_managed), not an error", got)
+	got := lastReport(t, rep)
+	if got.State != StatePolicyNotApplied && got.State != StateMDMManaged {
+		t.Fatalf("state = %q, want the OS probe's verdict (policy_not_applied or mdm_managed), not an error", got.State)
+	}
+	if got.EvaluatedHash != "" {
+		t.Fatalf("evaluated_hash = %q, want empty for ide_extension", got.EvaluatedHash)
 	}
 }
 

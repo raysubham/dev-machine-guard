@@ -136,6 +136,8 @@ type Reconciler struct {
 	// "dmg"). Stamped onto every report as EvaluatedEnforcement so it matches the
 	// backend's exact-match gate. Per-cycle scratch.
 	enforcement string
+	// evaluatedHash is the active npm policy hash fetched for this cycle.
+	evaluatedHash string
 }
 
 // readState / persistState / dropState are every category's access to the one
@@ -339,6 +341,7 @@ func (r *Reconciler) ownershipKey() string {
 //   - policy result → probe → ownership/drift-checked write + readback +
 //     verify + report (handleEnforce).
 func (r *Reconciler) Reconcile(ctx context.Context) error {
+	r.evaluatedHash = ""
 	if r.Fetcher == nil {
 		return errors.New("devicepolicy: nil fetcher")
 	}
@@ -349,6 +352,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	if err != nil {
 		// Malformed/transient: do nothing. The on-disk policy (if any) stands.
 		return fmt.Errorf("devicepolicy: fetch: %w", err)
+	}
+	if cat == CategoryPackageConfig && tgt == TargetNPM && ep.present() && !ep.Clear {
+		r.evaluatedHash = ep.Hash
 	}
 	// Resolve the requested channel to the canonical one this cycle actually
 	// runs, and stamp THAT on every report as EvaluatedEnforcement: the backend
@@ -1085,9 +1091,13 @@ func (r *Reconciler) report(ctx context.Context, cat, tgt, state, appliedHash st
 }
 
 // sendReport stamps the shared fields (agent version, platform,
-// EvaluatedEnforcement) and submits. Callers fill Category/Target/State and the
-// lane-specific field: AppliedHash for the write path, Observed for MDM.
+// EvaluatedEnforcement, and npm's fetched EvaluatedHash) and submits. Callers
+// fill Category/Target/State and the lane-specific field: AppliedHash for the
+// write path, Observed for MDM.
 func (r *Reconciler) sendReport(ctx context.Context, rep ComplianceReport) error {
+	if rep.EvaluatedHash == "" {
+		rep.EvaluatedHash = r.evaluatedHash
+	}
 	rep.AgentVersion = AgentVersion()
 	rep.Platform = r.Platform
 	rep.EvaluatedEnforcement = r.enforcement
