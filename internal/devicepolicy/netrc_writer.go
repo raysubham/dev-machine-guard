@@ -2,6 +2,7 @@ package devicepolicy
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -14,13 +15,15 @@ import (
 )
 
 const (
-	dmgNetrcBegin = "# BEGIN StepSecurity PyPI Secure Registry credential -- managed by dmg"
-	dmgNetrcEnd   = "# END StepSecurity PyPI Secure Registry credential"
+	dmgNetrcBegin = "#stepsecurity-pypi-credential-dmg-begin"
+	dmgNetrcEnd   = "#stepsecurity-pypi-credential-end"
 
-	mdmNetrcBegin = "# BEGIN StepSecurity PyPI Secure Registry credential -- managed by mdm"
-	mdmNetrcEnd   = "# END StepSecurity PyPI Secure Registry credential"
+	mdmNetrcBegin = "#stepsecurity-pypi-credential-mdm-begin"
+	mdmNetrcEnd   = "#stepsecurity-pypi-credential-end"
 
-	dmgNetrcDisabledPrefix = "# [stepsecurity-pypi-credential-dmg] "
+	dmgNetrcDisabledPrefix = "#stepsecurity-pypi-credential-dmg-disabled:"
+	mdmNetrcDisabledPrefix = "#stepsecurity-pypi-credential-mdm-disabled:"
+	mdmNetrcCreated        = "#stepsecurity-pypi-credential-mdm-created"
 	netrcBackupPrefix      = ".dmg-"
 )
 
@@ -174,7 +177,7 @@ func (w *NetrcWriter) Clear() (bool, error) {
 		}
 		analysis := netrcAnalysis{existed: existed}
 		if existed {
-			analysis, err = analyzeNetrc(data)
+			analysis, err = analyzeNetrc(data, w.host)
 			if err != nil {
 				return false, err
 			}
@@ -212,7 +215,7 @@ func (w *NetrcWriter) Clear() (bool, error) {
 		return false, purge()
 	}
 	target := candidates[owned]
-	next, changed, err := clearNetrc(target.analysis.data)
+	next, changed, err := clearNetrc(target.analysis.data, w.host)
 	if err != nil || !changed {
 		return false, err
 	}
@@ -319,11 +322,11 @@ func (w *NetrcWriter) HasMDMMarker() (bool, error) {
 		if !existed {
 			continue
 		}
-		markers, err := scanNetrcMarkers(data)
+		analysis, err := analyzeNetrc(data, w.host)
 		if err != nil {
 			return false, err
 		}
-		if markers.mdm {
+		if analysis.markers.mdm {
 			return true, nil
 		}
 	}
@@ -356,7 +359,7 @@ func (w *NetrcWriter) checkAlternateConflict() error {
 	if err != nil || !existed {
 		return err
 	}
-	analysis, err := analyzeNetrc(data)
+	analysis, err := analyzeNetrc(data, w.host)
 	if err != nil {
 		return err
 	}
@@ -374,7 +377,7 @@ func (w *NetrcWriter) readSelected() (netrcAnalysis, error) {
 	if err != nil || !existed {
 		return netrcAnalysis{existed: existed}, err
 	}
-	analysis, err := analyzeNetrc(data)
+	analysis, err := analyzeNetrc(data, w.host)
 	analysis.existed = true
 	return analysis, err
 }
@@ -389,9 +392,11 @@ type netrcAnalysis struct {
 }
 
 type netrcMarkers struct {
-	dmg      *netrcManagedBlock
-	mdmBlock *netrcManagedBlock
-	mdm      bool
+	dmg         *netrcManagedBlock
+	mdmBlock    *netrcManagedBlock
+	dmgDisabled []byte
+	mdmDisabled []byte
+	mdm         bool
 }
 
 type netrcManagedBlock struct {
@@ -407,10 +412,17 @@ type netrcEntry struct {
 	isDefault                  bool
 }
 
-func analyzeNetrc(data []byte) (netrcAnalysis, error) {
+func analyzeNetrc(data []byte, host string) (netrcAnalysis, error) {
 	markers, err := scanNetrcMarkers(data)
 	if err != nil {
 		return netrcAnalysis{}, err
+	}
+	for _, disabled := range [][]byte{markers.dmgDisabled, markers.mdmDisabled} {
+		if len(disabled) != 0 {
+			if err := validateNetrcDisabledEntry(disabled, host); err != nil {
+				return netrcAnalysis{}, err
+			}
+		}
 	}
 	rest, _ := stripBOM(data)
 	entries, err := parseNetrc(rest)
@@ -444,7 +456,7 @@ func entryMatches(entry netrcEntry, host, login, password string) bool {
 }
 
 func rewriteNetrc(data []byte, host, expected string) ([]byte, error) {
-	analysis, err := analyzeNetrc(data)
+	analysis, err := analyzeNetrc(data, host)
 	if err != nil {
 		return nil, err
 	}
@@ -468,7 +480,7 @@ func rewriteNetrc(data []byte, host, expected string) ([]byte, error) {
 		if entry.end <= entry.startLine || len(bytes.TrimSpace(rest[entry.startLine:entry.startToken])) != 0 {
 			return nil, fmt.Errorf("netrc: exact-host entry shares a line with another entry: %w", ErrTargetUnusable)
 		}
-		rest = prefixNetrcLines(rest, entry.startLine, entry.end)
+		rest = encodeNetrcEntry(rest, entry.startLine, entry.end)
 	}
 
 	newline := netrcNewline(data)
@@ -488,8 +500,8 @@ func rewriteNetrc(data []byte, host, expected string) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-func clearNetrc(data []byte) ([]byte, bool, error) {
-	analysis, err := analyzeNetrc(data)
+func clearNetrc(data []byte, host string) ([]byte, bool, error) {
+	analysis, err := analyzeNetrc(data, host)
 	if err != nil {
 		return nil, false, err
 	}
@@ -499,8 +511,11 @@ func clearNetrc(data []byte) ([]byte, bool, error) {
 		rest = append(append([]byte(nil), rest[:analysis.markers.dmg.start]...), rest[analysis.markers.dmg.end:]...)
 		changed = true
 	}
-	restored, unprefixed := unprefixNetrcLines(rest)
-	changed = changed || unprefixed
+	restored, decoded, err := decodeNetrcEntries(rest, dmgNetrcDisabledPrefix)
+	if err != nil {
+		return nil, false, err
+	}
+	changed = changed || decoded
 	if !changed {
 		return data, false, nil
 	}
@@ -510,40 +525,77 @@ func clearNetrc(data []byte) ([]byte, bool, error) {
 	return append(append([]byte(nil), bom...), restored...), true, nil
 }
 
-func prefixNetrcLines(data []byte, start, end int) []byte {
-	var out bytes.Buffer
-	out.Grow(len(data) + (bytes.Count(data[start:end], []byte("\n"))+1)*len(dmgNetrcDisabledPrefix))
-	out.Write(data[:start])
-	for pos := start; pos < end; {
-		lineEnd := bytes.IndexByte(data[pos:end], '\n')
-		if lineEnd < 0 {
-			lineEnd = end - pos
-		} else {
-			lineEnd++
-		}
-		out.WriteString(dmgNetrcDisabledPrefix)
-		out.Write(data[pos : pos+lineEnd])
-		pos += lineEnd
+func encodeNetrcEntry(data []byte, start, end int) []byte {
+	entry := data[start:end]
+	var terminator []byte
+	switch {
+	case bytes.HasSuffix(entry, []byte("\r\n")):
+		terminator = []byte("\r\n")
+	case bytes.HasSuffix(entry, []byte("\n")):
+		terminator = []byte("\n")
 	}
-	out.Write(data[end:])
-	return out.Bytes()
+	encoded := base64.RawURLEncoding.EncodeToString(entry)
+	out := make([]byte, 0, len(data)-len(entry)+len(dmgNetrcDisabledPrefix)+len(encoded)+len(terminator))
+	out = append(out, data[:start]...)
+	out = append(out, dmgNetrcDisabledPrefix...)
+	out = append(out, encoded...)
+	out = append(out, terminator...)
+	out = append(out, data[end:]...)
+	return out
 }
 
-func unprefixNetrcLines(data []byte) ([]byte, bool) {
+func decodeNetrcEntries(data []byte, prefix string) ([]byte, bool, error) {
 	lines := splitNetrcLines(data)
 	var out bytes.Buffer
 	changed := false
 	for _, line := range lines {
 		content := data[line.start:line.contentEnd]
-		if bytes.HasPrefix(content, []byte(dmgNetrcDisabledPrefix)) {
-			out.Write(content[len(dmgNetrcDisabledPrefix):])
-			out.Write(data[line.contentEnd:line.end])
-			changed = true
-		} else {
+		if !bytes.HasPrefix(content, []byte(prefix)) {
 			out.Write(data[line.start:line.end])
+			continue
+		}
+		decoded, err := decodeNetrcDisabledEntry(string(content[len(prefix):]))
+		if err != nil {
+			return nil, false, err
+		}
+		out.Write(decoded)
+		changed = true
+	}
+	return out.Bytes(), changed, nil
+}
+
+func decodeNetrcDisabledEntry(encoded string) ([]byte, error) {
+	if encoded == "" || base64.RawURLEncoding.DecodedLen(len(encoded)) > secureuserfile.MaxBytes {
+		return nil, fmt.Errorf("netrc: invalid disabled credential entry size: %w", ErrTargetUnusable)
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(encoded)
+	if err != nil || base64.RawURLEncoding.EncodeToString(decoded) != encoded {
+		return nil, fmt.Errorf("netrc: malformed disabled credential entry: %w", ErrTargetUnusable)
+	}
+	return decoded, nil
+}
+
+func validateNetrcDisabledEntry(data []byte, host string) error {
+	if len(data) > secureuserfile.MaxBytes || hasNetrcOwnershipLine(data) {
+		return fmt.Errorf("netrc: invalid disabled credential entry: %w", ErrTargetUnusable)
+	}
+	entries, err := parseNetrc(data)
+	if err != nil || len(entries) != 1 || entries[0].isDefault || entries[0].host != host ||
+		entries[0].startLine != 0 || entries[0].end != len(data) {
+		return fmt.Errorf("netrc: disabled credential entry is not one exact-host entry: %w", ErrTargetUnusable)
+	}
+	return nil
+}
+
+func hasNetrcOwnershipLine(data []byte) bool {
+	for _, line := range splitNetrcLines(data) {
+		text := strings.TrimSpace(string(data[line.start:line.contentEnd]))
+		if text == dmgNetrcBegin || text == mdmNetrcBegin || text == dmgNetrcEnd || text == mdmNetrcCreated ||
+			strings.HasPrefix(text, dmgNetrcDisabledPrefix) || strings.HasPrefix(text, mdmNetrcDisabledPrefix) {
+			return true
 		}
 	}
-	return out.Bytes(), changed
+	return false
 }
 
 type netrcLine struct {
@@ -575,36 +627,83 @@ func scanNetrcMarkers(data []byte) (netrcMarkers, error) {
 		return netrcMarkers{}, fmt.Errorf("netrc: invalid text encoding or line endings: %w", ErrTargetUnusable)
 	}
 	lines := splitNetrcLines(rest)
-	var begins, ends, mdmBegins []netrcLine
+	var begins, ends, mdmBegins, mdmCreated []netrcLine
+	var dmgDisabled, mdmDisabled [][]byte
 	for _, line := range lines {
-		text := strings.TrimSpace(string(rest[line.start:line.contentEnd]))
-		switch text {
-		case dmgNetrcBegin:
+		raw := string(rest[line.start:line.contentEnd])
+		text := strings.TrimSpace(raw)
+		switch {
+		case text == dmgNetrcBegin:
+			if raw != text {
+				return netrcMarkers{}, fmt.Errorf("netrc: managed marker contains whitespace: %w", ErrTargetUnusable)
+			}
 			begins = append(begins, line)
-		case dmgNetrcEnd:
+		case text == dmgNetrcEnd:
+			if raw != text {
+				return netrcMarkers{}, fmt.Errorf("netrc: managed marker contains whitespace: %w", ErrTargetUnusable)
+			}
 			ends = append(ends, line)
-		case mdmNetrcBegin:
+		case text == mdmNetrcBegin:
+			if raw != text {
+				return netrcMarkers{}, fmt.Errorf("netrc: managed marker contains whitespace: %w", ErrTargetUnusable)
+			}
 			mdmBegins = append(mdmBegins, line)
+		case text == mdmNetrcCreated:
+			if raw != text {
+				return netrcMarkers{}, fmt.Errorf("netrc: created marker contains whitespace: %w", ErrTargetUnusable)
+			}
+			mdmCreated = append(mdmCreated, line)
+		case strings.HasPrefix(text, dmgNetrcDisabledPrefix):
+			if raw != text {
+				return netrcMarkers{}, fmt.Errorf("netrc: disabled credential entry contains whitespace: %w", ErrTargetUnusable)
+			}
+			decoded, err := decodeNetrcDisabledEntry(strings.TrimPrefix(text, dmgNetrcDisabledPrefix))
+			if err != nil {
+				return netrcMarkers{}, err
+			}
+			dmgDisabled = append(dmgDisabled, decoded)
+		case strings.HasPrefix(text, mdmNetrcDisabledPrefix):
+			if raw != text {
+				return netrcMarkers{}, fmt.Errorf("netrc: disabled credential entry contains whitespace: %w", ErrTargetUnusable)
+			}
+			decoded, err := decodeNetrcDisabledEntry(strings.TrimPrefix(text, mdmNetrcDisabledPrefix))
+			if err != nil {
+				return netrcMarkers{}, err
+			}
+			mdmDisabled = append(mdmDisabled, decoded)
 		}
 	}
-	if len(mdmBegins) > 1 || (len(mdmBegins) == 1 && len(begins) != 0) {
-		return netrcMarkers{}, fmt.Errorf("netrc: duplicate or conflicting managed markers: %w", ErrTargetUnusable)
+	if len(begins) > 1 || len(mdmBegins) > 1 || len(ends) > 1 || len(mdmCreated) > 1 || len(dmgDisabled) > 1 || len(mdmDisabled) > 1 ||
+		(len(begins) != 0 && len(mdmBegins) != 0) || (len(dmgDisabled) != 0 && len(mdmDisabled) != 0) {
+		return netrcMarkers{}, fmt.Errorf("netrc: duplicate or conflicting managed ownership: %w", ErrTargetUnusable)
 	}
-	if len(begins) == 0 {
-		if len(ends) == 0 {
-			return netrcMarkers{}, nil
+	if len(begins) == 0 && len(mdmBegins) == 0 {
+		if len(ends) != 0 || len(mdmCreated) != 0 || len(dmgDisabled) != 0 || len(mdmDisabled) != 0 {
+			return netrcMarkers{}, fmt.Errorf("netrc: orphaned managed ownership: %w", ErrTargetUnusable)
 		}
-		if len(mdmBegins) != 1 || len(ends) != 1 || mdmBegins[0].start >= ends[0].start {
-			return netrcMarkers{}, fmt.Errorf("netrc: malformed managed markers: %w", ErrTargetUnusable)
+		return netrcMarkers{}, nil
+	}
+	if len(begins) == 1 {
+		if len(ends) != 1 || begins[0].start >= ends[0].start || len(mdmCreated) != 0 || len(mdmDisabled) != 0 {
+			return netrcMarkers{}, fmt.Errorf("netrc: malformed or crossed-lane managed ownership: %w", ErrTargetUnusable)
 		}
-		block, err := netrcMarkerBlock(rest, mdmBegins[0], ends[0])
-		return netrcMarkers{mdm: true, mdmBlock: block}, err
+		block, err := netrcMarkerBlock(rest, begins[0], ends[0])
+		markers := netrcMarkers{dmg: block}
+		if len(dmgDisabled) == 1 {
+			markers.dmgDisabled = dmgDisabled[0]
+		}
+		return markers, err
 	}
-	if len(begins) != 1 || len(ends) != 1 || begins[0].start >= ends[0].start {
-		return netrcMarkers{}, fmt.Errorf("netrc: duplicate or malformed managed markers: %w", ErrTargetUnusable)
+	if len(ends) != 1 || mdmBegins[0].start >= ends[0].start || len(dmgDisabled) != 0 ||
+		(len(mdmCreated) == 1 && (mdmCreated[0].start <= mdmBegins[0].start || mdmCreated[0].start >= ends[0].start)) {
+		return netrcMarkers{}, fmt.Errorf("netrc: malformed or crossed-lane managed ownership: %w", ErrTargetUnusable)
 	}
-	block, err := netrcMarkerBlock(rest, begins[0], ends[0])
-	return netrcMarkers{dmg: block}, err
+	block, err := netrcMarkerBlock(rest, mdmBegins[0], ends[0])
+	markers := netrcMarkers{mdm: true, mdmBlock: block}
+	if len(mdmDisabled) == 1 {
+		markers.mdmDisabled = mdmDisabled[0]
+	}
+	return markers, err
 }
 
 func netrcMarkerBlock(data []byte, begin, end netrcLine) (*netrcManagedBlock, error) {

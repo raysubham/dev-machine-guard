@@ -3,6 +3,7 @@ package devicepolicy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -23,16 +24,64 @@ func TestNetrcMarkers_Canonical(t *testing.T) {
 		got  string
 		want string
 	}{
-		{"DMG begin", dmgNetrcBegin, "# BEGIN StepSecurity PyPI Secure Registry credential -- managed by dmg"},
-		{"DMG end", dmgNetrcEnd, "# END StepSecurity PyPI Secure Registry credential"},
-		{"MDM begin", mdmNetrcBegin, "# BEGIN StepSecurity PyPI Secure Registry credential -- managed by mdm"},
-		{"MDM end", mdmNetrcEnd, "# END StepSecurity PyPI Secure Registry credential"},
-		{"disabled prefix", dmgNetrcDisabledPrefix, "# [stepsecurity-pypi-credential-dmg] "},
+		{"DMG begin", dmgNetrcBegin, "#stepsecurity-pypi-credential-dmg-begin"},
+		{"DMG end", dmgNetrcEnd, "#stepsecurity-pypi-credential-end"},
+		{"MDM begin", mdmNetrcBegin, "#stepsecurity-pypi-credential-mdm-begin"},
+		{"MDM end", mdmNetrcEnd, "#stepsecurity-pypi-credential-end"},
+		{"DMG disabled prefix", dmgNetrcDisabledPrefix, "#stepsecurity-pypi-credential-dmg-disabled:"},
+		{"MDM disabled prefix", mdmNetrcDisabledPrefix, "#stepsecurity-pypi-credential-mdm-disabled:"},
+		{"MDM created", mdmNetrcCreated, "#stepsecurity-pypi-credential-mdm-created"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.got != tc.want {
 				t.Errorf("marker = %q, want %q", tc.got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNetrcWriter_CredentialOwnershipLinesAreSingleTokens(t *testing.T) {
+	tests := []struct {
+		name      string
+		initial   string
+		wantLines int
+	}{
+		{
+			name:      "ordinary entry before managed block",
+			initial:   "machine other.example login user password secret\n",
+			wantLines: 2,
+		},
+		{
+			name:      "displaced exact-host entry",
+			initial:   "machine registry.stepsecurity.io login old password old-secret\nmachine other.example login user password secret\n",
+			wantLines: 3,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w, path := newNetrcTestWriter(t, []byte(tc.initial))
+			if _, err := w.Write(netrcExpected); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			content, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ownershipLines []string
+			for _, line := range strings.Split(string(content), "\n") {
+				line = strings.TrimSuffix(line, "\r")
+				if strings.HasPrefix(line, "#") && strings.Contains(strings.ToLower(line), "credential") {
+					ownershipLines = append(ownershipLines, line)
+				}
+			}
+			if len(ownershipLines) != tc.wantLines {
+				t.Fatalf("credential ownership lines = %q, want %d", ownershipLines, tc.wantLines)
+			}
+			for _, line := range ownershipLines {
+				if !strings.HasPrefix(line, "#stepsecurity-pypi-credential") || strings.ContainsAny(line, " \t\r") {
+					t.Errorf("credential ownership line %q is not one whitespace-free token", line)
+				}
 			}
 		})
 	}
@@ -117,21 +166,33 @@ func TestNetrcWriter_MigratesOneExactHostReversibly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range []string{
-		"machine registry.stepsecurity.io",
-		"  login old-user",
-		"  account old-account",
-		"  password old-secret",
-	} {
-		if !strings.Contains(string(content), dmgNetrcDisabledPrefix+line) {
-			t.Errorf("migration did not reversibly comment %q:\n%s", line, content)
+	displaced := "machine registry.stepsecurity.io\n  login old-user\n  account old-account\n  password old-secret\n"
+	var encoded string
+	for _, line := range strings.Split(string(content), "\n") {
+		if strings.HasPrefix(line, dmgNetrcDisabledPrefix) {
+			encoded = strings.TrimPrefix(line, dmgNetrcDisabledPrefix)
+			break
 		}
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("disabled ownership record is not canonical base64url: %v", err)
+	}
+	if string(decoded) != displaced {
+		t.Fatalf("disabled ownership record decodes to %q, want exact %q", decoded, displaced)
 	}
 	if !strings.Contains(string(content), "machine other.example login other password other-secret") {
 		t.Fatalf("unrelated host was not preserved:\n%s", content)
 	}
 	if _, err := w.Write(netrcExpected); err != nil {
 		t.Fatalf("idempotent Write: %v", err)
+	}
+	content, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(content), dmgNetrcDisabledPrefix); got != 1 {
+		t.Fatalf("disabled ownership records after idempotent write = %d, want 1", got)
 	}
 	if changed, err := w.Clear(); err != nil || !changed {
 		t.Fatalf("Clear = %v, %v, want changed", changed, err)
@@ -141,6 +202,82 @@ func TestNetrcWriter_MigratesOneExactHostReversibly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(restored) != string(initial) {
+		t.Fatalf("clear restored %q, want exact original %q", restored, initial)
+	}
+}
+
+func TestNetrcWriter_EncodedEntryRoundTripsExactBytes(t *testing.T) {
+	tests := []struct {
+		name    string
+		initial []byte
+	}{
+		{"LF one-line final newline", []byte("machine registry.stepsecurity.io login old password secret\n")},
+		{"CRLF multiline", []byte("machine registry.stepsecurity.io\r\n\tlogin old\r\n\tpassword secret\r\n")},
+		{"UTF-8 BOM and indentation", append([]byte{0xef, 0xbb, 0xbf}, []byte("  machine registry.stepsecurity.io login old password secret\n")...)},
+		{"no final newline", []byte("machine registry.stepsecurity.io login old password secret")},
+		{"surrounding entries", []byte("# before\nmachine first.example login one password one\nmachine registry.stepsecurity.io\n login old\n password secret\nmachine last.example login last password last\n# after\n")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w, path := newNetrcTestWriter(t, tc.initial)
+			if _, err := w.Write(netrcExpected); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			content, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Count(string(content), dmgNetrcDisabledPrefix); got != 1 {
+				t.Fatalf("disabled ownership records = %d, want 1", got)
+			}
+			if changed, err := w.Clear(); err != nil || !changed {
+				t.Fatalf("Clear = %v, %v, want changed", changed, err)
+			}
+			restored, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(restored, tc.initial) {
+				t.Fatalf("clear restored %q, want exact original %q", restored, tc.initial)
+			}
+		})
+	}
+}
+
+func TestNetrcWriter_KeyRotationRetainsOneEncodedEntry(t *testing.T) {
+	initial := []byte("machine registry.stepsecurity.io login old password secret\n")
+	w, path := newNetrcTestWriter(t, initial)
+	if _, err := w.Write(netrcExpected); err != nil {
+		t.Fatalf("initial Write: %v", err)
+	}
+	rotatedPolicy, err := ParsePyPIPolicy(json.RawMessage(`{"ecosystem":"pypi","clients":["pip","uv"],"registry_url":"https://registry.stepsecurity.io/python/simple","auth":{"scheme":"stepsecurity_device_token","api_key":"step_rotated"}}`), "DEVICE-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := NewNetrcWriter(newSecureTestHome(t, filepath.Dir(path)), rotatedPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated.lookupEnv = os.Getenv
+	rotatedExpected := renderNetrcEntry(rotatedPolicy.RegistryHost(), rotatedPolicy.DeviceToken())
+	if _, err := rotated.Write(rotatedExpected); err != nil {
+		t.Fatalf("rotated Write: %v", err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(content), dmgNetrcDisabledPrefix); got != 1 {
+		t.Fatalf("disabled ownership records after rotation = %d, want 1", got)
+	}
+	if changed, err := rotated.Clear(); err != nil || !changed {
+		t.Fatalf("Clear = %v, %v, want changed", changed, err)
+	}
+	restored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(restored, initial) {
 		t.Fatalf("clear restored %q, want exact original %q", restored, initial)
 	}
 }
@@ -253,6 +390,66 @@ func TestNetrcWriter_RejectsAmbiguousOrMalformedInput(t *testing.T) {
 				t.Fatalf("refused write changed file: before=%q after=%q", before, after)
 			}
 		})
+	}
+}
+
+func TestNetrcWriter_RejectsInvalidEncodedOwnershipWithoutMutation(t *testing.T) {
+	encode := func(data string) string {
+		return base64.RawURLEncoding.EncodeToString([]byte(data))
+	}
+	exact := "machine registry.stepsecurity.io login old password old-secret\n"
+	valid := encode(exact)
+	block := func(record string) string {
+		return record + "\n" + dmgNetrcBegin + "\n" + netrcExpected + "\n" + dmgNetrcEnd + "\n"
+	}
+	tests := []struct {
+		name    string
+		initial string
+	}{
+		{"malformed base64url", block(dmgNetrcDisabledPrefix + "%%%")},
+		{"padded base64url", block(dmgNetrcDisabledPrefix + valid + "=")},
+		{"duplicate records", block(dmgNetrcDisabledPrefix + valid + "\n" + dmgNetrcDisabledPrefix + valid)},
+		{"wrong-lane record", block(mdmNetrcDisabledPrefix + valid)},
+		{"wrong-lane created marker", block(mdmNetrcCreated)},
+		{"orphan record", dmgNetrcDisabledPrefix + valid + "\nmachine other.example login user password secret\n"},
+		{"leading record whitespace", block(" " + dmgNetrcDisabledPrefix + valid)},
+		{"trailing record whitespace", block(dmgNetrcDisabledPrefix + valid + " ")},
+		{"leading marker whitespace", dmgNetrcDisabledPrefix + valid + "\n " + dmgNetrcBegin + "\n" + netrcExpected + "\n" + dmgNetrcEnd + "\n"},
+		{"decoded invalid UTF-8", block(dmgNetrcDisabledPrefix + base64.RawURLEncoding.EncodeToString([]byte{0xff}))},
+		{"decoded NUL", block(dmgNetrcDisabledPrefix + base64.RawURLEncoding.EncodeToString([]byte("machine registry.stepsecurity.io login u password p\x00")))},
+		{"decoded lone carriage return", block(dmgNetrcDisabledPrefix + encode("machine registry.stepsecurity.io\rlogin u password p"))},
+		{"decoded wrong host", block(dmgNetrcDisabledPrefix + encode("machine other.example login u password p\n"))},
+		{"decoded default entry", block(dmgNetrcDisabledPrefix + encode("default login u password p\n"))},
+		{"decoded multiple entries", block(dmgNetrcDisabledPrefix + encode("machine registry.stepsecurity.io login u password p\nmachine other.example login u password p\n"))},
+		{"decoded hidden MDM ownership", block(dmgNetrcDisabledPrefix + encode(exact+mdmNetrcCreated+"\n"))},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w, path := newNetrcTestWriter(t, []byte(tc.initial))
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Clear(); err == nil {
+				t.Fatal("Clear error = nil, want fail-closed refusal")
+			} else if strings.Contains(err.Error(), "old-secret") {
+				t.Fatalf("Clear error leaked displaced credential material: %v", err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatalf("refused clear changed file: before=%q after=%q", before, after)
+			}
+		})
+	}
+}
+
+func TestDecodeNetrcEntries_RejectsOversizedDecodedContent(t *testing.T) {
+	payload := base64.RawURLEncoding.EncodeToString(make([]byte, secureuserfile.MaxBytes+1))
+	if _, _, err := decodeNetrcEntries([]byte(dmgNetrcDisabledPrefix+payload), dmgNetrcDisabledPrefix); err == nil {
+		t.Fatal("decodeNetrcEntries error = nil, want oversized refusal")
 	}
 }
 
@@ -477,6 +674,23 @@ func TestNetrcWriter_MDMOwnershipRequiresExactHostInsideBlock(t *testing.T) {
 				t.Fatal("MDMOwned = true, want false")
 			}
 		})
+	}
+}
+
+func TestNetrcWriter_AcceptsValidMDMEncodedOwnership(t *testing.T) {
+	displaced := []byte("machine registry.stepsecurity.io login old password old-secret\n")
+	encoded := base64.RawURLEncoding.EncodeToString(displaced)
+	initial := []byte(mdmNetrcDisabledPrefix + encoded + "\n" + mdmNetrcBegin + "\n" + mdmNetrcCreated + "\n" + netrcExpected + "\n" + mdmNetrcEnd + "\n")
+	w, _ := newNetrcTestWriter(t, initial)
+	hardenSecureTestFile(t, w.file)
+	if present, err := w.HasMDMMarker(); err != nil || !present {
+		t.Fatalf("HasMDMMarker = %v, %v, want true", present, err)
+	}
+	if owned, err := w.MDMOwned(); err != nil || !owned {
+		t.Fatalf("MDMOwned = %v, %v, want true", owned, err)
+	}
+	if status, err := w.Observation(netrcExpected); err != nil || status != authTokenMatch {
+		t.Fatalf("Observation = %q, %v, want match", status, err)
 	}
 }
 
