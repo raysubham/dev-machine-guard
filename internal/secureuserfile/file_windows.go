@@ -16,6 +16,9 @@ import (
 
 const enforcePOSIXMetadata = false
 
+// FILE_ALL_ACCESS from WinNT.h; x/sys/windows does not export it.
+const windowsFileAllAccess windows.ACCESS_MASK = 0x001F01FF
+
 func nonblockOpenFlag() int { return 0 }
 
 func secureUserIDs(u *user.User) (int, int, error) {
@@ -50,8 +53,8 @@ func applySecureMetadata(h *Home, f *os.File, _ os.FileMode, directory bool) err
 		inheritance = windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT
 	}
 	entries := []windows.EXPLICIT_ACCESS{
-		secureExplicitAccess(targetSID, windows.GENERIC_ALL, inheritance, windows.TRUSTEE_IS_USER),
-		secureExplicitAccess(systemSID, windows.GENERIC_ALL, inheritance, windows.TRUSTEE_IS_WELL_KNOWN_GROUP),
+		secureExplicitAccess(targetSID, windowsFileAllAccess, inheritance, windows.TRUSTEE_IS_USER),
+		secureExplicitAccess(systemSID, windowsFileAllAccess, inheritance, windows.TRUSTEE_IS_WELL_KNOWN_GROUP),
 	}
 	acl, err := windows.ACLFromEntries(entries, nil)
 	if err != nil {
@@ -130,7 +133,7 @@ func (windowsOwnerReader) secure(f *os.File, h *Home, _ os.FileMode) (bool, erro
 		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags&windows.INHERITED_ACE != 0 {
 			return false, nil
 		}
-		if ace.Mask != windows.GENERIC_ALL {
+		if ace.Mask != windowsFileAllAccess {
 			return false, nil
 		}
 		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
