@@ -7,12 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/secureuserfile"
 )
 
@@ -509,6 +512,63 @@ func TestNetrcWriter_ObservationUsesExactTokenAndNETRCOverride(t *testing.T) {
 	t.Setenv("NETRC", w.Location())
 	if status, err := w.Observation(netrcExpected); err != nil || status != authTokenMatch {
 		t.Fatalf("exact NETRC Observation = %q, %v, want match", status, err)
+	}
+}
+
+func TestNetrcWriter_NETRCOverrideRefusesWriteWithoutMutation(t *testing.T) {
+	w, path := newNetrcTestWriter(t, nil)
+	before := []byte("machine other.example login user password value\n")
+	if err := os.WriteFile(path, before, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NETRC", filepath.Join(t.TempDir(), "alternate.netrc"))
+
+	if _, err := w.Write(w.expected); err == nil {
+		t.Fatal("Write succeeded with an alternate NETRC path")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("default netrc changed: %q", after)
+	}
+}
+
+func TestNetrcWriter_NETRCRelativeDefaultPathIsEquivalent(t *testing.T) {
+	w, _ := newNetrcTestWriter(t, nil)
+	t.Chdir(filepath.Dir(w.Location()))
+	t.Setenv("NETRC", filepath.Base(w.Location()))
+	if err := w.ValidateEffectivePath(); err != nil {
+		t.Fatalf("ValidateEffectivePath: %v", err)
+	}
+}
+
+func TestNetrcWriter_UsesResolvedPlatformForWindowsAlternate(t *testing.T) {
+	homeDir := t.TempDir()
+	underscore := filepath.Join(homeDir, "_netrc")
+	if err := os.WriteFile(underscore, []byte("machine other.example login u password p\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	u, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.HomeDir = homeDir
+	normalizeSecureTestUser(t, u)
+	mock := executor.NewMock()
+	mock.SetGOOS(model.PlatformWindows)
+	home, err := secureuserfile.OpenUserHome(secureTestExecutor{Executor: mock, user: u})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer home.Close()
+	w, err := NewNetrcWriter(home, netrcTestPolicy(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Location() != underscore {
+		t.Fatalf("Location = %q, want Windows alternate %q", w.Location(), underscore)
 	}
 }
 

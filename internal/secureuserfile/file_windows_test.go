@@ -135,6 +135,112 @@ func TestSecureUserFile_CreatedParentsHaveRestrictedACL(t *testing.T) {
 	assertWindowsOwner(t, file.Location(), targetSID)
 }
 
+func TestSecureUserFile_RepairsOnlyPreexistingManagedParentACL(t *testing.T) {
+	home := t.TempDir()
+	ancestor := filepath.Join(home, "AppData", "Roaming")
+	parent := filepath.Join(ancestor, "pip")
+	if err := os.MkdirAll(parent, ParentMode); err != nil {
+		t.Fatal(err)
+	}
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.HomeDir = home
+	normalizeSecureTestUser(t, current)
+	h, err := openHome(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	targetSID, err := windows.StringToSid(current.Uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	systemSID, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	everyoneSID, err := windows.CreateWellKnownSid(windows.WinWorldSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{
+		secureExplicitAccess(targetSID, windows.GENERIC_ALL, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT, windows.TRUSTEE_IS_USER),
+		secureExplicitAccess(systemSID, windows.GENERIC_ALL, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT, windows.TRUSTEE_IS_WELL_KNOWN_GROUP),
+		secureExplicitAccess(everyoneSID, windows.GENERIC_READ, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT, windows.TRUSTEE_IS_WELL_KNOWN_GROUP),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{ancestor, parent} {
+		if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.UNPROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := h.EnsureParent(filepath.Join("AppData", "Roaming", "pip", "pip.ini")); err != nil {
+		t.Fatalf("EnsureParent: %v", err)
+	}
+	ancestorFile, err := os.Open(ancestor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secure, err := h.MetadataSecure(ancestorFile, ParentMode)
+	_ = ancestorFile.Close()
+	if err != nil || secure {
+		t.Fatalf("ancestor metadata = %v, %v, want unchanged broad ACL", secure, err)
+	}
+	file, err := os.Open(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secure, err = h.MetadataSecure(file, ParentMode)
+	_ = file.Close()
+	if err != nil || !secure {
+		t.Fatalf("upgraded parent metadata = %v, %v, want secure", secure, err)
+	}
+}
+
+func TestSecureUserFile_RejectsWeakExpectedPrincipalACL(t *testing.T) {
+	home := t.TempDir()
+	h := newSecureTestHome(t, home)
+	file := openSecureTestFile(t, h, "config")
+	if err := file.Commit([]byte("managed\n"), FileMode); err != nil {
+		t.Fatal(err)
+	}
+	targetSID, err := windows.StringToSid(h.targetUser.Uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	systemSID, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{
+		secureExplicitAccess(targetSID, windows.GENERIC_READ, windows.NO_INHERITANCE, windows.TRUSTEE_IS_USER),
+		secureExplicitAccess(systemSID, windows.GENERIC_READ, windows.NO_INHERITANCE, windows.TRUSTEE_IS_WELL_KNOWN_GROUP),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetNamedSecurityInfo(
+		file.Location(),
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil,
+		nil,
+		acl,
+		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if secure, err := file.MetadataSecure(FileMode); err != nil || secure {
+		t.Fatalf("MetadataSecure with read-only target and SYSTEM ACEs = %v, %v, want false", secure, err)
+	}
+}
+
 func TestSecureUserFile_PreexistingWrongOwnerRejected(t *testing.T) {
 	home := t.TempDir()
 	path := filepath.Join(home, "config")

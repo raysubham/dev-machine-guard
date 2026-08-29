@@ -297,6 +297,49 @@ func TestNPMAdoptsAlreadyConvergedState(t *testing.T) {
 	}
 }
 
+func TestNPMLegacySecretStateMigratesWithoutConfigWrite(t *testing.T) {
+	w := &fakeWriter{value: npmRendered, present: true}
+	st := newNPMStore(t).seed(t, CategoryPackageConfig, TargetNPM, AppliedTargetState{
+		AppliedHash:     "sha256:N",
+		WrittenSettings: npmOwnRec(npmRendered),
+	})
+	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
+	r.OwnershipStateValue = NPMOwnershipValue
+	r.Converged = func(string) (bool, error) { return true, nil }
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(w.writes) != 0 {
+		t.Fatalf("legacy state migration rewrote config: %v", w.writes)
+	}
+	record, ok := st.get(CategoryPackageConfig, TargetNPM)
+	if !ok || record.WrittenSettings[NPMOwnedKey] != NPMOwnershipValue {
+		t.Fatalf("migrated state = %+v, %v; want secret-free ownership", record, ok)
+	}
+	if got := lastReport(t, rep).State; got != StateCompliant {
+		t.Fatalf("state = %q, want compliant", got)
+	}
+}
+
+func TestFullStateConvergenceFailureWithSameHashReportsDrift(t *testing.T) {
+	w := &fakeWriter{value: npmRendered, present: true}
+	st := newNPMStore(t).seed(t, CategoryPackageConfig, TargetNPM, AppliedTargetState{
+		AppliedHash:     "sha256:N",
+		WrittenSettings: npmOwnRec(npmRendered),
+	})
+	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, st)
+	r.Converged = func(string) (bool, error) { return false, nil }
+	r.FullStateDrift = true
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastReport(t, rep).State; got != StateDriftDetected {
+		t.Fatalf("state = %q, want drift_detected", got)
+	}
+}
+
 func TestNPMReadErrorClassification(t *testing.T) {
 	// A structural refusal on the initial read (the target cannot be enforced at
 	// all — wraps ErrTargetUnusable) is a write-class fact → write_failed; a plain

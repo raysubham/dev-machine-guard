@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"os/user"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -153,11 +154,16 @@ func newCoordinatorFixture() *coordinatorFixture {
 }
 
 func (f *coordinatorFixture) components(policy PyPIPolicy) *pypiComponents {
-	return &pypiComponents{
+	components := &pypiComponents{
 		credential: fakeCoordinatorComponent("credential", PyPICredentialOwnershipTarget, PyPICredentialOwnershipValue, policy.DeviceToken(), f.credential, "", policy.RegistryURL),
 		pip:        fakeCoordinatorComponent("pip", PyPIPipOwnershipTarget, "", "pip-settings:"+policy.RegistryURL, f.pip, PyPIClientPip, policy.RegistryURL),
 		uv:         fakeCoordinatorComponent("uv", PyPIUVOwnershipTarget, "", "uv-settings:"+policy.RegistryURL, f.uv, PyPIClientUV, policy.RegistryURL),
 	}
+	components.credential.completeState = func(_ AppliedTargetState, _ bool, state *AppliedTargetState) error {
+		state.RegistryHost = policy.RegistryHost()
+		return nil
+	}
+	return components
 }
 
 func fakeCoordinatorComponent(name, ownershipTarget, ownershipValue, expected string, writer *coordinatorWriter, client PyPIClient, registryURL string) *pypiComponent {
@@ -171,6 +177,7 @@ func fakeCoordinatorComponent(name, ownershipTarget, ownershipValue, expected st
 		converged:           writer.converged,
 		restoreSnapshot:     writer.restore,
 		hasMDMMarker:        func() (bool, error) { return writer.mdm, nil },
+		hasManagedMarker:    func() (bool, error) { return writer.present || writer.mdm, nil },
 		mdmOwned:            func() (bool, error) { return writer.mdm && !writer.mdmUnowned, nil },
 		staticConverged:     writer.staticConverged,
 		observe: func(context.Context) (componentObservation, error) {
@@ -180,10 +187,14 @@ func fakeCoordinatorComponent(name, ownershipTarget, ownershipValue, expected st
 }
 
 func coordinatorPolicy(clients string, hash string, enforcement string) EffectivePolicy {
+	return coordinatorPolicyForHost(clients, hash, enforcement, "registry.stepsecurity.io")
+}
+
+func coordinatorPolicyForHost(clients, hash, enforcement, host string) EffectivePolicy {
 	return EffectivePolicy{
 		Category:    CategoryPackageConfig,
 		Target:      TargetPyPI,
-		Policy:      json.RawMessage(`{"ecosystem":"pypi","clients":` + clients + `,"registry_url":"https://registry.stepsecurity.io/python/simple","auth":{"scheme":"stepsecurity_device_token","api_key":"tenant-secret"}}`),
+		Policy:      json.RawMessage(`{"ecosystem":"pypi","clients":` + clients + `,"registry_url":"https://` + host + `/python/simple","auth":{"scheme":"stepsecurity_device_token","api_key":"tenant-secret"}}`),
 		Hash:        hash,
 		Enforcement: enforcement,
 	}
@@ -205,6 +216,11 @@ func newTestCoordinator(t *testing.T, policy EffectivePolicy, fixture *coordinat
 			return fixture.components(parsed), nil
 		},
 	}
+	if policy.Clear {
+		if err := WriteAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget, AppliedTargetState{RegistryHost: "registry.stepsecurity.io"}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return coordinator, fetcher, reporter
 }
 
@@ -221,6 +237,107 @@ func TestPyPICoordinator_FetchesOnceAndMissingPolicyIsNoOp(t *testing.T) {
 	}
 	if fetcher.calls != 1 || len(reporter.reports) != 0 || len(fixture.events) != 0 {
 		t.Fatalf("calls=%d reports=%d events=%v, want one fetch and no side effects", fetcher.calls, len(reporter.reports), fixture.events)
+	}
+}
+
+func TestPyPICoordinator_PreflightDoesNotCreateEmptyOwnershipLanes(t *testing.T) {
+	fixture := newCoordinatorFixture()
+	fixture.credential.writeErr = errors.New("credential write failed")
+	coordinator, _, _ := newTestCoordinator(t, coordinatorPolicy(`["pip"]`, "sha256:H", enforcementDMG), fixture)
+
+	if err := coordinator.Reconcile(context.Background()); err == nil {
+		t.Fatal("Reconcile error = nil")
+	}
+	for _, target := range []string{PyPICredentialOwnershipTarget, PyPIPipOwnershipTarget, PyPIUVOwnershipTarget} {
+		if state, ok := ReadAppliedState(CategoryPackageConfig, target); ok {
+			t.Fatalf("failed apply left empty ownership lane %q: %+v", target, state)
+		}
+	}
+}
+
+func TestPyPICoordinator_CredentialPreflightStopsAllMutation(t *testing.T) {
+	fixture := newCoordinatorFixture()
+	coordinator, _, _ := newTestCoordinator(t, coordinatorPolicy(`["pip","uv"]`, "sha256:H", enforcementDMG), fixture)
+	coordinator.buildComponents = func(_ context.Context, _ executor.Executor, policy PyPIPolicy) (*pypiComponents, error) {
+		components := fixture.components(policy)
+		components.credential.preflight = func() error { return errors.New("effective credential path mismatch") }
+		return components, nil
+	}
+
+	if err := coordinator.Reconcile(context.Background()); err == nil {
+		t.Fatal("Reconcile error = nil")
+	}
+	if len(fixture.events) != 0 {
+		t.Fatalf("preflight failure mutated components: %v", fixture.events)
+	}
+	if _, err := os.Stat(CachePath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("preflight failure created state: %v", err)
+	}
+}
+
+func TestPyPICoordinator_ClearUsesAppliedHostAndRetriesCredentialFailure(t *testing.T) {
+	tests := []struct {
+		name string
+		host string
+	}{
+		{"integration", "registry-int.stepsecurity.io"},
+		{"production", "registry.stepsecurity.io"},
+		{"custom", "tenant.registry.stepsecurity.io"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newCoordinatorFixture()
+			coordinator, _, _ := newTestCoordinator(t, coordinatorPolicyForHost(`["pip"]`, "sha256:H", enforcementDMG, tc.host), fixture)
+			if err := coordinator.Reconcile(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			state, ok := ReadAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget)
+			if !ok || state.RegistryHost != tc.host {
+				t.Fatalf("credential state = %+v, %v; want host %q", state, ok, tc.host)
+			}
+
+			clear := EffectivePolicy{Category: CategoryPackageConfig, Target: TargetPyPI, Clear: true}
+			coordinator.Fetcher = &coordinatorFetcher{policy: clear}
+			coordinator.buildComponents = func(_ context.Context, _ executor.Executor, policy PyPIPolicy) (*pypiComponents, error) {
+				if policy.RegistryHost() != tc.host {
+					t.Fatalf("clear host = %q, want %q", policy.RegistryHost(), tc.host)
+				}
+				return fixture.components(policy), nil
+			}
+			fixture.credential.clearErr = errors.New("credential clear failed")
+			if err := coordinator.Reconcile(context.Background()); err == nil {
+				t.Fatal("first clear error = nil, want retryable credential failure")
+			}
+			if retained, ok := ReadAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget); !ok || retained.RegistryHost != tc.host {
+				t.Fatalf("credential retry state = %+v, %v; want host retained", retained, ok)
+			}
+
+			fixture.credential.clearErr = nil
+			if err := coordinator.Reconcile(context.Background()); err != nil {
+				t.Fatalf("retry clear: %v", err)
+			}
+			if _, ok := ReadAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget); ok {
+				t.Fatal("successful retry retained credential ownership")
+			}
+		})
+	}
+}
+
+func TestPyPICoordinator_ClearWithoutTrustedHostStillClearsClientLanes(t *testing.T) {
+	fixture := newCoordinatorFixture()
+	fixture.pip.present, fixture.uv.present = true, true
+	clear := EffectivePolicy{Category: CategoryPackageConfig, Target: TargetPyPI, Clear: true}
+	coordinator, _, _ := newTestCoordinator(t, clear, fixture)
+	if err := ClearAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget); err != nil {
+		t.Fatal(err)
+	}
+
+	err := coordinator.Reconcile(context.Background())
+	if err == nil {
+		t.Fatal("Reconcile error = nil, want incomplete credential clear")
+	}
+	if got := strings.Join(fixture.events, ","); got != "pip:clear,uv:clear" {
+		t.Fatalf("events = %q, want client clears despite missing credential host", got)
 	}
 }
 
@@ -287,6 +404,55 @@ func TestPyPICoordinator_ComponentOrdering(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPyPICoordinator_ClearReclaimsOnlyProvablyEmptyLegacyLane(t *testing.T) {
+	fixture := newCoordinatorFixture()
+	clear := EffectivePolicy{Category: CategoryPackageConfig, Target: TargetPyPI, Clear: true}
+	coordinator, _, _ := newTestCoordinator(t, clear, fixture)
+	if err := WriteAppliedState(CategoryPackageConfig, PyPIPipOwnershipTarget, AppliedTargetState{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteAppliedState(CategoryIDEExtension, TargetVSCode, AppliedTargetState{AppliedHash: "sibling"}); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.buildComponents = func(_ context.Context, _ executor.Executor, policy PyPIPolicy) (*pypiComponents, error) {
+		components := fixture.components(policy)
+		components.pip.initErr = errors.New("pip init failed")
+		return components, nil
+	}
+
+	if err := coordinator.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ReadAppliedState(CategoryPackageConfig, PyPIPipOwnershipTarget); ok {
+		t.Fatal("empty legacy pip lane remains")
+	}
+	if state, ok := ReadAppliedState(CategoryIDEExtension, TargetVSCode); !ok || state.AppliedHash != "sibling" {
+		t.Fatalf("sibling state = %+v, %v", state, ok)
+	}
+}
+
+func TestPyPICoordinator_ClearRetainsEmptyLaneWhenMarkerIsPresent(t *testing.T) {
+	fixture := newCoordinatorFixture()
+	fixture.pip.present = true
+	clear := EffectivePolicy{Category: CategoryPackageConfig, Target: TargetPyPI, Clear: true}
+	coordinator, _, _ := newTestCoordinator(t, clear, fixture)
+	if err := WriteAppliedState(CategoryPackageConfig, PyPIPipOwnershipTarget, AppliedTargetState{}); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.buildComponents = func(_ context.Context, _ executor.Executor, policy PyPIPolicy) (*pypiComponents, error) {
+		components := fixture.components(policy)
+		components.pip.initErr = errors.New("pip init failed")
+		return components, nil
+	}
+
+	if err := coordinator.Reconcile(context.Background()); err == nil {
+		t.Fatal("Reconcile error = nil, want marker-bearing lane retained")
+	}
+	if _, ok := ReadAppliedState(CategoryPackageConfig, PyPIPipOwnershipTarget); !ok {
+		t.Fatal("marker-bearing empty lane was reclaimed")
 	}
 }
 
@@ -450,6 +616,48 @@ func TestPyPICoordinator_UnsupportedUVReportsPolicyNotApplied(t *testing.T) {
 	}
 	if len(reporter.reports) != 1 || reporter.reports[0].State != StatePolicyNotApplied || reporter.reports[0].AppliedHash != "" {
 		t.Fatalf("reports = %+v", reporter.reports)
+	}
+}
+
+func TestPyPICoordinator_UVOnlyApplyOnCleanHome(t *testing.T) {
+	withTempCache(t)
+	homeDir := t.TempDir()
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.HomeDir = homeDir
+	current.Username = ""
+	mock := executor.NewMock()
+	mock.SetGOOS("linux")
+	mock.SetHomeDir(homeDir)
+	mock.SetUsername("")
+	exec := &coordinatorUserExecutor{Mock: mock, user: current}
+	reporter := &coordinatorReporter{}
+	coordinator := &PyPICoordinator{
+		Fetcher:    &coordinatorFetcher{policy: coordinatorPolicy(`["uv"]`, "sha256:H", enforcementDMG)},
+		Reporter:   reporter,
+		Exec:       exec,
+		CustomerID: "cust",
+		DeviceID:   "DEVICE-123",
+		Platform:   "linux",
+	}
+
+	if err := coordinator.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(homeDir, ".config", "pip", "pip.conf")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("UV-only apply created pip config: %v", err)
+	}
+	uv, err := os.ReadFile(filepath.Join(homeDir, ".config", "uv", "uv.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(uv, []byte(dmgUVBegin)) {
+		t.Fatalf("UV-only apply did not write managed UV config: %s", uv)
+	}
+	if len(reporter.reports) != 1 || reporter.reports[0].State != StateCompliant {
+		t.Fatalf("reports = %+v, want one compliant report", reporter.reports)
 	}
 }
 

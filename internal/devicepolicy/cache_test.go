@@ -1,21 +1,73 @@
 package devicepolicy
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/model"
 )
 
-// ownRec / npmOwnRec build the one-entry ownership record a single-value lane
-// persists: WrittenSettings is the only ownership field, so a lane that owns one
-// opaque value records it under its own ownership key — the allowlist setting id
-// for a plain VS Code Writer, NPMOwnedKey for the ~/.npmrc block.
+func TestConfigureCacheTargetWithoutWindowsUserPreservesState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), CacheFilename)
+	restorePath := SetCachePathForTest(path)
+	t.Cleanup(restorePath)
+	if err := WriteAppliedState(CategoryIDEExtension, TargetVSCode, AppliedTargetState{AppliedHash: "keep"}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock := executor.NewMock()
+	mock.SetGOOS(model.PlatformWindows)
+	mock.SetLoggedInUserError(errors.New("session 0"))
+	if target, restore, err := ConfigureCacheTarget(mock); err == nil || restore != nil || target != nil {
+		t.Fatalf("ConfigureCacheTarget returned target=%t, restore=%t, err=%v; want no target error", target != nil, restore != nil, err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("state changed without an active target user")
+	}
+}
+
+func TestConfiguredCacheRejectsRedirectedStateParent(t *testing.T) {
+	homeDir := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(homeDir, ".stepsecurity")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	u, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.HomeDir = homeDir
+	normalizeSecureTestUser(t, u)
+	mock := executor.NewMock()
+	mock.SetGOOS(model.PlatformWindows)
+	target, restore, err := ConfigureCacheTarget(secureTestExecutor{Executor: mock, user: u})
+	if err == nil || target != nil || restore != nil {
+		t.Fatalf("ConfigureCacheTarget returned target=%t restore=%t err=%v, want redirected-parent refusal", target != nil, restore != nil, err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, CacheFilename)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("redirected state path was modified: %v", err)
+	}
+}
+
+// ownRec / npmOwnRec build the one-entry WrittenSettings record used by the
+// single-value IDE and npm lanes.
 func ownRec(value string) map[string]string {
 	return map[string]string{allowedExtensionsSettingKey: value}
 }
@@ -271,16 +323,8 @@ func TestClearRemovesOnlyTargetWithinCategory(t *testing.T) {
 	if err := ClearAppliedState(CategoryIDEExtension, "jetbrains"); err != nil {
 		t.Fatalf("ClearAppliedState jetbrains: %v", err)
 	}
-	raw, err = os.ReadFile(CachePath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	f = AppliedStateFile{}
-	if err := json.Unmarshal(raw, &f); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := f.Categories[CategoryIDEExtension]; ok {
-		t.Fatalf("category should be dropped once its last target is cleared: %+v", f)
+	if _, err := os.Stat(CachePath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("last target clear must remove the state file, stat error = %v", err)
 	}
 }
 

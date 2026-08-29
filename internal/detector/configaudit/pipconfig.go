@@ -596,8 +596,8 @@ func (d *PipConfigDetector) populateFileMetadata(ctx context.Context, f *model.P
 	f.ModTimeUnix = info.ModTime().Unix()
 	f.Mode = fmt.Sprintf("%#o", info.Mode().Perm())
 
-	if info.IsDir() {
-		f.ParseError = "path is a directory"
+	if !info.Mode().IsRegular() {
+		f.ParseError = "path is not a regular file"
 		return
 	}
 

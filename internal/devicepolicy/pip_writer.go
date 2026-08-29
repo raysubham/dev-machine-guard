@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -223,6 +225,74 @@ func (w *PipWriter) RestoreSnapshot() error {
 	return firstErr
 }
 
+func (w *PipWriter) CompleteState(previous AppliedTargetState, hadPrevious bool, current *AppliedTargetState) error {
+	resolvedPaths := make(map[string]string, len(w.files))
+	for _, managed := range w.files {
+		resolved, err := managed.file.ResolvedPath()
+		if err != nil {
+			return err
+		}
+		resolvedPaths[managed.file.RelativePath()] = resolved
+	}
+	if hadPrevious && len(previous.ResolvedPaths) != 0 {
+		if len(previous.ResolvedPaths) != len(resolvedPaths) {
+			return fmt.Errorf("pip: resolved ownership targets changed: %w", ErrTargetUnusable)
+		}
+		for relative, expected := range previous.ResolvedPaths {
+			if resolvedPaths[relative] != expected {
+				return fmt.Errorf("pip: resolved ownership target %q changed from %q to %q: %w", relative, expected, resolvedPaths[relative], ErrTargetUnusable)
+			}
+		}
+		current.ResolvedPaths = maps.Clone(previous.ResolvedPaths)
+		return nil
+	}
+	current.ResolvedPaths = resolvedPaths
+	return nil
+}
+
+func (w *PipWriter) PrepareClear(previous AppliedTargetState, hadPrevious bool) error {
+	if !hadPrevious || emptyOwnershipState(previous) {
+		for _, managed := range w.files {
+			if _, err := readPipFile(managed.file); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if len(previous.ResolvedPaths) == 0 {
+		for _, managed := range w.files {
+			analysis, err := readPipFile(managed.file)
+			if err != nil {
+				return err
+			}
+			if managed.current && analysis.markers.dmg == nil {
+				return fmt.Errorf("pip: legacy ownership target cannot be verified: %w", ErrTargetUnusable)
+			}
+		}
+		return nil
+	}
+	seen := make(map[string]bool, len(w.files))
+	for _, managed := range w.files {
+		relative := managed.file.RelativePath()
+		expected, ok := previous.ResolvedPaths[relative]
+		if !ok {
+			return fmt.Errorf("pip: ownership state does not identify %q: %w", relative, ErrTargetUnusable)
+		}
+		if err := managed.file.RequireResolvedPath(expected); err != nil {
+			return err
+		}
+		seen[relative] = true
+	}
+	if len(seen) != len(previous.ResolvedPaths) {
+		return fmt.Errorf("pip: recorded ownership target is unavailable: %w", ErrTargetUnusable)
+	}
+	return nil
+}
+
+func (w *PipWriter) PrepareWrite(previous AppliedTargetState, hadPrevious bool) error {
+	return w.PrepareClear(previous, hadPrevious)
+}
+
 func (w *PipWriter) Clear() (bool, error) {
 	changed := false
 	var firstErr error
@@ -333,6 +403,19 @@ func (w *PipWriter) HasMDMMarker() (bool, error) {
 	return false, nil
 }
 
+func (w *PipWriter) HasManagedMarker() (bool, error) {
+	for _, managed := range w.files {
+		analysis, err := readPipFile(managed.file)
+		if err != nil {
+			return false, err
+		}
+		if analysis.markers.dmg != nil || analysis.markers.mdm {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func pipFileApplicable(current bool, analysis pipAnalysis) bool {
 	return current || analysis.markers.dmg != nil || analysis.markers.mdm || analysis.existed && analysis.activeConflict
 }
@@ -397,6 +480,7 @@ type pipMarkers struct {
 type pipManagedBlock struct {
 	start, end              int
 	body                    string
+	rawBody                 []string
 	appendedGlobal          bool
 	createdFile             bool
 	originalFinalNewline    bool
@@ -453,9 +537,10 @@ func scanPipMarkers(data []byte) (pipMarkers, error) {
 
 func pipMarkerBody(data []byte, lines []pipLine, begin, end int) *pipManagedBlock {
 	bodyLines := make([]string, 0, end-begin-1)
-	block := &pipManagedBlock{start: lines[begin].start, end: lines[end].end}
+	block := &pipManagedBlock{start: lines[begin].start, end: lines[end].end, rawBody: make([]string, 0, end-begin-1)}
 	for _, line := range lines[begin+1 : end] {
 		text := string(data[line.start:line.contentEnd])
+		block.rawBody = append(block.rawBody, strings.TrimRight(text, "\r"))
 		if strings.HasPrefix(text, pipAppendMetadata) {
 			block.appendedGlobal = true
 			block.createdFile = strings.Contains(text, "created=true")
@@ -473,6 +558,27 @@ func pipMarkerBody(data []byte, lines []pipLine, begin, end int) *pipManagedBloc
 	}
 	block.body = strings.Join(bodyLines, "\n")
 	return block
+}
+
+func canonicalMDMPipBody(block *pipManagedBlock, expected string) bool {
+	if block == nil {
+		return false
+	}
+	want := strings.Split(expected, "\n")
+	got := block.rawBody
+	if len(got) != len(want) && len(got) != len(want)+1 && len(got) != len(want)+2 {
+		return false
+	}
+	if len(got) > 0 && got[0] == "# [stepsecurity-pypi-pip-mdm] created=true" {
+		if len(got) < 2 || got[1] != "[global]" {
+			return false
+		}
+		got = got[1:]
+	}
+	if len(got) > 0 && got[0] == "[global]" {
+		got = got[1:]
+	}
+	return slices.Equal(got, want)
 }
 
 type pipLine struct{ start, contentEnd, end int }
@@ -829,10 +935,12 @@ func (w *PipWriter) observedStaticConverged(expected string) (bool, error) {
 		}
 		selected++
 		block := analysis.markers.dmg
+		blockMatches := block != nil && block.body == expected
 		if block == nil {
 			block = analysis.markers.mdmBlock
+			blockMatches = canonicalMDMPipBody(block, expected)
 		}
-		if !analysis.existed || block == nil || block.body != expected || analysis.activeConflict {
+		if !analysis.existed || !blockMatches || analysis.activeConflict {
 			return false, nil
 		}
 		secure, err := managed.file.MetadataSecure(secureuserfile.FileMode)

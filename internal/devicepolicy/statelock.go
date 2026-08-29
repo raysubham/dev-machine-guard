@@ -1,6 +1,7 @@
 package devicepolicy
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -89,13 +90,24 @@ func acquireStateLock() (release func(), err error) {
 	if path == "" {
 		return nil, errNoHomeDir
 	}
+	if cacheLockFile != nil {
+		f, err := cacheLockFile.OpenLock()
+		if err != nil {
+			return nil, fmt.Errorf("devicepolicy: open secure state lock: %w", err)
+		}
+		return waitForStateLock(f, path)
+	}
 	// The parent may not exist yet on a first write; persistStateFile creates it
 	// too, but the lock has to be opened before that runs.
-	if err := os.MkdirAll(filepath.Dir(path), cacheParentDirMode); err != nil {
+	if err := ensureCacheParent(filepath.Dir(path)); err != nil {
 		return nil, fmt.Errorf("devicepolicy: state lock dir: %w", err)
 	}
-	// #nosec G304 -- path is CachePath() (a test override, or the resolved home
-	// joined with the package constant CacheFilename) plus a constant suffix.
+	_, statErr := os.Lstat(path)
+	created := errors.Is(statErr, os.ErrNotExist)
+	if statErr != nil && !created {
+		return nil, fmt.Errorf("devicepolicy: inspect state lock %s: %w", path, statErr)
+	}
+	// #nosec G304 -- path is CachePath() plus the constant lock suffix.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, cacheFileMode)
 	if err != nil {
 		// Not openable is actionable, not benign: an existing lock file this process
@@ -104,9 +116,18 @@ func acquireStateLock() (release func(), err error) {
 		// this process would be the one silently clobbering it.
 		return nil, fmt.Errorf("devicepolicy: open state lock %s: %w", path, err)
 	}
+	err = f.Chmod(cacheFileMode)
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("devicepolicy: secure state lock %s: %w", path, err)
+	}
 	// The lock file is a rendezvous point, never a record: it is created empty and
 	// left empty, and it is deliberately NOT unlinked on release. Unlinking would
 	// let a peer that already opened the old inode hold a lock nobody else can see.
+	return waitForStateLock(f, path)
+}
+
+func waitForStateLock(f *os.File, path string) (release func(), err error) {
 	deadline := time.Now().Add(stateLockWait)
 	for {
 		ok, lerr := tryLockHandle(f)

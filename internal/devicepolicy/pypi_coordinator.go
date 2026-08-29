@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/secureuserfile"
@@ -49,10 +48,16 @@ type pypiComponent struct {
 	initErr             error
 	expected            string
 	converged           func(string) (bool, error)
+	fullStateDrift      bool
 	restoreSnapshot     func() error
 	hasMDMMarker        func() (bool, error)
+	hasManagedMarker    func() (bool, error)
 	mdmOwned            func() (bool, error)
 	staticConverged     func(string) (bool, error)
+	completeState       func(AppliedTargetState, bool, *AppliedTargetState) error
+	prepareWrite        func(AppliedTargetState, bool) error
+	prepareClear        func(AppliedTargetState, bool) error
+	preflight           func() error
 	observe             func(context.Context) (componentObservation, error)
 }
 
@@ -103,7 +108,11 @@ func (c *PyPICoordinator) Reconcile(ctx context.Context) error {
 
 	enforcement := canonicalEnforcement(effective.Enforcement)
 	if effective.Clear {
-		return c.clear(ctx, effective, clearPyPIPolicy())
+		host, hostErr := c.clearRegistryHost()
+		if host == "" {
+			host = "invalid.invalid"
+		}
+		return c.clear(ctx, effective, clearPyPIPolicy(host), hostErr)
 	}
 
 	policy, err := ParsePyPIPolicy(effective.Policy, c.DeviceID)
@@ -131,7 +140,7 @@ func (c *PyPICoordinator) Reconcile(ctx context.Context) error {
 	return c.reconcileDMG(ctx, effective, policy, components)
 }
 
-func (c *PyPICoordinator) clear(ctx context.Context, effective EffectivePolicy, policy PyPIPolicy) error {
+func (c *PyPICoordinator) clear(ctx context.Context, effective EffectivePolicy, policy PyPIPolicy, credentialInitErr error) error {
 	components, err := c.components(ctx, policy)
 	if err != nil {
 		if errors.Is(err, ErrNoTargetUser) || errors.Is(err, secureuserfile.ErrNoTargetUser) {
@@ -141,6 +150,13 @@ func (c *PyPICoordinator) clear(ctx context.Context, effective EffectivePolicy, 
 	}
 	if components.close != nil {
 		defer func() { _ = components.close() }()
+	}
+	if credentialInitErr != nil {
+		if components.credential == nil {
+			components.credential = &pypiComponent{name: "credential", ownershipTarget: PyPICredentialOwnershipTarget, initErr: credentialInitErr}
+		} else {
+			components.credential.initErr = errors.Join(components.credential.initErr, credentialInitErr)
+		}
 	}
 	effective.Enforcement = enforcementDMG
 	var errs []error
@@ -251,11 +267,12 @@ func (c *PyPICoordinator) reconcileDMG(ctx context.Context, effective EffectiveP
 	}
 
 	credentialPriorState, credentialHadPriorState := ReadAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget)
-	if err := c.preflightOwnership(all); err != nil {
-		reportErr := c.report(ctx, StateWriteFailed, "", effective.Hash, enforcementDMG, nil)
-		return errors.Join(err, reportErr)
+	if components.credential.preflight != nil {
+		if err := components.credential.preflight(); err != nil {
+			reportErr := c.report(ctx, StatePolicyNotApplied, "", effective.Hash, enforcementDMG, nil)
+			return errors.Join(err, reportErr)
+		}
 	}
-
 	credentialWasConverged := false
 	if components.credential.initErr == nil {
 		var convergeErr error
@@ -382,6 +399,15 @@ func (c *PyPICoordinator) runClear(ctx context.Context, effective EffectivePolic
 	}
 	result := componentResult{name: component.name, state: StateCompliant}
 	if component.initErr != nil {
+		state, ok := ReadAppliedState(CategoryPackageConfig, component.ownershipTarget)
+		if ok && emptyOwnershipState(state) && component.hasManagedMarker != nil {
+			managed, err := component.hasManagedMarker()
+			if err == nil && !managed {
+				if err := c.clearOwnershipState(CategoryPackageConfig, component.ownershipTarget); err == nil {
+					return result
+				}
+			}
+		}
 		result.state = StateWriteFailed
 		result.err = component.initErr
 		return result
@@ -410,13 +436,18 @@ func (c *PyPICoordinator) childReconciler(effective EffectivePolicy, component *
 		OwnershipKey:        component.ownershipKey,
 		OwnsByMarker:        true,
 		Converged:           component.converged,
+		FullStateDrift:      component.fullStateDrift,
 		RestoreSnapshot:     component.restoreSnapshot,
+		CompleteState:       component.completeState,
+		PrepareWrite:        component.prepareWrite,
+		PrepareClear:        component.prepareClear,
 		ProbeExpected:       func(string) (bool, string) { return false, "" },
 		ProbeContent:        func(string) (bool, map[string]json.RawMessage, error) { return true, nil, nil },
 		Render:              func(json.RawMessage) (string, error) { return component.expected, nil },
 		Logf:                c.Logf,
 		writeState:          c.writeOwnershipState,
 		clearState:          c.clearOwnershipState,
+		probeState:          ProbeAppliedStateWritable,
 	}
 	return reconciler
 }
@@ -444,12 +475,18 @@ func buildPyPIComponents(ctx context.Context, exec executor.Executor, policy PyP
 	components.credential = &pypiComponent{
 		name: "credential", ownershipTarget: PyPICredentialOwnershipTarget, ownershipKey: pypiCredentialOwnershipKey,
 		ownershipStateValue: PyPICredentialOwnershipValue, writer: credential, initErr: credentialErr, expected: credentialExpected,
+		hasManagedMarker: func() (bool, error) { return hasManagedNetrcMarker(home) },
 	}
 	if credential != nil {
+		components.credential.preflight = credential.ValidateEffectivePath
 		components.credential.converged = credential.Converged
 		components.credential.restoreSnapshot = credential.RestoreSnapshot
 		components.credential.hasMDMMarker = credential.HasMDMMarker
 		components.credential.mdmOwned = credential.MDMOwned
+		components.credential.completeState = func(_ AppliedTargetState, _ bool, state *AppliedTargetState) error {
+			state.RegistryHost = policy.RegistryHost()
+			return nil
+		}
 		components.credential.observe = func(context.Context) (componentObservation, error) {
 			status, err := credential.Observation(credentialExpected)
 			return componentObservation{credential: status}, err
@@ -461,10 +498,15 @@ func buildPyPIComponents(ctx context.Context, exec executor.Executor, policy PyP
 	components.pip = &pypiComponent{name: "pip", ownershipTarget: PyPIPipOwnershipTarget, ownershipKey: pypiPipOwnershipKey, writer: pip, initErr: errors.Join(pipRenderErr, pipErr), expected: pipExpected}
 	if pip != nil {
 		components.pip.converged = pip.Converged
+		components.pip.fullStateDrift = true
 		components.pip.restoreSnapshot = pip.RestoreSnapshot
 		components.pip.hasMDMMarker = pip.HasMDMMarker
+		components.pip.hasManagedMarker = pip.HasManagedMarker
 		components.pip.mdmOwned = pip.MDMOwned
 		components.pip.staticConverged = pip.StaticConverged
+		components.pip.completeState = pip.CompleteState
+		components.pip.prepareWrite = pip.PrepareWrite
+		components.pip.prepareClear = pip.PrepareClear
 		components.pip.observe = func(ctx context.Context) (componentObservation, error) {
 			observation, err := pip.Observation(ctx, pipExpected)
 			client := PyPIClientObservation(observation)
@@ -479,6 +521,7 @@ func buildPyPIComponents(ctx context.Context, exec executor.Executor, policy PyP
 		components.uv.converged = uv.Converged
 		components.uv.restoreSnapshot = uv.RestoreSnapshot
 		components.uv.hasMDMMarker = uv.HasMDMMarker
+		components.uv.hasManagedMarker = uv.HasManagedMarker
 		components.uv.mdmOwned = uv.MDMOwned
 		components.uv.staticConverged = uv.StaticConverged
 		components.uv.observe = func(ctx context.Context) (componentObservation, error) {
@@ -490,24 +533,39 @@ func buildPyPIComponents(ctx context.Context, exec executor.Executor, policy PyP
 	return components, nil
 }
 
-func clearPyPIPolicy() PyPIPolicy {
-	policy := PyPIPolicy{Ecosystem: "pypi", Clients: []PyPIClient{PyPIClientPip, PyPIClientUV}, RegistryURL: "https://registry.stepsecurity.io/python/simple", deviceID: "clear"}
+func emptyOwnershipState(state AppliedTargetState) bool {
+	return state.AppliedHash == "" && len(state.WrittenSettings) == 0 && !state.FileCreated &&
+		state.ResolvedPath == "" && len(state.ResolvedPaths) == 0 && state.RegistryHost == ""
+}
+
+func clearPyPIPolicy(host string) PyPIPolicy {
+	policy := PyPIPolicy{Ecosystem: "pypi", Clients: []PyPIClient{PyPIClientPip, PyPIClientUV}, RegistryURL: "https://" + host + "/python/simple", deviceID: "clear"}
 	policy.Auth.Scheme = pypiAuthScheme
 	policy.Auth.APIKey = "clear"
 	return policy
 }
 
-func (c *PyPICoordinator) preflightOwnership(components []*pypiComponent) error {
-	for _, component := range components {
-		state, ok := ReadAppliedState(CategoryPackageConfig, component.ownershipTarget)
-		if !ok {
-			state = AppliedTargetState{FetchedAt: time.Now().UTC()}
+func (c *PyPICoordinator) clearRegistryHost() (string, error) {
+	state, ok := ReadAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget)
+	if ok && state.RegistryHost != "" {
+		if !isValidHost(state.RegistryHost) {
+			return "", fmt.Errorf("devicepolicy: invalid registry host in credential ownership state: %w", ErrTargetUnusable)
 		}
-		if err := c.writeOwnershipState(CategoryPackageConfig, component.ownershipTarget, state); err != nil {
-			return fmt.Errorf("devicepolicy: preflight %s ownership state: %w", component.name, err)
-		}
+		return state.RegistryHost, nil
 	}
-	return nil
+	if c.Exec == nil {
+		return "", fmt.Errorf("devicepolicy: cannot derive registry host without an executor: %w", ErrTargetUnusable)
+	}
+	home, err := secureuserfile.OpenUserHome(c.Exec)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = home.Close() }()
+	host, err := discoverDMGNetrcHost(home)
+	if err != nil {
+		return "", fmt.Errorf("devicepolicy: derive clear registry host: %w", err)
+	}
+	return host, nil
 }
 
 func (c *PyPICoordinator) writeOwnershipState(category, target string, state AppliedTargetState) error {

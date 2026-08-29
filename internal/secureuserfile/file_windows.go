@@ -130,6 +130,9 @@ func (windowsOwnerReader) secure(f *os.File, h *Home, _ os.FileMode) (bool, erro
 		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags&windows.INHERITED_ACE != 0 {
 			return false, nil
 		}
+		if ace.Mask != windows.GENERIC_ALL {
+			return false, nil
+		}
 		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
 		switch {
 		case sid.Equals(targetSID):

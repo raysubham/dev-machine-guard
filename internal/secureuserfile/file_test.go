@@ -544,6 +544,32 @@ func TestSecureUserFile_SnapshotBackupRotationAndCleanup(t *testing.T) {
 	}
 }
 
+type rejectingMetadataReader struct{ metadataReader }
+
+func (rejectingMetadataReader) secure(*os.File, *Home, os.FileMode) (bool, error) {
+	return false, nil
+}
+
+func TestSecureUserFile_CommitRollsBackPostReplacementVerificationFailure(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "config")
+	f := openSecureTestFile(t, newSecureTestHome(t, home), "config")
+	if err := f.Commit([]byte("sibling-state"), FileMode); err != nil {
+		t.Fatal(err)
+	}
+	f.home.metadata = rejectingMetadataReader{metadataReader: f.home.metadata}
+	if err := f.Commit([]byte("replacement"), FileMode); err == nil {
+		t.Fatal("Commit error = nil, want post-replacement verification failure")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "sibling-state" {
+		t.Fatalf("rollback content = %q, want sibling-state", got)
+	}
+}
+
 func TestSecureUserFile_RemoveAndRestoreSnapshot(t *testing.T) {
 	home := t.TempDir()
 	path := filepath.Join(home, "config")

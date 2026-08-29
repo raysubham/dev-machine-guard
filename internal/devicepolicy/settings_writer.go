@@ -13,6 +13,9 @@ import (
 
 	"github.com/tailscale/hujson"
 
+	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/model"
+
 	"github.com/step-security/dev-machine-guard/internal/atomicfile"
 )
 
@@ -149,7 +152,19 @@ func newSettingsWriterAt(path string) *settingsWriter { return &settingsWriter{p
 // NewWriter returns the user-scope settings.json writer for this OS. ok=false
 // when settingsPath cannot resolve the target (unsupported OS, no home dir or
 // %APPDATA%) — the reconciler treats that as not agent-enforceable and no-ops.
-func NewWriter() (Writer, bool) {
+
+func NewWriter(exec executor.Executor) (Writer, bool) {
+	if exec != nil && exec.GOOS() == model.PlatformWindows {
+		user, err := exec.LoggedInUser()
+		if err != nil || user == nil {
+			return nil, false
+		}
+		appdata := executor.NewUserAwareExecutor(exec, user.Username).Getenv("APPDATA")
+		if appdata == "" {
+			return nil, false
+		}
+		return newSettingsWriterAt(filepath.Join(appdata, "Code", "User", "settings.json")), true
+	}
 	path, ok := settingsPath()
 	if !ok {
 		return nil, false
@@ -160,7 +175,6 @@ func NewWriter() (Writer, bool) {
 // settingsPath resolves the user-scope VS Code settings.json for this OS,
 // matching VS Code's own resolution (the default profile's user settings):
 //
-//	windows  %APPDATA%\Code\User\settings.json
 //	darwin   ~/Library/Application Support/Code/User/settings.json
 //	linux    $XDG_CONFIG_HOME/Code/User/settings.json (default ~/.config)
 //
@@ -168,12 +182,6 @@ func NewWriter() (Writer, bool) {
 // or the OS is not one of the three supported platforms.
 func settingsPath() (string, bool) {
 	switch runtime.GOOS {
-	case "windows":
-		appdata := os.Getenv("APPDATA")
-		if appdata == "" {
-			return "", false
-		}
-		return filepath.Join(appdata, "Code", "User", "settings.json"), true
 	case "darwin":
 		home, err := os.UserHomeDir()
 		if err != nil || home == "" {

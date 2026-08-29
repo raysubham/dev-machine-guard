@@ -277,6 +277,18 @@ func (w *UVWriter) HasMDMMarker() (bool, error) {
 	return markers.mdmComplete(), nil
 }
 
+func (w *UVWriter) HasManagedMarker() (bool, error) {
+	data, existed, _, err := w.readCurrent()
+	if err != nil || !existed {
+		return false, err
+	}
+	markers, err := scanUVMarkers(data)
+	if err != nil {
+		return false, err
+	}
+	return markers.complete() || markers.mdmComplete(), nil
+}
+
 type uvMarkers struct {
 	owner      string
 	begin, end int
@@ -802,11 +814,11 @@ func (w *UVWriter) environmentOverride() string {
 }
 
 func (w *UVWriter) probeSettings(ctx context.Context) (status, source, registry string) {
-	dir, err := w.probeDirectory(ctx)
+	dir, cleanup, err := w.probeDirectory(ctx)
 	if err != nil {
 		return "unknown", "unknown", ""
 	}
-	defer os.Remove(dir)
+	defer cleanup()
 	stdout, _, exit, err := w.exec.RunInDir(ctx, dir, 10*time.Second, "uv", "pip", "install", "--show-settings", uvProbePackage)
 	if err != nil || exit != 0 {
 		return "unknown", "unknown", ""
@@ -818,17 +830,24 @@ func (w *UVWriter) probeSettings(ctx context.Context) (status, source, registry 
 	return status, "unknown", registry
 }
 
-func (w *UVWriter) probeDirectory(ctx context.Context) (string, error) {
+func (w *UVWriter) probeDirectory(ctx context.Context) (string, func(), error) {
 	base := strings.TrimSpace(w.exec.Getenv("TMPDIR"))
 	if base == "" {
 		base = os.TempDir()
 	}
 	base = filepath.Clean(base)
 	if !filepath.IsAbs(base) {
-		return "", errors.New("uv: target-user temporary directory is not absolute")
+		return "", nil, errors.New("uv: target-user temporary directory is not absolute")
+	}
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		return "", nil, fmt.Errorf("uv: opening target-user temporary root: %w", err)
+	}
+	fail := func(err error) (string, func(), error) {
+		_ = root.Close()
+		return "", nil, err
 	}
 	var dir string
-	var err error
 	if w.exec.GOOS() == model.PlatformWindows {
 		dir, err = os.MkdirTemp(base, "dmg-uv-probe-")
 	} else {
@@ -839,27 +858,50 @@ func (w *UVWriter) probeDirectory(ctx context.Context) (string, error) {
 		}
 	}
 	if err != nil {
-		return "", fmt.Errorf("uv: creating target-user probe directory: %w", err)
+		return fail(fmt.Errorf("uv: creating target-user probe directory: %w", err))
 	}
 	dir = filepath.Clean(strings.TrimSpace(dir))
 	relative, relErr := filepath.Rel(base, dir)
-	if relErr != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) || !strings.HasPrefix(filepath.Base(dir), "dmg-uv-probe-") {
-		_ = os.Remove(dir)
-		return "", errors.New("uv: target-user probe directory escaped temporary root")
+	if relErr != nil || filepath.Dir(relative) != "." || filepath.IsAbs(relative) || !strings.HasPrefix(relative, "dmg-uv-probe-") {
+		return fail(errors.New("uv: target-user probe directory escaped temporary root"))
 	}
-	f, err := os.Open(dir)
+	before, err := root.Lstat(relative)
+	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.IsDir() {
+		_ = root.Remove(relative)
+		return fail(errors.Join(err, errors.New("uv: target-user probe path is not a real directory")))
+	}
+	f, err := root.Open(relative)
 	if err != nil {
-		_ = os.Remove(dir)
-		return "", fmt.Errorf("uv: opening target-user probe directory: %w", err)
+		_ = root.Remove(relative)
+		return fail(fmt.Errorf("uv: opening target-user probe directory: %w", err))
+	}
+	opened, statErr := f.Stat()
+	current, lstatErr := root.Lstat(relative)
+	identityOK := statErr == nil && lstatErr == nil && current.Mode()&os.ModeSymlink == 0 && current.IsDir() && os.SameFile(opened, current)
+	if !identityOK {
+		_ = f.Close()
+		_ = root.Remove(relative)
+		return fail(errors.Join(statErr, lstatErr, errors.New("uv: target-user probe directory changed during open")))
+	}
+	if w.exec.GOOS() == model.PlatformWindows {
+		if err := w.home.ApplyMetadata(f, secureuserfile.ParentMode, true); err != nil {
+			_ = f.Close()
+			_ = root.Remove(relative)
+			return fail(fmt.Errorf("uv: securing target-user probe directory: %w", err))
+		}
 	}
 	ownerErr := w.home.VerifyOwner(f, dir)
-	info, statErr := f.Stat()
+	metadataSecure, metadataErr := w.home.MetadataSecure(f, secureuserfile.ParentMode)
 	closeErr := f.Close()
-	if ownerErr != nil || statErr != nil || closeErr != nil || !info.IsDir() || w.exec.GOOS() != model.PlatformWindows && info.Mode().Perm() != 0o700 {
-		_ = os.Remove(dir)
-		return "", errors.Join(ownerErr, statErr, closeErr, errors.New("uv: insecure target-user probe directory"))
+	if ownerErr != nil || metadataErr != nil || !metadataSecure || closeErr != nil {
+		_ = root.Remove(relative)
+		return fail(errors.Join(ownerErr, metadataErr, closeErr, errors.New("uv: insecure target-user probe directory")))
 	}
-	return dir, nil
+	cleanup := func() {
+		_ = root.RemoveAll(relative)
+		_ = root.Close()
+	}
+	return dir, cleanup, nil
 }
 
 var uvDebugGivenPattern = regexp.MustCompile(`(?s)given:\s*Some\(\s*("(\\.|[^"\\])*")`)

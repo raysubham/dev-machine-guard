@@ -148,6 +148,7 @@ func TestRunHook_ValidPayloadEmitsAllow(t *testing.T) {
 // wire-format we ship; the seam-stubbed tests intentionally
 // short-circuit before that wiring.
 func TestRunHook_RealUploadWiring(t *testing.T) {
+	clearEnterpriseConfigOverrides(t)
 	type captured struct {
 		method string
 		path   string

@@ -48,6 +48,9 @@ func TestSecureUserFile_RejectsFIFOAndWrongOwner(t *testing.T) {
 		if _, _, _, err := f.Read(); !errors.Is(err, ErrTargetUnusable) {
 			t.Fatalf("Read error = %v, want ErrTargetUnusable", err)
 		}
+		if found, err := f.ContainsAny("x"); err != nil || !found {
+			t.Fatalf("ContainsAny = %v, %v, want content-blind marker detection", found, err)
+		}
 	})
 
 	t.Run("wrong-owner parent", func(t *testing.T) {

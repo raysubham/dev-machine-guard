@@ -319,6 +319,8 @@ type uvUserContextExecutor struct {
 	showSettings string
 	tempBase     string
 	createdDir   string
+	mktempResult string
+	runErr       error
 	mktempCalled bool
 }
 
@@ -332,10 +334,16 @@ func (e *uvUserContextExecutor) RunAsUser(_ context.Context, _, command string) 
 		return "uv 0.10.0", nil
 	case strings.HasPrefix(command, "'mktemp' '-d' "):
 		e.mktempCalled = true
+		if e.mktempResult != "" {
+			return e.mktempResult, nil
+		}
 		dir, err := os.MkdirTemp(e.tempBase, "dmg-uv-probe-")
 		e.createdDir = dir
 		return dir, err
 	case strings.HasPrefix(command, "cd "):
+		if e.runErr != nil {
+			return "", e.runErr
+		}
 		info, err := os.Stat(e.createdDir)
 		if err != nil {
 			return "", err
@@ -413,6 +421,42 @@ func TestUVObservation_ParsesRealSettingsInTargetUserDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(inner.createdDir); !os.IsNotExist(err) {
 		t.Fatalf("probe directory remains after observation: %v", err)
+	}
+}
+
+func TestUVProbeDirectory_DoesNotRemoveRejectedPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("target-user mktemp probing is Unix-only")
+	}
+	writer, inner, _ := newResolvedUserUVWriter(t, "TMPDIR={TMP}\x00", "")
+	victim := t.TempDir()
+	sentinel := filepath.Join(victim, "keep")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inner.mktempResult = victim
+
+	if _, _, err := writer.probeDirectory(context.Background()); err == nil {
+		t.Fatal("probeDirectory error = nil, want escaped-path refusal")
+	}
+	if got, err := os.ReadFile(sentinel); err != nil || string(got) != "keep" {
+		t.Fatalf("rejected path was modified: %q, %v", got, err)
+	}
+}
+
+func TestUVProbeSettings_RemovesTrustedDirectoryAfterCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("target-user mktemp probing is Unix-only")
+	}
+	writer, inner, _ := newResolvedUserUVWriter(t, "TMPDIR={TMP}\x00", "")
+	inner.runErr = context.Canceled
+
+	status, source, _ := writer.probeSettings(context.Background())
+	if status != "unknown" || source != "unknown" {
+		t.Fatalf("probeSettings = %q, %q, want unknown", status, source)
+	}
+	if _, err := os.Stat(inner.createdDir); !os.IsNotExist(err) {
+		t.Fatalf("trusted probe directory remains after cancellation: %v", err)
 	}
 }
 
