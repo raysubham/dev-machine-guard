@@ -716,6 +716,11 @@ func TestPipObservedStaticConvergedAcceptsOnlyCanonicalMDMCreatedBlocks(t *testi
 			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 				t.Fatal(err)
 			}
+			for _, managed := range w.files {
+				if managed.current {
+					hardenSecureTestFile(t, managed.file)
+				}
+			}
 			got, err := w.observedStaticConverged(pipExpected)
 			if err != nil {
 				t.Fatal(err)
