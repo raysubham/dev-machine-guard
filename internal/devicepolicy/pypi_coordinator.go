@@ -33,10 +33,11 @@ type PyPICoordinator struct {
 }
 
 type pypiComponents struct {
-	credential *pypiComponent
-	pip        *pypiComponent
-	uv         *pypiComponent
-	close      func() error
+	credential   *pypiComponent
+	pip          *pypiComponent
+	uv           *pypiComponent
+	hasGoSibling func() (bool, error)
+	close        func() error
 }
 
 type pypiComponent struct {
@@ -160,13 +161,23 @@ func (c *PyPICoordinator) clear(ctx context.Context, effective EffectivePolicy, 
 	}
 	effective.Enforcement = enforcementDMG
 	var errs []error
-	for _, component := range []*pypiComponent{components.pip, components.uv, components.credential} {
+	for _, component := range []*pypiComponent{components.pip, components.uv} {
 		result := c.runClear(ctx, effective, component)
 		if result.err != nil {
 			errs = append(errs, result.err)
 		}
 	}
-	return errors.Join(errs...)
+	if components.hasGoSibling != nil {
+		sibling, err := components.hasGoSibling()
+		if err != nil {
+			return errors.Join(errors.Join(errs...), fmt.Errorf("devicepolicy: inspect Go sibling marker: %w", err))
+		}
+		if sibling {
+			return errors.Join(errors.Join(errs...), c.clearOwnershipState(CategoryPackageConfig, PyPICredentialOwnershipTarget))
+		}
+	}
+	credentialResult := c.runClear(ctx, effective, components.credential)
+	return errors.Join(errors.Join(errs...), credentialResult.err)
 }
 
 func (c *PyPICoordinator) reconcileMDM(ctx context.Context, effective EffectivePolicy, policy PyPIPolicy, components *pypiComponents) error {
@@ -469,6 +480,7 @@ func buildPyPIComponents(ctx context.Context, exec executor.Executor, policy PyP
 	}
 	components := &pypiComponents{close: home.Close}
 	userExec := executor.NewUserAwareExecutor(exec, home.Username())
+	components.hasGoSibling = func() (bool, error) { return hasGoDMGMarker(exec, home) }
 
 	credentialExpected := renderNetrcEntry(policy.RegistryHost(), policy.DeviceToken())
 	credential, credentialErr := NewNetrcWriter(home, policy)

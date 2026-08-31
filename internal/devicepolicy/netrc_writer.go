@@ -14,15 +14,15 @@ import (
 )
 
 const (
-	dmgNetrcBegin = "#stepsecurity-pypi-credential-dmg-begin"
-	dmgNetrcEnd   = "#stepsecurity-pypi-credential-end"
+	dmgNetrcBegin = "#stepsecurity-package-registry-credential-dmg-begin"
+	dmgNetrcEnd   = "#stepsecurity-package-registry-credential-end"
 
-	mdmNetrcBegin = "#stepsecurity-pypi-credential-mdm-begin"
-	mdmNetrcEnd   = "#stepsecurity-pypi-credential-end"
+	mdmNetrcBegin = "#stepsecurity-package-registry-credential-mdm-begin"
+	mdmNetrcEnd   = "#stepsecurity-package-registry-credential-end"
 
-	dmgNetrcDisabledPrefix = "#stepsecurity-pypi-credential-dmg-disabled:"
-	mdmNetrcDisabledPrefix = "#stepsecurity-pypi-credential-mdm-disabled:"
-	mdmNetrcCreated        = "#stepsecurity-pypi-credential-mdm-created"
+	dmgNetrcDisabledPrefix = "#stepsecurity-package-registry-credential-dmg-disabled:"
+	mdmNetrcDisabledPrefix = "#stepsecurity-package-registry-credential-mdm-disabled:"
+	mdmNetrcCreated        = "#stepsecurity-package-registry-credential-mdm-created"
 	netrcBackupPrefix      = ".dmg-"
 )
 
@@ -50,6 +50,18 @@ func NewNetrcWriter(home *secureuserfile.Home, policy PyPIPolicy) (*NetrcWriter,
 		strings.Contains(policy.Auth.APIKey, "::") || !isNPMSafe(policy.Auth.APIKey) || !isNPMSafe(policy.deviceID) ||
 		!isValidHost(host) || !isNetrcCredential(token) {
 		return nil, errors.New("netrc: policy cannot render a safe credential entry")
+	}
+	return newNetrcWriter(home, host, token)
+}
+
+// newNetrcWriter builds the shared exact-host credential writer after the
+// ecosystem-specific policy parser has validated and derived its inputs.
+func newNetrcWriter(home *secureuserfile.Home, host, token string) (*NetrcWriter, error) {
+	if home == nil {
+		return nil, errors.New("netrc: nil secure user home")
+	}
+	if !isValidHost(host) || !isNetrcCredential(token) {
+		return nil, errors.New("netrc: cannot render a safe credential entry")
 	}
 	expected := renderNetrcEntry(host, token)
 
@@ -416,11 +428,7 @@ func (w *NetrcWriter) ValidateEffectivePath() error {
 		return nil
 	}
 	if !filepath.IsAbs(override) {
-		absolute, err := filepath.Abs(override)
-		if err != nil {
-			return fmt.Errorf("netrc: resolve NETRC override: %w", ErrTargetUnusable)
-		}
-		override = absolute
+		return fmt.Errorf("netrc: NETRC override must be absolute: %w", ErrTargetUnusable)
 	}
 	override, managed := filepath.Clean(override), filepath.Clean(w.Location())
 	if override != managed && (w.goos != model.PlatformWindows || !strings.EqualFold(override, managed)) {

@@ -39,6 +39,16 @@ const (
 	CategoryPackageConfig = "package_config"
 	TargetNPM             = "npm"
 	TargetPyPI            = "pypi"
+	TargetGo              = "go"
+)
+
+// Go component targets are local ownership identities beneath the public
+// package_config/go policy. They are never used for fetches or reports.
+const (
+	GoCredentialOwnershipTarget = "go-credential" //#nosec G101 -- public ownership target identifier, not a credential.
+	GoEnvOwnershipTarget        = "go-env"
+	GoCredentialOwnershipValue  = "stepsecurity-go-credential" //#nosec G101 -- public ownership marker, not a credential.
+	GoEnvOwnershipValue         = "stepsecurity-go-env"
 )
 
 // PyPI component targets are local ownership identities beneath the public
