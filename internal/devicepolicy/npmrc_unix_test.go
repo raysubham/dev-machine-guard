@@ -209,6 +209,57 @@ func TestClear_AbsentFileIsNoOp(t *testing.T) {
 	}
 }
 
+func TestClear_RestoresCreatedFileToAbsent(t *testing.T) {
+	home := t.TempDir()
+	w := newDiskWriter(t, home)
+	if _, err := w.Write(stdBody); err != nil {
+		t.Fatal(err)
+	}
+	state := AppliedTargetState{}
+	if err := w.CompleteState(AppliedTargetState{}, false, &state); err != nil {
+		t.Fatal(err)
+	}
+	if !state.FileCreated {
+		t.Fatal("first write to an absent .npmrc must record file creation")
+	}
+	if err := w.PrepareClear(state, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Clear(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(npmrcPath(home)); !os.IsNotExist(err) {
+		t.Fatalf("created .npmrc survived clear: %v", err)
+	}
+}
+
+func TestClear_PreservesPreexistingEmptyFile(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(npmrcPath(home), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w := newDiskWriter(t, home)
+	if _, err := w.Write(stdBody); err != nil {
+		t.Fatal(err)
+	}
+	state := AppliedTargetState{}
+	if err := w.CompleteState(AppliedTargetState{}, false, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.FileCreated {
+		t.Fatal("pre-existing empty .npmrc recorded as agent-created")
+	}
+	if err := w.PrepareClear(state, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Clear(); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(npmrcPath(home)); err != nil || info.Size() != 0 {
+		t.Fatalf("pre-existing empty .npmrc was not preserved: info=%v err=%v", info, err)
+	}
+}
+
 // Clear's bool is what lets a caller describe what happened without weakening the
 // unconditional call: the clear must still run when no block is present (a lost
 // ownership record must never strand a live one), so "did anything change" cannot

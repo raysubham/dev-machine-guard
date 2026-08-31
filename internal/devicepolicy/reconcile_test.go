@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -1468,5 +1469,189 @@ func TestReconcileDMGEchoesEvaluatedEnforcement(t *testing.T) {
 	}
 	if got := lastReport(t, rep); got.EvaluatedEnforcement != enforcementDMG {
 		t.Fatalf("evaluated_enforcement = %q, want dmg", got.EvaluatedEnforcement)
+	}
+}
+
+const testPyPICredentialOwnershipKey = "credential"
+
+func newPyPICredentialRec(t *testing.T, hash, rendered string, w *fakeWriter) (*Reconciler, *fakeReporter) {
+	t.Helper()
+	withTempCache(t)
+	rep := &fakeReporter{}
+	r := &Reconciler{
+		Fetcher: &fakeFetcher{ep: EffectivePolicy{
+			Category: CategoryPackageConfig,
+			Target:   TargetPyPI,
+			Policy:   json.RawMessage(`{"ecosystem":"pypi"}`),
+			Hash:     hash,
+		}},
+		Reporter:            rep,
+		Writer:              w,
+		CustomerID:          "cust",
+		DeviceID:            "dev-1",
+		Platform:            "linux",
+		Category:            CategoryPackageConfig,
+		Target:              TargetPyPI,
+		OwnershipTarget:     PyPICredentialOwnershipTarget,
+		OwnershipStateValue: PyPICredentialOwnershipValue,
+		OwnershipKey:        testPyPICredentialOwnershipKey,
+		OwnsByMarker:        true,
+		Render:              func(json.RawMessage) (string, error) { return rendered, nil },
+		Converged:           func(expected string) (bool, error) { return w.present && w.value == expected, nil },
+		Probe:               func() (bool, string) { return false, "" },
+		Now:                 func() time.Time { return time.Date(2026, 8, 26, 0, 0, 0, 0, time.UTC) },
+	}
+	return r, rep
+}
+
+func TestReconcilerComponentOwnershipUsesLocalTargetAndExternalReportIdentity(t *testing.T) {
+	const rendered = "tenant-key::dev:dev-1"
+	w := &fakeWriter{}
+	r, rep := newPyPICredentialRec(t, "sha256:H", rendered, w)
+
+	publicState := AppliedTargetState{
+		AppliedHash: "sha256:H",
+		WrittenSettings: map[string]string{
+			testPyPICredentialOwnershipKey: "public-target-sentinel",
+		},
+	}
+	if err := WriteAppliedState(CategoryPackageConfig, TargetPyPI, publicState); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	gotReport := lastReport(t, rep)
+	if gotReport.Target != TargetPyPI || gotReport.State != StateCompliant {
+		t.Fatalf("report = %+v, want external target pypi and compliant", gotReport)
+	}
+	credentialState, ok := ReadAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget)
+	if !ok {
+		t.Fatal("credential ownership target was not written")
+	}
+	if got := credentialState.WrittenSettings[testPyPICredentialOwnershipKey]; len(credentialState.WrittenSettings) != 1 || got != PyPICredentialOwnershipValue {
+		t.Fatalf("credential ownership = %+v, want only %q", credentialState.WrittenSettings, PyPICredentialOwnershipValue)
+	}
+	rawState, err := os.ReadFile(CachePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rawState), rendered) {
+		t.Fatalf("rendered credential leaked into ownership state: %s", rawState)
+	}
+	if got, ok := ReadAppliedState(CategoryPackageConfig, TargetPyPI); !ok || got.WrittenSettings[testPyPICredentialOwnershipKey] != "public-target-sentinel" {
+		t.Fatalf("public target state changed: %+v ok=%v", got, ok)
+	}
+
+	r.Fetcher.(*fakeFetcher).ep = EffectivePolicy{Category: CategoryPackageConfig, Target: TargetPyPI, Clear: true}
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("clear Reconcile: %v", err)
+	}
+	if _, ok := ReadAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget); ok {
+		t.Fatal("credential ownership target must be removed by clear")
+	}
+	if got, ok := ReadAppliedState(CategoryPackageConfig, TargetPyPI); !ok || got.WrittenSettings[testPyPICredentialOwnershipKey] != "public-target-sentinel" {
+		t.Fatalf("clear changed public target state: %+v ok=%v", got, ok)
+	}
+}
+
+func TestReconcilerFixedOwnershipAdoptsStaleOrMismatchedState(t *testing.T) {
+	const rendered = "tenant-key::dev:dev-1"
+	tests := []struct {
+		name  string
+		prior *AppliedTargetState
+	}{
+		{"missing state", nil},
+		{"stale hash", &AppliedTargetState{AppliedHash: "sha256:OLD", WrittenSettings: map[string]string{testPyPICredentialOwnershipKey: PyPICredentialOwnershipValue}}},
+		{"missing ownership key", &AppliedTargetState{AppliedHash: "sha256:H", WrittenSettings: map[string]string{}}},
+		{"mismatched ownership value", &AppliedTargetState{AppliedHash: "sha256:H", WrittenSettings: map[string]string{testPyPICredentialOwnershipKey: "wrong"}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &fakeWriter{value: rendered, present: true}
+			r, rep := newPyPICredentialRec(t, "sha256:H", rendered, w)
+			if tc.prior != nil {
+				if err := WriteAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget, *tc.prior); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := r.Reconcile(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(w.writes) != 0 {
+				t.Fatalf("writes = %v, want converged marker adoption", w.writes)
+			}
+			state, ok := ReadAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget)
+			if !ok || state.AppliedHash != "sha256:H" || state.WrittenSettings[testPyPICredentialOwnershipKey] != PyPICredentialOwnershipValue {
+				t.Fatalf("ownership state = %+v ok=%v, want repaired current state", state, ok)
+			}
+			if got := lastReport(t, rep); got.State != StateCompliant || got.AppliedHash != "sha256:H" {
+				t.Fatalf("report = %+v, want compliant current hash", got)
+			}
+		})
+	}
+}
+
+func TestReconcilerFixedOwnershipPolicyRotationIsNotDrift(t *testing.T) {
+	const (
+		oldRendered = "old-key::dev:dev-1"
+		newRendered = "new-key::dev:dev-1"
+	)
+	w := &fakeWriter{value: oldRendered, present: true}
+	r, rep := newPyPICredentialRec(t, "sha256:NEW", newRendered, w)
+	if err := WriteAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget, AppliedTargetState{
+		AppliedHash: "sha256:OLD",
+		WrittenSettings: map[string]string{
+			testPyPICredentialOwnershipKey: PyPICredentialOwnershipValue,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(w.writes) != 1 || w.writes[0] != newRendered {
+		t.Fatalf("writes = %v, want rotated credential", w.writes)
+	}
+	if got := lastReport(t, rep); got.State != StateCompliant {
+		t.Fatalf("state = %q, want compliant for desired-hash rotation", got.State)
+	}
+}
+
+func TestReconcilerFixedOwnershipSameHashMismatchIsDrift(t *testing.T) {
+	const rendered = "tenant-key::dev:dev-1"
+	w := &fakeWriter{value: "manually-edited", present: true}
+	r, rep := newPyPICredentialRec(t, "sha256:H", rendered, w)
+	if err := WriteAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget, AppliedTargetState{
+		AppliedHash: "sha256:H",
+		WrittenSettings: map[string]string{
+			testPyPICredentialOwnershipKey: PyPICredentialOwnershipValue,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := lastReport(t, rep); got.State != StateDriftDetected {
+		t.Fatalf("state = %q, want drift_detected for same-hash convergence failure", got.State)
+	}
+}
+
+func TestReconcilerDefaultOwnershipBehaviorUnchanged(t *testing.T) {
+	w := &fakeWriter{}
+	r, rep := newRec(t, policyEP("sha256:H"), nil, w)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	st, ok := ReadAppliedState(CategoryIDEExtension, TargetVSCode)
+	if !ok || st.WrittenSettings[allowedExtensionsSettingKey] != samplePolicy {
+		t.Fatalf("default ownership = %+v ok=%v, want rendered policy under vscode", st, ok)
+	}
+	if got := lastReport(t, rep); got.Target != TargetVSCode || got.State != StateCompliant {
+		t.Fatalf("default report = %+v, want vscode compliant", got)
 	}
 }

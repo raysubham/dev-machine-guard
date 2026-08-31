@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -50,17 +51,30 @@ var pipEnvVarsToWatch = []string{
 	"HTTPS_PROXY",
 }
 
-// pipInvocationsToTry orders the candidate ways to find pip on the host.
-// The detector probes each in turn and uses the first that resolves.
-var pipInvocationsToTry = []struct {
+type pipInvocationCandidate struct {
 	binary  string
 	args    []string // args prepended to the binary call (e.g., "-m" "pip")
 	display string
-}{
+}
+
+// pipInvocationsToTry orders the candidate ways to find pip on the host.
+// The detector probes each in turn and uses the first that resolves.
+var pipInvocationsToTry = []pipInvocationCandidate{
 	{"pip", nil, "pip"},
 	{"pip3", nil, "pip3"},
 	{"python3", []string{"-m", "pip"}, "python3 -m pip"},
 	{"python", []string{"-m", "pip"}, "python -m pip"},
+}
+
+func pipEnforcementInvocationCandidates(goos string) []pipInvocationCandidate {
+	out := append([]pipInvocationCandidate(nil), pipInvocationsToTry...)
+	if goos == model.PlatformWindows {
+		out = append(out,
+			pipInvocationCandidate{"py", []string{"-m", "pip"}, "py -m pip"},
+			pipInvocationCandidate{"py", []string{"-3", "-m", "pip"}, "py -3 -m pip"},
+		)
+	}
+	return out
 }
 
 // pipConfigDebugSectionRE matches the layer headers in `pip config debug`
@@ -152,7 +166,7 @@ func (d *PipConfigDetector) Detect(ctx context.Context, loggedInUser *user.User)
 //	ok       — true when a working pip was found
 func (d *PipConfigDetector) detectPip(ctx context.Context) (string, []string, string, string, bool) {
 	for _, cand := range pipInvocationsToTry {
-		path, err := d.exec.LookPath(cand.binary)
+		path, err := executor.LookPathWithContext(ctx, d.exec, cand.binary)
 		if err != nil {
 			continue
 		}
@@ -184,7 +198,7 @@ func (d *PipConfigDetector) detectPip(ctx context.Context) (string, []string, st
 // was available at all.
 func (d *PipConfigDetector) runPip(ctx context.Context, timeout time.Duration, pipArgs ...string) (string, int, bool) {
 	for _, cand := range pipInvocationsToTry {
-		path, err := d.exec.LookPath(cand.binary)
+		path, err := executor.LookPathWithContext(ctx, d.exec, cand.binary)
 		if err != nil {
 			continue
 		}
@@ -208,6 +222,201 @@ func (d *PipConfigDetector) runPip(ctx context.Context, timeout time.Duration, p
 }
 
 // --- discovery --------------------------------------------------------------
+
+// PipUserConfigDiscovery is the trusted user-tier path and invocation set used
+// by package policy enforcement. Paths are resolved beneath the interactive
+// user's home; pip output can only confirm entries already in that allowlist.
+type PipUserConfigDiscovery struct {
+	AllowedUserPaths  []string
+	ExistingUserPaths []string
+	Invocations       [][]string
+}
+
+// DiscoverPipUserConfig discovers every supported pip invocation and only
+// documented user-tier configuration paths for the resolved interactive user.
+func DiscoverPipUserConfig(ctx context.Context, exec executor.Executor) (PipUserConfigDiscovery, error) {
+	u, err := exec.LoggedInUser()
+	if err != nil {
+		return PipUserConfigDiscovery{}, fmt.Errorf("pip discovery: resolving interactive user: %w", err)
+	}
+	if u == nil || u.HomeDir == "" {
+		return PipUserConfigDiscovery{}, errors.New("pip discovery: resolved interactive user has no home directory")
+	}
+	home := filepath.Clean(u.HomeDir)
+	userExec := executor.NewUserAwareExecutor(exec, u.Username)
+	allowed := pipAllowedUserPaths(userExec, home)
+	if err := executor.UserEnvironmentError(userExec); err != nil {
+		return PipUserConfigDiscovery{}, fmt.Errorf("pip discovery: resolving user environment: %w", err)
+	}
+
+	invocations := make([][]string, 0, len(pipInvocationsToTry)+2)
+	seenInvocations := map[string]bool{}
+	confirmed := map[string]bool{}
+	for _, candidate := range pipEnforcementInvocationCandidates(exec.GOOS()) {
+		path, err := executor.LookPathWithContext(ctx, userExec, candidate.binary)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return PipUserConfigDiscovery{}, ctxErr
+		}
+		if err != nil || userExec.IsAppleCLTStub(ctx, path) {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return PipUserConfigDiscovery{}, ctxErr
+			}
+			continue
+		}
+		key := filepath.Clean(path) + "\x00" + strings.Join(candidate.args, "\x00")
+		if seenInvocations[key] {
+			continue
+		}
+		versionArgs := append(append([]string(nil), candidate.args...), "--version")
+		stdout, _, exit, err := userExec.RunWithTimeout(ctx, 5*time.Second, candidate.binary, versionArgs...)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return PipUserConfigDiscovery{}, ctxErr
+		}
+		if err != nil || exit != 0 || !strings.HasPrefix(strings.TrimSpace(stdout), "pip ") {
+			continue
+		}
+		seenInvocations[key] = true
+		invocation := append([]string{candidate.binary}, candidate.args...)
+		invocations = append(invocations, invocation)
+
+		debugArgs := append(append([]string(nil), candidate.args...), "config", "debug")
+		debug, _, exit, err := userExec.RunWithTimeout(ctx, 10*time.Second, candidate.binary, debugArgs...)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return PipUserConfigDiscovery{}, ctxErr
+		}
+		if err != nil || exit != 0 {
+			continue
+		}
+		for _, discovered := range parsePipConfigDebug(debug) {
+			if discovered.layer != "user" || !discovered.exists {
+				continue
+			}
+			if trusted, ok := matchingPipAllowedPath(discovered.path, allowed, exec.GOOS()); ok {
+				confirmed[trusted] = true
+			}
+		}
+	}
+
+	existing := make([]string, 0, len(allowed))
+	for _, path := range allowed {
+		if exec.FileExists(path) || confirmed[path] {
+			existing = append(existing, path)
+		}
+	}
+	return PipUserConfigDiscovery{AllowedUserPaths: allowed, ExistingUserPaths: existing, Invocations: invocations}, nil
+}
+
+func pipAllowedUserPaths(exec executor.Executor, home string) []string {
+	paths := pipUserConfigPaths(exec, home, true)
+	out := make([]string, len(paths))
+	for i := range paths {
+		out[i] = paths[i].path
+	}
+	return out
+}
+
+type pipUserConfigPath struct {
+	path  string
+	layer string
+}
+
+// pipUserConfigPaths is the shared documented user-path source for inventory
+// and enforcement. Enforcement requests current-first, home-confined paths;
+// inventory retains its historical platform order and visibility.
+func pipUserConfigPaths(exec executor.Executor, home string, trusted bool) []pipUserConfigPath {
+	if home == "" {
+		return nil
+	}
+	var paths []pipUserConfigPath
+	switch exec.GOOS() {
+	case model.PlatformWindows:
+		appData := strings.TrimSpace(exec.Getenv("APPDATA"))
+		if trusted && !pipPathWithinHome(appData, home, true) {
+			appData = filepath.Join(home, "AppData", "Roaming")
+		}
+		if appData != "" {
+			paths = append(paths, pipUserConfigPath{filepath.Join(appData, "pip", "pip.ini"), "user"})
+		}
+		paths = append(paths, pipUserConfigPath{filepath.Join(home, "pip", "pip.ini"), "user-legacy"})
+	case model.PlatformDarwin:
+		applicationSupportDir := filepath.Join(home, "Library", "Application Support", "pip")
+		applicationSupport := filepath.Join(applicationSupportDir, "pip.conf")
+		xdg := filepath.Join(home, ".config", "pip", "pip.conf")
+		if trusted && !exec.DirExists(applicationSupportDir) {
+			paths = append(paths, pipUserConfigPath{xdg, "user"}, pipUserConfigPath{applicationSupport, "user"})
+		} else {
+			paths = append(paths, pipUserConfigPath{applicationSupport, "user"}, pipUserConfigPath{xdg, "user"})
+		}
+		paths = append(paths, pipUserConfigPath{filepath.Join(home, ".pip", "pip.conf"), "user-legacy"})
+	default:
+		xdgHome := strings.TrimSpace(exec.Getenv("XDG_CONFIG_HOME"))
+		if xdgHome == "" || trusted && !pipPathWithinHome(xdgHome, home, false) {
+			xdgHome = filepath.Join(home, ".config")
+		}
+		paths = append(paths,
+			pipUserConfigPath{filepath.Join(xdgHome, "pip", "pip.conf"), "user"},
+			pipUserConfigPath{filepath.Join(home, ".pip", "pip.conf"), "user-legacy"},
+		)
+	}
+	out := make([]pipUserConfigPath, 0, len(paths))
+	seen := map[string]bool{}
+	for _, candidate := range paths {
+		candidate.path = filepath.Clean(candidate.path)
+		if candidate.path == "." || seen[candidate.path] {
+			continue
+		}
+		seen[candidate.path] = true
+		out = append(out, candidate)
+	}
+	return out
+}
+
+func pipPathWithinHome(path, home string, windows bool) bool {
+	if path == "" || !filepath.IsAbs(path) {
+		return false
+	}
+	path, home = filepath.Clean(path), filepath.Clean(home)
+	if windows {
+		path, home = strings.ToLower(path), strings.ToLower(home)
+	}
+	rel, err := filepath.Rel(home, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+type pipDebugPath struct {
+	path   string
+	layer  string
+	exists bool
+}
+
+func parsePipConfigDebug(stdout string) []pipDebugPath {
+	var out []pipDebugPath
+	currentLayer := ""
+	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if match := pipConfigDebugSectionRE.FindStringSubmatch(line); match != nil {
+			currentLayer = match[1]
+			continue
+		}
+		if currentLayer != "global" && currentLayer != "user" && currentLayer != "site" {
+			continue
+		}
+		if match := pipConfigDebugFileRE.FindStringSubmatch(line); match != nil {
+			out = append(out, pipDebugPath{path: strings.TrimSpace(match[1]), layer: currentLayer, exists: match[2] == "True"})
+		}
+	}
+	return out
+}
+
+func matchingPipAllowedPath(reported string, allowed []string, goos string) (string, bool) {
+	reported = filepath.Clean(reported)
+	for _, trusted := range allowed {
+		if reported == trusted || goos == model.PlatformWindows && strings.EqualFold(reported, trusted) {
+			return trusted, true
+		}
+	}
+	return "", false
+}
 
 // discoverFiles returns the union of (`pip config debug`-derived paths) and
 // (PIP_CONFIG_FILE / VIRTUAL_ENV-derived paths). Deduplicates by absolute
@@ -320,31 +529,13 @@ func (d *PipConfigDetector) discoverViaPathEnumeration(loggedInUser *user.User) 
 	var out []struct{ path, layer string }
 
 	switch goos {
-	case "windows":
+	case model.PlatformWindows:
 		// Global. Vista is unsupported; skip.
 		if pd := d.exec.Getenv("ProgramData"); pd != "" {
 			out = append(out, struct{ path, layer string }{filepath.Join(pd, "pip", "pip.ini"), "global"})
 		}
-		// User.
-		if appdata := d.exec.Getenv("APPDATA"); appdata != "" {
-			out = append(out, struct{ path, layer string }{filepath.Join(appdata, "pip", "pip.ini"), "user"})
-		}
-		if homeDir != "" {
-			out = append(out, struct{ path, layer string }{filepath.Join(homeDir, "pip", "pip.ini"), "user-legacy"})
-		}
-	case "darwin":
-		// Global.
+	case model.PlatformDarwin:
 		out = append(out, struct{ path, layer string }{"/Library/Application Support/pip/pip.conf", "global"})
-		if homeDir != "" {
-			// pip itself prefers ~/Library/Application Support/pip when that
-			// directory exists, and otherwise reads ~/.config/pip. We surface
-			// both candidates: the audit is inventory-only, and having a
-			// stray config at the unused path is itself worth showing.
-			out = append(out, struct{ path, layer string }{filepath.Join(homeDir, "Library", "Application Support", "pip", "pip.conf"), "user"})
-			out = append(out, struct{ path, layer string }{filepath.Join(homeDir, ".config", "pip", "pip.conf"), "user"})
-			// Legacy.
-			out = append(out, struct{ path, layer string }{filepath.Join(homeDir, ".pip", "pip.conf"), "user-legacy"})
-		}
 	default: // linux + everything else
 		// XDG_CONFIG_DIRS is colon-separated; check each.
 		xdgDirs := d.exec.Getenv("XDG_CONFIG_DIRS")
@@ -359,15 +550,9 @@ func (d *PipConfigDetector) discoverViaPathEnumeration(loggedInUser *user.User) 
 			out = append(out, struct{ path, layer string }{filepath.Join(dir, "pip", "pip.conf"), "global"})
 		}
 		out = append(out, struct{ path, layer string }{"/etc/pip.conf", "global"})
-
-		if homeDir != "" {
-			xdgHome := d.exec.Getenv("XDG_CONFIG_HOME")
-			if xdgHome == "" {
-				xdgHome = filepath.Join(homeDir, ".config")
-			}
-			out = append(out, struct{ path, layer string }{filepath.Join(xdgHome, "pip", "pip.conf"), "user"})
-			out = append(out, struct{ path, layer string }{filepath.Join(homeDir, ".pip", "pip.conf"), "user-legacy"})
-		}
+	}
+	for _, candidate := range pipUserConfigPaths(d.exec, homeDir, false) {
+		out = append(out, struct{ path, layer string }{candidate.path, candidate.layer})
 	}
 	return out
 }
@@ -411,8 +596,8 @@ func (d *PipConfigDetector) populateFileMetadata(ctx context.Context, f *model.P
 	f.ModTimeUnix = info.ModTime().Unix()
 	f.Mode = fmt.Sprintf("%#o", info.Mode().Perm())
 
-	if info.IsDir() {
-		f.ParseError = "path is a directory"
+	if !info.Mode().IsRegular() {
+		f.ParseError = "path is not a regular file"
 		return
 	}
 

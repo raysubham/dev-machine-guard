@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/step-security/dev-machine-guard/internal/secureuserfile"
 )
 
 // enforcementDMG and enforcementMDM are the enforcement channels carried in
@@ -36,6 +38,13 @@ type Reconciler struct {
 	Platform   string // reported in compliance; e.g. "windows", "linux", "darwin"
 	Category   string // defaults to ide_extension
 	Target     string // defaults to vscode
+
+	// OwnershipTarget changes only the local state key. Reports still use Target.
+	OwnershipTarget string
+
+	// OwnershipStateValue replaces the rendered single-value ownership payload.
+	// Empty preserves existing IDE and npm behavior.
+	OwnershipStateValue string
 
 	// Probe reports whether a real MDM/admin-managed AllowedExtensions policy
 	// exists at this OS's policy location (registry / policy.json / managed
@@ -76,6 +85,9 @@ type Reconciler struct {
 	// user). Body equality alone is a hole there: a `registry=` line appended
 	// below an unchanged block leaves the body equal but defeats precedence.
 	Converged func(expected string) (bool, error)
+	// FullStateDrift reports a failed target-specific convergence check under an
+	// unchanged hash as drift even when the marker body itself is unchanged.
+	FullStateDrift bool
 
 	// Render, when set, derives the value to write/compare from the raw policy —
 	// e.g. rendering the two ~/.npmrc content lines from the npm policy object
@@ -105,6 +117,13 @@ type Reconciler struct {
 	// lost/drifted/empty record must not strand a token-bearing block on disk.
 	OwnsByMarker bool
 
+	// CompleteState adds non-secret ownership metadata discovered by a writer
+	// after a successful write or adoption. PrepareWrite and PrepareClear validate
+	// that metadata before the corresponding mutation.
+	CompleteState func(previous AppliedTargetState, hadPrevious bool, current *AppliedTargetState) error
+	PrepareWrite  func(previous AppliedTargetState, hadPrevious bool) error
+	PrepareClear  func(previous AppliedTargetState, hadPrevious bool) error
+
 	// WriterInitErr carries a writer-construction failure (Writer is then nil).
 	// The reconciler classifies it AFTER the fetch: absent policy → silent no-op,
 	// clear → retain all state (no target to act against), enforce →
@@ -121,12 +140,15 @@ type Reconciler struct {
 	// (WriteAppliedState / ClearAppliedState). nil → the real implementation.
 	writeState func(category, target string, s AppliedTargetState) error
 	clearState func(category, target string) error
+	probeState func() error
 
 	// enforcement is the canonical channel the current cycle actually ran —
 	// always "dmg" or "mdm" (an empty or unrecognized ep.Enforcement resolves to
 	// "dmg"). Stamped onto every report as EvaluatedEnforcement so it matches the
 	// backend's exact-match gate. Per-cycle scratch.
 	enforcement string
+	// evaluatedHash is the active npm policy hash fetched for this cycle.
+	evaluatedHash string
 }
 
 // readState / persistState / dropState are every category's access to the one
@@ -135,22 +157,39 @@ type Reconciler struct {
 // category and target, and takes a cross-process lock so two agent processes
 // reconciling different categories cannot drop each other's record. The
 // writeState/clearState test seams inject persist failures.
-func (r *Reconciler) readState(cat, tgt string) (AppliedTargetState, bool) {
-	return ReadAppliedState(cat, tgt)
+func (r *Reconciler) readState(cat string) (AppliedTargetState, bool) {
+	return ReadAppliedState(cat, r.stateTarget())
 }
 
-func (r *Reconciler) persistState(cat, tgt string, s AppliedTargetState) error {
+func (r *Reconciler) persistState(cat string, s AppliedTargetState) error {
+	tgt := r.stateTarget()
 	if r.writeState != nil {
 		return r.writeState(cat, tgt, s)
 	}
 	return WriteAppliedState(cat, tgt, s)
 }
 
-func (r *Reconciler) dropState(cat, tgt string) error {
+func (r *Reconciler) dropState(cat string) error {
+	tgt := r.stateTarget()
 	if r.clearState != nil {
 		return r.clearState(cat, tgt)
 	}
 	return ClearAppliedState(cat, tgt)
+}
+
+func (r *Reconciler) probeOwnershipState(cat string, previous AppliedTargetState, hadPrevious bool) error {
+	if r.probeState != nil {
+		return r.probeState()
+	}
+	// Preserve the existing injected write seam for tests that distinguish the
+	// pre-write and post-write ownership-store failures.
+	if r.writeState != nil {
+		if !hadPrevious {
+			previous = AppliedTargetState{FetchedAt: r.now()}
+		}
+		return r.persistState(cat, previous)
+	}
+	return ProbeAppliedStateWritable()
 }
 
 // renderValue produces the value to write/compare: the rendered block via the
@@ -209,7 +248,7 @@ func (r *Reconciler) rollback(prevOnDisk string, prevPresent bool) (state string
 // transient I/O) stays verification_failed. The IDE writer never wraps the
 // sentinel, so this always returns verification_failed for it.
 func classifyReadError(err error) string {
-	if errors.Is(err, ErrTargetUnusable) {
+	if errors.Is(err, ErrTargetUnusable) || errors.Is(err, secureuserfile.ErrTargetUnusable) {
 		return StateWriteFailed
 	}
 	return StateVerificationFailed
@@ -222,7 +261,7 @@ func classifyReadError(err error) string {
 // which is verification_failed, not a clean write failure. The IDE writer never
 // returns that sentinel, so this is always write_failed for it.
 func classifyWriteError(err error) string {
-	if errors.Is(err, ErrWriteUnverified) {
+	if errors.Is(err, ErrWriteUnverified) || errors.Is(err, secureuserfile.ErrWriteUnverified) {
 		return StateVerificationFailed
 	}
 	return StateWriteFailed
@@ -253,6 +292,34 @@ func (r *Reconciler) target() string {
 		return r.Target
 	}
 	return TargetVSCode
+}
+
+func (r *Reconciler) stateTarget() string {
+	if r.OwnershipTarget != "" {
+		return r.OwnershipTarget
+	}
+	return r.target()
+}
+
+func (r *Reconciler) stateValue(rendered string) string {
+	if r.OwnershipStateValue != "" {
+		return r.OwnershipStateValue
+	}
+	return rendered
+}
+
+func (r *Reconciler) completedState(previous AppliedTargetState, hadPrevious bool, hash, key, value string) (AppliedTargetState, error) {
+	state := AppliedTargetState{
+		AppliedHash:     hash,
+		WrittenSettings: map[string]string{key: r.stateValue(value)},
+		FetchedAt:       r.now(),
+	}
+	if r.CompleteState != nil {
+		if err := r.CompleteState(previous, hadPrevious, &state); err != nil {
+			return AppliedTargetState{}, err
+		}
+	}
+	return state, nil
 }
 
 func (r *Reconciler) probe() (bool, string) {
@@ -314,6 +381,7 @@ func (r *Reconciler) ownershipKey() string {
 //   - policy result → probe → ownership/drift-checked write + readback +
 //     verify + report (handleEnforce).
 func (r *Reconciler) Reconcile(ctx context.Context) error {
+	r.evaluatedHash = ""
 	if r.Fetcher == nil {
 		return errors.New("devicepolicy: nil fetcher")
 	}
@@ -324,6 +392,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	if err != nil {
 		// Malformed/transient: do nothing. The on-disk policy (if any) stands.
 		return fmt.Errorf("devicepolicy: fetch: %w", err)
+	}
+	if cat == CategoryPackageConfig && tgt == TargetNPM && ep.present() && !ep.Clear {
+		r.evaluatedHash = ep.Hash
 	}
 	// Resolve the requested channel to the canonical one this cycle actually
 	// runs, and stamp THAT on every report as EvaluatedEnforcement: the backend
@@ -466,7 +537,7 @@ func (r *Reconciler) handleClear(cat, tgt string) error {
 		return r.handleClearByMarker(cat, tgt)
 	}
 
-	prev, hadPrev := r.readState(cat, tgt)
+	prev, hadPrev := r.readState(cat)
 	if mw, ok := r.Writer.(managedSettingsWriter); ok {
 		return r.clearManaged(cat, tgt, prev, hadPrev, mw)
 	}
@@ -540,7 +611,7 @@ func (r *Reconciler) clearManaged(cat, tgt string, prev AppliedTargetState, hadP
 // failed. An absent entry → no-op (idempotent).
 func (r *Reconciler) dropClearedState(cat, tgt string, hadPrev bool) error {
 	if hadPrev {
-		if err := r.dropState(cat, tgt); err != nil {
+		if err := r.dropState(cat); err != nil {
 			return fmt.Errorf("devicepolicy: clear: update state: %w", err)
 		}
 	}
@@ -557,6 +628,12 @@ func (r *Reconciler) dropClearedState(cat, tgt string, hadPrev bool) error {
 // record is dropped UNCONDITIONALLY afterward — a store read that failed or lied
 // (no record found) must not leave an orphan behind; Drop is idempotent.
 func (r *Reconciler) handleClearByMarker(cat, tgt string) error {
+	prev, hadPrev := r.readState(cat)
+	if r.PrepareClear != nil {
+		if err := r.PrepareClear(prev, hadPrev); err != nil {
+			return fmt.Errorf("devicepolicy: prepare clear %s: %w", r.Writer.Location(), err)
+		}
+	}
 	changed, err := r.Writer.Clear()
 	if err != nil {
 		return fmt.Errorf("devicepolicy: clear %s: %w", r.Writer.Location(), err)
@@ -566,7 +643,7 @@ func (r *Reconciler) handleClearByMarker(cat, tgt string) error {
 	} else {
 		r.logf("devicepolicy: clear requested but %s holds no managed block; nothing to remove", r.Writer.Location())
 	}
-	if err := r.dropState(cat, tgt); err != nil {
+	if err := r.dropState(cat); err != nil {
 		return fmt.Errorf("devicepolicy: clear: update state: %w", err)
 	}
 	return nil
@@ -661,8 +738,15 @@ func (r *Reconciler) handleEnforce(ctx context.Context, cat, tgt string, ep Effe
 func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep EffectivePolicy, newValue string) error {
 	ownKey := r.ownershipKey()
 
-	// 2. Read the current value.
-	prev, hadPrev := r.readState(cat, tgt)
+	// 2. Read ownership state and validate it before any convergence return.
+	prev, hadPrev := r.readState(cat)
+	if r.PrepareWrite != nil {
+		if err := r.PrepareWrite(prev, hadPrev); err != nil {
+			_ = r.report(ctx, cat, tgt, StateWriteFailed, "")
+			return fmt.Errorf("devicepolicy: enforce: prepare write %s: %w", r.Writer.Location(), err)
+		}
+	}
+	prevWritten := prev.WrittenSettings[ownKey]
 	onDisk, present, err := r.Writer.Read()
 	if err != nil {
 		// Couldn't read to decide idempotency/drift. A structural refusal (the
@@ -686,8 +770,8 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 		_ = r.report(ctx, cat, tgt, state, "")
 		return fmt.Errorf("devicepolicy: enforce: convergence check %s: %w", r.Writer.Location(), cerr)
 	}
-	if converged && prev.AppliedHash == ep.Hash {
-		r.logf("devicepolicy: policy already applied (hash unchanged) — no write")
+	if converged && prev.AppliedHash == ep.Hash && (r.OwnershipStateValue == "" || prevWritten == r.stateValue(newValue)) {
+		r.logf("devicepolicy: policy already applied (hash unchanged) - no write")
 		return r.report(ctx, cat, tgt, StateCompliant, ep.Hash)
 	}
 
@@ -702,11 +786,12 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 	// cycle. Gated on the Converged seam so the settings.json path (body equality)
 	// is byte-identical to before.
 	if converged && r.Converged != nil {
-		if perr := r.persistState(cat, tgt, AppliedTargetState{
-			AppliedHash:     ep.Hash,
-			WrittenSettings: map[string]string{ownKey: newValue},
-			FetchedAt:       r.now(),
-		}); perr != nil {
+		state, serr := r.completedState(prev, hadPrev, ep.Hash, ownKey, newValue)
+		if serr != nil {
+			_ = r.report(ctx, cat, tgt, StateVerificationFailed, "")
+			return fmt.Errorf("devicepolicy: complete adopted state: %w", serr)
+		}
+		if perr := r.persistState(cat, state); perr != nil {
 			r.logf("devicepolicy: could not adopt already-converged state at %s: %v", r.Writer.Location(), perr)
 		}
 		r.logf("devicepolicy: %s already holds the desired block (adopted) — no write", r.Writer.Location())
@@ -717,21 +802,21 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 	// it (edited or removed — typically the user hand-editing settings.json).
 	// Enforcement means converging it back; the distinct state lets the
 	// backend surface that it happened.
-	prevWritten := prev.WrittenSettings[ownKey]
 	drifted := hadPrev && prevWritten != "" && (!present || onDisk != prevWritten)
+	if (r.OwnershipStateValue != "" || r.FullStateDrift) && r.Converged != nil {
+		// A fixed marker proves ownership, not content equality. Under the same
+		// desired hash, failed target-specific convergence is drift; a new hash is
+		// a desired-policy transition.
+		drifted = hadPrev && prevWritten != "" && prev.AppliedHash == ep.Hash && !converged
+	}
 	if drifted {
 		r.logf("devicepolicy: %s diverged from the recorded written value → re-applying (drift)", r.Writer.Location())
 	}
-
 	// Preflight: prove the ownership store is writable BEFORE mutating the
 	// settings file. An enforced value with no ownership record is orphaned — a
 	// later clear refuses to remove it. Re-persisting the current state is a
 	// meaning-preserving writability probe.
-	probe := prev
-	if !hadPrev {
-		probe = AppliedTargetState{FetchedAt: r.now()}
-	}
-	if perr := r.persistState(cat, tgt, probe); perr != nil {
+	if perr := r.probeOwnershipState(cat, prev, hadPrev); perr != nil {
 		_ = r.report(ctx, cat, tgt, StateWriteFailed, "")
 		return fmt.Errorf("devicepolicy: enforce: ownership state not writable, refusing to write policy: %w", perr)
 	}
@@ -746,16 +831,16 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 	}
 	readbackMatch := rb == newValue
 
-	// Ownership is recorded on EVERY successful write — it means "what the agent
-	// wrote", not "what it verified". On a readback mismatch the write may still
-	// have landed; without a record the next cycle would classify the agent's
-	// own value as drift forever. Value-based ownership self-corrects: the
-	// record only takes effect when the on-disk value actually equals it.
-	if err := r.persistState(cat, tgt, AppliedTargetState{
-		AppliedHash:     ep.Hash,
-		WrittenSettings: map[string]string{ownKey: newValue},
-		FetchedAt:       r.now(),
-	}); err != nil {
+	// Ownership is recorded on EVERY successful write. By default it records the
+	// rendered value; a fixed-state marker component records its non-secret
+	// identity instead and delegates exact content checks to Converged. On a
+	// readback mismatch the write may still have landed, so the record is retained
+	// for next-cycle recovery.
+	stateRecord, stateErr := r.completedState(prev, hadPrev, ep.Hash, ownKey, newValue)
+	if stateErr == nil {
+		stateErr = r.persistState(cat, stateRecord)
+	}
+	if stateErr != nil {
 		// The write happened but ownership couldn't be recorded — undo it so no
 		// unrecorded value is left behind. The rollback outcome decides the state:
 		// cleanly undone → write_failed; restore failed/aborted → verification_failed.
@@ -764,7 +849,7 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 			r.logf("devicepolicy: rollback at %s failed: %v", r.Writer.Location(), rbErr)
 		}
 		_ = r.report(ctx, cat, tgt, state, "")
-		return fmt.Errorf("devicepolicy: enforce: update state: %w", err)
+		return fmt.Errorf("devicepolicy: enforce: update state: %w", stateErr)
 	}
 	r.logf("devicepolicy: wrote policy to %s (readback_match=%v)", r.Writer.Location(), readbackMatch)
 
@@ -792,7 +877,7 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 // (a foreign or absent value is never deleted). No setting id is special-cased,
 // so a new managed key rides through with no change here.
 func (r *Reconciler) enforceManaged(ctx context.Context, cat, tgt string, ep EffectivePolicy, desired map[string]string, mw managedSettingsWriter) error {
-	prev, hadPrev := r.readState(cat, tgt)
+	prev, hadPrev := r.readState(cat)
 	owned := ownedKeys(prev, hadPrev)
 
 	// 1. Read every key this cycle may touch: the union of the settings map's keys
@@ -861,11 +946,7 @@ func (r *Reconciler) enforceManaged(ctx context.Context, cat, tgt string, ep Eff
 
 	// 6. Preflight: prove the ownership store is writable BEFORE mutating the
 	// settings file (same rationale as the single-key path).
-	probe := prev
-	if !hadPrev {
-		probe = AppliedTargetState{FetchedAt: r.now()}
-	}
-	if perr := r.persistState(cat, tgt, probe); perr != nil {
+	if perr := r.probeOwnershipState(cat, prev, hadPrev); perr != nil {
 		_ = r.report(ctx, cat, tgt, StateWriteFailed, "")
 		return fmt.Errorf("devicepolicy: enforce: ownership state not writable, refusing to write policy: %w", perr)
 	}
@@ -901,7 +982,7 @@ func (r *Reconciler) enforceManaged(ctx context.Context, cat, tgt string, ep Eff
 	for key, v := range desired {
 		ownedAfter[key] = v
 	}
-	if err := r.persistState(cat, tgt, AppliedTargetState{
+	if err := r.persistState(cat, AppliedTargetState{
 		AppliedHash:     ep.Hash,
 		WrittenSettings: ownedAfter,
 		FetchedAt:       r.now(),
@@ -1054,9 +1135,13 @@ func (r *Reconciler) report(ctx context.Context, cat, tgt, state, appliedHash st
 }
 
 // sendReport stamps the shared fields (agent version, platform,
-// EvaluatedEnforcement) and submits. Callers fill Category/Target/State and the
-// lane-specific field: AppliedHash for the write path, Observed for MDM.
+// EvaluatedEnforcement, and npm's fetched EvaluatedHash) and submits. Callers
+// fill Category/Target/State and the lane-specific field: AppliedHash for the
+// write path, Observed for MDM.
 func (r *Reconciler) sendReport(ctx context.Context, rep ComplianceReport) error {
+	if rep.EvaluatedHash == "" {
+		rep.EvaluatedHash = r.evaluatedHash
+	}
 	rep.AgentVersion = AgentVersion()
 	rep.Platform = r.Platform
 	rep.EvaluatedEnforcement = r.enforcement

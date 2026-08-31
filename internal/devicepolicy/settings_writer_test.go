@@ -3,6 +3,7 @@ package devicepolicy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/step-security/dev-machine-guard/internal/atomicfile"
+	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/model"
 )
 
 const samplePolicyObject = `{"github.copilot":true,"ms-python.python":"1.2.3"}`
@@ -373,15 +376,8 @@ func TestSettingsWriteFailureLeavesFileUntouched(t *testing.T) {
 func TestSettingsPathPerOS(t *testing.T) {
 	switch runtime.GOOS {
 	case "windows":
-		t.Setenv("APPDATA", `C:\Users\dev\AppData\Roaming`)
-		got, ok := settingsPath()
-		want := filepath.Join(`C:\Users\dev\AppData\Roaming`, "Code", "User", "settings.json")
-		if !ok || got != want {
-			t.Fatalf("settingsPath = (%q, %v), want (%q, true)", got, ok, want)
-		}
-		t.Setenv("APPDATA", "")
 		if _, ok := settingsPath(); ok {
-			t.Fatal("settingsPath with empty %APPDATA%: want ok=false")
+			t.Fatal("settingsPath on Windows must use NewWriter's resolved-user path")
 		}
 	case "darwin":
 		got, ok := settingsPath()
@@ -405,6 +401,25 @@ func TestSettingsPathPerOS(t *testing.T) {
 		if _, ok := settingsPath(); ok {
 			t.Fatalf("settingsPath on %s: want ok=false", runtime.GOOS)
 		}
+	}
+}
+
+func TestNewWriterWindowsRequiresResolvedUserAndUsesTheirAppData(t *testing.T) {
+	mock := executor.NewMock()
+	mock.SetGOOS(model.PlatformWindows)
+	mock.SetLoggedInUserError(errors.New("session 0"))
+	if writer, ok := NewWriter(mock); ok || writer != nil {
+		t.Fatalf("NewWriter without target = %v, %v", writer, ok)
+	}
+
+	mock.SetLoggedInUserError(nil)
+	mock.SetEnv("APPDATA", filepath.Join(t.TempDir(), "Roaming"))
+	writer, ok := NewWriter(mock)
+	if !ok {
+		t.Fatal("NewWriter with target user failed")
+	}
+	if !strings.Contains(writer.Location(), filepath.Join("Roaming", "Code", "User", "settings.json")) {
+		t.Fatalf("Location = %q", writer.Location())
 	}
 }
 

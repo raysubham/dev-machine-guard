@@ -272,16 +272,23 @@ func main() {
 		}
 		armExecutionWatchdog(telemetry.ExecutionDeadline(config.MaxExecutionDuration), log)
 		telemetryErr := telemetry.Run(exec, log, cfg)
+		targetExec, restoreTarget, targetOK := resolveDevicePolicyTarget(exec, log)
 		// Package-config enforcement runs on every cycle, even one where telemetry
 		// failed, so an emergency unassignment/offboarding directive is never
 		// blocked by a telemetry outage — hence before the error-exit below.
-		runPackageConfigEnforce(exec, log)
+		if targetOK {
+			runPackageConfigEnforce(targetExec, log)
+		}
 		if telemetryErr != nil {
+			restoreTarget()
 			log.Error("%v", telemetryErr)
 			os.Exit(1)
 		}
 		runHookStateReconcile(exec, log)
-		runIDEExtensionEnforce(exec, log)
+		if targetOK {
+			runIDEExtensionEnforce(targetExec, log)
+		}
+		restoreTarget()
 
 	case "install":
 		_, _ = fmt.Fprintf(os.Stdout, "StepSecurity Dev Machine Guard v%s\n\n", buildinfo.Version)
@@ -379,8 +386,9 @@ func main() {
 		// so let the first scheduled /ru INTERACTIVE firing do the first enforcement
 		// (macOS root installs resolve the console user; Linux installs are user
 		// mode, and the Windows-SYSTEM / macOS paths already returned above).
-		if runtime.GOOS != model.PlatformWindows {
-			runPackageConfigEnforce(exec, log)
+		targetExec, restoreTarget, targetOK := resolveDevicePolicyTarget(exec, log)
+		if runtime.GOOS != model.PlatformWindows && targetOK {
+			runPackageConfigEnforce(targetExec, log)
 		}
 
 		if telemetryErr != nil {
@@ -393,12 +401,16 @@ func main() {
 				// to surface real misconfigurations during interactive use.
 				log.Warn("initial telemetry failed (%v) — the scheduled task will retry on its next firing", telemetryErr)
 			} else {
+				restoreTarget()
 				log.Error("%v", telemetryErr)
 				os.Exit(1)
 			}
 		}
 		runHookStateReconcile(exec, log)
-		runIDEExtensionEnforce(exec, log)
+		if targetOK {
+			runIDEExtensionEnforce(targetExec, log)
+		}
+		restoreTarget()
 
 	case "uninstall":
 		_, _ = fmt.Fprintf(os.Stdout, "StepSecurity Dev Machine Guard v%s\n\n", buildinfo.Version)
@@ -513,7 +525,11 @@ func main() {
 			telemetryErr := telemetry.Run(exec, log, cfg)
 			// Package-config enforcement runs on every enterprise cycle — including a
 			// manually invoked one, and even when telemetry failed.
-			runPackageConfigEnforce(exec, log)
+			targetExec, restoreTarget, targetOK := resolveDevicePolicyTarget(exec, log)
+			if targetOK {
+				runPackageConfigEnforce(targetExec, log)
+			}
+			restoreTarget()
 			if telemetryErr != nil {
 				log.Error("%v", telemetryErr)
 				os.Exit(1)
@@ -747,6 +763,15 @@ func runHookStateReconcile(exec executor.Executor, log *progress.Logger) {
 // rest is local file/registry I/O.
 const devicePolicyEnforceTimeout = 30 * time.Second
 
+func resolveDevicePolicyTarget(exec executor.Executor, log *progress.Logger) (executor.Executor, func(), bool) {
+	targetExec, restore, err := devicepolicy.ConfigureCacheTarget(exec)
+	if err != nil {
+		log.Debug("device-policy enforce: no active target user; preserving user-scoped state")
+		return nil, func() {}, false
+	}
+	return targetExec, restore, true
+}
+
 // runIDEExtensionEnforce fetches the device's effective IDE-extension policy
 // and converges the user-scope VS Code settings.json (extensions.allowed) to
 // match, then reports compliance — all on the existing scheduled cycle and the
@@ -761,7 +786,7 @@ func runIDEExtensionEnforce(exec executor.Executor, log *progress.Logger) {
 		log.Debug("ide-extension enforce: skipped (feature gated)")
 		return
 	}
-	writer, ok := devicepolicy.NewWriter()
+	writer, ok := devicepolicy.NewWriter(exec)
 	if !ok {
 		// No user-scope settings path (no home / %APPDATA%). The write path
 		// no-ops on a nil Writer, but verify-only (MDM) mode owns nothing on
@@ -809,16 +834,8 @@ func runIDEExtensionEnforce(exec executor.Executor, log *progress.Logger) {
 	}
 }
 
-// runPackageConfigEnforce fetches the device's effective package-config policy
-// (the npm secure-registry directive) and converges the managed block in the
-// console user's ~/.npmrc to match, then reports compliance — on the same
-// scheduled cycle and agent auth channel as the IDE-extension enforcement above.
-// It runs on every telemetry cycle, INCLUDING cycles where telemetry itself
-// failed, so an emergency unassignment/offboarding directive is never blocked by
-// a telemetry outage. A device whose npm config is already governed by the MDM
-// remediation script is detected by the writer's content-aware probe and reported
-// mdm_managed instead. A silent no-op when enterprise config is missing. Failures
-// are logged but never crash main.
+// runPackageConfigEnforce runs npm and PyPI independently after resolving their
+// shared enterprise and device identity once. Failures never crash main.
 func runPackageConfigEnforce(exec executor.Executor, log *progress.Logger) {
 	cfg, ok := ingest.Snapshot()
 	if !ok {
@@ -837,74 +854,79 @@ func runPackageConfigEnforce(exec executor.Executor, log *progress.Logger) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), devicePolicyEnforceTimeout)
-	defer cancel()
-
 	dev := device.Gather(ctx, exec)
+	cancel()
 	if dev.SerialNumber == "" || dev.SerialNumber == "unknown" {
 		log.Warn("package-config enforce: device serial unresolved; skipping")
 		return
 	}
-	serial := dev.SerialNumber
+	runPackageConfigLanes(exec, log, fetcher, reporter, cfg.CustomerID, dev.SerialNumber, dev.Platform)
+}
 
+func runPackageConfigLanes(exec executor.Executor, log *progress.Logger, fetcher devicepolicy.Fetcher, reporter devicepolicy.Reporter, customerID, serial, platform string) {
+	npmCtx, npmCancel := context.WithTimeout(context.Background(), devicePolicyEnforceTimeout)
+	npmErr := runNPMPackageConfigLane(npmCtx, exec, log, fetcher, reporter, customerID, serial, platform)
+	npmCancel()
+	if npmErr != nil {
+		wrapped := fmt.Errorf("npm package-config enforce: %w", npmErr)
+		log.Warn("%v", wrapped)
+		aiagentscli.AppendError("devicepolicy", "enforce_failed", wrapped.Error(), "")
+	}
+
+	pypiCtx, pypiCancel := context.WithTimeout(context.Background(), devicePolicyEnforceTimeout)
+	pypiErr := runPyPIPackageConfigLane(pypiCtx, exec, log, fetcher, reporter, customerID, serial, platform)
+	pypiCancel()
+	if pypiErr != nil {
+		wrapped := fmt.Errorf("PyPI package-config enforce: %w", pypiErr)
+		log.Warn("%v", wrapped)
+		aiagentscli.AppendError("devicepolicy", "enforce_failed", wrapped.Error(), "")
+	}
+}
+
+func runNPMPackageConfigLane(ctx context.Context, exec executor.Executor, log *progress.Logger, fetcher devicepolicy.Fetcher, reporter devicepolicy.Reporter, customerID, serial, platform string) error {
 	r := &devicepolicy.Reconciler{
 		Fetcher:    fetcher,
 		Reporter:   reporter,
-		CustomerID: cfg.CustomerID,
+		CustomerID: customerID,
 		DeviceID:   serial,
-		Platform:   dev.Platform,
+		Platform:   platform,
 		Category:   devicepolicy.CategoryPackageConfig,
 		Target:     devicepolicy.TargetNPM,
-		// Render derives the two managed ~/.npmrc content lines from the policy and
-		// this device's serial. It fully validates the policy and is pure, so it is
-		// wired even when the writer below could not be constructed.
 		Render: func(policy json.RawMessage) (string, error) {
 			return devicepolicy.RenderNPMRCBlock(policy, serial)
 		},
-		OwnsByMarker: true,
-		// The managed block is one atomic unit, so the lane owns exactly one
-		// WrittenSettings entry under this key.
-		OwnershipKey: devicepolicy.NPMOwnedKey,
-		Logf:         func(format string, args ...any) { log.Debug(format, args...) },
+		OwnsByMarker:        true,
+		OwnershipKey:        devicepolicy.NPMOwnedKey,
+		OwnershipStateValue: devicepolicy.NPMOwnershipValue,
+		Logf:                func(format string, args ...any) { log.Debug(format, args...) },
 	}
 
-	// The writer resolves the console user and opens a directory fd over their
-	// home. When it cannot (no enforceable target user, or an infrastructure
-	// failure) leave the writer seams nil and hand the reconciler the init error:
-	// it classifies AFTER the fetch (absent → silent, clear → retain all state,
-	// enforce → policy_not_applied for no-target else write_failed). Binding
-	// w.Converged / w.ProbeExpected before this nil check would capture method
-	// values on a nil receiver, and the deferred Close would panic.
-	w, werr := devicepolicy.NewNPMRCWriter(exec)
-	if werr != nil {
-		r.WriterInitErr = werr
+	w, err := devicepolicy.NewNPMRCWriter(exec)
+	if err != nil {
+		r.WriterInitErr = err
 	} else {
 		defer w.Close()
 		w.SetLogf(func(format string, args ...any) { log.Debug(format, args...) })
-
-		// Concurrent convergence of this ~/.npmrc is not serialized across
-		// processes. Every write is an atomic temp+rename, so an overlapping
-		// cycle never sees a torn file. While the policy is stable both cycles
-		// render identical bytes; only a policy transition (a key rotation, or an
-		// enforce racing a clear) that interleaves with a concurrent cycle can
-		// briefly leave the superseded value, reconverged next cycle — eventual
-		// consistency, the same model the VS Code settings.json lane relies on.
-		// The telemetry singleton lock already serializes the preceding scan phase.
-		// Ownership state is the exception: it shares one file with every other
-		// category, so its read-modify-write does take a cross-process lock.
 		r.Writer = w
 		r.Converged = w.Converged
+		r.CompleteState = w.CompleteState
+		r.PrepareClear = w.PrepareClear
 		r.ProbeExpected = w.ProbeExpected
 		r.RestoreSnapshot = w.RestoreSnapshot
-		// Verify-only channel (enforcement=mdm): read the effective ~/.npmrc and
-		// report the observed bag instead of writing. Bound here because it needs the
-		// writer's identity-checked read path; with no writer the reconciler's
-		// category-aware fallback reports verification_failed rather than probing VS
-		// Code policy for an npm category.
 		r.ProbeContent = w.ProbeContentNPM
 	}
+	return r.Reconcile(ctx)
+}
 
-	if err := r.Reconcile(ctx); err != nil {
-		log.Warn("package-config enforce: %v", err)
-		aiagentscli.AppendError("devicepolicy", "enforce_failed", err.Error(), "")
+func runPyPIPackageConfigLane(ctx context.Context, exec executor.Executor, log *progress.Logger, fetcher devicepolicy.Fetcher, reporter devicepolicy.Reporter, customerID, serial, platform string) error {
+	coordinator := &devicepolicy.PyPICoordinator{
+		Fetcher:    fetcher,
+		Reporter:   reporter,
+		Exec:       exec,
+		CustomerID: customerID,
+		DeviceID:   serial,
+		Platform:   platform,
+		Logf:       func(format string, args ...any) { log.Debug(format, args...) },
 	}
+	return coordinator.Reconcile(ctx)
 }

@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/secureuserfile"
 )
 
 // This file backs the package_config#npm policy category: it converges a
@@ -44,11 +45,11 @@ const (
 )
 
 // NPMOwnedKey is the WrittenSettings key the npm lane records ownership under.
-// The managed block is ONE atomic unit (its BEGIN/END markers bound it), so the
-// lane owns exactly one entry — value = the rendered block body — where the VS
-// Code lane owns one entry per setting id. Wired as Reconciler.OwnershipKey so
-// drift, adoption, persistence, and the value-based clear all read the same key.
 const NPMOwnedKey = "npmrc"
+
+// NPMOwnershipValue is the secret-free identity persisted for marker-owned npm
+// configuration. Exact content and effectiveness are verified from disk.
+const NPMOwnershipValue = "dmg_marker_v1"
 
 // The observed-bag keys and auth verdicts of the MDM verify-only report. They are
 // WIRE-PERMANENT: the backend validates exactly these three keys and rejects any
@@ -152,14 +153,18 @@ type NPMRCWriter struct {
 	home       string
 	uid, gid   int // parsed from targetUser; only meaningful where enforcePOSIXMetadata
 
-	root   *os.Root // directory fd over the target home, held for the writer's lifetime
-	owners ownerReader
-	logf   func(format string, args ...any)
+	root       *os.Root // directory fd over the target home, held for the writer's lifetime
+	owners     ownerReader
+	secureHome *secureuserfile.Home
+	logf       func(format string, args ...any)
 
 	// pending is the memory-only snapshot captured at the start of the last
 	// mutating op (Write/Clear) and retained on success so a later
 	// RestoreSnapshot can undo it. It is never persisted.
 	pending *pendingSnapshot
+
+	ownedCreated bool
+	ownedLeaf    string
 }
 
 // pendingSnapshot is the pre-mutation state one Write or Clear can roll back to.
@@ -177,6 +182,7 @@ type pendingSnapshot struct {
 	// parent directory or the leaf inode was swapped underneath it, and reverting
 	// into that would write stale bytes into someone else's file.
 	committed os.FileInfo
+	removed   bool
 }
 
 // ownerReader reads the uid/gid owning an open file. enforcePOSIXMetadata
@@ -193,26 +199,22 @@ type ownerReader interface {
 // user); any other error is an infrastructure failure (home unresolvable or
 // unopenable). The caller defers Close to release the directory fd.
 func NewNPMRCWriter(exec executor.Executor) (*NPMRCWriter, error) {
-	// On Windows, a write from any identity that is not the interactive user of
-	// an active session would silently land in the wrong profile
-	// (service/RMM account, session 0, runas alternate credentials). Fail
-	// closed to no-target rather than enforce against the wrong .npmrc.
-	if !interactiveSessionOK() {
-		return nil, ErrNoTargetUser
-	}
-
-	u, err := exec.LoggedInUser()
+	secureHome, err := secureuserfile.OpenUserHome(exec)
 	if err != nil {
-		// The only error LoggedInUser returns is the darwin-root "no GUI console
-		// user" case; treat the absence of a resolvable user as no-target.
-		return nil, fmt.Errorf("%w: %v", ErrNoTargetUser, err)
+		if errors.Is(err, secureuserfile.ErrNoTargetUser) {
+			return nil, fmt.Errorf("%w: %v", ErrNoTargetUser, err)
+		}
+		return nil, err
 	}
+	u := secureHome.User()
 	if u == nil || u.HomeDir == "" {
+		_ = secureHome.Close()
 		return nil, fmt.Errorf("npmrc: resolved user has no home directory")
 	}
 
 	root, err := os.OpenRoot(u.HomeDir)
 	if err != nil {
+		_ = secureHome.Close()
 		return nil, fmt.Errorf("npmrc: open home root %q: %w", u.HomeDir, err)
 	}
 
@@ -222,6 +224,7 @@ func NewNPMRCWriter(exec executor.Executor) (*NPMRCWriter, error) {
 		home:       u.HomeDir,
 		root:       root,
 		owners:     newOwnerReader(),
+		secureHome: secureHome,
 	}
 	if enforcePOSIXMetadata {
 		// Uid/Gid are numeric on POSIX. A parse failure means we cannot chown to
@@ -230,6 +233,7 @@ func NewNPMRCWriter(exec executor.Executor) (*NPMRCWriter, error) {
 		gid, gerr := strconv.Atoi(u.Gid)
 		if uerr != nil || gerr != nil {
 			_ = root.Close()
+			_ = secureHome.Close()
 			return nil, fmt.Errorf("npmrc: target user %q has non-numeric uid/gid", u.Username)
 		}
 		w.uid, w.gid = uid, gid
@@ -244,6 +248,10 @@ func (w *NPMRCWriter) Close() error {
 	}
 	err := w.root.Close()
 	w.root = nil
+	if w.secureHome != nil {
+		err = errors.Join(err, w.secureHome.Close())
+		w.secureHome = nil
+	}
 	w.pending = nil
 	return err
 }
@@ -258,6 +266,36 @@ func (w *NPMRCWriter) Location() string {
 // END marker stripped to EOF, a backup-rotation prune failure, a snapshot
 // restore that aborted). It is never handed file contents or key material.
 func (w *NPMRCWriter) SetLogf(logf func(format string, args ...any)) { w.logf = logf }
+
+// CompleteState records only non-secret facts needed for exact restoration.
+func (w *NPMRCWriter) CompleteState(previous AppliedTargetState, hadPrevious bool, current *AppliedTargetState) error {
+	current.FileCreated = previous.FileCreated
+	current.ResolvedPath = previous.ResolvedPath
+	if w.pending != nil {
+		if !hadPrevious {
+			current.FileCreated = !w.pending.existed
+		}
+		current.ResolvedPath = w.pending.leaf
+		return nil
+	}
+	rt, err := w.resolveLeaf()
+	if err != nil {
+		return err
+	}
+	defer rt.close()
+	current.ResolvedPath = rt.rel
+	return nil
+}
+
+// PrepareClear pins the target and creation fact recorded by apply.
+func (w *NPMRCWriter) PrepareClear(previous AppliedTargetState, hadPrevious bool) error {
+	if hadPrevious && previous.FileCreated && previous.ResolvedPath == "" {
+		return fmt.Errorf("npmrc: created-file ownership has no resolved target: %w", ErrTargetUnusable)
+	}
+	w.ownedCreated = hadPrevious && previous.FileCreated
+	w.ownedLeaf = previous.ResolvedPath
+	return nil
+}
 
 func (w *NPMRCWriter) log(format string, args ...any) {
 	if w.logf != nil {
@@ -479,6 +517,12 @@ func (w *NPMRCWriter) readCurrent(rt *resolvedTarget) ([]byte, bool, os.FileMode
 // it left behind, so there is nothing legitimate to tolerate. On Windows
 // (enforced=false) ownership is governed by ACLs and this check is skipped.
 func (w *NPMRCWriter) checkOwner(f *os.File, rt *resolvedTarget) error {
+	if w.secureHome != nil {
+		if err := w.secureHome.VerifyOwner(f, rt.base); err != nil {
+			return fmt.Errorf("npmrc: %w", err)
+		}
+		return nil
+	}
 	uid, _, enforced, err := w.owners.ownerUIDGID(f)
 	if err != nil {
 		return fmt.Errorf("npmrc: read owner: %w", err)
@@ -582,6 +626,9 @@ func (w *NPMRCWriter) Clear() (bool, error) {
 		return false, err
 	}
 	defer rt.close()
+	if w.ownedLeaf != "" && rt.rel != w.ownedLeaf {
+		return false, fmt.Errorf("npmrc: resolved target changed from %q to %q: %w", w.ownedLeaf, rt.rel, ErrTargetUnusable)
+	}
 
 	cur, existed, mode, err := w.readCurrent(rt)
 	if err != nil {
@@ -606,6 +653,28 @@ func (w *NPMRCWriter) Clear() (bool, error) {
 		// hand. Retry the purge; the clear itself stays a no-op.
 		w.purgeBackups(rt)
 		return false, nil
+	}
+	if w.ownedCreated && len(next) == 0 {
+		if enforcePOSIXMetadata && mode.Perm() != npmrcFileMode {
+			return false, fmt.Errorf("npmrc: created target metadata changed: %w", ErrTargetUnusable)
+		}
+		if secure, err := w.metadataSecure(rt); err != nil || !secure {
+			if err == nil {
+				err = ErrTargetUnusable
+			}
+			return false, fmt.Errorf("npmrc: created target metadata changed: %w", err)
+		}
+		info, err := rt.child.Lstat(rt.base)
+		if err != nil {
+			return false, fmt.Errorf("npmrc: inspect created target before remove: %w", err)
+		}
+		if err := rt.child.Remove(rt.base); err != nil {
+			return false, fmt.Errorf("npmrc: remove created target: %w", err)
+		}
+		w.pending = &pendingSnapshot{existed: true, data: cur, mode: mode, leaf: rt.rel, committed: info, removed: true}
+		w.purgeBackups(rt)
+		w.syncDir(rt)
+		return true, nil
 	}
 
 	snap := &pendingSnapshot{existed: true, data: cur, mode: mode, leaf: rt.rel}
@@ -647,7 +716,13 @@ func (w *NPMRCWriter) RestoreSnapshot() error {
 	snap := w.pending
 	w.pending = nil
 
-	rt, err := w.resolveLeaf()
+	var rt *resolvedTarget
+	var err error
+	if snap.removed {
+		rt, err = w.pin(snap.leaf, false, false)
+	} else {
+		rt, err = w.resolveLeaf()
+	}
 	if err != nil {
 		return err
 	}
@@ -655,7 +730,14 @@ func (w *NPMRCWriter) RestoreSnapshot() error {
 	if rt.rel != snap.leaf {
 		return fmt.Errorf("npmrc: chain moved from %q to %q; refusing to restore: %w", snap.leaf, rt.rel, ErrTargetUnusable)
 	}
-	if err := w.verifyCommitted(rt, snap); err != nil {
+	if snap.removed {
+		if _, err := rt.child.Lstat(rt.base); !errors.Is(err, os.ErrNotExist) {
+			if err == nil {
+				err = ErrTargetUnusable
+			}
+			return fmt.Errorf("npmrc: removed target changed before restore: %w", err)
+		}
+	} else if err := w.verifyCommitted(rt, snap); err != nil {
 		return err
 	}
 	return w.restoreFrom(rt, snap)
@@ -782,6 +864,12 @@ func (w *NPMRCWriter) commit(rt *resolvedTarget, data []byte, mode os.FileMode) 
 	if li.Mode()&fs.ModeSymlink != 0 || !li.Mode().IsRegular() || !os.SameFile(li, tmpInfo) {
 		return commitOutcome{renamed: true}, fmt.Errorf("npmrc: leaf identity changed across rename: %w", ErrTargetUnusable)
 	}
+	if secure, err := w.metadataSecure(rt); err != nil || !secure {
+		if err == nil {
+			err = ErrTargetUnusable
+		}
+		return commitOutcome{renamed: true}, fmt.Errorf("npmrc: committed metadata verification: %w", err)
+	}
 	w.syncDir(rt)
 	return commitOutcome{committed: li, renamed: true}, nil
 }
@@ -813,6 +901,22 @@ func (w *NPMRCWriter) createExclusive(rt *resolvedTarget, prefix, suffix string)
 // applyMetadata sets mode and owner on an open handle. Both are POSIX-only:
 // Windows inherits ACLs and asserts no POSIX mode, so this is a no-op there.
 func (w *NPMRCWriter) applyMetadata(f *os.File, mode os.FileMode) error {
+	if w.secureHome != nil {
+		if err := w.secureHome.ApplyMetadata(f, mode, false); err != nil {
+			return fmt.Errorf("npmrc: apply secure metadata: %w", err)
+		}
+		if err := w.secureHome.VerifyOwner(f, filepath.Base(f.Name())); err != nil {
+			return fmt.Errorf("npmrc: verify secure owner: %w", err)
+		}
+		secure, err := w.secureHome.MetadataSecure(f, mode)
+		if err != nil {
+			return fmt.Errorf("npmrc: verify secure metadata: %w", err)
+		}
+		if !secure {
+			return fmt.Errorf("npmrc: insecure metadata after apply: %w", ErrTargetUnusable)
+		}
+		return nil
+	}
 	if !enforcePOSIXMetadata {
 		return nil
 	}
@@ -823,6 +927,29 @@ func (w *NPMRCWriter) applyMetadata(f *os.File, mode os.FileMode) error {
 		return fmt.Errorf("npmrc: fchown: %w", err)
 	}
 	return nil
+}
+
+func (w *NPMRCWriter) metadataSecure(rt *resolvedTarget) (bool, error) {
+	if w.secureHome == nil {
+		return true, nil
+	}
+	file, err := rt.child.OpenFile(rt.base, os.O_RDONLY|nonblockOpenFlag(), 0)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return false, err
+	}
+	current, err := rt.child.Lstat(rt.base)
+	if err != nil || current.Mode()&fs.ModeSymlink != 0 || !os.SameFile(info, current) {
+		return false, fmt.Errorf("npmrc: leaf changed during metadata check: %w", ErrTargetUnusable)
+	}
+	if err := w.secureHome.VerifyOwner(file, rt.base); err != nil {
+		return false, err
+	}
+	return w.secureHome.MetadataSecure(file, npmrcFileMode)
 }
 
 // syncDir best-effort fsyncs the resolved parent directory so the rename is
@@ -1545,6 +1672,9 @@ func (w *NPMRCWriter) Converged(expected string) (bool, error) {
 	if enforcePOSIXMetadata && mode.Perm() != npmrcFileMode {
 		return false, nil
 	}
+	if w.secureHome != nil {
+		return w.metadataSecure(rt)
+	}
 	// Ownership is not re-checked here: readCurrent already required the resolved
 	// leaf to be owned by the target user, from the same identity-verified handle
 	// it read the content through. A second open to re-read the owner would race
@@ -1624,6 +1754,12 @@ func (w *NPMRCWriter) ProbeExpected(expected string) (bool, string) {
 	}
 	if enforcePOSIXMetadata && mode.Perm() != npmrcFileMode {
 		return false, ""
+	}
+	if w.secureHome != nil {
+		secure, err := w.metadataSecure(rt)
+		if err != nil || !secure {
+			return false, ""
+		}
 	}
 	// Ownership is already enforced by readCurrent's checkOwner on the same
 	// identity-verified handle; re-opening to re-read the owner would race the

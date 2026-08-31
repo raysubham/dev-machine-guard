@@ -2,6 +2,7 @@ package configaudit
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -387,4 +388,261 @@ func TestPipConfigDetector_DetectsUsrBinWhenCLTInstalled(t *testing.T) {
 	if audit.Version != "24.0" {
 		t.Errorf("expected Version=24.0, got %q", audit.Version)
 	}
+}
+
+func TestDiscoverPipUserConfig_PlatformPaths(t *testing.T) {
+	tests := []struct {
+		name        string
+		goos        string
+		configure   func(*executor.Mock, string)
+		wantAllowed []string
+		wantCurrent string
+	}{
+		{
+			name: "linux XDG and legacy",
+			goos: "linux",
+			configure: func(mock *executor.Mock, home string) {
+				mock.SetEnv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+				mock.SetFile(filepath.Join(home, "xdg", "pip", "pip.conf"), nil)
+				mock.SetFile(filepath.Join(home, ".pip", "pip.conf"), nil)
+			},
+			wantAllowed: []string{filepath.Join("xdg", "pip", "pip.conf"), filepath.Join(".pip", "pip.conf")},
+			wantCurrent: filepath.Join("xdg", "pip", "pip.conf"),
+		},
+		{
+			name: "macOS current Application Support directory",
+			goos: "darwin",
+			configure: func(mock *executor.Mock, home string) {
+				mock.SetDir(filepath.Join(home, "Library", "Application Support", "pip"))
+			},
+			wantAllowed: []string{
+				filepath.Join("Library", "Application Support", "pip", "pip.conf"),
+				filepath.Join(".config", "pip", "pip.conf"),
+				filepath.Join(".pip", "pip.conf"),
+			},
+			wantCurrent: filepath.Join("Library", "Application Support", "pip", "pip.conf"),
+		},
+		{
+			name: "windows APPDATA and legacy",
+			goos: "windows",
+			configure: func(mock *executor.Mock, home string) {
+				mock.SetEnv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+				mock.SetFile(filepath.Join(home, "pip", "pip.ini"), nil)
+			},
+			wantAllowed: []string{
+				filepath.Join("AppData", "Roaming", "pip", "pip.ini"),
+				filepath.Join("pip", "pip.ini"),
+			},
+			wantCurrent: filepath.Join("AppData", "Roaming", "pip", "pip.ini"),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			mock := executor.NewMock()
+			mock.SetGOOS(tc.goos)
+			mock.SetHomeDir(home)
+			mock.SetUsername("")
+			tc.configure(mock, home)
+
+			got, err := DiscoverPipUserConfig(context.Background(), mock)
+			if err != nil {
+				t.Fatalf("DiscoverPipUserConfig: %v", err)
+			}
+			if len(got.AllowedUserPaths) != len(tc.wantAllowed) {
+				t.Fatalf("AllowedUserPaths = %v, want %v", got.AllowedUserPaths, tc.wantAllowed)
+			}
+			for i, relative := range tc.wantAllowed {
+				if want := filepath.Join(home, relative); got.AllowedUserPaths[i] != want {
+					t.Errorf("AllowedUserPaths[%d] = %q, want %q", i, got.AllowedUserPaths[i], want)
+				}
+			}
+			if got.AllowedUserPaths[0] != filepath.Join(home, tc.wantCurrent) {
+				t.Errorf("current path = %q, want %q", got.AllowedUserPaths[0], filepath.Join(home, tc.wantCurrent))
+			}
+		})
+	}
+}
+
+func TestDiscoverPipUserConfig_InvocationsDeduplicateAndRejectOutsidePath(t *testing.T) {
+	home := t.TempDir()
+	current := filepath.Join(home, ".config", "pip", "pip.conf")
+	legacy := filepath.Join(home, ".pip", "pip.conf")
+	outside := filepath.Join(t.TempDir(), "pip.conf")
+	mock := executor.NewMock()
+	mock.SetGOOS("linux")
+	mock.SetHomeDir(home)
+	mock.SetUsername("")
+	mock.SetPath("pip", "/opt/bin/pip")
+	mock.SetPath("pip3", "/opt/bin/pip")
+	mock.SetPath("python3", "/opt/bin/python3")
+	mock.SetCommand("pip 25.2 from /opt/site-packages/pip\n", "", 0, "pip", "--version")
+	mock.SetCommand("pip 25.2 from /opt/site-packages/pip\n", "", 0, "python3", "-m", "pip", "--version")
+	debug := "user:\n  " + current + ", exists: True\n  " + legacy + ", exists: True\n  " + outside + ", exists: True\n"
+	mock.SetCommand(debug, "", 0, "pip", "config", "debug")
+	mock.SetCommand(debug, "", 0, "python3", "-m", "pip", "config", "debug")
+	mock.SetFile(current, nil)
+	mock.SetFile(legacy, nil)
+	mock.SetFile(outside, nil)
+
+	got, err := DiscoverPipUserConfig(context.Background(), mock)
+	if err != nil {
+		t.Fatalf("DiscoverPipUserConfig: %v", err)
+	}
+	wantInvocations := [][]string{{"pip"}, {"python3", "-m", "pip"}}
+	if strings.TrimSpace(invocationStrings(got.Invocations)) != strings.TrimSpace(invocationStrings(wantInvocations)) {
+		t.Fatalf("Invocations = %v, want %v", got.Invocations, wantInvocations)
+	}
+	if len(got.ExistingUserPaths) != 2 || got.ExistingUserPaths[0] != current || got.ExistingUserPaths[1] != legacy {
+		t.Fatalf("ExistingUserPaths = %v, want [%q %q] without outside path", got.ExistingUserPaths, current, legacy)
+	}
+	for _, path := range got.AllowedUserPaths {
+		if path == outside {
+			t.Fatalf("outside debug path entered allowlist: %q", path)
+		}
+	}
+}
+
+func TestPipConfigDetector_WindowsPreservesHistoricalLauncherSelection(t *testing.T) {
+	mock := executor.NewMock()
+	mock.SetGOOS("windows")
+	mock.SetPath("py", `C:\\Windows\\py.exe`)
+	mock.SetCommand("pip 25.2\n", "", 0, "py", "-m", "pip", "--version")
+	detector := NewPipConfigDetector(mock)
+	if _, _, _, _, ok := detector.detectPip(context.Background()); ok {
+		t.Fatal("config audit selected enforcement-only py launcher")
+	}
+}
+
+func TestDiscoverPipUserConfig_WindowsLauncherForms(t *testing.T) {
+	home := t.TempDir()
+	mock := executor.NewMock()
+	mock.SetGOOS("windows")
+	mock.SetHomeDir(home)
+	mock.SetEnv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	mock.SetPath("py", `C:\\Windows\\py.exe`)
+	mock.SetCommand("pip 25.2\n", "", 0, "py", "-m", "pip", "--version")
+	mock.SetCommand("pip 25.2\n", "", 0, "py", "-3", "-m", "pip", "--version")
+	mock.SetCommand("user:\n", "", 0, "py", "-m", "pip", "config", "debug")
+	mock.SetCommand("user:\n", "", 0, "py", "-3", "-m", "pip", "config", "debug")
+
+	got, err := DiscoverPipUserConfig(context.Background(), mock)
+	if err != nil {
+		t.Fatalf("DiscoverPipUserConfig: %v", err)
+	}
+	want := [][]string{{"py", "-m", "pip"}, {"py", "-3", "-m", "pip"}}
+	if invocationStrings(got.Invocations) != invocationStrings(want) {
+		t.Fatalf("Invocations = %v, want %v", got.Invocations, want)
+	}
+}
+
+type resolvedPipEnvironmentExecutor struct {
+	*executor.Mock
+	environment string
+	runAsUser   func(context.Context, string) (string, error)
+}
+
+func (e *resolvedPipEnvironmentExecutor) RunAsUser(ctx context.Context, username, command string) (string, error) {
+	if e.runAsUser != nil {
+		return e.runAsUser(ctx, command)
+	}
+	if strings.Contains(command, "XDG_CONFIG_HOME") && strings.Contains(command, "PIP_CONFIG_FILE") {
+		return e.environment, nil
+	}
+	return e.Mock.RunAsUser(ctx, username, command)
+}
+
+func TestDiscoverPipUserConfig_UsesResolvedUserEnvironment(t *testing.T) {
+	home := t.TempDir()
+	mock := executor.NewMock()
+	mock.SetGOOS("linux")
+	mock.SetUsername("alice")
+	mock.SetHomeDir(home)
+	mock.SetEnv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "service-xdg"))
+	exec := &resolvedPipEnvironmentExecutor{
+		Mock:        mock,
+		environment: "XDG_CONFIG_HOME=" + filepath.Join(home, "user-xdg") + "\x00",
+	}
+	got, err := DiscoverPipUserConfig(context.Background(), exec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, "user-xdg", "pip", "pip.conf")
+	if len(got.AllowedUserPaths) == 0 || got.AllowedUserPaths[0] != want {
+		t.Fatalf("AllowedUserPaths = %v, want resolved-user path first %q", got.AllowedUserPaths, want)
+	}
+}
+
+func TestDiscoverPipUserConfig_UsesResolvedUserLoginShellPATH(t *testing.T) {
+	home := t.TempDir()
+	mock := executor.NewMock()
+	mock.SetGOOS("darwin")
+	mock.SetIsRoot(true)
+	mock.SetUsername("alice")
+	mock.SetHomeDir(home)
+	mock.SetAppleCLTInstalled(true)
+	mock.SetCommand("/opt/homebrew/bin/pip\n", "", 0, "bash", "-c", "which 'pip'")
+	mock.SetCommand("pip 25.2 from /opt/homebrew/lib/python/site-packages/pip\n", "", 0, "bash", "-c", "'pip' '--version'")
+	mock.SetCommand("user:\n", "", 0, "bash", "-c", "'pip' 'config' 'debug'")
+
+	exec := &resolvedPipEnvironmentExecutor{Mock: mock}
+	got, err := DiscoverPipUserConfig(context.Background(), exec)
+	if err != nil {
+		t.Fatalf("DiscoverPipUserConfig: %v", err)
+	}
+	if len(got.Invocations) != 1 || invocationStrings(got.Invocations) != "pip" {
+		t.Fatalf("Invocations = %v, want login-shell pip", got.Invocations)
+	}
+}
+
+func TestDiscoverPipUserConfig_UserEnvironmentFailureIsError(t *testing.T) {
+	home := t.TempDir()
+	mock := executor.NewMock()
+	mock.SetGOOS("linux")
+	mock.SetUsername("alice")
+	mock.SetHomeDir(home)
+	exec := &resolvedPipEnvironmentExecutor{Mock: mock}
+	exec.runAsUser = func(context.Context, string) (string, error) {
+		return "", context.DeadlineExceeded
+	}
+	if _, err := DiscoverPipUserConfig(context.Background(), exec); err == nil {
+		t.Fatal("DiscoverPipUserConfig() error = nil, want environment inspection failure")
+	}
+}
+
+func TestDiscoverPipUserConfig_CanceledContextReturnsError(t *testing.T) {
+	home := t.TempDir()
+	mock := executor.NewMock()
+	mock.SetGOOS("linux")
+	mock.SetUsername("alice")
+	mock.SetHomeDir(home)
+	calls := 0
+	exec := &resolvedPipEnvironmentExecutor{Mock: mock}
+	exec.runAsUser = func(ctx context.Context, command string) (string, error) {
+		calls++
+		if strings.Contains(command, "XDG_CONFIG_HOME") {
+			return "XDG_CONFIG_HOME=\x00", nil
+		}
+		if ctx.Err() != context.Canceled {
+			t.Fatalf("path lookup context error = %v, want canceled", ctx.Err())
+		}
+		return "", ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := DiscoverPipUserConfig(ctx, exec); !errors.Is(err, context.Canceled) {
+		t.Fatalf("DiscoverPipUserConfig() error = %v, want context.Canceled", err)
+	}
+	if calls != 1 {
+		t.Fatalf("RunAsUser calls = %d, want only environment snapshot", calls)
+	}
+}
+
+func invocationStrings(invocations [][]string) string {
+	parts := make([]string, len(invocations))
+	for i, invocation := range invocations {
+		parts[i] = strings.Join(invocation, " ")
+	}
+	return strings.Join(parts, "|")
 }

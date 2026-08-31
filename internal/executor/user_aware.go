@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/user"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,6 +22,32 @@ import (
 type UserAwareExecutor struct {
 	inner    Executor
 	username string // logged-in user to delegate to; empty = no delegation
+
+	envOnce sync.Once
+	env     map[string]string
+	envErr  error
+}
+
+var userEnvironmentKeys = []string{
+	"APPDATA",
+	"NETRC",
+	"PIP_CONFIG_FILE",
+	"PIP_EXTRA_INDEX_URL",
+	"PIP_FIND_LINKS",
+	"PIP_INDEX_URL",
+	"PIP_NO_INDEX",
+	"TMPDIR",
+	"UV_CONFIG_FILE",
+	"UV_DEFAULT_INDEX",
+	"UV_EXTRA_INDEX_URL",
+	"UV_FIND_LINKS",
+	"UV_INDEX",
+	"UV_INDEX_STRATEGY",
+	"UV_INDEX_URL",
+	"UV_NO_CONFIG",
+	"UV_NO_INDEX",
+	"VIRTUAL_ENV",
+	"XDG_CONFIG_HOME",
 }
 
 // NewUserAwareExecutor returns a wrapped executor that runs commands through the
@@ -35,6 +62,9 @@ type UserAwareExecutor struct {
 func NewUserAwareExecutor(inner Executor, username string) Executor {
 	if username == "" || inner.GOOS() == "windows" {
 		return inner // no wrapping needed
+	}
+	if current, ok := inner.(*UserAwareExecutor); ok && current.username == username {
+		return inner
 	}
 	return &UserAwareExecutor{inner: inner, username: username}
 }
@@ -100,12 +130,81 @@ func (e *UserAwareExecutor) RunAsUser(ctx context.Context, username, command str
 }
 
 func (e *UserAwareExecutor) LookPath(name string) (string, error) {
-	stdout, err := e.inner.RunAsUser(context.Background(), e.username, "which "+posixShellQuote(name))
+	return e.lookPath(context.Background(), name)
+}
+
+func (e *UserAwareExecutor) lookPath(ctx context.Context, name string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	stdout, err := e.inner.RunAsUser(ctx, e.username, "which "+posixShellQuote(name))
 	path := strings.TrimSpace(stdout)
-	if err != nil || path == "" || !strings.HasPrefix(path, "/") {
+	if err != nil {
+		return "", fmt.Errorf("%s not found in user PATH: %w", name, err)
+	}
+	if path == "" || !strings.HasPrefix(path, "/") {
 		return "", fmt.Errorf("%s not found in user PATH", name)
 	}
 	return path, nil
+}
+
+// LookPathWithContext resolves name without outliving the caller's deadline.
+func LookPathWithContext(ctx context.Context, exec Executor, name string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if userExec, ok := exec.(*UserAwareExecutor); ok {
+		return userExec.lookPath(ctx, name)
+	}
+	return exec.LookPath(name)
+}
+
+func (e *UserAwareExecutor) loadUserEnvironment() {
+	e.env = make(map[string]string, len(userEnvironmentKeys))
+	var format strings.Builder
+	var command strings.Builder
+	for _, key := range userEnvironmentKeys {
+		format.WriteString(key)
+		format.WriteString("=%s\\000")
+	}
+	command.WriteString("printf ")
+	command.WriteString(posixShellQuote(format.String()))
+	for _, key := range userEnvironmentKeys {
+		command.WriteString(` "${`)
+		command.WriteString(key)
+		command.WriteString(`-}"`)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stdout, err := e.inner.RunAsUser(ctx, e.username, command.String())
+	if err != nil {
+		e.envErr = fmt.Errorf("inspect user environment: %w", err)
+		return
+	}
+	for _, entry := range strings.Split(stdout, "\x00") {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			e.env[key] = value
+		}
+	}
+}
+
+// UserEnvironmentError reports a failed target-user environment snapshot.
+func UserEnvironmentError(exec Executor) error {
+	userExec, ok := exec.(*UserAwareExecutor)
+	if !ok {
+		return nil
+	}
+	userExec.envOnce.Do(userExec.loadUserEnvironment)
+	return userExec.envErr
+}
+
+func isUserEnvironmentKey(key string) bool {
+	for _, candidate := range userEnvironmentKeys {
+		if key == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Pass-through methods ---
@@ -118,9 +217,15 @@ func (e *UserAwareExecutor) ReadDir(path string) ([]os.DirEntry, error) {
 }
 func (e *UserAwareExecutor) Stat(path string) (os.FileInfo, error) { return e.inner.Stat(path) }
 func (e *UserAwareExecutor) Hostname() (string, error)             { return e.inner.Hostname() }
-func (e *UserAwareExecutor) Getenv(key string) string              { return e.inner.Getenv(key) }
-func (e *UserAwareExecutor) IsRoot() bool                          { return e.inner.IsRoot() }
-func (e *UserAwareExecutor) CurrentUser() (*user.User, error)      { return e.inner.CurrentUser() }
+func (e *UserAwareExecutor) Getenv(key string) string {
+	if !isUserEnvironmentKey(key) {
+		return e.inner.Getenv(key)
+	}
+	e.envOnce.Do(e.loadUserEnvironment)
+	return e.env[key]
+}
+func (e *UserAwareExecutor) IsRoot() bool                     { return e.inner.IsRoot() }
+func (e *UserAwareExecutor) CurrentUser() (*user.User, error) { return e.inner.CurrentUser() }
 func (e *UserAwareExecutor) HomeDir(username string) (string, error) {
 	return e.inner.HomeDir(username)
 }
