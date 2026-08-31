@@ -539,6 +539,8 @@ func TestGoAndPyPISharedCredentialFinalClearAcrossRemovalOrders(t *testing.T) {
 				t.Fatal(err)
 			}
 			homeDir := t.TempDir()
+			current.HomeDir = homeDir
+			normalizeSecureTestUser(t, current)
 			initialNetrc := []byte("machine registry.stepsecurity.io login original password original\nmachine other.example login user password pass\n")
 			if err := os.WriteFile(filepath.Join(homeDir, ".netrc"), initialNetrc, 0o600); err != nil {
 				t.Fatal(err)
@@ -547,7 +549,7 @@ func TestGoAndPyPISharedCredentialFinalClearAcrossRemovalOrders(t *testing.T) {
 			mock.SetGOOS("linux")
 			mock.SetUsername(current.Username)
 			mock.SetHomeDir(homeDir)
-			exec := &coordinatorUserExecutor{Mock: mock, user: &user.User{Username: current.Username, Uid: current.Uid, Gid: current.Gid, HomeDir: homeDir}}
+			exec := &coordinatorUserExecutor{Mock: mock, user: current}
 			pypiFetcher := &coordinatorFetcher{policy: coordinatorPolicy(`["pip"]`, "sha256:P", enforcementDMG)}
 			goFetcher := &goCoordinatorFetcher{policy: goCoordinatorPolicy("sha256:G", enforcementDMG)}
 			pypi := &PyPICoordinator{Fetcher: pypiFetcher, Reporter: &coordinatorReporter{}, Exec: exec, CustomerID: "cust", DeviceID: "DEVICE-123", Platform: "linux"}
@@ -623,11 +625,13 @@ func TestGoCoordinatorFinalClearIgnoresMalformedPipWithoutMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	homeDir := t.TempDir()
+	current.HomeDir = homeDir
+	normalizeSecureTestUser(t, current)
 	mock := executor.NewMock()
 	mock.SetGOOS("linux")
 	mock.SetUsername(current.Username)
 	mock.SetHomeDir(homeDir)
-	exec := &coordinatorUserExecutor{Mock: mock, user: &user.User{Username: current.Username, Uid: current.Uid, Gid: current.Gid, HomeDir: homeDir}}
+	exec := &coordinatorUserExecutor{Mock: mock, user: current}
 	getter := &goCoordinatorFetcher{policy: goCoordinatorPolicy("sha256:G", enforcementDMG)}
 	coordinator := &GoCoordinator{Fetcher: getter, Reporter: &coordinatorReporter{}, Exec: exec, CustomerID: "cust", DeviceID: "DEVICE-123", Platform: "linux"}
 	if err := coordinator.Reconcile(context.Background()); err != nil {

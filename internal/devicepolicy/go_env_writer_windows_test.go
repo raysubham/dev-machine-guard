@@ -149,6 +149,9 @@ func TestGoCoordinatorWindowsMDMNilCredentialWriterReportsVerificationFailed(t *
 		t.Fatal(err)
 	}
 	mdm := []byte(mdmGoEnvBegin + "\r\n" + goEnvExpected + "\r\n" + goEnvEnd + "\r\n")
+	if err := home.EnsureParent(w.file.RelativePath()); err != nil {
+		t.Fatal(err)
+	}
 	if err := w.file.Commit(mdm, secureuserfile.FileMode); err != nil {
 		t.Fatal(err)
 	}

@@ -520,6 +520,8 @@ func rewriteGoEnv(current []byte, expected string, created bool) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
+	newline := analysis.newline
+	hadFinal := bytes.HasSuffix(current, []byte(newline))
 	if analysis.owner == "mdm" {
 		return nil, fmt.Errorf("go env: MDM marker present: %w", ErrTargetUnusable)
 	}
@@ -531,7 +533,6 @@ func rewriteGoEnv(current []byte, expected string, created bool) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	newline := goEnvNewline(base)
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 	for i, line := range lines {
 		if strings.HasPrefix(line, "GOPROXY=") {
@@ -545,7 +546,6 @@ func rewriteGoEnv(current []byte, expected string, created bool) ([]byte, error)
 	}
 	managed = append(managed, expected, goEnvEnd)
 	block := strings.Join(managed, newline)
-	hadFinal := strings.HasSuffix(text, newline)
 	if baseText != "" {
 		baseText += newline
 	}

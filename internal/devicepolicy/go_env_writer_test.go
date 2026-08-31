@@ -101,6 +101,17 @@ func TestGoEnvWriter_TransformsAndExactlyRestores(t *testing.T) {
 	}
 }
 
+func TestRewriteGoEnvPreservesManagedOnlyCRLF(t *testing.T) {
+	initial := []byte(dmgGoEnvBegin + "\r\n" + goEnvExpected + "\r\n" + goEnvEnd + "\r\n")
+	got, err := rewriteGoEnv(initial, goEnvExpected, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, initial) {
+		t.Fatalf("rewriteGoEnv = %q, want %q", got, initial)
+	}
+}
+
 func TestGoEnvWriter_CreatedFileIsRemovedOnClear(t *testing.T) {
 	w, _, path := newGoEnvTestWriter(t, nil)
 	if _, err := w.Write(goEnvExpected); err != nil {
@@ -316,7 +327,8 @@ func TestGoEnvWriter_ObservesExactMDMShapeWithoutWriting(t *testing.T) {
 }
 
 func TestGoUserEnvPath(t *testing.T) {
-	home := filepath.Join(string(filepath.Separator), "users", "alice")
+	home := t.TempDir()
+	externalRoot := t.TempDir()
 	cases := []struct {
 		name, goos, xdg, appdata, want string
 		wantErr                        bool
@@ -327,7 +339,7 @@ func TestGoUserEnvPath(t *testing.T) {
 		{"darwin", model.PlatformDarwin, "", "", filepath.Join(home, "Library", "Application Support", "go", "env"), false},
 		{"windows AppData", model.PlatformWindows, "", filepath.Join(home, "AppData", "Roaming"), filepath.Join(home, "AppData", "Roaming", "go", "env"), false},
 		{"windows AppData trailing separator", model.PlatformWindows, "", filepath.Join(home, "AppData", "Roaming") + string(filepath.Separator), filepath.Join(home, "AppData", "Roaming", "go", "env"), false},
-		{"external XDG", model.PlatformLinux, filepath.Join(string(filepath.Separator), "tmp", "xdg"), "", "", true},
+		{"external XDG", model.PlatformLinux, externalRoot, "", "", true},
 		{"normalized AppData", model.PlatformWindows, "", filepath.Join(home, "AppData", "..", "Roaming"), filepath.Join(home, "Roaming", "go", "env"), false},
 	}
 	for _, tc := range cases {
