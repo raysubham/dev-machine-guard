@@ -152,7 +152,6 @@ func newSettingsWriterAt(path string) *settingsWriter { return &settingsWriter{p
 // NewWriter returns the user-scope settings.json writer for this OS. ok=false
 // when settingsPath cannot resolve the target (unsupported OS, no home dir or
 // %APPDATA%) — the reconciler treats that as not agent-enforceable and no-ops.
-
 func NewWriter(exec executor.Executor) (Writer, bool) {
 	if exec != nil && exec.GOOS() == model.PlatformWindows {
 		user, err := exec.LoggedInUser()
