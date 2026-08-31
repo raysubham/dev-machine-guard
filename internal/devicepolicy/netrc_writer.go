@@ -14,15 +14,15 @@ import (
 )
 
 const (
-	dmgNetrcBegin = "#stepsecurity-package-registry-credential-dmg-begin"
-	dmgNetrcEnd   = "#stepsecurity-package-registry-credential-end"
+	dmgNetrcBegin = "#stepsecurity-secure-registry-credential-dmg-begin"
+	dmgNetrcEnd   = "#stepsecurity-secure-registry-credential-end"
 
-	mdmNetrcBegin = "#stepsecurity-package-registry-credential-mdm-begin"
-	mdmNetrcEnd   = "#stepsecurity-package-registry-credential-end"
+	mdmNetrcBegin = "#stepsecurity-secure-registry-credential-mdm-begin"
+	mdmNetrcEnd   = "#stepsecurity-secure-registry-credential-end"
 
-	dmgNetrcDisabledPrefix = "#stepsecurity-package-registry-credential-dmg-disabled:"
-	mdmNetrcDisabledPrefix = "#stepsecurity-package-registry-credential-mdm-disabled:"
-	mdmNetrcCreated        = "#stepsecurity-package-registry-credential-mdm-created"
+	dmgNetrcDisabledPrefix = "#stepsecurity-secure-registry-credential-dmg-disabled:"
+	mdmNetrcDisabledPrefix = "#stepsecurity-secure-registry-credential-mdm-disabled:"
+	mdmNetrcCreated        = "#stepsecurity-secure-registry-credential-mdm-created"
 	netrcBackupPrefix      = ".dmg-"
 )
 

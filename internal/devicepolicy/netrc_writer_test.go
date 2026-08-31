@@ -27,13 +27,13 @@ func TestNetrcMarkers_Canonical(t *testing.T) {
 		got  string
 		want string
 	}{
-		{"DMG begin", dmgNetrcBegin, "#stepsecurity-package-registry-credential-dmg-begin"},
-		{"DMG end", dmgNetrcEnd, "#stepsecurity-package-registry-credential-end"},
-		{"MDM begin", mdmNetrcBegin, "#stepsecurity-package-registry-credential-mdm-begin"},
-		{"MDM end", mdmNetrcEnd, "#stepsecurity-package-registry-credential-end"},
-		{"DMG disabled prefix", dmgNetrcDisabledPrefix, "#stepsecurity-package-registry-credential-dmg-disabled:"},
-		{"MDM disabled prefix", mdmNetrcDisabledPrefix, "#stepsecurity-package-registry-credential-mdm-disabled:"},
-		{"MDM created", mdmNetrcCreated, "#stepsecurity-package-registry-credential-mdm-created"},
+		{"DMG begin", dmgNetrcBegin, "#stepsecurity-secure-registry-credential-dmg-begin"},
+		{"DMG end", dmgNetrcEnd, "#stepsecurity-secure-registry-credential-end"},
+		{"MDM begin", mdmNetrcBegin, "#stepsecurity-secure-registry-credential-mdm-begin"},
+		{"MDM end", mdmNetrcEnd, "#stepsecurity-secure-registry-credential-end"},
+		{"DMG disabled prefix", dmgNetrcDisabledPrefix, "#stepsecurity-secure-registry-credential-dmg-disabled:"},
+		{"MDM disabled prefix", mdmNetrcDisabledPrefix, "#stepsecurity-secure-registry-credential-mdm-disabled:"},
+		{"MDM created", mdmNetrcCreated, "#stepsecurity-secure-registry-credential-mdm-created"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -82,7 +82,7 @@ func TestNetrcWriter_CredentialOwnershipLinesAreSingleTokens(t *testing.T) {
 				t.Fatalf("credential ownership lines = %q, want %d", ownershipLines, tc.wantLines)
 			}
 			for _, line := range ownershipLines {
-				if !strings.HasPrefix(line, "#stepsecurity-package-registry-credential") || strings.ContainsAny(line, " \t\r") {
+				if !strings.HasPrefix(line, "#stepsecurity-secure-registry-credential") || strings.ContainsAny(line, " \t\r") {
 					t.Errorf("credential ownership line %q is not one whitespace-free token", line)
 				}
 			}
