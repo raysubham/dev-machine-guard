@@ -101,7 +101,7 @@ func TestGoEnvWriter_TransformsAndExactlyRestores(t *testing.T) {
 	}
 }
 
-func TestRewriteGoEnvPreservesManagedOnlyCRLF(t *testing.T) {
+func TestRewriteGoEnv_PreservesManagedOnlyCRLF(t *testing.T) {
 	initial := []byte(dmgGoEnvBegin + "\r\n" + goEnvExpected + "\r\n" + goEnvEnd + "\r\n")
 	got, err := rewriteGoEnv(initial, goEnvExpected, false)
 	if err != nil {
