@@ -247,6 +247,83 @@ func TestGoEnvWriter_WindowsGoCommandReadsValuesWithoutCarriageReturns(t *testin
 	}
 }
 
+func TestGoCoordinator_WindowsClearWithoutCredentialStateRestoresDualFiles(t *testing.T) {
+	withTempCache(t)
+	homeDir := t.TempDir()
+	appData := filepath.Join(homeDir, "AppData", "Roaming")
+	dotPath := filepath.Join(homeDir, ".netrc")
+	underscorePath := filepath.Join(homeDir, "_netrc")
+	dotInitial := []byte("machine dot.example login user password keep\r\n")
+	underscoreInitial := []byte("machine underscore.example login user password keep\r\n")
+	if err := os.WriteFile(dotPath, dotInitial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(underscorePath, underscoreInitial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.HomeDir = homeDir
+	normalizeSecureTestUser(t, current)
+	mock := executor.NewMock()
+	mock.SetGOOS(model.PlatformWindows)
+	mock.SetUsername(current.Username)
+	mock.SetHomeDir(homeDir)
+	mock.SetEnv("APPDATA", appData)
+	exec := &coordinatorUserExecutor{Mock: mock, user: current}
+	pypi := &PyPICoordinator{
+		Fetcher: &coordinatorFetcher{policy: coordinatorPolicy(`["pip"]`, "sha256:P", enforcementDMG)}, Reporter: &coordinatorReporter{},
+		Exec: exec, CustomerID: "cust", DeviceID: "DEVICE-123", Platform: model.PlatformWindows,
+	}
+	goFetcher := &goCoordinatorFetcher{policy: goCoordinatorPolicy("sha256:G", enforcementDMG)}
+	goCoordinator := &GoCoordinator{
+		Fetcher: goFetcher, Reporter: &coordinatorReporter{}, Exec: exec,
+		CustomerID: "cust", DeviceID: "DEVICE-123", Platform: model.PlatformWindows,
+	}
+	if err := pypi.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := goCoordinator.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{dotPath, underscorePath} {
+		data, err := os.ReadFile(path)
+		if err != nil || !bytes.Contains(data, []byte(dmgNetrcBegin)) {
+			t.Fatalf("managed credential %s = %q, %v", path, data, err)
+		}
+	}
+	if err := ClearAppliedState(CategoryPackageConfig, GoCredentialOwnershipTarget); err != nil {
+		t.Fatal(err)
+	}
+
+	goFetcher.policy = EffectivePolicy{Category: CategoryPackageConfig, Target: TargetGo, Clear: true}
+	if err := goCoordinator.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(underscorePath)
+	if err != nil || !bytes.Equal(got, underscoreInitial) {
+		t.Fatalf("restored _netrc = %q, %v, want %q", got, err, underscoreInitial)
+	}
+	dot, err := os.ReadFile(dotPath)
+	if err != nil || !bytes.Contains(dot, []byte(dmgNetrcBegin)) {
+		t.Fatalf("PyPI credential changed: %q, %v", dot, err)
+	}
+	if _, err := os.Stat(filepath.Join(appData, "go", "env")); !os.IsNotExist(err) {
+		t.Fatalf("Go env remains after clear: %v", err)
+	}
+	for _, target := range []string{GoCredentialOwnershipTarget, GoEnvOwnershipTarget} {
+		if _, ok := ReadAppliedState(CategoryPackageConfig, target); ok {
+			t.Fatalf("clear retained %s state", target)
+		}
+	}
+	if _, ok := ReadAppliedState(CategoryPackageConfig, PyPICredentialOwnershipTarget); !ok {
+		t.Fatal("clear removed PyPI credential state")
+	}
+}
+
 func TestGoCoordinator_WindowsMDMNilCredentialWriterReportsVerificationFailed(t *testing.T) {
 	homeDir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(homeDir, ".netrc"), 0o700); err != nil {

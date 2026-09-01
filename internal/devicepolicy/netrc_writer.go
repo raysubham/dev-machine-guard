@@ -99,7 +99,14 @@ func newGoNetrcWriter(home *secureuserfile.Home, host, token string) (*NetrcWrit
 	if err != nil || home.GOOS() != model.PlatformWindows {
 		return w, err
 	}
-	if filepath.Base(w.file.Location()) != "_netrc" {
+	if filepath.Base(w.file.Location()) == "_netrc" {
+		return w, nil
+	}
+	_, underscoreExists, _, err := w.alternate.Read()
+	if err != nil {
+		return nil, err
+	}
+	if underscoreExists {
 		w.file, w.alternate = w.alternate, w.file
 	}
 	return w, nil
@@ -287,17 +294,18 @@ func discoverDMGNetrcHost(home *secureuserfile.Home) (string, error) {
 		if markers.dmg == nil {
 			continue
 		}
-		if host != "" {
-			return "", fmt.Errorf("netrc: multiple managed credential files: %w", ErrTargetUnusable)
-		}
 		entries, err := parseNetrc([]byte(markers.dmg.body))
 		if err != nil || len(entries) != 1 || entries[0].isDefault || !isValidHost(entries[0].host) {
 			return "", fmt.Errorf("netrc: cannot derive a trusted managed host: %w", ErrTargetUnusable)
 		}
-		host = entries[0].host
-		if _, err := analyzeNetrc(data, host); err != nil {
+		managedHost := entries[0].host
+		if host != "" && (home.GOOS() != model.PlatformWindows || host != managedHost) {
+			return "", fmt.Errorf("netrc: conflicting managed credential files: %w", ErrTargetUnusable)
+		}
+		if _, err := analyzeNetrc(data, managedHost); err != nil {
 			return "", err
 		}
+		host = managedHost
 	}
 	if host == "" {
 		return "", fmt.Errorf("netrc: no trusted managed host: %w", ErrTargetUnusable)

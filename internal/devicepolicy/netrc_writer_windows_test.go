@@ -70,18 +70,21 @@ func TestNetrcWriter_WindowsPathSelectionAndAlternateConflict(t *testing.T) {
 	})
 }
 
-func TestNetrcWriter_WindowsGoAlwaysUsesUnderscoreNetrc(t *testing.T) {
+func TestNetrcWriter_WindowsGoUsesCmdGoNetrcPrecedence(t *testing.T) {
 	tests := []struct {
 		name       string
 		dot        []byte
 		underscore []byte
+		selected   string
 	}{
-		{name: "neither file"},
-		{name: "dot file only", dot: []byte("machine dot.example login user password keep\r\n")},
+		{name: "neither file", selected: ".netrc"},
+		{name: "dot file only", dot: []byte("machine dot.example login user password keep\r\n"), selected: ".netrc"},
+		{name: "underscore file only", underscore: []byte("machine underscore.example login user password keep\r\n"), selected: "_netrc"},
 		{
 			name:       "both files",
 			dot:        []byte("machine dot.example login user password keep\r\n"),
 			underscore: []byte("machine underscore.example login user password keep\r\n"),
+			selected:   "_netrc",
 		},
 	}
 	for _, tc := range tests {
@@ -89,6 +92,19 @@ func TestNetrcWriter_WindowsGoAlwaysUsesUnderscoreNetrc(t *testing.T) {
 			homeDir := t.TempDir()
 			dotPath := filepath.Join(homeDir, ".netrc")
 			underscorePath := filepath.Join(homeDir, "_netrc")
+			assertFile := func(path string, want []byte) {
+				t.Helper()
+				got, err := os.ReadFile(path)
+				if want == nil {
+					if !os.IsNotExist(err) {
+						t.Fatalf("%s exists, want absent: %q, %v", path, got, err)
+					}
+					return
+				}
+				if err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("%s = %q, %v, want %q", path, got, err, want)
+				}
+			}
 			if tc.dot != nil {
 				if err := os.WriteFile(dotPath, tc.dot, 0o600); err != nil {
 					t.Fatal(err)
@@ -105,55 +121,39 @@ func TestNetrcWriter_WindowsGoAlwaysUsesUnderscoreNetrc(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if writer.Location() != underscorePath {
-				t.Fatalf("Location = %q, want %q", writer.Location(), underscorePath)
+			selectedPath := filepath.Join(homeDir, tc.selected)
+			if writer.Location() != selectedPath {
+				t.Fatalf("Location = %q, want %q", writer.Location(), selectedPath)
 			}
 			if _, err := writer.Write(writer.expected); err != nil {
 				t.Fatal(err)
 			}
-			first, err := os.ReadFile(underscorePath)
+			first, err := os.ReadFile(selectedPath)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if _, err := writer.Write(writer.expected); err != nil {
 				t.Fatal(err)
 			}
-			second, err := os.ReadFile(underscorePath)
+			second, err := os.ReadFile(selectedPath)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !bytes.Equal(second, first) {
-				t.Fatalf("repeated write changed _netrc: %q, want %q", second, first)
+				t.Fatalf("repeated write changed %s: %q, want %q", tc.selected, second, first)
 			}
-			if tc.dot != nil {
-				got, err := os.ReadFile(dotPath)
-				if err != nil || !bytes.Equal(got, tc.dot) {
-					t.Fatalf(".netrc changed: %q, %v", got, err)
-				}
-			} else if _, err := os.Stat(dotPath); !os.IsNotExist(err) {
-				t.Fatalf(".netrc was created: %v", err)
+			if tc.selected == ".netrc" {
+				assertFile(underscorePath, tc.underscore)
+			} else {
+				assertFile(dotPath, tc.dot)
 			}
 
 			changed, err := writer.Clear()
 			if err != nil || !changed {
 				t.Fatalf("Clear = %v, %v, want true", changed, err)
 			}
-			if tc.underscore == nil {
-				if _, err := os.Stat(underscorePath); !os.IsNotExist(err) {
-					t.Fatalf("created _netrc remains: %v", err)
-				}
-			} else {
-				got, err := os.ReadFile(underscorePath)
-				if err != nil || !bytes.Equal(got, tc.underscore) {
-					t.Fatalf("restored _netrc = %q, %v, want %q", got, err, tc.underscore)
-				}
-			}
-			if tc.dot != nil {
-				got, err := os.ReadFile(dotPath)
-				if err != nil || !bytes.Equal(got, tc.dot) {
-					t.Fatalf("clear changed .netrc: %q, %v", got, err)
-				}
-			}
+			assertFile(dotPath, tc.dot)
+			assertFile(underscorePath, tc.underscore)
 		})
 	}
 }
