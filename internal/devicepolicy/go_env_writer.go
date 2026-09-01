@@ -22,7 +22,7 @@ const (
 	mdmGoEnvDisabledPrefix = "# [stepsecurity-go-env-mdm] "
 	dmgGoEnvCreatedFile    = "# [stepsecurity-go-env-dmg] created=true"
 	mdmGoEnvCreatedFile    = "# [stepsecurity-go-env-mdm] created=true"
-	dmgGoEnvRestoreCRLF    = "# [stepsecurity-go-env-dmg] newline=crlf"
+	dmgGoEnvRestoreCRLF    = "# [stepsecurity-go-env-dmg] restore-crlf=true"
 	mdmGoEnvRestoreCRLF    = "# [stepsecurity-go-env-mdm] restore-crlf=true"
 	goEnvBackupPrefix      = ".dmg-go-env-"
 )

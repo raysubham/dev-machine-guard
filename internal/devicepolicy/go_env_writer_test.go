@@ -118,7 +118,7 @@ func TestRewriteGoEnv_NormalizesCRLFAndExactlyRestores(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(first, []byte("\r")) || !bytes.Contains(first, []byte(dmgGoEnvRestoreCRLF)) {
+	if bytes.Contains(first, []byte("\r")) || !bytes.Contains(first, []byte("# [stepsecurity-go-env-dmg] restore-crlf=true")) {
 		t.Fatalf("rewriteGoEnv did not normalize CRLF with restoration metadata: %q", first)
 	}
 	second, err := rewriteGoEnv(first, goEnvExpected, false, true)
@@ -255,15 +255,16 @@ func TestGoEnvWriter_RepairsDriftAndPreservesPrivateSettings(t *testing.T) {
 
 func TestGoEnvWriter_RejectsAmbiguousInput(t *testing.T) {
 	cases := map[string][]byte{
-		"invalid UTF-8": {0xff},
-		"NUL":           []byte("GOPROXY=x\x00"),
-		"lone CR":       []byte("GOPROXY=x\rnext"),
-		"mixed newline": []byte("one\r\ntwo\n"),
-		"orphan prefix": []byte(dmgGoEnvDisabledPrefix + "GOPROXY=direct\n"),
-		"incomplete":    []byte(dmgGoEnvBegin + "\n" + goEnvExpected + "\n"),
-		"duplicate":     []byte(dmgGoEnvBegin + "\n" + goEnvExpected + "\n" + goEnvEnd + "\n" + dmgGoEnvBegin + "\n" + goEnvExpected + "\n" + goEnvEnd),
-		"mixed owner":   []byte(mdmGoEnvBegin + "\n" + goEnvExpected + "\n" + goEnvEnd + "\n" + dmgGoEnvDisabledPrefix + "GOPROXY=direct"),
-		"oversized":     bytes.Repeat([]byte("x"), (1<<20)+1),
+		"invalid UTF-8":   {0xff},
+		"NUL":             []byte("GOPROXY=x\x00"),
+		"lone CR":         []byte("GOPROXY=x\rnext"),
+		"mixed newline":   []byte("one\r\ntwo\n"),
+		"orphan prefix":   []byte(dmgGoEnvDisabledPrefix + "GOPROXY=direct\n"),
+		"incomplete":      []byte(dmgGoEnvBegin + "\n" + goEnvExpected + "\n"),
+		"duplicate":       []byte(dmgGoEnvBegin + "\n" + goEnvExpected + "\n" + goEnvEnd + "\n" + dmgGoEnvBegin + "\n" + goEnvExpected + "\n" + goEnvEnd),
+		"mixed owner":     []byte(mdmGoEnvBegin + "\n" + goEnvExpected + "\n" + goEnvEnd + "\n" + dmgGoEnvDisabledPrefix + "GOPROXY=direct"),
+		"old CRLF marker": []byte(dmgGoEnvBegin + "\n# [stepsecurity-go-env-dmg] newline=crlf\n" + goEnvExpected + "\n" + goEnvEnd),
+		"oversized":       bytes.Repeat([]byte("x"), (1<<20)+1),
 	}
 	for name, initial := range cases {
 		t.Run(name, func(t *testing.T) {
