@@ -3,6 +3,7 @@
 package devicepolicy
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,6 +68,94 @@ func TestNetrcWriter_WindowsPathSelectionAndAlternateConflict(t *testing.T) {
 			t.Fatalf("alternate conflict leaked credential: %v", err)
 		}
 	})
+}
+
+func TestNetrcWriter_WindowsGoAlwaysUsesUnderscoreNetrc(t *testing.T) {
+	tests := []struct {
+		name       string
+		dot        []byte
+		underscore []byte
+	}{
+		{name: "neither file"},
+		{name: "dot file only", dot: []byte("machine dot.example login user password keep\r\n")},
+		{
+			name:       "both files",
+			dot:        []byte("machine dot.example login user password keep\r\n"),
+			underscore: []byte("machine underscore.example login user password keep\r\n"),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			homeDir := t.TempDir()
+			dotPath := filepath.Join(homeDir, ".netrc")
+			underscorePath := filepath.Join(homeDir, "_netrc")
+			if tc.dot != nil {
+				if err := os.WriteFile(dotPath, tc.dot, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.underscore != nil {
+				if err := os.WriteFile(underscorePath, tc.underscore, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			policy := goTestPolicy(t)
+			writer, err := newGoNetrcWriter(newSecureTestHome(t, homeDir), policy.RegistryHost(), policy.DeviceToken())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if writer.Location() != underscorePath {
+				t.Fatalf("Location = %q, want %q", writer.Location(), underscorePath)
+			}
+			if _, err := writer.Write(writer.expected); err != nil {
+				t.Fatal(err)
+			}
+			first, err := os.ReadFile(underscorePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := writer.Write(writer.expected); err != nil {
+				t.Fatal(err)
+			}
+			second, err := os.ReadFile(underscorePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(second, first) {
+				t.Fatalf("repeated write changed _netrc: %q, want %q", second, first)
+			}
+			if tc.dot != nil {
+				got, err := os.ReadFile(dotPath)
+				if err != nil || !bytes.Equal(got, tc.dot) {
+					t.Fatalf(".netrc changed: %q, %v", got, err)
+				}
+			} else if _, err := os.Stat(dotPath); !os.IsNotExist(err) {
+				t.Fatalf(".netrc was created: %v", err)
+			}
+
+			changed, err := writer.Clear()
+			if err != nil || !changed {
+				t.Fatalf("Clear = %v, %v, want true", changed, err)
+			}
+			if tc.underscore == nil {
+				if _, err := os.Stat(underscorePath); !os.IsNotExist(err) {
+					t.Fatalf("created _netrc remains: %v", err)
+				}
+			} else {
+				got, err := os.ReadFile(underscorePath)
+				if err != nil || !bytes.Equal(got, tc.underscore) {
+					t.Fatalf("restored _netrc = %q, %v, want %q", got, err, tc.underscore)
+				}
+			}
+			if tc.dot != nil {
+				got, err := os.ReadFile(dotPath)
+				if err != nil || !bytes.Equal(got, tc.dot) {
+					t.Fatalf("clear changed .netrc: %q, %v", got, err)
+				}
+			}
+		})
+	}
 }
 
 func TestNetrcWriter_WindowsClearFindsOwnedFile(t *testing.T) {

@@ -5,10 +5,14 @@ package devicepolicy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
+	osexec "os/exec"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
@@ -16,7 +20,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func TestGoEnvWriterWindowsACLCRLFAndRollback(t *testing.T) {
+func TestGoEnvWriter_WindowsNormalizesCRLFAndRollsBack(t *testing.T) {
 	homeDir := t.TempDir()
 	appData := filepath.Join(homeDir, "AppData", "Roaming")
 	path := filepath.Join(appData, "go", "env")
@@ -46,8 +50,8 @@ func TestGoEnvWriterWindowsACLCRLFAndRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(bytes.ReplaceAll(content, []byte("\r\n"), nil), []byte("\n")) {
-		t.Fatalf("writer introduced LF into CRLF file: %q", content)
+	if bytes.Contains(content, []byte("\r")) || !bytes.Contains(content, []byte(dmgGoEnvRestoreCRLF)) {
+		t.Fatalf("writer did not normalize CRLF with restoration metadata: %q", content)
 	}
 	secure, err := w.file.MetadataSecure(secureuserfile.FileMode)
 	if err != nil || !secure {
@@ -69,11 +73,11 @@ func TestGoEnvWriterWindowsACLCRLFAndRollback(t *testing.T) {
 	}
 }
 
-func TestGoEnvWriterWindowsRepairsOnlyACLForCompliantContent(t *testing.T) {
+func TestGoEnvWriter_WindowsACLRepairPreservesCompliantBytes(t *testing.T) {
 	homeDir := t.TempDir()
 	appData := filepath.Join(homeDir, "AppData", "Roaming")
 	path := filepath.Join(appData, "go", "env")
-	initial := []byte(dmgGoEnvBegin + "\r\n" + goEnvExpected + "\r\n" + goEnvEnd + "\r\n")
+	initial := []byte(dmgGoEnvBegin + "\n" + goEnvExpected + "\n" + goEnvEnd + "\n")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +138,116 @@ func weakenGoEnvTestACL(t *testing.T, path string) {
 	}
 }
 
-func TestGoCoordinatorWindowsMDMNilCredentialWriterReportsVerificationFailed(t *testing.T) {
+func TestGoEnvWriter_WindowsGoCommandReadsValuesWithoutCarriageReturns(t *testing.T) {
+	withTempCache(t)
+	homeDir := t.TempDir()
+	appData := filepath.Join(homeDir, "AppData", "Roaming")
+	path := filepath.Join(appData, "go", "env")
+	initial := []byte("# keep\r\n" +
+		"GOPROXY=https://proxy.golang.org,direct\r\n" +
+		"GOPRIVATE=corp.example/*\r\n" +
+		"GONOPROXY=noproxy.example/*\r\n" +
+		"GONOSUMDB=nosum.example/*\r\n" +
+		"GOSUMDB=sum.golang.org\r\n")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, initial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.HomeDir = homeDir
+	normalizeSecureTestUser(t, current)
+	mock := executor.NewMock()
+	mock.SetGOOS(model.PlatformWindows)
+	mock.SetUsername(current.Username)
+	mock.SetHomeDir(homeDir)
+	mock.SetEnv("APPDATA", appData)
+	userExec := &coordinatorUserExecutor{Mock: mock, user: current}
+	fetcher := &goCoordinatorFetcher{policy: goCoordinatorPolicy("sha256:H", enforcementDMG)}
+	coordinator := &GoCoordinator{
+		Fetcher: fetcher, Reporter: &coordinatorReporter{}, Exec: userExec,
+		CustomerID: "cust", DeviceID: "DEVICE-123", Platform: model.PlatformWindows,
+	}
+	if err := coordinator.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(first, []byte("\r")) {
+		t.Fatalf("enforced Go env contains carriage returns: %q", first)
+	}
+	firstInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := osexec.CommandContext(ctx, "go", "env", "-json", "GOPROXY", "GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOSUMDB")
+	blocked := map[string]bool{
+		"GOENV": true, "GOPROXY": true, "GOPRIVATE": true, "GONOPROXY": true, "GONOSUMDB": true, "GOSUMDB": true,
+	}
+	for _, value := range os.Environ() {
+		key, _, _ := strings.Cut(value, "=")
+		if !blocked[strings.ToUpper(key)] {
+			cmd.Env = append(cmd.Env, value)
+		}
+	}
+	cmd.Env = append(cmd.Env, "GOENV="+path)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go env: %v", err)
+	}
+	var values map[string]string
+	if err := json.Unmarshal(out, &values); err != nil {
+		t.Fatalf("decode go env output: %v", err)
+	}
+	want := map[string]string{
+		"GOPROXY":   goTestPolicy(t).RegistryURL,
+		"GOPRIVATE": "corp.example/*", "GONOPROXY": "noproxy.example/*",
+		"GONOSUMDB": "nosum.example/*", "GOSUMDB": "sum.golang.org",
+	}
+	for key, expected := range want {
+		if values[key] != expected || strings.Contains(values[key], "\r") {
+			t.Errorf("go env %s = %q, want %q without carriage return", key, values[key], expected)
+		}
+	}
+
+	if err := coordinator.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(second, first) || !os.SameFile(firstInfo, secondInfo) || !secondInfo.ModTime().Equal(firstInfo.ModTime()) {
+		t.Fatal("repeated enforcement rewrote the converged Go env file")
+	}
+
+	fetcher.policy = EffectivePolicy{Category: CategoryPackageConfig, Target: TargetGo, Clear: true}
+	if err := coordinator.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(restored, initial) {
+		t.Fatalf("clear restored %q, want %q", restored, initial)
+	}
+}
+
+func TestGoCoordinator_WindowsMDMNilCredentialWriterReportsVerificationFailed(t *testing.T) {
 	homeDir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(homeDir, ".netrc"), 0o700); err != nil {
 		t.Fatal(err)

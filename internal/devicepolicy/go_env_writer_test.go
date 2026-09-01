@@ -103,12 +103,37 @@ func TestGoEnvWriter_TransformsAndExactlyRestores(t *testing.T) {
 
 func TestRewriteGoEnv_PreservesManagedOnlyCRLF(t *testing.T) {
 	initial := []byte(dmgGoEnvBegin + "\r\n" + goEnvExpected + "\r\n" + goEnvEnd + "\r\n")
-	got, err := rewriteGoEnv(initial, goEnvExpected, false)
+	got, err := rewriteGoEnv(initial, goEnvExpected, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, initial) {
 		t.Fatalf("rewriteGoEnv = %q, want %q", got, initial)
+	}
+}
+
+func TestRewriteGoEnv_NormalizesCRLFAndExactlyRestores(t *testing.T) {
+	initial := []byte("# keep\r\nGOPROXY=https://proxy.golang.org\r\nGOPRIVATE=corp.example/*\r\n")
+	first, err := rewriteGoEnv(initial, goEnvExpected, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(first, []byte("\r")) || !bytes.Contains(first, []byte(dmgGoEnvRestoreCRLF)) {
+		t.Fatalf("rewriteGoEnv did not normalize CRLF with restoration metadata: %q", first)
+	}
+	second, err := rewriteGoEnv(first, goEnvExpected, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(second, first) {
+		t.Fatalf("repeated rewrite = %q, want %q", second, first)
+	}
+	restored, changed, err := clearGoEnv(first)
+	if err != nil || !changed {
+		t.Fatalf("clearGoEnv = %q, %v, %v", restored, changed, err)
+	}
+	if !bytes.Equal(restored, initial) {
+		t.Fatalf("clearGoEnv = %q, want %q", restored, initial)
 	}
 }
 

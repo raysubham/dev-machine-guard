@@ -22,6 +22,7 @@ const (
 	mdmGoEnvDisabledPrefix = "# [stepsecurity-go-env-mdm] "
 	dmgGoEnvCreatedFile    = "# [stepsecurity-go-env-dmg] created=true"
 	mdmGoEnvCreatedFile    = "# [stepsecurity-go-env-mdm] created=true"
+	dmgGoEnvRestoreCRLF    = "# [stepsecurity-go-env-dmg] newline=crlf"
 	goEnvBackupPrefix      = ".dmg-go-env-"
 )
 
@@ -160,7 +161,7 @@ func (w *GoEnvWriter) Write(expected string) (string, error) {
 	if markers.owner == "dmg" {
 		created = markers.created
 	}
-	updated, err := rewriteGoEnv(current, expected, created)
+	updated, err := rewriteGoEnv(current, expected, created, w.exec.GOOS() == model.PlatformWindows)
 	if err != nil {
 		return "", err
 	}
@@ -230,7 +231,8 @@ func (w *GoEnvWriter) StaticConverged(expected string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if analysis.owner != "dmg" || analysis.managedValue != expected || analysis.activeOutside {
+	if analysis.owner != "dmg" || analysis.managedValue != expected || analysis.activeOutside ||
+		w.exec.GOOS() == model.PlatformWindows && analysis.newline != "\n" {
 		return false, nil
 	}
 	return w.file.MetadataSecure(secureuserfile.FileMode)
@@ -331,7 +333,8 @@ func (w *GoEnvWriter) Observation(expected, credentialLocation string) (GoEnvObs
 		if analysis.owner == "mdm" {
 			conflicting = analysis.activeAfter
 		}
-		if secure && (analysis.owner == "dmg" || analysis.owner == "mdm") && analysis.managedValue == expected && !conflicting {
+		if secure && (analysis.owner == "dmg" || analysis.owner == "mdm") && analysis.managedValue == expected && !conflicting &&
+			(w.exec.GOOS() != model.PlatformWindows || analysis.newline == "\n") {
 			observation.ConfigStatus = "match"
 			observation.RegistryURL = w.registryURL
 		} else {
@@ -407,6 +410,7 @@ type goEnvAnalysis struct {
 	activeAfter   bool
 	lastActiveURL string
 	newline       string
+	restoreCRLF   bool
 	bom           bool
 }
 
@@ -449,6 +453,12 @@ func scanGoEnv(data []byte) (goEnvAnalysis, error) {
 				return analysis, fmt.Errorf("go env: misplaced or duplicated file marker: %w", ErrTargetUnusable)
 			}
 			analysis.created = true
+			continue
+		case dmgGoEnvRestoreCRLF:
+			if !inside || analysis.owner != "dmg" || analysis.restoreCRLF {
+				return analysis, fmt.Errorf("go env: misplaced or duplicated newline marker: %w", ErrTargetUnusable)
+			}
+			analysis.restoreCRLF = true
 			continue
 		}
 		switch {
@@ -515,13 +525,17 @@ func goEnvNewline(data []byte) string {
 	return "\n"
 }
 
-func rewriteGoEnv(current []byte, expected string, created bool) ([]byte, error) {
+func rewriteGoEnv(current []byte, expected string, created, normalizeCRLF bool) ([]byte, error) {
 	analysis, err := scanGoEnv(current)
 	if err != nil {
 		return nil, err
 	}
 	newline := analysis.newline
 	hadFinal := bytes.HasSuffix(current, []byte(newline))
+	restoreCRLF := analysis.restoreCRLF || normalizeCRLF && newline == "\r\n"
+	if normalizeCRLF {
+		newline = "\n"
+	}
 	if analysis.owner == "mdm" {
 		return nil, fmt.Errorf("go env: MDM marker present: %w", ErrTargetUnusable)
 	}
@@ -543,6 +557,9 @@ func rewriteGoEnv(current []byte, expected string, created bool) ([]byte, error)
 	managed := []string{dmgGoEnvBegin}
 	if created {
 		managed = append(managed, dmgGoEnvCreatedFile)
+	}
+	if restoreCRLF {
+		managed = append(managed, dmgGoEnvRestoreCRLF)
 	}
 	managed = append(managed, expected, goEnvEnd)
 	block := strings.Join(managed, newline)
@@ -582,7 +599,11 @@ func clearGoEnv(data []byte) ([]byte, bool, error) {
 			out[i] = strings.TrimPrefix(line, dmgGoEnvDisabledPrefix)
 		}
 	}
-	result := strings.Join(out, analysis.newline)
+	newline := analysis.newline
+	if analysis.restoreCRLF {
+		newline = "\r\n"
+	}
+	result := strings.Join(out, newline)
 	if analysis.bom {
 		result = string([]byte{0xef, 0xbb, 0xbf}) + result
 	}

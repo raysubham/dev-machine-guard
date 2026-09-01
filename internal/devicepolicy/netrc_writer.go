@@ -94,6 +94,17 @@ func newNetrcWriter(home *secureuserfile.Home, host, token string) (*NetrcWriter
 	return w, nil
 }
 
+func newGoNetrcWriter(home *secureuserfile.Home, host, token string) (*NetrcWriter, error) {
+	w, err := newNetrcWriter(home, host, token)
+	if err != nil || home.GOOS() != model.PlatformWindows {
+		return w, err
+	}
+	if filepath.Base(w.file.Location()) != "_netrc" {
+		w.file, w.alternate = w.alternate, w.file
+	}
+	return w, nil
+}
+
 func renderNetrcEntry(host, token string) string {
 	return "machine " + host + "\nlogin step-security\npassword " + token
 }

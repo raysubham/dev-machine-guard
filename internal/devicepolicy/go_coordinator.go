@@ -407,7 +407,7 @@ func buildGoComponents(exec executor.Executor, policy GoPolicy) (*goComponents, 
 	components := &goComponents{close: home.Close}
 	components.hasManagedCredential = func() (bool, error) { return hasManagedNetrcMarker(home) }
 	credentialExpected := renderNetrcEntry(policy.RegistryHost(), policy.DeviceToken())
-	credential, credentialErr := newNetrcWriter(home, policy.RegistryHost(), policy.DeviceToken())
+	credential, credentialErr := newGoNetrcWriter(home, policy.RegistryHost(), policy.DeviceToken())
 	components.credential = &goComponent{
 		name: "credential", ownershipTarget: GoCredentialOwnershipTarget, ownershipKey: goCredentialOwnershipKey,
 		ownershipStateValue: GoCredentialOwnershipValue, writer: credential, initErr: credentialErr, expected: credentialExpected,

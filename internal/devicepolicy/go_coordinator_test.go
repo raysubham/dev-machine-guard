@@ -484,7 +484,7 @@ func TestGoAndPyPIShareOneNetrcBlockAcrossOrdersAndRotation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			goWriter, err := newNetrcWriter(home, goPolicy.RegistryHost(), goPolicy.DeviceToken())
+			goWriter, err := newGoNetrcWriter(home, goPolicy.RegistryHost(), goPolicy.DeviceToken())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -509,7 +509,7 @@ func TestGoAndPyPIShareOneNetrcBlockAcrossOrdersAndRotation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			rotated, err := newNetrcWriter(home, rotatedGo.RegistryHost(), rotatedGo.DeviceToken())
+			rotated, err := newGoNetrcWriter(home, rotatedGo.RegistryHost(), rotatedGo.DeviceToken())
 			if err != nil {
 				t.Fatal(err)
 			}
