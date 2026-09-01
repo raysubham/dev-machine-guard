@@ -3,9 +3,11 @@ package detector
 import (
 	"context"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/progress"
 )
 
@@ -38,6 +40,42 @@ func TestNodeGlobalRoots_PrefixOverride(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected npm global root %q from prefix override", nm)
+	}
+}
+
+func TestNodeGlobalRoots_UsesLoggedInUserHome(t *testing.T) {
+	serviceHome := "/root"
+	userHome := "/home/testuser"
+	npmRoot := filepath.Join(userHome, ".npm-global", "lib", "node_modules")
+	pnpmRoot := filepath.Join(userHome, ".local", "share", "pnpm", "global", "5", "node_modules")
+	yarnRoot := filepath.Join(userHome, ".config", "yarn", "global", "node_modules")
+	serviceNPMRoot := filepath.Join(serviceHome, ".npm-global", "lib", "node_modules")
+	servicePNPMRoot := filepath.Join(serviceHome, ".local", "share", "pnpm", "global", "5", "node_modules")
+	serviceYarnRoot := filepath.Join(serviceHome, ".config", "yarn", "global", "node_modules")
+	want := []nodeGlobalRoot{
+		{pm: "npm", dir: npmRoot},
+		{pm: "pnpm", dir: pnpmRoot},
+		{pm: "yarn", dir: yarnRoot},
+	}
+	mock := executor.NewMock()
+	mock.SetGOOS(model.PlatformLinux)
+	mock.SetEnv("HOME", serviceHome)
+	mock.SetHomeDir(userHome)
+	for _, dir := range []string{
+		npmRoot,
+		pnpmRoot,
+		yarnRoot,
+		serviceNPMRoot,
+		servicePNPMRoot,
+		serviceYarnRoot,
+	} {
+		mock.SetDir(dir)
+	}
+	mock.SetGlob(filepath.Join(userHome, ".local", "share", "pnpm", "global", "*", "node_modules"), []string{pnpmRoot})
+	mock.SetGlob(filepath.Join(serviceHome, ".local", "share", "pnpm", "global", "*", "node_modules"), []string{servicePNPMRoot})
+
+	if got := NodeGlobalRoots(mock); !slices.Equal(got, want) {
+		t.Fatalf("NodeGlobalRoots() = %+v, want %+v", got, want)
 	}
 }
 
