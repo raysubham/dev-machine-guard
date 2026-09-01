@@ -480,7 +480,13 @@ func buildPyPIComponents(ctx context.Context, exec executor.Executor, policy PyP
 	}
 	components := &pypiComponents{close: home.Close}
 	userExec := executor.NewUserAwareExecutor(exec, home.Username())
-	components.hasGoSibling = func() (bool, error) { return hasGoDMGMarker(exec, home) }
+	components.hasGoSibling = func() (bool, error) {
+		sibling, err := hasGoDMGMarker(exec, home)
+		if err != nil || !sibling {
+			return sibling, err
+		}
+		return hasSingleManagedNetrc(home)
+	}
 
 	credentialExpected := renderNetrcEntry(policy.RegistryHost(), policy.DeviceToken())
 	credential, credentialErr := NewNetrcWriter(home, policy)

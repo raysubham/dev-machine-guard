@@ -464,7 +464,13 @@ func buildGoComponents(exec executor.Executor, policy GoPolicy) (*goComponents, 
 			return goComponentObservation{env: &observation}, err
 		}
 	}
-	components.hasPyPISibling = func() (bool, error) { return hasPyPIDMGMarker(exec, home) }
+	components.hasPyPISibling = func() (bool, error) {
+		sibling, err := hasPyPIDMGMarker(exec, home)
+		if err != nil || !sibling {
+			return sibling, err
+		}
+		return hasSingleManagedNetrc(home)
+	}
 	return components, nil
 }
 

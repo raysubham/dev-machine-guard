@@ -158,6 +158,63 @@ func TestNetrcWriter_WindowsGoAlwaysUsesUnderscoreNetrc(t *testing.T) {
 	}
 }
 
+func TestNetrcWriter_WindowsSeparateManagedFilesClearInEitherOrder(t *testing.T) {
+	for _, first := range []string{"go", "pypi"} {
+		t.Run(first+" first", func(t *testing.T) {
+			homeDir := t.TempDir()
+			dotPath := filepath.Join(homeDir, ".netrc")
+			underscorePath := filepath.Join(homeDir, "_netrc")
+			dotInitial := []byte("machine dot.example login user password keep\r\n")
+			underscoreInitial := []byte("machine underscore.example login user password keep\r\n")
+			if err := os.WriteFile(dotPath, dotInitial, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(underscorePath, underscoreInitial, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			home := newSecureTestHome(t, homeDir)
+			pypi, err := NewNetrcWriter(home, netrcTestPolicy(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			policy := goTestPolicy(t)
+			goWriter, err := newGoNetrcWriter(home, policy.RegistryHost(), policy.DeviceToken())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, writer := range []*NetrcWriter{pypi, goWriter} {
+				if _, err := writer.Write(writer.expected); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if single, err := hasSingleManagedNetrc(home); err != nil || single {
+				t.Fatalf("hasSingleManagedNetrc = %v, %v, want false", single, err)
+			}
+
+			writers := map[string]*NetrcWriter{"go": goWriter, "pypi": pypi}
+			if changed, err := writers[first].Clear(); err != nil || !changed {
+				t.Fatalf("first Clear = %v, %v", changed, err)
+			}
+			if single, err := hasSingleManagedNetrc(home); err != nil || !single {
+				t.Fatalf("hasSingleManagedNetrc after first clear = %v, %v, want true", single, err)
+			}
+			second := "go"
+			if first == second {
+				second = "pypi"
+			}
+			if changed, err := writers[second].Clear(); err != nil || !changed {
+				t.Fatalf("second Clear = %v, %v", changed, err)
+			}
+			for path, want := range map[string][]byte{dotPath: dotInitial, underscorePath: underscoreInitial} {
+				got, err := os.ReadFile(path)
+				if err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("restored %s = %q, %v, want %q", path, got, err, want)
+				}
+			}
+		})
+	}
+}
+
 func TestNetrcWriter_WindowsClearFindsOwnedFile(t *testing.T) {
 	t.Run("managed underscore survives selection change", func(t *testing.T) {
 		home := t.TempDir()

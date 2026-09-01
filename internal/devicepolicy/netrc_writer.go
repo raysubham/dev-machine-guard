@@ -215,17 +215,16 @@ func (w *NetrcWriter) Clear() (bool, error) {
 			if err != nil || len(exactHostEntries(entries, w.host)) != 1 {
 				return false, fmt.Errorf("netrc: managed credential host conflicts with ownership state: %w", ErrTargetUnusable)
 			}
-			if owned >= 0 {
-				return false, fmt.Errorf("netrc: multiple managed credential files: %w", ErrTargetUnusable)
+			if owned < 0 || file == w.file {
+				owned = len(candidates) - 1
 			}
-			owned = len(candidates) - 1
 		} else if analysis.markers.mdm || len(exactHostEntries(analysis.entries, w.host)) != 0 {
 			conflict = true
 		}
 	}
 	if owned >= 0 {
 		for i, candidate := range candidates {
-			if i != owned && (candidate.analysis.markers.dmg != nil || candidate.analysis.markers.mdm || len(exactHostEntries(candidate.analysis.entries, w.host)) != 0) {
+			if i != owned && (candidate.analysis.markers.mdm || candidate.analysis.markers.dmg == nil && len(exactHostEntries(candidate.analysis.entries, w.host)) != 0) {
 				return false, fmt.Errorf("netrc: alternate credential file conflicts with managed file: %w", ErrTargetUnusable)
 			}
 		}
@@ -324,6 +323,34 @@ func hasManagedNetrcMarker(home *secureuserfile.Home) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func hasSingleManagedNetrc(home *secureuserfile.Home) (bool, error) {
+	if home == nil {
+		return false, errors.New("netrc: nil secure user home")
+	}
+	count := 0
+	for _, name := range []string{".netrc", "_netrc"} {
+		file, err := home.Open(name, netrcBackupPrefix, secureuserfile.MaxBytes)
+		if err != nil {
+			return false, err
+		}
+		data, existed, _, err := file.Read()
+		if err != nil {
+			return false, err
+		}
+		if !existed {
+			continue
+		}
+		markers, err := scanNetrcMarkers(data)
+		if err != nil {
+			return false, err
+		}
+		if markers.dmg != nil {
+			count++
+		}
+	}
+	return count == 1, nil
 }
 
 func (w *NetrcWriter) RestoreSnapshot() error { return w.file.RestoreSnapshot() }
@@ -460,7 +487,14 @@ func (w *NetrcWriter) checkAlternateConflict() error {
 	if err != nil {
 		return err
 	}
-	if analysis.markers.dmg != nil || analysis.markers.mdm || len(exactHostEntries(analysis.entries, w.host)) != 0 {
+	exact := exactHostEntries(analysis.entries, w.host)
+	if analysis.markers.dmg != nil {
+		managed, err := parseNetrc([]byte(analysis.markers.dmg.body))
+		if err == nil && len(exactHostEntries(managed, w.host)) == 1 && len(exact) == 1 {
+			return nil
+		}
+	}
+	if analysis.markers.dmg != nil || analysis.markers.mdm || len(exact) != 0 {
 		return fmt.Errorf("netrc: alternate credential file conflicts with selected file: %w", ErrTargetUnusable)
 	}
 	return nil
