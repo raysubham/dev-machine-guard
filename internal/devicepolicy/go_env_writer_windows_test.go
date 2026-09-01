@@ -247,7 +247,7 @@ func TestGoEnvWriter_WindowsGoCommandReadsValuesWithoutCarriageReturns(t *testin
 	}
 }
 
-func TestGoCoordinator_WindowsClearWithoutCredentialStateRestoresDualFiles(t *testing.T) {
+func TestGoCoordinator_WindowsClearWithoutCredentialStateRetainsSharedCredential(t *testing.T) {
 	withTempCache(t)
 	homeDir := t.TempDir()
 	appData := filepath.Join(homeDir, "AppData", "Roaming")
@@ -289,11 +289,13 @@ func TestGoCoordinator_WindowsClearWithoutCredentialStateRestoresDualFiles(t *te
 	if err := goCoordinator.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{dotPath, underscorePath} {
-		data, err := os.ReadFile(path)
-		if err != nil || !bytes.Contains(data, []byte(dmgNetrcBegin)) {
-			t.Fatalf("managed credential %s = %q, %v", path, data, err)
-		}
+	dot, err := os.ReadFile(dotPath)
+	if err != nil || !bytes.Equal(dot, dotInitial) {
+		t.Fatalf(".netrc = %q, %v, want unchanged %q", dot, err, dotInitial)
+	}
+	managed, err := os.ReadFile(underscorePath)
+	if err != nil || !bytes.Contains(managed, []byte(dmgNetrcBegin)) {
+		t.Fatalf("managed _netrc = %q, %v", managed, err)
 	}
 	if err := ClearAppliedState(CategoryPackageConfig, GoCredentialOwnershipTarget); err != nil {
 		t.Fatal(err)
@@ -304,12 +306,12 @@ func TestGoCoordinator_WindowsClearWithoutCredentialStateRestoresDualFiles(t *te
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(underscorePath)
-	if err != nil || !bytes.Equal(got, underscoreInitial) {
-		t.Fatalf("restored _netrc = %q, %v, want %q", got, err, underscoreInitial)
+	if err != nil || !bytes.Equal(got, managed) {
+		t.Fatalf("shared _netrc changed: %q, %v", got, err)
 	}
-	dot, err := os.ReadFile(dotPath)
-	if err != nil || !bytes.Contains(dot, []byte(dmgNetrcBegin)) {
-		t.Fatalf("PyPI credential changed: %q, %v", dot, err)
+	dot, err = os.ReadFile(dotPath)
+	if err != nil || !bytes.Equal(dot, dotInitial) {
+		t.Fatalf(".netrc changed: %q, %v", dot, err)
 	}
 	if _, err := os.Stat(filepath.Join(appData, "go", "env")); !os.IsNotExist(err) {
 		t.Fatalf("Go env remains after clear: %v", err)
