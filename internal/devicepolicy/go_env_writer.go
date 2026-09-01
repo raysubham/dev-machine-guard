@@ -23,6 +23,7 @@ const (
 	dmgGoEnvCreatedFile    = "# [stepsecurity-go-env-dmg] created=true"
 	mdmGoEnvCreatedFile    = "# [stepsecurity-go-env-mdm] created=true"
 	dmgGoEnvRestoreCRLF    = "# [stepsecurity-go-env-dmg] newline=crlf"
+	mdmGoEnvRestoreCRLF    = "# [stepsecurity-go-env-mdm] restore-crlf=true"
 	goEnvBackupPrefix      = ".dmg-go-env-"
 )
 
@@ -454,8 +455,12 @@ func scanGoEnv(data []byte) (goEnvAnalysis, error) {
 			}
 			analysis.created = true
 			continue
-		case dmgGoEnvRestoreCRLF:
-			if !inside || analysis.owner != "dmg" || analysis.restoreCRLF {
+		case dmgGoEnvRestoreCRLF, mdmGoEnvRestoreCRLF:
+			owner := "dmg"
+			if line == mdmGoEnvRestoreCRLF {
+				owner = "mdm"
+			}
+			if !inside || analysis.owner != owner || analysis.restoreCRLF {
 				return analysis, fmt.Errorf("go env: misplaced or duplicated newline marker: %w", ErrTargetUnusable)
 			}
 			analysis.restoreCRLF = true

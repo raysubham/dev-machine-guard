@@ -314,6 +314,7 @@ func TestGoEnvWriter_ObservesExactMDMShapeWithoutWriting(t *testing.T) {
 		"GOPROXY=https://prior.example/go",
 		mdmGoEnvDisabledPrefix + "GOPROXY=https://proxy.golang.org",
 		mdmGoEnvBegin,
+		mdmGoEnvRestoreCRLF,
 		goEnvExpected,
 		goEnvEnd,
 		"GOPRIVATE=corp.example/*",
@@ -348,6 +349,31 @@ func TestGoEnvWriter_ObservesExactMDMShapeWithoutWriting(t *testing.T) {
 	observed, err = w.Observation(goEnvExpected, filepath.Join(w.home.Path(), ".netrc"))
 	if err != nil || observed.ConfigStatus != "mismatch" {
 		t.Fatalf("active line after MDM block = %#v, %v", observed, err)
+	}
+}
+
+func TestScanGoEnv_MDMRestoreCRLFMarker(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		wantErr bool
+	}{
+		{"inside MDM block", mdmGoEnvBegin + "\n" + mdmGoEnvRestoreCRLF + "\n" + goEnvExpected + "\n" + goEnvEnd, false},
+		{"outside block", mdmGoEnvRestoreCRLF + "\n" + mdmGoEnvBegin + "\n" + goEnvExpected + "\n" + goEnvEnd, true},
+		{"inside DMG block", dmgGoEnvBegin + "\n" + mdmGoEnvRestoreCRLF + "\n" + goEnvExpected + "\n" + goEnvEnd, true},
+		{"duplicated", mdmGoEnvBegin + "\n" + mdmGoEnvRestoreCRLF + "\n" + mdmGoEnvRestoreCRLF + "\n" + goEnvExpected + "\n" + goEnvEnd, true},
+		{"different value", mdmGoEnvBegin + "\n# [stepsecurity-go-env-mdm] restore-crlf=false\n" + goEnvExpected + "\n" + goEnvEnd, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			analysis, err := scanGoEnv([]byte(tc.content))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("scanGoEnv() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if !tc.wantErr && (analysis.owner != "mdm" || !analysis.restoreCRLF) {
+				t.Fatalf("scanGoEnv() = %+v, want MDM CRLF restoration", analysis)
+			}
+		})
 	}
 }
 
