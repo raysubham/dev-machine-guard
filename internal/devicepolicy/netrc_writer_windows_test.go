@@ -34,7 +34,7 @@ func TestNetrcWriter_WindowsPathSelectionAndAlternateConflict(t *testing.T) {
 		}
 	})
 
-	t.Run("dot file wins when both exist", func(t *testing.T) {
+	t.Run("underscore file wins when both exist", func(t *testing.T) {
 		home := t.TempDir()
 		for _, name := range []string{".netrc", "_netrc"} {
 			if err := os.WriteFile(filepath.Join(home, name), []byte("machine other.example login u password p\r\n"), 0o600); err != nil {
@@ -45,17 +45,17 @@ func TestNetrcWriter_WindowsPathSelectionAndAlternateConflict(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if filepath.Base(w.Location()) != ".netrc" {
-			t.Fatalf("Location = %q, want preferred .netrc", w.Location())
+		if filepath.Base(w.Location()) != "_netrc" {
+			t.Fatalf("Location = %q, want preferred _netrc", w.Location())
 		}
 	})
 
 	t.Run("unused alternate exact host fails closed", func(t *testing.T) {
 		home := t.TempDir()
-		if err := os.WriteFile(filepath.Join(home, ".netrc"), []byte("machine other.example login u password p\r\n"), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(home, ".netrc"), []byte("machine registry.stepsecurity.io login stale password old-secret\r\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(home, "_netrc"), []byte("machine registry.stepsecurity.io login stale password old-secret\r\n"), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(home, "_netrc"), []byte("machine other.example login u password p\r\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		w, err := NewNetrcWriter(newSecureTestHome(t, home), netrcTestPolicy(t))
@@ -158,69 +158,58 @@ func TestNetrcWriter_WindowsGoUsesCmdGoNetrcPrecedence(t *testing.T) {
 	}
 }
 
-func TestNetrcWriter_WindowsSeparateManagedFilesClearInEitherOrder(t *testing.T) {
-	for _, first := range []string{"go", "pypi"} {
-		t.Run(first+" first", func(t *testing.T) {
-			homeDir := t.TempDir()
-			dotPath := filepath.Join(homeDir, ".netrc")
-			underscorePath := filepath.Join(homeDir, "_netrc")
-			dotInitial := []byte("machine dot.example login user password keep\r\n")
-			underscoreInitial := []byte("machine underscore.example login user password keep\r\n")
-			if err := os.WriteFile(dotPath, dotInitial, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(underscorePath, underscoreInitial, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			home := newSecureTestHome(t, homeDir)
-			pypi, err := NewNetrcWriter(home, netrcTestPolicy(t))
-			if err != nil {
-				t.Fatal(err)
-			}
-			policy := goTestPolicy(t)
-			goWriter, err := newGoNetrcWriter(home, policy.RegistryHost(), policy.DeviceToken())
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, writer := range []*NetrcWriter{pypi, goWriter} {
-				if _, err := writer.Write(writer.expected); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if single, err := hasSingleManagedNetrc(home); err != nil || single {
-				t.Fatalf("hasSingleManagedNetrc = %v, %v, want false", single, err)
-			}
-
-			writers := map[string]*NetrcWriter{"go": goWriter, "pypi": pypi}
-			if changed, err := writers[first].Clear(); err != nil || !changed {
-				t.Fatalf("first Clear = %v, %v", changed, err)
-			}
-			if single, err := hasSingleManagedNetrc(home); err != nil || !single {
-				t.Fatalf("hasSingleManagedNetrc after first clear = %v, %v, want true", single, err)
-			}
-			second := "go"
-			if first == second {
-				second = "pypi"
-			}
-			if changed, err := writers[second].Clear(); err != nil || !changed {
-				t.Fatalf("second Clear = %v, %v", changed, err)
-			}
-			for path, want := range map[string][]byte{dotPath: dotInitial, underscorePath: underscoreInitial} {
-				got, err := os.ReadFile(path)
-				if err != nil || !bytes.Equal(got, want) {
-					t.Fatalf("restored %s = %q, %v, want %q", path, got, err, want)
-				}
-			}
-		})
+func TestNetrcWriter_WindowsGoAndPyPIShareUnderscoreNetrc(t *testing.T) {
+	homeDir := t.TempDir()
+	dotPath := filepath.Join(homeDir, ".netrc")
+	underscorePath := filepath.Join(homeDir, "_netrc")
+	dotInitial := []byte("machine dot.example login user password keep\r\n")
+	underscoreInitial := []byte("machine underscore.example login user password keep\r\n")
+	if err := os.WriteFile(dotPath, dotInitial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(underscorePath, underscoreInitial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	home := newSecureTestHome(t, homeDir)
+	policy := netrcTestPolicy(t)
+	pypi, err := NewNetrcWriter(home, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goWriter, err := newGoNetrcWriter(home, policy.RegistryHost(), policy.DeviceToken())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, writer := range []*NetrcWriter{pypi, goWriter} {
+		if writer.Location() != underscorePath {
+			t.Fatalf("Location = %q, want shared %q", writer.Location(), underscorePath)
+		}
+		if _, err := writer.Write(writer.expected); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := os.ReadFile(dotPath)
+	if err != nil || !bytes.Equal(got, dotInitial) {
+		t.Fatalf(".netrc = %q, %v, want unchanged %q", got, err, dotInitial)
+	}
+	got, err = os.ReadFile(underscorePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Count(got, []byte(dmgNetrcBegin)) != 1 || bytes.Count(got, []byte("machine registry.stepsecurity.io")) != 1 {
+		t.Fatalf("shared credential duplicated:\n%s", got)
+	}
+	if single, err := hasSingleManagedNetrc(home); err != nil || !single {
+		t.Fatalf("hasSingleManagedNetrc = %v, %v, want true", single, err)
 	}
 }
 
 func TestNetrcWriter_WindowsClearFindsOwnedFile(t *testing.T) {
-	t.Run("managed underscore survives selection change", func(t *testing.T) {
+	t.Run("managed dot file survives selection change", func(t *testing.T) {
 		home := t.TempDir()
-		underscore := filepath.Join(home, "_netrc")
+		dot := filepath.Join(home, ".netrc")
 		initial := []byte("machine other.example login u password p\r\n")
-		if err := os.WriteFile(underscore, initial, 0o600); err != nil {
+		if err := os.WriteFile(dot, initial, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		writer, err := NewNetrcWriter(newSecureTestHome(t, home), netrcTestPolicy(t))
@@ -230,9 +219,9 @@ func TestNetrcWriter_WindowsClearFindsOwnedFile(t *testing.T) {
 		if _, err := writer.Write(netrcExpected); err != nil {
 			t.Fatal(err)
 		}
-		dot := filepath.Join(home, ".netrc")
-		dotContent := []byte("machine dot.example login u password p\r\n")
-		if err := os.WriteFile(dot, dotContent, 0o600); err != nil {
+		underscore := filepath.Join(home, "_netrc")
+		underscoreContent := []byte("machine underscore.example login u password p\r\n")
+		if err := os.WriteFile(underscore, underscoreContent, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		writer, err = NewNetrcWriter(newSecureTestHome(t, home), netrcTestPolicy(t))
@@ -243,16 +232,16 @@ func TestNetrcWriter_WindowsClearFindsOwnedFile(t *testing.T) {
 		if err != nil || !changed {
 			t.Fatalf("Clear = %v, %v, want managed alternate cleared", changed, err)
 		}
-		got, err := os.ReadFile(underscore)
+		got, err := os.ReadFile(dot)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if string(got) != string(initial) {
-			t.Fatalf("underscore = %q, want restored %q", got, initial)
+			t.Fatalf("dot file = %q, want restored %q", got, initial)
 		}
-		got, err = os.ReadFile(dot)
-		if err != nil || string(got) != string(dotContent) {
-			t.Fatalf("dot file changed: %q, %v", got, err)
+		got, err = os.ReadFile(underscore)
+		if err != nil || string(got) != string(underscoreContent) {
+			t.Fatalf("underscore file changed: %q, %v", got, err)
 		}
 	})
 

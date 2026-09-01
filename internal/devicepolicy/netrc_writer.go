@@ -78,15 +78,14 @@ func newNetrcWriter(home *secureuserfile.Home, host, token string) (*NetrcWriter
 	if err != nil {
 		return nil, err
 	}
-	_, primaryExists, _, err := primary.Read()
-	if err != nil {
+	if _, _, _, err := primary.Read(); err != nil {
 		return nil, err
 	}
 	_, alternateExists, _, err := alternate.Read()
 	if err != nil {
 		return nil, err
 	}
-	if !primaryExists && alternateExists {
+	if alternateExists {
 		w.file, w.alternate = alternate, primary
 	} else {
 		w.alternate = alternate
