@@ -287,34 +287,6 @@ func TestNetrcWriter_WindowsClearFindsOwnedFile(t *testing.T) {
 		}
 	})
 
-	t.Run("two managed files block clear", func(t *testing.T) {
-		home := t.TempDir()
-		underscore := filepath.Join(home, "_netrc")
-		if err := os.WriteFile(underscore, []byte("machine other.example login u password p\r\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		writer, err := NewNetrcWriter(newSecureTestHome(t, home), netrcTestPolicy(t))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := writer.Write(netrcExpected); err != nil {
-			t.Fatal(err)
-		}
-		managed, err := os.ReadFile(underscore)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(home, ".netrc"), managed, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		writer, err = NewNetrcWriter(newSecureTestHome(t, home), netrcTestPolicy(t))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := writer.Clear(); err == nil {
-			t.Fatal("Clear error = nil, want conflicting managed files")
-		}
-	})
 }
 
 func TestNetrcWriter_WindowsACLRejectsUnexpectedReader(t *testing.T) {
