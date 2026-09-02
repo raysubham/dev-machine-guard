@@ -287,6 +287,37 @@ func TestGoCoordinator_MDMVerificationIsWriteFree(t *testing.T) {
 	}
 }
 
+func TestGoCoordinator_MDMReportsManagedWithGOPROXYDrift(t *testing.T) {
+	fixture := newGoCoordinatorFixture()
+	fixture.credential.value = renderNetrcEntry("registry.stepsecurity.io", "tenant-secret::dev:DEVICE-123")
+	fixture.credential.present, fixture.credential.static, fixture.credential.mdm = true, true, true
+	fixture.env.value = "GOPROXY=https://other.example/go"
+	fixture.env.present, fixture.env.static, fixture.env.mdm = true, true, true
+	coordinator, _, reporter := newTestGoCoordinator(t, goCoordinatorPolicy("sha256:H", enforcementMDM), fixture)
+	if err := coordinator.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var observed GoObserved
+	if len(reporter.reports) != 1 {
+		t.Fatalf("reports = %d, want 1", len(reporter.reports))
+	}
+	if err := json.Unmarshal(reporter.reports[0].Observed, &observed); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(fixture.events), 0; got != want {
+		t.Fatalf("events = %d, want %d", got, want)
+	}
+	if got, want := reporter.reports[0].State, StateMDMManaged; got != want {
+		t.Fatalf("state = %q, want %q", got, want)
+	}
+	if got, want := reporter.reports[0].AppliedHash, ""; got != want {
+		t.Fatalf("applied hash = %q, want %q", got, want)
+	}
+	if got, want := observed.ConfigStatus, "mismatch"; got != want {
+		t.Fatalf("config status = %q, want %q", got, want)
+	}
+}
+
 func TestGoCoordinator_DMGYieldsToCompleteMDMOwnership(t *testing.T) {
 	fixture := newGoCoordinatorFixture()
 	fixture.credential.value = renderNetrcEntry("registry.stepsecurity.io", "tenant-secret::dev:DEVICE-123")
@@ -299,6 +330,37 @@ func TestGoCoordinator_DMGYieldsToCompleteMDMOwnership(t *testing.T) {
 	}
 	if len(fixture.events) != 0 || len(reporter.reports) != 1 || reporter.reports[0].State != StateMDMManaged || reporter.reports[0].EvaluatedEnforcement != enforcementDMG {
 		t.Fatalf("events=%v reports=%+v", fixture.events, reporter.reports)
+	}
+}
+
+func TestGoCoordinator_DMGYieldsToMDMWithCredentialDrift(t *testing.T) {
+	fixture := newGoCoordinatorFixture()
+	fixture.credential.value = renderNetrcEntry("registry.stepsecurity.io", "different-token")
+	fixture.credential.present, fixture.credential.static, fixture.credential.mdm = true, true, true
+	fixture.env.value = goEnvExpected
+	fixture.env.present, fixture.env.static, fixture.env.mdm = true, true, true
+	coordinator, _, reporter := newTestGoCoordinator(t, goCoordinatorPolicy("sha256:H", enforcementDMG), fixture)
+	if err := coordinator.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var observed GoObserved
+	if len(reporter.reports) != 1 {
+		t.Fatalf("reports = %d, want 1", len(reporter.reports))
+	}
+	if err := json.Unmarshal(reporter.reports[0].Observed, &observed); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(fixture.events), 0; got != want {
+		t.Fatalf("events = %d, want %d", got, want)
+	}
+	if got, want := reporter.reports[0].State, StateMDMManaged; got != want {
+		t.Fatalf("state = %q, want %q", got, want)
+	}
+	if got, want := reporter.reports[0].AppliedHash, ""; got != want {
+		t.Fatalf("applied hash = %q, want %q", got, want)
+	}
+	if got, want := observed.AuthTokenStatus, authTokenMismatch; got != want {
+		t.Fatalf("auth token status = %q, want %q", got, want)
 	}
 }
 

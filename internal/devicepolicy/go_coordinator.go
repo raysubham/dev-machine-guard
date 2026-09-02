@@ -194,7 +194,7 @@ func (c *GoCoordinator) observeMDM(component *goComponent) goComponentResult {
 	owned, err := component.mdmOwned()
 	if err != nil {
 		result.state, result.err = StateVerificationFailed, err
-	} else if owned && goObservationState(result.observation, nil) == StateCompliant {
+	} else if owned {
 		result.state = StateMDMManaged
 	} else {
 		result.state = StatePolicyNotApplied
