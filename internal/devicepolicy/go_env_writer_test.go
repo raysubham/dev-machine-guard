@@ -449,6 +449,10 @@ func (failingGoEnvExecutor) RunAsUser(context.Context, string, string) (string, 
 	return "", errors.New("environment capture failed")
 }
 
+type filesystemStatExecutor struct{ executor.Executor }
+
+func (filesystemStatExecutor) Stat(path string) (os.FileInfo, error) { return os.Stat(path) }
+
 func TestGoEnvObservationCaptureFailureIsUnknown(t *testing.T) {
 	if runtime.GOOS == model.PlatformWindows {
 		t.Skip("Windows environment capture is supplied directly by the executor")
@@ -502,9 +506,28 @@ func TestGoSiblingMarkerOnDarwinDoesNotRequireEnvironmentCapture(t *testing.T) {
 	home := newSecureTestHomeAs(t, homeDir, "alice")
 	inner := executor.NewMock()
 	inner.SetGOOS(model.PlatformDarwin)
+	inner.SetFile(path, content)
 	managed, err := hasGoDMGMarker(failingGoEnvExecutor{Executor: inner}, home)
 	if err != nil || !managed {
 		t.Fatalf("hasGoDMGMarker = %v, %v", managed, err)
+	}
+}
+
+func TestGoSiblingMarkerAbsentFileIgnoresUnusableParent(t *testing.T) {
+	homeDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(homeDir, ".config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(homeDir, ".config", "go")); err != nil {
+		t.Fatal(err)
+	}
+	home := newSecureTestHomeAs(t, homeDir, "")
+	mock := executor.NewMock()
+	mock.SetGOOS(model.PlatformLinux)
+	mock.SetHomeDir(homeDir)
+	managed, err := hasGoDMGMarker(filesystemStatExecutor{Executor: mock}, home)
+	if err != nil || managed {
+		t.Fatalf("hasGoDMGMarker = %v, %v, want false, nil", managed, err)
 	}
 }
 

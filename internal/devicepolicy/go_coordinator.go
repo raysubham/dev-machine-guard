@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -541,6 +542,9 @@ func hasGoDMGMarker(exec executor.Executor, home *secureuserfile.Home) (bool, er
 	}
 	if err := executor.UserEnvironmentError(userExec); err != nil && userExec.GOOS() != model.PlatformDarwin {
 		return false, fmt.Errorf("devicepolicy: inspect target-user environment: %w", err)
+	}
+	if _, err := userExec.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return false, nil
 	}
 	file, err := secureHomeFile(home, path, goEnvBackupPrefix)
 	if err != nil {
