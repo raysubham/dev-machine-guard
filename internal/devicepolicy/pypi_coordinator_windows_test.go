@@ -244,7 +244,7 @@ func TestGoAndPyPICoordinatorsWindows_DMGIgnoresAlternateMDMMarker(t *testing.T)
 			if got, want := len(reporter.reports), 1; got != want {
 				t.Fatalf("reports = %d, want %d", got, want)
 			}
-			if got, want := reporter.reports[0].State, StateDriftDetected; got != want {
+			if got, want := reporter.reports[0].State, StateCompliant; got != want {
 				t.Fatalf("state = %q, want %q", got, want)
 			}
 			if got, want := reporter.reports[0].AppliedHash, tc.hash; got != want {

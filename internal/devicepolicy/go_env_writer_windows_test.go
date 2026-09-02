@@ -247,7 +247,7 @@ func TestGoEnvWriter_WindowsGoCommandReadsValuesWithoutCarriageReturns(t *testin
 	}
 }
 
-func TestGoCoordinator_WindowsClearWithoutCredentialStateRetainsSharedCredential(t *testing.T) {
+func TestGoCoordinator_WindowsClearWithoutCredentialStatePreservesPyPICredential(t *testing.T) {
 	withTempCache(t)
 	homeDir := t.TempDir()
 	appData := filepath.Join(homeDir, "AppData", "Roaming")
@@ -289,13 +289,13 @@ func TestGoCoordinator_WindowsClearWithoutCredentialStateRetainsSharedCredential
 	if err := goCoordinator.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	dot, err := os.ReadFile(dotPath)
-	if err != nil || !bytes.Equal(dot, dotInitial) {
-		t.Fatalf(".netrc = %q, %v, want unchanged %q", dot, err, dotInitial)
+	managedDot, err := os.ReadFile(dotPath)
+	if err != nil || !bytes.Contains(managedDot, []byte(dmgNetrcBegin)) {
+		t.Fatalf("managed .netrc = %q, %v", managedDot, err)
 	}
-	managed, err := os.ReadFile(underscorePath)
-	if err != nil || !bytes.Contains(managed, []byte(dmgNetrcBegin)) {
-		t.Fatalf("managed _netrc = %q, %v", managed, err)
+	managedUnderscore, err := os.ReadFile(underscorePath)
+	if err != nil || !bytes.Contains(managedUnderscore, []byte(dmgNetrcBegin)) {
+		t.Fatalf("managed _netrc = %q, %v", managedUnderscore, err)
 	}
 	if err := ClearAppliedState(CategoryPackageConfig, GoCredentialOwnershipTarget); err != nil {
 		t.Fatal(err)
@@ -306,12 +306,12 @@ func TestGoCoordinator_WindowsClearWithoutCredentialStateRetainsSharedCredential
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(underscorePath)
-	if err != nil || !bytes.Equal(got, managed) {
-		t.Fatalf("shared _netrc changed: %q, %v", got, err)
+	if err != nil || !bytes.Equal(got, underscoreInitial) {
+		t.Fatalf("_netrc = %q, %v, want restored %q", got, err, underscoreInitial)
 	}
-	dot, err = os.ReadFile(dotPath)
-	if err != nil || !bytes.Equal(dot, dotInitial) {
-		t.Fatalf(".netrc changed: %q, %v", dot, err)
+	dot, err := os.ReadFile(dotPath)
+	if err != nil || !bytes.Equal(dot, managedDot) {
+		t.Fatalf("PyPI .netrc changed: %q, %v", dot, err)
 	}
 	if _, err := os.Stat(filepath.Join(appData, "go", "env")); !os.IsNotExist(err) {
 		t.Fatalf("Go env remains after clear: %v", err)

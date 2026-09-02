@@ -241,26 +241,27 @@ func TestNetrcWriter_WindowsSeparateManagedFilesClearInEitherOrder(t *testing.T)
 }
 
 func TestNetrcWriter_WindowsClearFindsOwnedFile(t *testing.T) {
-	t.Run("managed underscore survives selection change", func(t *testing.T) {
+	t.Run("managed dot file survives Go selection change", func(t *testing.T) {
 		home := t.TempDir()
-		underscore := filepath.Join(home, "_netrc")
+		dot := filepath.Join(home, ".netrc")
 		initial := []byte("machine other.example login u password p\r\n")
-		if err := os.WriteFile(underscore, initial, 0o600); err != nil {
+		if err := os.WriteFile(dot, initial, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		writer, err := NewNetrcWriter(newSecureTestHome(t, home), netrcTestPolicy(t))
+		policy := netrcTestPolicy(t)
+		writer, err := newGoNetrcWriter(newSecureTestHome(t, home), policy.RegistryHost(), policy.DeviceToken())
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, err := writer.Write(netrcExpected); err != nil {
 			t.Fatal(err)
 		}
-		dot := filepath.Join(home, ".netrc")
-		dotContent := []byte("machine dot.example login u password p\r\n")
-		if err := os.WriteFile(dot, dotContent, 0o600); err != nil {
+		underscore := filepath.Join(home, "_netrc")
+		underscoreContent := []byte("machine underscore.example login u password p\r\n")
+		if err := os.WriteFile(underscore, underscoreContent, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		writer, err = NewNetrcWriter(newSecureTestHome(t, home), netrcTestPolicy(t))
+		writer, err = newGoNetrcWriter(newSecureTestHome(t, home), policy.RegistryHost(), policy.DeviceToken())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -268,16 +269,16 @@ func TestNetrcWriter_WindowsClearFindsOwnedFile(t *testing.T) {
 		if err != nil || !changed {
 			t.Fatalf("Clear = %v, %v, want managed alternate cleared", changed, err)
 		}
-		got, err := os.ReadFile(underscore)
+		got, err := os.ReadFile(dot)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if string(got) != string(initial) {
-			t.Fatalf("underscore = %q, want restored %q", got, initial)
+			t.Fatalf("dot file = %q, want restored %q", got, initial)
 		}
-		got, err = os.ReadFile(dot)
-		if err != nil || string(got) != string(dotContent) {
-			t.Fatalf("dot file changed: %q, %v", got, err)
+		got, err = os.ReadFile(underscore)
+		if err != nil || string(got) != string(underscoreContent) {
+			t.Fatalf("underscore file changed: %q, %v", got, err)
 		}
 	})
 
