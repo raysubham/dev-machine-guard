@@ -544,10 +544,11 @@ func TestNetrcWriter_NETRCRelativeOverrideIsUnusable(t *testing.T) {
 	}
 }
 
-func TestNetrcWriter_UsesResolvedPlatformForWindowsAlternate(t *testing.T) {
+func TestNetrcWriter_UsesResolvedPlatformForWindowsAlternateValidation(t *testing.T) {
 	homeDir := t.TempDir()
+	dot := filepath.Join(homeDir, ".netrc")
 	underscore := filepath.Join(homeDir, "_netrc")
-	if err := os.WriteFile(underscore, []byte("machine other.example login u password p\n"), 0o600); err != nil {
+	if err := os.WriteFile(underscore, []byte("machine registry.stepsecurity.io login stale password old-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	u, err := user.Current()
@@ -567,8 +568,11 @@ func TestNetrcWriter_UsesResolvedPlatformForWindowsAlternate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if w.Location() != underscore {
-		t.Fatalf("Location = %q, want Windows alternate %q", w.Location(), underscore)
+	if w.Location() != dot {
+		t.Fatalf("Location = %q, want %q", w.Location(), dot)
+	}
+	if _, err := w.Write(netrcExpected); !errors.Is(err, ErrTargetUnusable) {
+		t.Fatalf("Write error = %v, want alternate conflict", err)
 	}
 }
 

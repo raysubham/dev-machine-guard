@@ -81,15 +81,10 @@ func newNetrcWriter(home *secureuserfile.Home, host, token string) (*NetrcWriter
 	if _, _, _, err := primary.Read(); err != nil {
 		return nil, err
 	}
-	_, alternateExists, _, err := alternate.Read()
-	if err != nil {
+	if _, _, _, err := alternate.Read(); err != nil {
 		return nil, err
 	}
-	if alternateExists {
-		w.file, w.alternate = alternate, primary
-	} else {
-		w.alternate = alternate
-	}
+	w.alternate = alternate
 	return w, nil
 }
 
@@ -97,9 +92,6 @@ func newGoNetrcWriter(home *secureuserfile.Home, host, token string) (*NetrcWrit
 	w, err := newNetrcWriter(home, host, token)
 	if err != nil || home.GOOS() != model.PlatformWindows {
 		return w, err
-	}
-	if filepath.Base(w.file.Location()) == "_netrc" {
-		return w, nil
 	}
 	_, underscoreExists, _, err := w.alternate.Read()
 	if err != nil {
@@ -440,26 +432,11 @@ func (w *NetrcWriter) MDMOwned() (bool, error) {
 }
 
 func (w *NetrcWriter) HasMDMMarker() (bool, error) {
-	for _, file := range []*secureuserfile.File{w.file, w.alternate} {
-		if file == nil {
-			continue
-		}
-		data, existed, _, err := file.Read()
-		if err != nil {
-			return false, err
-		}
-		if !existed {
-			continue
-		}
-		analysis, err := analyzeNetrc(data, w.host)
-		if err != nil {
-			return false, err
-		}
-		if analysis.markers.mdm {
-			return true, nil
-		}
+	analysis, err := w.readSelected()
+	if err != nil || !analysis.existed {
+		return false, err
 	}
-	return false, nil
+	return analysis.markers.mdm, nil
 }
 
 // ValidateEffectivePath fails closed when NETRC redirects credential lookup
@@ -495,8 +472,12 @@ func (w *NetrcWriter) checkAlternateConflict() error {
 		return err
 	}
 	exact := exactHostEntries(analysis.entries, w.host)
-	if analysis.markers.dmg != nil {
-		managed, err := parseNetrc([]byte(analysis.markers.dmg.body))
+	managedBlock := analysis.markers.dmg
+	if managedBlock == nil {
+		managedBlock = analysis.markers.mdmBlock
+	}
+	if managedBlock != nil {
+		managed, err := parseNetrc([]byte(managedBlock.body))
 		if err == nil && len(exactHostEntries(managed, w.host)) == 1 && len(exact) == 1 {
 			return nil
 		}

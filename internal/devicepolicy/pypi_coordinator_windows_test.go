@@ -17,7 +17,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func TestPyPICoordinatorWindows_MDMUsesUnderscoreNetrcWhenBothExist(t *testing.T) {
+func TestGoAndPyPICoordinatorsWindows_MDMUseSeparateNetrcFiles(t *testing.T) {
 	withTempCache(t)
 	current, err := user.Current()
 	if err != nil {
@@ -39,19 +39,29 @@ func TestPyPICoordinatorWindows_MDMUsesUnderscoreNetrcWhenBothExist(t *testing.T
 	}
 	defer home.Close()
 
-	effective := coordinatorPolicy(`["pip"]`, "sha256:MDM", enforcementMDM)
-	policy, err := ParsePyPIPolicy(effective.Policy, "DEVICE-123")
+	pypiEffective := coordinatorPolicy(`["pip"]`, "sha256:PYPI-MDM", enforcementMDM)
+	pypiPolicy, err := ParsePyPIPolicy(pypiEffective.Policy, "DEVICE-123")
 	if err != nil {
 		t.Fatal(err)
 	}
-	pipExpected, err := renderPipSettings(policy)
+	pipExpected, err := renderPipSettings(pypiPolicy)
 	if err != nil {
 		t.Fatal(err)
 	}
-	credentialExpected := renderNetrcEntry(policy.RegistryHost(), policy.DeviceToken())
-	dotInitial := []byte("machine unrelated.example login user password keep\r\n")
-	underscoreInitial := []byte(mdmNetrcBegin + "\r\n" + strings.ReplaceAll(credentialExpected, "\n", "\r\n") + "\r\n" + mdmNetrcEnd + "\r\n")
+	goEffective := goCoordinatorPolicy("sha256:GO-MDM", enforcementMDM)
+	goPolicy, err := ParseGoPolicy(goEffective.Policy, "DEVICE-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	goExpected, err := renderGoEnvSettings(goPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialExpected := renderNetrcEntry(pypiPolicy.RegistryHost(), pypiPolicy.DeviceToken())
+	dotInitial := []byte(mdmNetrcBegin + "\r\n" + strings.ReplaceAll(credentialExpected, "\n", "\r\n") + "\r\n" + mdmNetrcEnd + "\r\n")
+	underscoreInitial := append([]byte(nil), dotInitial...)
 	pipInitial := []byte(mdmPipBegin + "\r\n# [stepsecurity-pypi-pip-mdm] created=true\r\n[global]\r\n" + strings.ReplaceAll(pipExpected, "\n", "\r\n") + "\r\n" + mdmPipEnd + "\r\n")
+	goInitial := []byte(mdmGoEnvBegin + "\r\n" + strings.ReplaceAll(goExpected, "\n", "\r\n") + "\r\n" + goEnvEnd + "\r\n")
 	writeSecure := func(relative, backupPrefix string, data []byte) string {
 		t.Helper()
 		file, err := home.Open(relative, backupPrefix, secureuserfile.MaxBytes)
@@ -68,7 +78,8 @@ func TestPyPICoordinatorWindows_MDMUsesUnderscoreNetrcWhenBothExist(t *testing.T
 	}
 	dotPath := writeSecure(".netrc", netrcBackupPrefix, dotInitial)
 	underscorePath := writeSecure("_netrc", netrcBackupPrefix, underscoreInitial)
-	writeSecure(filepath.Join("AppData", "Roaming", "pip", "pip.ini"), pipBackupPrefix, pipInitial)
+	pipPath := writeSecure(filepath.Join("AppData", "Roaming", "pip", "pip.ini"), pipBackupPrefix, pipInitial)
+	goPath := writeSecure(filepath.Join("AppData", "Roaming", "go", "env"), goEnvBackupPrefix, goInitial)
 
 	type fileSnapshot struct {
 		data       []byte
@@ -95,18 +106,36 @@ func TestPyPICoordinatorWindows_MDMUsesUnderscoreNetrcWhenBothExist(t *testing.T
 	before := map[string]fileSnapshot{
 		dotPath:        snapshot(dotPath),
 		underscorePath: snapshot(underscorePath),
+		pipPath:        snapshot(pipPath),
+		goPath:         snapshot(goPath),
 	}
 
-	reporter := &coordinatorReporter{}
-	coordinator := &PyPICoordinator{
-		Fetcher: &coordinatorFetcher{policy: effective}, Reporter: reporter, Exec: exec,
+	pypiReporter := &coordinatorReporter{}
+	pypiCoordinator := &PyPICoordinator{
+		Fetcher: &coordinatorFetcher{policy: pypiEffective}, Reporter: pypiReporter, Exec: exec,
 		CustomerID: "cust", DeviceID: "DEVICE-123", Platform: model.PlatformWindows,
 	}
-	if err := coordinator.Reconcile(context.Background()); err != nil {
+	if err := pypiCoordinator.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(reporter.reports) != 1 || reporter.reports[0].State != StateMDMManaged || reporter.reports[0].AppliedHash != "" {
-		t.Fatalf("reports = %+v, want mdm_managed without applied hash", reporter.reports)
+	goReporter := &coordinatorReporter{}
+	goCoordinator := &GoCoordinator{
+		Fetcher: &goCoordinatorFetcher{policy: goEffective}, Reporter: goReporter, Exec: exec,
+		CustomerID: "cust", DeviceID: "DEVICE-123", Platform: model.PlatformWindows,
+	}
+	if err := goCoordinator.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for name, reports := range map[string][]ComplianceReport{"PyPI": pypiReporter.reports, "Go": goReporter.reports} {
+		if len(reports) != 1 {
+			t.Fatalf("%s reports = %d, want 1", name, len(reports))
+		}
+		if reports[0].State != StateMDMManaged {
+			t.Fatalf("%s state = %q, want %q", name, reports[0].State, StateMDMManaged)
+		}
+		if reports[0].AppliedHash != "" {
+			t.Fatalf("%s applied hash = %q, want empty", name, reports[0].AppliedHash)
+		}
 	}
 	for path, want := range before {
 		got := snapshot(path)
@@ -129,6 +158,113 @@ func TestPyPICoordinatorWindows_MDMUsesUnderscoreNetrcWhenBothExist(t *testing.T
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestGoAndPyPICoordinatorsWindows_DMGIgnoresAlternateMDMMarker(t *testing.T) {
+	tests := []struct {
+		name      string
+		selected  string
+		alternate string
+		hash      string
+		reconcile func(executor.Executor, *coordinatorReporter) error
+	}{
+		{
+			name:      "PyPI ignores Go MDM marker",
+			selected:  ".netrc",
+			alternate: "_netrc",
+			hash:      "sha256:PYPI-DMG",
+			reconcile: func(exec executor.Executor, reporter *coordinatorReporter) error {
+				coordinator := &PyPICoordinator{
+					Fetcher: &coordinatorFetcher{policy: coordinatorPolicy(`["pip"]`, "sha256:PYPI-DMG", enforcementDMG)}, Reporter: reporter, Exec: exec,
+					CustomerID: "cust", DeviceID: "DEVICE-123", Platform: model.PlatformWindows,
+				}
+				return coordinator.Reconcile(context.Background())
+			},
+		},
+		{
+			name:      "Go ignores PyPI MDM marker",
+			selected:  "_netrc",
+			alternate: ".netrc",
+			hash:      "sha256:GO-DMG",
+			reconcile: func(exec executor.Executor, reporter *coordinatorReporter) error {
+				coordinator := &GoCoordinator{
+					Fetcher: &goCoordinatorFetcher{policy: goCoordinatorPolicy("sha256:GO-DMG", enforcementDMG)}, Reporter: reporter, Exec: exec,
+					CustomerID: "cust", DeviceID: "DEVICE-123", Platform: model.PlatformWindows,
+				}
+				return coordinator.Reconcile(context.Background())
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			withTempCache(t)
+			current, err := user.Current()
+			if err != nil {
+				t.Fatal(err)
+			}
+			homeDir := t.TempDir()
+			current.HomeDir = homeDir
+			normalizeSecureTestUser(t, current)
+			mock := executor.NewMock()
+			mock.SetGOOS(model.PlatformWindows)
+			mock.SetUsername(current.Username)
+			mock.SetHomeDir(homeDir)
+			mock.SetEnv("APPDATA", filepath.Join(homeDir, "AppData", "Roaming"))
+			exec := &coordinatorUserExecutor{Mock: mock, user: current}
+			home, err := secureuserfile.OpenUserHome(exec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer home.Close()
+
+			writeSecure := func(name string, data []byte) string {
+				t.Helper()
+				file, err := home.Open(name, netrcBackupPrefix, secureuserfile.MaxBytes)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := home.EnsureParent(name); err != nil {
+					t.Fatal(err)
+				}
+				if err := file.Commit(data, secureuserfile.FileMode); err != nil {
+					t.Fatal(err)
+				}
+				return file.Location()
+			}
+			selectedPath := writeSecure(tc.selected, []byte("machine unrelated.example login user password keep\r\n"))
+			credential := renderNetrcEntry("registry.stepsecurity.io", "tenant-secret::dev:DEVICE-123")
+			alternateInitial := []byte(mdmNetrcBegin + "\r\n" + strings.ReplaceAll(credential, "\n", "\r\n") + "\r\n" + mdmNetrcEnd + "\r\n")
+			alternatePath := writeSecure(tc.alternate, alternateInitial)
+
+			reporter := &coordinatorReporter{}
+			if err := tc.reconcile(exec, reporter); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := len(reporter.reports), 1; got != want {
+				t.Fatalf("reports = %d, want %d", got, want)
+			}
+			if got, want := reporter.reports[0].State, StateDriftDetected; got != want {
+				t.Fatalf("state = %q, want %q", got, want)
+			}
+			if got, want := reporter.reports[0].AppliedHash, tc.hash; got != want {
+				t.Fatalf("applied hash = %q, want %q", got, want)
+			}
+			selectedData, err := os.ReadFile(selectedPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(selectedData, []byte(dmgNetrcBegin)) {
+				t.Fatalf("selected file does not contain DMG marker:\n%s", selectedData)
+			}
+			alternateData, err := os.ReadFile(alternatePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(alternateData, alternateInitial) {
+				t.Fatalf("alternate file = %q, want unchanged %q", alternateData, alternateInitial)
+			}
+		})
 	}
 }
 
