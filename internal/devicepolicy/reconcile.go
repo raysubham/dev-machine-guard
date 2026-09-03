@@ -90,8 +90,8 @@ type Reconciler struct {
 	FullStateDrift bool
 
 	// Render, when set, derives the value to write/compare from the raw policy —
-	// e.g. rendering the two ~/.npmrc content lines from the npm policy object
-	// and the device serial. nil → the value is the compacted policy JSON
+	// e.g. rendering the ~/.npmrc managed body from the npm policy object and the
+	// device serial. nil → the value is the compacted policy JSON
 	// (settings.json). A render failure is a malformed backend payload and is
 	// reported as policy_not_applied.
 	Render func(policy json.RawMessage) (string, error)
@@ -131,6 +131,12 @@ type Reconciler struct {
 	// Writer is the ordinary unsupported-platform silent no-op.
 	WriterInitErr error
 
+	// InitWriter initializes the npm writer after an active policy has rendered,
+	// or before an explicit DMG clear. It is nil for every other target. This
+	// preserves the npm trust-boundary ordering: malformed compiled settings are
+	// rejected before resolving the target user or opening their home.
+	InitWriter func() error
+
 	// Now and Logf are optional seams. Now defaults to time.Now().UTC; Logf to a
 	// no-op.
 	Now  func() time.Time
@@ -149,6 +155,9 @@ type Reconciler struct {
 	enforcement string
 	// evaluatedHash is the active npm policy hash fetched for this cycle.
 	evaluatedHash string
+	// renderedValue caches the trust-boundary render performed before InitWriter.
+	renderedValue string
+	rendered      bool
 }
 
 // readState / persistState / dropState are every category's access to the one
@@ -195,10 +204,23 @@ func (r *Reconciler) probeOwnershipState(cat string, previous AppliedTargetState
 // renderValue produces the value to write/compare: the rendered block via the
 // Render seam, or the compacted policy JSON for settings.json.
 func (r *Reconciler) renderValue(policy json.RawMessage) (string, error) {
+	if r.rendered {
+		return r.renderedValue, nil
+	}
 	if r.Render != nil {
 		return r.Render(policy)
 	}
 	return compactJSON(policy)
+}
+
+func (r *Reconciler) prepareRenderedValue(policy json.RawMessage) error {
+	value, err := r.renderValue(policy)
+	if err != nil {
+		return err
+	}
+	r.renderedValue = value
+	r.rendered = true
+	return nil
 }
 
 // converged answers "is the desired value already fully in place?". With the
@@ -382,6 +404,8 @@ func (r *Reconciler) ownershipKey() string {
 //     verify + report (handleEnforce).
 func (r *Reconciler) Reconcile(ctx context.Context) error {
 	r.evaluatedHash = ""
+	r.renderedValue = ""
+	r.rendered = false
 	if r.Fetcher == nil {
 		return errors.New("devicepolicy: nil fetcher")
 	}
@@ -405,12 +429,30 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	switch strings.ToLower(strings.TrimSpace(ep.Enforcement)) {
 	case enforcementMDM:
 		r.enforcement = enforcementMDM
-		return r.verifyMDM(ctx, cat, tgt, ep)
 	case enforcementDMG, "":
 		r.enforcement = enforcementDMG
 	default:
 		r.logf("devicepolicy: unknown enforcement %q; running DMG path", ep.Enforcement)
 		r.enforcement = enforcementDMG
+	}
+
+	needsWriter := ep.present() && (r.enforcement == enforcementDMG || !ep.Clear)
+	if r.InitWriter != nil && needsWriter {
+		if ep.present() && !ep.Clear {
+			if err := r.prepareRenderedValue(ep.Policy); err != nil {
+				if r.enforcement == enforcementMDM {
+					r.logf("devicepolicy: mdm render desired value failed: %v → verification_failed", err)
+					return r.sendReport(ctx, ComplianceReport{Category: cat, Target: tgt, State: StateVerificationFailed})
+				}
+				_ = r.report(ctx, cat, tgt, StatePolicyNotApplied, "")
+				return fmt.Errorf("devicepolicy: enforce: render policy: %w", err)
+			}
+		}
+		r.WriterInitErr = r.InitWriter()
+	}
+
+	if r.enforcement == enforcementMDM {
+		return r.verifyMDM(ctx, cat, tgt, ep)
 	}
 
 	if r.Writer == nil {

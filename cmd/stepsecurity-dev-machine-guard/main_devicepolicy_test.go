@@ -53,6 +53,17 @@ func (npmLaneFetcher) Fetch(context.Context, string, string, string, string) (de
 	}, nil
 }
 
+type invalidNPMSettingsFetcher struct{}
+
+func (invalidNPMSettingsFetcher) Fetch(context.Context, string, string, string, string) (devicepolicy.EffectivePolicy, error) {
+	return devicepolicy.EffectivePolicy{
+		Category: devicepolicy.CategoryPackageConfig,
+		Target:   devicepolicy.TargetNPM,
+		Policy:   []byte(`{"ecosystem":"npm","registry_url":"https://registry-int.stepsecurity.io/javascript","auth":{"scheme":"stepsecurity_device_token","api_key":"device-secret"},"settings":null}`),
+		Hash:     "sha256:npm",
+	}, nil
+}
+
 type countingTargetExecutor struct {
 	*executor.Mock
 	user  *user.User
@@ -117,6 +128,17 @@ func TestNPMPackageConfigLanePersistsSecretFreeOwnership(t *testing.T) {
 	record, ok := devicepolicy.ReadAppliedState(devicepolicy.CategoryPackageConfig, devicepolicy.TargetNPM)
 	if !ok || record.WrittenSettings[devicepolicy.NPMOwnedKey] != "dmg_marker_v1" {
 		t.Fatalf("npm ownership = %+v, %v; want constant marker", record, ok)
+	}
+}
+
+func TestNPMPackageConfigLane_ValidatesSettingsBeforeResolvingTargetUser(t *testing.T) {
+	exec := &countingTargetExecutor{Mock: executor.NewMock()}
+	err := runNPMPackageConfigLane(context.Background(), exec, progress.NewNoop(), invalidNPMSettingsFetcher{}, packageConfigReporter{}, "customer", "serial", "linux")
+	if err == nil {
+		t.Fatal("invalid settings must fail")
+	}
+	if got, want := exec.calls, 0; got != want {
+		t.Fatalf("LoggedInUser calls = %d, want %d", got, want)
 	}
 }
 

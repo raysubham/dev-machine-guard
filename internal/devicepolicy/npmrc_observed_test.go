@@ -127,6 +127,85 @@ func TestProbeContentNPM_ObservedBag(t *testing.T) {
 	}
 }
 
+func TestProbeContentNPM_SettingsStatus(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "match", content: boundedMDMBlock(stdSettingsBody), want: settingsMatch},
+		{name: "absent from fixed block", content: mdmBlock(), want: settingsAbsent},
+		{name: "partial", content: boundedMDMBlock(strings.Replace(stdSettingsBody, "engine-strict=true\n", "", 1)), want: settingsMismatch},
+		{name: "wrong", content: boundedMDMBlock(strings.Replace(stdSettingsBody, "save-exact=true", "save-exact=false", 1)), want: settingsMismatch},
+		{name: "later override", content: boundedMDMBlock(stdSettingsBody) + "save-exact=false\n", want: settingsMismatch},
+		{name: "duplicate block", content: boundedMDMBlock(stdSettingsBody) + boundedMDMBlock(stdSettingsBody), want: settingsMismatch},
+		{name: "missing end", content: npmrcMDMBeginMarker + "\n" + stdSettingsBody + "\n", want: settingsMismatch},
+		{name: "bounded block without settings", content: boundedMDMBlock(stdBody), want: settingsAbsent},
+		{name: "stale extra setting", content: boundedMDMBlock(stdSettingsBody + "\nstale-option=true"), want: settingsMismatch},
+		{name: "registry drift keeps settings match", content: boundedMDMBlock(strings.Replace(stdSettingsBody, stdRegistry, "https://other.example/javascript", 1)), want: settingsMatch},
+		{name: "credential drift keeps settings match", content: boundedMDMBlock(strings.Replace(stdSettingsBody, stdTokenVal, "other::dev:SERIAL123", 1)), want: settingsMatch},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			present, observed, err := probeNPMRCObserved(tc.content, stdSettingsBody)
+			if err != nil {
+				t.Fatalf("probeNPMRCObserved: %v", err)
+			}
+			if !present {
+				t.Fatal("MDM ownership was not recognized")
+			}
+			got := observedStrings(t, observed)
+			if len(got) != 4 {
+				t.Fatalf("observed key count = %d, want 4", len(got))
+			}
+			if got[observedKeySettingsStatus] != tc.want {
+				t.Fatalf("settings_status = %q, want %q", got[observedKeySettingsStatus], tc.want)
+			}
+			raw, err := json.Marshal(observed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, sensitive := range []string{"save-exact", "EXAMPLE_NPM_TOKEN", "${EXAMPLE_NPM_TOKEN}", "engine-strict"} {
+				if strings.Contains(string(raw), sensitive) {
+					t.Fatalf("observed evidence contains %q: %s", sensitive, raw)
+				}
+			}
+		})
+	}
+}
+
+func TestProbeContentNPM_SettingsUnsafeShapesFailClosed(t *testing.T) {
+	cases := []string{
+		boundedMDMBlock(stdSettingsBody) + "save-exact[]=false\n",
+		"[team]\n" + boundedMDMBlock(stdSettingsBody),
+		boundedMDMBlock(stdSettingsBody) + "save-exact=false\r",
+	}
+	for _, content := range cases {
+		present, observed, err := probeNPMRCObserved(content, stdSettingsBody)
+		if err == nil {
+			t.Fatalf("unsafe content did not fail: present=%v observed=%v", present, observed)
+		}
+		if present {
+			t.Fatal("unsafe content reported MDM ownership")
+		}
+		if observed != nil {
+			t.Fatalf("unsafe content produced evidence: %v", observed)
+		}
+	}
+
+	planted := block(npmrcMDMBeginMarker + "\n" + stdSettingsBody + "\n" + npmrcMDMEndMarker)
+	present, observed, err := probeNPMRCObserved(planted, stdSettingsBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if present {
+		t.Fatal("bounded MDM marker inside a DMG block claimed ownership")
+	}
+	if observed != nil {
+		t.Fatalf("bounded MDM marker inside a DMG block produced evidence: %v", observed)
+	}
+}
+
 func TestProbeContentNPM_FailsClosedNotUnapplied(t *testing.T) {
 	// Constructs we cannot reason about must return an ERROR (→ verification_failed),
 	// never the clean present=false (→ policy_not_applied). Reporting "nothing is
@@ -298,6 +377,10 @@ func TestHasArrayAppendOverride(t *testing.T) {
 	// comma-joined list while a scalar last-wins scan still picks our line. Verified
 	// against npm 10.9.7. Only keys we manage are judged: an unrelated array config
 	// must not make the file unusable.
+	desired, ok := parseNPMDesired(stdBody)
+	if !ok {
+		t.Fatal("standard body did not parse")
+	}
 	flagged := []string{
 		"registry[]=https://evil.example/",
 		`"registry[]"=https://evil.example/`,
@@ -305,7 +388,7 @@ func TestHasArrayAppendOverride(t *testing.T) {
 		"registry[]=",
 	}
 	for _, l := range flagged {
-		if !hasArrayAppendOverride([]string{l}, stdTokenKey) {
+		if !hasArrayAppendOverride([]string{l}, desired) {
 			t.Errorf("hasArrayAppendOverride(%q) = false, want true", l)
 		}
 	}
@@ -325,20 +408,9 @@ func TestHasArrayAppendOverride(t *testing.T) {
 		"",
 	}
 	for _, l := range clean {
-		if hasArrayAppendOverride([]string{l}, stdTokenKey) {
+		if hasArrayAppendOverride([]string{l}, desired) {
 			t.Errorf("hasArrayAppendOverride(%q) = true, want false", l)
 		}
-	}
-
-	// With no parseable desired pair we cannot tell our token key from anyone
-	// else's, so every token key is judged rather than none.
-	for _, l := range []string{stdTokenKey + "[]=ssevil", "//other.example/:_authToken[]=x"} {
-		if !hasArrayAppendOverride([]string{l}, "") {
-			t.Errorf("hasArrayAppendOverride(%q, \"\") = false, want true", l)
-		}
-	}
-	if hasArrayAppendOverride([]string{"omit[]=dev"}, "") {
-		t.Error("an unrelated array config must stay clean even with no token key")
 	}
 }
 

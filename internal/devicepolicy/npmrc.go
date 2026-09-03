@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/secureuserfile"
@@ -42,6 +44,10 @@ const (
 	// The probe treats its presence (outside our block) as the first signal
 	// that the MDM lane is managing this file.
 	npmrcMDMMarker = "# StepSecurity Secure Registry -- managed by mdm"
+	// npmrcMDMBeginMarker and npmrcMDMEndMarker bound the variable-size block
+	// emitted by MDM when npm settings are present.
+	npmrcMDMBeginMarker = "# BEGIN StepSecurity Secure Registry -- managed by mdm"
+	npmrcMDMEndMarker   = "# END StepSecurity Secure Registry -- managed by mdm"
 )
 
 // NPMOwnedKey is the WrittenSettings key the npm lane records ownership under.
@@ -51,21 +57,24 @@ const NPMOwnedKey = "npmrc"
 // configuration. Exact content and effectiveness are verified from disk.
 const NPMOwnershipValue = "dmg_marker_v1"
 
-// The observed-bag keys and auth verdicts of the MDM verify-only report. They are
-// WIRE-PERMANENT: the backend validates exactly these three keys and rejects any
-// other (a secret-ingest guard), and maps auth_token_status to a redacted auth
-// change. auth_token_status is the ONLY axis decided on-device, because deciding
-// it backend-side would mean transmitting a token.
+// The observed-bag keys and verdicts of the MDM verify-only report. They are
+// WIRE-PERMANENT: the backend accepts the base three-key shape and the
+// settings-aware four-key shape. Both secret-bearing domains are reduced to
+// status enums on-device.
 const (
 	observedKeyEcosystem   = "ecosystem"
 	observedKeyRegistryURL = "registry_url"
 	// #nosec G101 -- a JSON field NAME, not a credential; the value it carries is
 	// one of the three verdicts below and never token material.
 	observedKeyAuthTokenStatus = "auth_token_status"
+	observedKeySettingsStatus  = "settings_status"
 
 	authTokenMatch    = "match"
 	authTokenMismatch = "mismatch"
 	authTokenAbsent   = "absent"
+	settingsMatch     = "match"
+	settingsMismatch  = "mismatch"
+	settingsAbsent    = "absent"
 )
 
 // npmrcMaxRegistryURLBytes caps the observed registry_url before transmission.
@@ -89,9 +98,12 @@ const (
 	// transform. A pathological multi-megabyte .npmrc must not balloon memory
 	// or the backup set; exceeding it is a structural refusal, not a transform.
 	npmrcMaxBytes = 1 << 20
-	// npmrcMaxRenderedBytes caps the two rendered content lines. Anything past
+	// npmrcMaxRenderedBytes caps the complete rendered body. Anything past
 	// this is a malformed policy, not a block to write.
-	npmrcMaxRenderedBytes = 4 << 10
+	npmrcMaxRenderedBytes     = 4 << 10
+	npmrcMaxSettings          = 50
+	npmrcMaxSettingKeyBytes   = 512
+	npmrcMaxSettingValueBytes = 4096
 	// npmrcMaxKeyBytes / npmrcMaxSerialBytes bound the two variable-length
 	// fields the renderer accepts.
 	npmrcMaxKeyBytes    = 256
@@ -1149,6 +1161,46 @@ func randomSuffix() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
+func parseNPMDesired(body string) (npmDesired, bool) {
+	lines := strings.Split(body, "\n")
+	if len(lines) < 2 || strings.HasSuffix(body, "\n") {
+		return npmDesired{}, false
+	}
+	values := make(map[string]string, len(lines))
+	settings := make([]npmSetting, 0, len(lines)-2)
+	for i, line := range lines {
+		// Compare the desired body using the same semantics npm applies when it
+		// reads the rendered bytes, notably doubled backslashes.
+		key, value, ok := activeKV(line)
+		if !ok || key == "" {
+			return npmDesired{}, false
+		}
+		if _, duplicate := values[key]; duplicate {
+			return npmDesired{}, false
+		}
+		values[key] = value
+		if i >= 2 {
+			settings = append(settings, npmSetting{key: key, value: value})
+		}
+	}
+	registryKey, registryValue, _ := activeKV(lines[0])
+	if registryKey != "registry" || registryValue == "" {
+		return npmDesired{}, false
+	}
+	tokenKey, tokenValue, _ := activeKV(lines[1])
+	if tokenValue == "" || tokenKey == "registry" || !strings.HasPrefix(tokenKey, "//") || !strings.HasSuffix(tokenKey, ":_authToken") {
+		return npmDesired{}, false
+	}
+	return npmDesired{
+		body:       body,
+		registry:   registryValue,
+		tokenKey:   tokenKey,
+		tokenValue: tokenValue,
+		settings:   settings,
+		values:     values,
+	}, true
+}
+
 // ---------------------------------------------------------------------------
 // Content transforms (rewrite / clear) and the INI classifier
 // ---------------------------------------------------------------------------
@@ -1158,6 +1210,10 @@ func randomSuffix() (string, error) {
 // section header, comment out active bare `registry=` lines, and append a fresh
 // block at the very bottom on its own line. Preserves all other bytes exactly.
 func (w *NPMRCWriter) rewriteContent(current []byte, body string) ([]byte, error) {
+	desired, ok := parseNPMDesired(body)
+	if !ok {
+		return nil, fmt.Errorf("npmrc: expected value is not a rendered npm policy: %w", ErrTargetUnusable)
+	}
 	rest, bom := stripBOM(current)
 	if hasLoneCR(string(rest)) {
 		return nil, fmt.Errorf("npmrc: file contains a bare CR npm would treat as a line break; cannot safely transform: %w", ErrTargetUnusable)
@@ -1167,6 +1223,9 @@ func (w *NPMRCWriter) rewriteContent(current []byte, body string) ([]byte, error
 	lines, strippedToEOF := stripManagedBlock(lines)
 	if strippedToEOF {
 		w.log("npmrc: managed block had no END marker; stripped to EOF and rewriting")
+	}
+	if countMarker(lines, npmrcMDMMarker) != 0 || countMarker(lines, npmrcMDMBeginMarker) != 0 || countMarker(lines, npmrcMDMEndMarker) != 0 {
+		return nil, fmt.Errorf("npmrc: file contains an mdm-managed block; cannot safely append: %w", ErrTargetUnusable)
 	}
 	if containsSection(lines) {
 		// An INI section header scopes every following key to section.key, which
@@ -1178,7 +1237,7 @@ func (w *NPMRCWriter) rewriteContent(current []byte, body string) ([]byte, error
 	if hasCoercibleQuotedKey(lines) {
 		return nil, fmt.Errorf("npmrc: file has a quoted key npm would coerce from non-string JSON; cannot safely transform: %w", ErrTargetUnusable)
 	}
-	if _, tokKey, _, _ := parseExpected(body); hasArrayAppendOverride(lines, tokKey) {
+	if hasArrayAppendOverride(lines, desired) {
 		// npm folds `registry[]=` and our block's `registry=` into one array, so the
 		// block would be present and last-wins yet npm would not resolve to the
 		// tenant registry alone. Commenting the array line out is not enough (npm
@@ -1353,19 +1412,15 @@ func hasCoercibleQuotedKey(lines []string) bool {
 //	registry=<ours> + registry[]=<theirs> → "<ours>,<theirs>"
 //	registry[]=<theirs> + registry=<ours> → "<theirs>,<ours>"
 //
-// Only the keys we manage are judged, so an unrelated array config (`omit[]=dev`)
-// is left alone. tokenKey is the single `//host/path/:_authToken` this writer
-// manages: npm consults exactly that key for the tenant registry's credential, so
-// an array-append on any OTHER registry's token cannot perturb what we render or
-// read, and refusing the file over it would be a false unenforceable. When the
-// desired pair does not parse, which key is ours is unknown, so every token key is
-// judged rather than none.
+// Only keys in the parsed desired body are judged, so an unrelated array config
+// (`omit[]=dev`) remains untouched while arrays for the registry, either token,
+// or any optional setting fail closed.
 //
 // The `[]` suffix is tested AFTER npmUnsafe, matching npm's own order (it unquotes
 // before checking for `[]`), which is what catches the quoted `"registry[]"=…` form;
 // `registry [] = …` is NOT flagged because npm stores that under the distinct key
 // "registry " and it overrides nothing.
-func hasArrayAppendOverride(lines []string, tokenKey string) bool {
+func hasArrayAppendOverride(lines []string, desired npmDesired) bool {
 	for _, l := range lines {
 		key, _, ok := activeKV(l)
 		if !ok {
@@ -1375,14 +1430,7 @@ func hasArrayAppendOverride(lines []string, tokenKey string) bool {
 		if !isAppend {
 			continue
 		}
-		if base == "registry" {
-			return true
-		}
-		if tokenKey != "" {
-			if base == tokenKey {
-				return true
-			}
-		} else if strings.HasSuffix(base, ":_authToken") {
+		if _, managed := desired.values[base]; managed {
 			return true
 		}
 	}
@@ -1487,9 +1535,8 @@ func activeKV(line string) (key, value string, ok bool) {
 // `registry#x=evil` as key `registry` and `"registry"=evil` as key `registry`, so
 // a naive first-'=' split keeping `registry#x` / `"registry"` would let a later
 // poisoned line defeat last-wins while Converged/ProbeExpected still reported
-// compliant. Every key and value this writer itself renders is drawn from a
-// comment-, quote-, and backslash-free alphabet, so this is the identity function
-// on our own content.
+// compliant. Rendered policy settings may contain backslashes, so
+// parseNPMDesired runs them through this same normalization before comparison.
 func npmUnsafe(s string) string {
 	s = strings.TrimSpace(s)
 	if inner, ok := unquoteININToken(s); ok {
@@ -1605,12 +1652,16 @@ func extractManagedBody(content string) (string, bool) {
 // Converged reports whether the file already reflects the desired block with no
 // further work needed. It is stronger than block-body equality: the block must
 // be present with body == expected, effective (nothing active overrides its
-// registry/token after it, END marker intact, no displaced duplicate), and
+// managed scalar values, END marker intact, no displaced duplicate), and
 // carry sane metadata (0600, target-user-owned on POSIX). A `registry=` line
 // appended below an unchanged block (e.g. `aws codeartifact login`) leaves the
 // body equal but defeats precedence — so body equality alone would report
 // converged forever without ever re-running the transform.
 func (w *NPMRCWriter) Converged(expected string) (bool, error) {
+	desired, ok := parseNPMDesired(expected)
+	if !ok {
+		return false, fmt.Errorf("npmrc: expected value is not a rendered npm policy: %w", ErrTargetUnusable)
+	}
 	rt, err := w.resolveLeaf()
 	if err != nil {
 		return false, err
@@ -1648,7 +1699,7 @@ func (w *NPMRCWriter) Converged(expected string) (bool, error) {
 		// closed, the same refusal the rewrite path makes.
 		return false, fmt.Errorf("npmrc: file has a quoted key npm would coerce from non-string JSON; managed block cannot be verified: %w", ErrTargetUnusable)
 	}
-	if _, tokKey, _, _ := parseExpected(expected); hasArrayAppendOverride(lines, tokKey) {
+	if hasArrayAppendOverride(lines, desired) {
 		// npm folds an array-append line into the same key as the block's scalar
 		// assignment, so last-wins would report converged while npm resolves to a
 		// list containing someone else's registry. Fail closed, as the rewrite path
@@ -1682,36 +1733,14 @@ func (w *NPMRCWriter) Converged(expected string) (bool, error) {
 	return true, nil
 }
 
-// blockIsLastEffective reports whether, after our block, no active line
-// overrides the block's registry or token — i.e. the block's own keys are the
-// last-wins values for the file.
+// blockIsLastEffective reports whether the block's registry, token, and optional
+// settings are the last-wins scalar values for the file.
 func blockIsLastEffective(lines []string, expected string) bool {
-	expReg, expTokKey, expTokVal, ok := parseExpected(expected)
+	desired, ok := parseNPMDesired(expected)
 	if !ok {
 		return false
 	}
-	endIdx := -1
-	for i, l := range lines {
-		if isMarkerLine(l, npmrcEndMarker) {
-			endIdx = i
-		}
-	}
-	if endIdx < 0 {
-		return false
-	}
-	for _, l := range lines[endIdx+1:] {
-		key, val, ok := activeKV(l)
-		if !ok {
-			continue
-		}
-		if key == "registry" && val != expReg {
-			return false
-		}
-		if key == expTokKey && val != expTokVal {
-			return false
-		}
-	}
-	return true
+	return desiredValuesEffective(lines, desired)
 }
 
 func countMarker(lines []string, marker string) int {
@@ -1733,9 +1762,9 @@ func countMarker(lines []string, marker string) int {
 // ~/.npmrc is user-writable (unlike the privileged VS Code policy locations),
 // trusting a marker alone would let a user pin permanent mdm_managed while
 // pointing npm anywhere. Managed requires all of: the MDM marker outside our
-// block, the MDM block's own registry/token lines equal to the expected
-// rendered content, those keys effective (last-wins) with nothing overriding
-// them, and sane metadata (0600, target-user-owned on POSIX).
+// block, the MDM block body matching the expected marker format, every managed
+// scalar effective (last-wins), and sane metadata (0600, target-user-owned on
+// POSIX).
 func (w *NPMRCWriter) ProbeExpected(expected string) (bool, string) {
 	rt, err := w.resolveLeaf()
 	if err != nil {
@@ -1771,7 +1800,7 @@ func (w *NPMRCWriter) ProbeExpected(expected string) (bool, string) {
 // whole file and the expected rendered body and reports whether the MDM lane
 // owns an effective, current block.
 func probeNPMRCContent(content, expected string) (bool, string) {
-	expReg, expTokKey, expTokVal, ok := parseExpected(expected)
+	desired, ok := parseNPMDesired(expected)
 	if !ok {
 		return false, ""
 	}
@@ -1796,77 +1825,107 @@ func probeNPMRCContent(content, expected string) (bool, string) {
 		// marker plus matching lines is then not proof; fail closed (not managed).
 		return false, ""
 	}
-	if hasArrayAppendOverride(lines, expTokKey) {
+	if hasArrayAppendOverride(lines, desired) {
 		// npm folds an array-append line into the MDM block's own key, so a marker
 		// plus matching lines is not proof the MDM lane governs npm. Fail closed.
 		return false, ""
 	}
 
-	// Our own block boundaries, so the MDM marker search can exclude it (a user
-	// planting the marker inside our block must not count).
-	ourBegin, ourEnd := managedBlockBounds(lines)
-
-	mdmIdx := -1
-	for i, l := range lines {
-		if i >= ourBegin && i <= ourEnd {
-			continue
-		}
-		if isMarkerLine(l, npmrcMDMMarker) {
-			mdmIdx = i
-			break
-		}
-	}
-	if mdmIdx < 0 {
+	markers, inDMG, err := scanNPMMDMMarkers(lines)
+	if err != nil {
 		return false, ""
 	}
-
-	// The MDM block's own lines (contiguous config after its header, stopping at
-	// a blank line, our block, or a section) must carry the expected content.
-	mdmReg, mdmTok := false, false
-	for i := mdmIdx + 1; i < len(lines); i++ {
-		if i >= ourBegin && i <= ourEnd {
-			break
+	if len(desired.settings) == 0 {
+		if len(markers.fixed) != 1 || len(markers.begins) != 0 || len(markers.ends) != 0 ||
+			!fixedMDMBlockMatches(lines, inDMG, markers.fixed[0], desired) {
+			return false, ""
 		}
-		l := lines[i]
-		if strings.TrimSpace(l) == "" || isSectionLine(l) {
-			break
-		}
-		key, val, ok := activeKV(l)
-		if !ok {
-			continue
-		}
-		if key == "registry" && val == expReg {
-			mdmReg = true
-		}
-		if key == expTokKey && val == expTokVal {
-			mdmTok = true
+	} else {
+		body, valid := boundedMDMBody(lines, inDMG, markers)
+		if len(markers.fixed) != 0 || !valid || body != desired.body {
+			return false, ""
 		}
 	}
-	if !mdmReg || !mdmTok {
-		return false, ""
-	}
-
-	// Effective precedence: the last active registry and token in the whole
-	// file must be the expected ones. A later override (poisoned token, bare
-	// registry) defeats this and we enforce instead.
-	lastReg, lastRegOK := "", false
-	lastTok, lastTokOK := "", false
-	for _, l := range lines {
-		key, val, ok := activeKV(l)
-		if !ok {
-			continue
-		}
-		if key == "registry" {
-			lastReg, lastRegOK = val, true
-		}
-		if key == expTokKey {
-			lastTok, lastTokOK = val, true
-		}
-	}
-	if !lastRegOK || lastReg != expReg || !lastTokOK || lastTok != expTokVal {
+	if !desiredValuesEffective(lines, desired) {
 		return false, ""
 	}
 	return true, "mdm-managed npmrc block present and effective"
+}
+
+type npmMDMMarkers struct {
+	fixed  []int
+	begins []int
+	ends   []int
+}
+
+func scanNPMMDMMarkers(lines []string) (npmMDMMarkers, []bool, error) {
+	inDMG, err := dmgBlockLines(lines)
+	if err != nil {
+		return npmMDMMarkers{}, nil, err
+	}
+	var markers npmMDMMarkers
+	for i, line := range lines {
+		if inDMG[i] {
+			continue
+		}
+		switch {
+		case isMarkerLine(line, npmrcMDMMarker):
+			markers.fixed = append(markers.fixed, i)
+		case isMarkerLine(line, npmrcMDMBeginMarker):
+			markers.begins = append(markers.begins, i)
+		case isMarkerLine(line, npmrcMDMEndMarker):
+			markers.ends = append(markers.ends, i)
+		}
+	}
+	return markers, inDMG, nil
+}
+
+func fixedMDMBlockMatches(lines []string, inDMG []bool, marker int, desired npmDesired) bool {
+	found := make(map[string]bool, 2)
+	for i := marker + 1; i < len(lines); i++ {
+		if inDMG[i] || strings.TrimSpace(lines[i]) == "" || isSectionLine(lines[i]) {
+			break
+		}
+		key, value, ok := activeKV(lines[i])
+		if ok && desired.values[key] == value {
+			found[key] = true
+		}
+	}
+	return found["registry"] && found[desired.tokenKey]
+}
+
+func boundedMDMBody(lines []string, inDMG []bool, markers npmMDMMarkers) (string, bool) {
+	if len(markers.begins) != 1 || len(markers.ends) != 1 || markers.ends[0] <= markers.begins[0] {
+		return "", false
+	}
+	begin, end := markers.begins[0], markers.ends[0]
+	body := make([]string, 0, end-begin-1)
+	for i := begin + 1; i < end; i++ {
+		if inDMG[i] {
+			return "", false
+		}
+		body = append(body, strings.TrimRight(lines[i], "\r"))
+	}
+	return strings.Join(body, "\n"), true
+}
+
+func desiredValuesEffective(lines []string, desired npmDesired) bool {
+	last := make(map[string]string, len(desired.values))
+	for _, line := range lines {
+		key, value, ok := activeKV(line)
+		if !ok {
+			continue
+		}
+		if _, managed := desired.values[key]; managed {
+			last[key] = value
+		}
+	}
+	for key, value := range desired.values {
+		if last[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 // managedBlockBounds returns the [begin, end] line indices of our block, or
@@ -1890,26 +1949,12 @@ func managedBlockBounds(lines []string) (int, int) {
 	return begin, len(lines) - 1
 }
 
-// parseExpected splits the rendered body (two content lines) into the registry
-// value, the token key, and the token value used by the precedence checks.
-func parseExpected(expected string) (registry, tokenKey, tokenVal string, ok bool) {
-	lines := strings.Split(expected, "\n")
-	if len(lines) != 2 {
-		return "", "", "", false
-	}
-	rk, rv, rok := activeKV(lines[0])
-	tk, tv, tok := activeKV(lines[1])
-	if !rok || rk != "registry" || !tok {
-		return "", "", "", false
-	}
-	return rv, tk, tv, true
-}
-
 // ProbeContentNPM is the MDM verify-only reader. It reports whether a
 // StepSecurity MDM-managed block is present in ~/.npmrc and, if so, the effective
-// (last-wins) configuration as the observed bag {ecosystem, registry_url,
-// auth_token_status}. It NEVER writes, patches, or clears — in MDM mode the agent
-// owns nothing on this file — and it never touches the ownership state store.
+// (last-wins) configuration as the base three-key observed bag plus aggregate
+// settings_status when settings are desired. It NEVER writes, patches, or
+// clears — in MDM mode the agent owns nothing on this file — and it never
+// touches the ownership state store.
 //
 // expected is the rendered desired block. Only its tenant key (the api_key before
 // `::dev:<serial>`) is used, to decide auth_token_status here on the device; no
@@ -1926,12 +1971,10 @@ func parseExpected(expected string) (registry, tokenKey, tokenVal string, ok boo
 //     policy_not_applied.
 //   - MDM marker present and the file parses → (true, bag, nil) → mdm_managed.
 //
-// Unlike the DMG-mode ProbeExpected this does NOT require 0600: perms are outside
-// the locked observed contract, so a correctly-deployed-but-lax file must still
-// report its real registry and auth status rather than be hidden behind a
-// synthetic failure. Ownership IS still enforced — readCurrent refuses a leaf the
-// target user does not own, because another user's file is not this user's
-// effective npm config.
+// Base-only MDM blocks retain the existing behavior of reporting their observed
+// values even when metadata is loose. Settings-aware blocks require secure mode
+// or ACL metadata because they may carry additional environment-backed registry
+// credentials. Ownership is always enforced by readCurrent.
 func (w *NPMRCWriter) ProbeContentNPM(expected string) (bool, map[string]json.RawMessage, error) {
 	rt, err := w.resolveLeaf()
 	if err != nil {
@@ -1946,27 +1989,45 @@ func (w *NPMRCWriter) ProbeContentNPM(expected string) (bool, map[string]json.Ra
 	if !existed {
 		return false, nil, nil
 	}
-	if enforcePOSIXMetadata && mode.Perm() != npmrcFileMode {
-		// Not a verification failure (see the doc comment), and not reportable — the
-		// observed bag has no perms field. Log it so support can spot a token file
-		// other local users can read; the mode only, never the content.
-		w.log("npmrc: mdm-managed file mode is %#o, not %#o (token may be readable by other local users)", mode.Perm(), npmrcFileMode)
+	present, observed, err := probeNPMRCObserved(string(data), expected)
+	if err != nil || !present {
+		return present, observed, err
 	}
-	return probeNPMRCObserved(string(data), expected)
+	desired, ok := parseNPMDesired(expected)
+	if !ok {
+		return false, nil, errors.New("npmrc: expected value is not a rendered npm policy")
+	}
+	if len(desired.settings) == 0 {
+		if enforcePOSIXMetadata && mode.Perm() != npmrcFileMode {
+			w.log("npmrc: mdm-managed file mode is %#o, not %#o (token may be readable by other local users)", mode.Perm(), npmrcFileMode)
+		}
+		return present, observed, nil
+	}
+	if enforcePOSIXMetadata && mode.Perm() != npmrcFileMode {
+		return false, nil, fmt.Errorf("npmrc: settings-aware mdm file has insecure mode: %w", ErrTargetUnusable)
+	}
+	if w.secureHome != nil {
+		secure, err := w.metadataSecure(rt)
+		if err != nil {
+			return false, nil, fmt.Errorf("npmrc: verify settings-aware mdm metadata: %w", err)
+		}
+		if !secure {
+			return false, nil, fmt.Errorf("npmrc: settings-aware mdm file has insecure metadata: %w", ErrTargetUnusable)
+		}
+	}
+	return present, observed, nil
 }
 
 // probeNPMRCObserved is the pure content logic behind ProbeContentNPM. It shares
 // the parse guards and the last-wins precedence scan with probeNPMRCContent, but
-// returns the observed VALUES instead of a yield/no-yield verdict: the backend
-// structurally compares registry_url and ecosystem against desired, so the agent
-// reports them raw and judges only the secret axis.
+// returns the observed registry plus secret-free auth and settings verdicts.
 func probeNPMRCObserved(content, expected string) (bool, map[string]json.RawMessage, error) {
 	// The desired registry is deliberately unused: the backend compares
 	// registry_url structurally. Only the token key (which _authToken line belongs
 	// to the tenant registry) and its value (the tenant key) are needed here.
-	_, expTokKey, expTokVal, ok := parseExpected(expected)
+	desired, ok := parseNPMDesired(expected)
 	if !ok {
-		return false, nil, errors.New("npmrc: expected value is not a rendered registry/token pair")
+		return false, nil, errors.New("npmrc: expected value is not a rendered npm policy")
 	}
 
 	rest, _ := stripBOM([]byte(content))
@@ -1984,7 +2045,7 @@ func probeNPMRCObserved(content, expected string) (bool, map[string]json.RawMess
 	if hasCoercibleQuotedKey(lines) {
 		return false, nil, fmt.Errorf("npmrc: file contains a coercible quoted key: %w", ErrTargetUnusable)
 	}
-	if hasArrayAppendOverride(lines, expTokKey) {
+	if hasArrayAppendOverride(lines, desired) {
 		// The registry we would report is not the one npm resolves: it folds the
 		// array-append line into the same key. Reporting the scalar last-wins value
 		// would be a confident wrong observation.
@@ -1993,19 +2054,13 @@ func probeNPMRCObserved(content, expected string) (bool, map[string]json.RawMess
 
 	// Presence = an MDM marker OUTSIDE every DMG-owned block, so a marker planted
 	// inside one of our own blocks cannot pass as MDM management.
-	inDMGBlock, err := dmgBlockLines(lines)
+	markers, inDMGBlock, err := scanNPMMDMMarkers(lines)
 	if err != nil {
 		return false, nil, err
 	}
-	present := false
-	for i, l := range lines {
-		if inDMGBlock[i] {
-			continue
-		}
-		if isMarkerLine(l, npmrcMDMMarker) {
-			present = true
-			break
-		}
+	present := len(markers.fixed) > 0
+	if len(desired.settings) > 0 {
+		present = present || len(markers.begins) > 0
 	}
 	if !present {
 		return false, nil, nil
@@ -2025,7 +2080,7 @@ func probeNPMRCObserved(content, expected string) (bool, map[string]json.RawMess
 		switch key {
 		case "registry":
 			lastReg, lastRegOK = val, true
-		case expTokKey:
+		case desired.tokenKey:
 			// The tenant registry's _authToken key. A block pointing at a DIFFERENT
 			// registry carries a different token key, so its token does not count as
 			// this policy's credential — it reports absent, alongside the registry drift.
@@ -2048,11 +2103,55 @@ func probeNPMRCObserved(content, expected string) (bool, map[string]json.RawMess
 		// match. The serial is device-specific and deliberately not part of the
 		// verdict.
 		status = authTokenMismatch
-		if tenantKeyPrefix(lastTok) == tenantKeyPrefix(expTokVal) {
+		if tenantKeyPrefix(lastTok) == tenantKeyPrefix(desired.tokenValue) {
 			status = authTokenMatch
 		}
 	}
-	return npmObservedBag(lastReg, status)
+
+	settingsStatus := ""
+	if len(desired.settings) > 0 {
+		lastSettings := make(map[string]string, len(desired.settings))
+		for _, line := range lines {
+			key, value, ok := activeKV(line)
+			if !ok || key == "registry" || key == desired.tokenKey {
+				continue
+			}
+			if _, managed := desired.values[key]; managed {
+				lastSettings[key] = value
+			}
+		}
+		settingsStatus = settingsAbsent
+		if len(lastSettings) > 0 {
+			settingsStatus = settingsMismatch
+			body, valid := boundedMDMBody(lines, inDMGBlock, markers)
+			if len(markers.fixed) == 0 && valid && boundedSettingsMatch(body, desired) {
+				matches := true
+				for _, setting := range desired.settings {
+					if lastSettings[setting.key] != setting.value {
+						matches = false
+						break
+					}
+				}
+				if matches {
+					settingsStatus = settingsMatch
+				}
+			}
+		}
+	}
+	return npmObservedBag(lastReg, status, settingsStatus)
+}
+
+func boundedSettingsMatch(body string, desired npmDesired) bool {
+	observed, ok := parseNPMDesired(body)
+	if !ok || len(observed.settings) != len(desired.settings) {
+		return false
+	}
+	for i, setting := range desired.settings {
+		if observed.settings[i] != setting {
+			return false
+		}
+	}
+	return true
 }
 
 // dmgBlockLines marks every line that falls inside a DMG-owned block, so the MDM
@@ -2128,10 +2227,10 @@ func tenantKeyPrefix(token string) string {
 	return strings.SplitN(token, "::dev:", 2)[0]
 }
 
-// npmObservedBag builds the observed bag. Exactly three keys, JSON strings — the
-// backend rejects any unknown key, and nothing derived from the token beyond the
-// verdict is included.
-func npmObservedBag(registryURL, authStatus string) (bool, map[string]json.RawMessage, error) {
+// npmObservedBag builds the base three-key or settings-aware four-key observed
+// bag. Nothing derived from a token or setting beyond its aggregate verdict is
+// included.
+func npmObservedBag(registryURL, authStatus, settingsStatus string) (bool, map[string]json.RawMessage, error) {
 	reg, err := json.Marshal(registryURL)
 	if err != nil {
 		return false, nil, fmt.Errorf("npmrc: encode observed registry_url: %w", err)
@@ -2144,11 +2243,19 @@ func npmObservedBag(registryURL, authStatus string) (bool, map[string]json.RawMe
 	if err != nil {
 		return false, nil, fmt.Errorf("npmrc: encode observed auth_token_status: %w", err)
 	}
-	return true, map[string]json.RawMessage{
+	observed := map[string]json.RawMessage{
 		observedKeyEcosystem:       eco,
 		observedKeyRegistryURL:     reg,
 		observedKeyAuthTokenStatus: status,
-	}, nil
+	}
+	if settingsStatus != "" {
+		value, err := json.Marshal(settingsStatus)
+		if err != nil {
+			return false, nil, fmt.Errorf("npmrc: encode observed settings_status: %w", err)
+		}
+		observed[observedKeySettingsStatus] = value
+	}
+	return true, observed, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -2163,20 +2270,51 @@ type npmPolicy struct {
 		Scheme string `json:"scheme"`
 		APIKey string `json:"api_key"`
 	} `json:"auth"`
+	Settings json.RawMessage `json:"settings"`
 }
 
-// RenderNPMRCBlock validates a policy and returns the two content lines the
-// writer wraps in its markers: the `registry=` line and the `//host/path/:_authToken=`
-// line, '\n'-joined with no markers and no trailing newline. It fully validates
-// the policy (the HTTP layer only checks "is a JSON object"): the token line's
-// host and path derive from registry_url, and the composed device token is
-// `<api_key>::dev:<serial>`. Any validation failure returns an error the
-// reconciler reports as policy_not_applied; error messages never echo the key
-// or the policy.
+type npmSetting struct {
+	key   string
+	value string
+}
+
+// npmDesired is the one parsed form shared by rewrite, convergence, MDM
+// verification, and observation. The first two assignments are always the
+// StepSecurity registry and token; settings contains only optional policy
+// settings, already sorted by key.
+type npmDesired struct {
+	body       string
+	registry   string
+	tokenKey   string
+	tokenValue string
+	settings   []npmSetting
+	values     map[string]string
+}
+
+// RenderNPMRCBlock validates a policy and returns the content lines the writer
+// wraps in its markers: the StepSecurity registry/token pair followed by any
+// settings in byte-sorted key order, with no markers or trailing newline. It
+// fully validates the policy (the HTTP layer only checks "is a JSON object"):
+// the token line's host and path derive from registry_url, and the composed
+// device token is `<api_key>::dev:<serial>`. Any validation failure returns an
+// error the reconciler reports as policy_not_applied; error messages never echo
+// the key or the policy.
 func RenderNPMRCBlock(policy json.RawMessage, serial string) (string, error) {
+	if !utf8.Valid(policy) {
+		return "", errors.New("npmrc: policy is not valid UTF-8")
+	}
 	var p npmPolicy
-	if err := json.Unmarshal(policy, &p); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(policy))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&p); err != nil {
 		return "", errors.New("npmrc: policy is not a well-formed npm policy object")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return "", errors.New("npmrc: policy has trailing data")
+	}
+	if err := rejectDuplicateJSONKeys(policy); err != nil {
+		return "", errors.New("npmrc: policy contains duplicate JSON keys")
 	}
 	if p.Ecosystem != "npm" {
 		return "", errors.New("npmrc: policy ecosystem is not npm")
@@ -2214,11 +2352,240 @@ func RenderNPMRCBlock(policy json.RawMessage, serial string) (string, error) {
 	// npm's _authToken key is `//host/path/:_authToken` with a trailing slash
 	// before the colon.
 	tokenKey := "//" + host + path + "/:_authToken"
-	body := "registry=" + p.RegistryURL + "\n" + tokenKey + "=" + token
+
+	settings, err := validateNPMSettings(p.Settings, tokenKey)
+	if err != nil {
+		return "", err
+	}
+	lines := make([]string, 0, 2+len(settings))
+	lines = append(lines, "registry="+p.RegistryURL, tokenKey+"="+token)
+	for _, setting := range settings {
+		lines = append(lines, setting.key+"="+setting.value)
+	}
+	body := strings.Join(lines, "\n")
 	if len(body) > npmrcMaxRenderedBytes {
 		return "", errors.New("npmrc: rendered block exceeds size limit")
 	}
 	return body, nil
+}
+
+func validateNPMSettings(raw json.RawMessage, productTokenKey string) ([]npmSetting, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil || members == nil {
+		return nil, errors.New("npmrc: policy settings must be a non-null object of strings")
+	}
+	settings := make(map[string]string, len(members))
+	for key, rawValue := range members {
+		var value string
+		if bytes.Equal(bytes.TrimSpace(rawValue), []byte("null")) || json.Unmarshal(rawValue, &value) != nil {
+			return nil, errors.New("npmrc: policy settings must be a non-null object of strings")
+		}
+		settings[key] = value
+	}
+	if len(settings) == 0 || len(settings) > npmrcMaxSettings {
+		return nil, fmt.Errorf("npmrc: policy settings must contain 1 through %d entries", npmrcMaxSettings)
+	}
+
+	keys := make([]string, 0, len(settings))
+	registryAuthKeys := make(map[string]struct{})
+	for key, value := range settings {
+		if err := validateNPMSettingKey(key); err != nil {
+			return nil, err
+		}
+		if err := validateNPMSettingValue(value); err != nil {
+			return nil, err
+		}
+		if key == productTokenKey {
+			return nil, errors.New("npmrc: policy setting collides with the StepSecurity token key")
+		}
+		if scope, ok := npmScopedRegistryKey(key); ok {
+			authKey, canonical, err := canonicalNPMRegistry(value)
+			if err != nil || canonical != value || scope == "" {
+				return nil, errors.New("npmrc: policy contains a non-canonical scoped registry")
+			}
+			registryAuthKeys[authKey] = struct{}{}
+		}
+		keys = append(keys, key)
+	}
+
+	for _, key := range keys {
+		value := settings[key]
+		if isReservedNPMSetting(key) {
+			return nil, errors.New("npmrc: policy contains a reserved setting key")
+		}
+		credential, scoped := npmURLScopedCredential(key)
+		if !scoped {
+			continue
+		}
+		if !strings.EqualFold(credential, "_authToken") {
+			return nil, errors.New("npmrc: policy contains an unsupported credential setting")
+		}
+		if _, ok := registryAuthKeys[key]; !ok || !isExactEnvReference(value) {
+			return nil, errors.New("npmrc: policy scoped auth token is not canonical")
+		}
+	}
+
+	sort.Strings(keys)
+	result := make([]npmSetting, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, npmSetting{key: key, value: settings[key]})
+	}
+	return result, nil
+}
+
+func validateNPMSettingKey(key string) error {
+	if key == "" || strings.Trim(key, " \t") != key {
+		return errors.New("npmrc: policy contains a non-canonical setting key")
+	}
+	if len(key) > npmrcMaxSettingKeyBytes || !utf8.ValidString(key) {
+		return errors.New("npmrc: policy contains an invalid setting key")
+	}
+	for _, r := range key {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || strings.ContainsRune("=#;'\"[]", r) {
+			return errors.New("npmrc: policy contains an unsafe setting key")
+		}
+	}
+	return nil
+}
+
+func validateNPMSettingValue(value string) error {
+	if strings.Trim(value, " \t") != value {
+		return errors.New("npmrc: policy contains a non-canonical setting value")
+	}
+	if len(value) > npmrcMaxSettingValueBytes || !utf8.ValidString(value) {
+		return errors.New("npmrc: policy contains an invalid setting value")
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) || strings.ContainsRune("#;'\"", r) {
+			return errors.New("npmrc: policy contains an unsafe setting value")
+		}
+	}
+	if !validEnvReferences(value) {
+		return errors.New("npmrc: policy contains a malformed environment reference")
+	}
+	if u, err := url.Parse(value); err == nil && u.IsAbs() && u.User != nil {
+		return errors.New("npmrc: policy setting URL contains userinfo")
+	}
+	return nil
+}
+
+func validEnvReferences(value string) bool {
+	for start := 0; ; {
+		i := strings.Index(value[start:], "${")
+		if i < 0 {
+			return true
+		}
+		i += start
+		end := strings.IndexByte(value[i+2:], '}')
+		if end < 0 {
+			return false
+		}
+		end += i + 2
+		if !validEnvName(value[i+2 : end]) {
+			return false
+		}
+		start = end + 1
+	}
+}
+
+func validEnvName(name string) bool {
+	if name == "" || !isASCIIAlpha(name[0]) && name[0] != '_' {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		if !isASCIIAlpha(name[i]) && (name[i] < '0' || name[i] > '9') && name[i] != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIAlpha(b byte) bool {
+	return b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z'
+}
+
+func isExactEnvReference(value string) bool {
+	return len(value) >= 4 && strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}") && validEnvName(value[2:len(value)-1])
+}
+
+func isReservedNPMSetting(key string) bool {
+	if strings.HasPrefix(key, "//") {
+		return false
+	}
+	switch strings.ToLower(key) {
+	case "registry", "_authtoken", "_auth", "_password", "username", "tokenhelper", "cert", "key":
+		return true
+	default:
+		return false
+	}
+}
+
+func npmScopedRegistryKey(key string) (string, bool) {
+	const suffix = ":registry"
+	if !strings.HasPrefix(key, "@") || len(key) < len(suffix) || !strings.EqualFold(key[len(key)-len(suffix):], suffix) {
+		return "", false
+	}
+	if !strings.HasSuffix(key, suffix) {
+		return "", true
+	}
+	scope := strings.TrimSuffix(strings.TrimPrefix(key, "@"), suffix)
+	if scope == "" {
+		return "", true
+	}
+	for i := 0; i < len(scope); i++ {
+		c := scope[i]
+		if c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || strings.ContainsRune("._~-", rune(c)) {
+			continue
+		}
+		return "", true
+	}
+	return scope, true
+}
+
+func canonicalNPMRegistry(raw string) (authKey, canonical string, err error) {
+	if hasControlBytes(raw) || strings.ContainsAny(raw, "#?") {
+		return "", "", errors.New("unsafe registry URL")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
+		return "", "", errors.New("invalid registry URL")
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return "", "", errors.New("invalid registry port")
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", "", errors.New("invalid registry port")
+		}
+	}
+	host := strings.ToLower(u.Host)
+	path := strings.TrimRight(u.EscapedPath(), "/") + "/"
+	if path == "" {
+		path = "/"
+	}
+	canonical = "https://" + host + path
+	return "//" + host + path + ":_authToken", canonical, nil
+}
+
+func npmURLScopedCredential(key string) (string, bool) {
+	if !strings.HasPrefix(key, "//") {
+		return "", false
+	}
+	i := strings.LastIndexByte(key, ':')
+	if i < 2 || i == len(key)-1 {
+		return "", false
+	}
+	credential := key[i+1:]
+	switch strings.ToLower(credential) {
+	case "_authtoken", "_auth", "_password", "username", "tokenhelper", "cert", "key":
+		return credential, true
+	default:
+		return "", false
+	}
 }
 
 // validateRegistryURL requires an HTTPS URL with no userinfo, query, fragment,

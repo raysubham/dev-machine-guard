@@ -893,6 +893,7 @@ func runPackageConfigLanes(exec executor.Executor, log *progress.Logger, fetcher
 }
 
 func runNPMPackageConfigLane(ctx context.Context, exec executor.Executor, log *progress.Logger, fetcher devicepolicy.Fetcher, reporter devicepolicy.Reporter, customerID, serial, platform string) error {
+	var w *devicepolicy.NPMRCWriter
 	r := &devicepolicy.Reconciler{
 		Fetcher:    fetcher,
 		Reporter:   reporter,
@@ -909,12 +910,12 @@ func runNPMPackageConfigLane(ctx context.Context, exec executor.Executor, log *p
 		OwnershipStateValue: devicepolicy.NPMOwnershipValue,
 		Logf:                func(format string, args ...any) { log.Debug(format, args...) },
 	}
-
-	w, err := devicepolicy.NewNPMRCWriter(exec)
-	if err != nil {
-		r.WriterInitErr = err
-	} else {
-		defer w.Close()
+	r.InitWriter = func() error {
+		var err error
+		w, err = devicepolicy.NewNPMRCWriter(exec)
+		if err != nil {
+			return err
+		}
 		w.SetLogf(func(format string, args ...any) { log.Debug(format, args...) })
 		r.Writer = w
 		r.Converged = w.Converged
@@ -923,8 +924,13 @@ func runNPMPackageConfigLane(ctx context.Context, exec executor.Executor, log *p
 		r.ProbeExpected = w.ProbeExpected
 		r.RestoreSnapshot = w.RestoreSnapshot
 		r.ProbeContent = w.ProbeContentNPM
+		return nil
 	}
-	return r.Reconcile(ctx)
+	err := r.Reconcile(ctx)
+	if w != nil {
+		_ = w.Close()
+	}
+	return err
 }
 
 func runPyPIPackageConfigLane(ctx context.Context, exec executor.Executor, log *progress.Logger, fetcher devicepolicy.Fetcher, reporter devicepolicy.Reporter, customerID, serial, platform string) error {
