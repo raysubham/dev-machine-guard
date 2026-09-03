@@ -126,8 +126,9 @@ func TestPackageConfigLanes_FailureDoesNotSuppressSibling(t *testing.T) {
 		name       string
 		failTarget string
 	}{
-		{"npm failure still runs PyPI", devicepolicy.TargetNPM},
-		{"PyPI failure keeps npm success", devicepolicy.TargetPyPI},
+		{"npm failure still runs siblings", devicepolicy.TargetNPM},
+		{"PyPI failure still runs siblings", devicepolicy.TargetPyPI},
+		{"Go failure keeps earlier lanes", devicepolicy.TargetGo},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -137,7 +138,7 @@ func TestPackageConfigLanes_FailureDoesNotSuppressSibling(t *testing.T) {
 
 			runPackageConfigLanes(mock, progress.NewNoop(), fetcher, packageConfigReporter{}, "customer", "serial", "linux")
 
-			if got, want := strings.Join(fetcher.calls, ","), devicepolicy.TargetNPM+","+devicepolicy.TargetPyPI; got != want {
+			if got, want := strings.Join(fetcher.calls, ","), devicepolicy.TargetNPM+","+devicepolicy.TargetPyPI+","+devicepolicy.TargetGo; got != want {
 				t.Errorf("lane calls = %q, want %q", got, want)
 			}
 		})
@@ -153,16 +154,20 @@ func TestPackageConfigLanes_UseSeparateTimeoutContexts(t *testing.T) {
 
 	npmCtx := fetcher.contexts[devicepolicy.TargetNPM]
 	pypiCtx := fetcher.contexts[devicepolicy.TargetPyPI]
-	if npmCtx == nil || pypiCtx == nil {
-		t.Fatalf("lane contexts = %#v, want both", fetcher.contexts)
+	goCtx := fetcher.contexts[devicepolicy.TargetGo]
+	if npmCtx == nil || pypiCtx == nil || goCtx == nil {
+		t.Fatalf("lane contexts = %#v, want all three", fetcher.contexts)
 	}
-	if npmCtx == pypiCtx {
-		t.Error("npm and PyPI shared one context")
+	if npmCtx == pypiCtx || npmCtx == goCtx || pypiCtx == goCtx {
+		t.Error("package-config lanes shared a context")
 	}
 	if _, ok := npmCtx.Deadline(); !ok {
 		t.Error("npm context has no deadline")
 	}
 	if _, ok := pypiCtx.Deadline(); !ok {
 		t.Error("PyPI context has no deadline")
+	}
+	if _, ok := goCtx.Deadline(); !ok {
+		t.Error("Go context has no deadline")
 	}
 }
