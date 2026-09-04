@@ -1182,7 +1182,7 @@ func TestNPMNeverLogsOrReportsTheToken(t *testing.T) {
 	const apiKey = "ssSECRETKEY123"
 	const serial = "SERIAL-ABC"
 	const rendered = "registry=https://t.registry.stepsecurity.io/javascript\n" +
-		"//t.registry.stepsecurity.io/javascript/:_authToken=" + apiKey + "::dev:" + serial
+		"//t.registry.stepsecurity.io/:_authToken=" + apiKey + "::dev:" + serial
 
 	var logged strings.Builder
 	run := func(channel string, probe func(string) (bool, map[string]json.RawMessage, error)) {

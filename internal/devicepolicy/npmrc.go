@@ -2343,15 +2343,15 @@ func RenderNPMRCBlock(policy json.RawMessage, serial string) (string, error) {
 		return "", errors.New("npmrc: device serial contains unsupported characters")
 	}
 
-	host, path, err := validateRegistryURL(p.RegistryURL)
+	host, _, err := validateRegistryURL(p.RegistryURL)
 	if err != nil {
 		return "", err
 	}
 
 	token := key + "::dev:" + serial
-	// npm's _authToken key is `//host/path/:_authToken` with a trailing slash
-	// before the colon.
-	tokenKey := "//" + host + path + "/:_authToken"
+	// npm rewrites npmjs tarball hosts without retaining the registry path, so
+	// the product token must cover the whole StepSecurity registry host.
+	tokenKey := "//" + host + "/:_authToken"
 
 	settings, err := validateNPMSettings(p.Settings, tokenKey)
 	if err != nil {

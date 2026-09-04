@@ -12,9 +12,9 @@ import (
 const (
 	stdSerial       = "SERIAL123"
 	stdPolicyJSON   = `{"ecosystem":"npm","registry_url":"https://registry-int.stepsecurity.io/javascript","auth":{"scheme":"stepsecurity_device_token","api_key":"ssabc123"}}`
-	stdBody         = "registry=https://registry-int.stepsecurity.io/javascript\n//registry-int.stepsecurity.io/javascript/:_authToken=ssabc123::dev:SERIAL123"
+	stdBody         = "registry=https://registry-int.stepsecurity.io/javascript\n//registry-int.stepsecurity.io/:_authToken=ssabc123::dev:SERIAL123"
 	stdRegistry     = "https://registry-int.stepsecurity.io/javascript"
-	stdTokenKey     = "//registry-int.stepsecurity.io/javascript/:_authToken"
+	stdTokenKey     = "//registry-int.stepsecurity.io/:_authToken"
 	stdTokenVal     = "ssabc123::dev:SERIAL123"
 	stdSettingsBody = stdBody + "\n//registry.npmjs.org/:_authToken=${EXAMPLE_NPM_TOKEN}\n@example:registry=https://registry.npmjs.org/\nengine-strict=true\nsave-exact=true"
 )
@@ -772,7 +772,7 @@ func TestRewrite_CoercibleQuotedKeyFailsClosed(t *testing.T) {
 	w := &NPMRCWriter{}
 	for _, in := range []string{
 		`'["registry"]'=https://evil/` + "\n",
-		`'["//registry-int.stepsecurity.io/javascript/:_authToken"]'=evil::dev:X` + "\n",
+		`'["//registry-int.stepsecurity.io/:_authToken"]'=evil::dev:X` + "\n",
 		`'[["registry"]]'=https://evil/` + "\n",
 	} {
 		if _, err := w.rewriteContent([]byte(in), stdBody); !isTargetUnusable(err) {
@@ -804,7 +804,7 @@ func TestRewrite_ArrayAppendOverrideFailsClosed(t *testing.T) {
 	for _, in := range []string{
 		"registry[]=https://evil.example/\n",
 		`"registry[]"=https://evil.example/` + "\n",
-		"//registry-int.stepsecurity.io/javascript/:_authToken[]=ssevil\n",
+		"//registry-int.stepsecurity.io/:_authToken[]=ssevil\n",
 	} {
 		if _, err := w.rewriteContent([]byte(in), stdBody); !isTargetUnusable(err) {
 			t.Fatalf("rewriteContent(%q) must fail closed with ErrTargetUnusable, got %v", in, err)
