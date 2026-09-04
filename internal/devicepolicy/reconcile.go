@@ -1168,12 +1168,25 @@ func (r *Reconciler) rollbackWrite(prevOnDisk string, prevPresent bool) {
 
 // report submits a write-path compliance report.
 func (r *Reconciler) report(ctx context.Context, cat, tgt, state, appliedHash string) error {
-	return r.sendReport(ctx, ComplianceReport{
+	rep := ComplianceReport{
 		Category:    cat,
 		Target:      tgt,
 		State:       state,
 		AppliedHash: appliedHash,
-	})
+	}
+	if cat == CategoryPackageConfig && tgt == TargetNPM && (state == StateCompliant || state == StateDriftDetected) {
+		if desired, ok := parseNPMDesired(r.renderedValue); ok && len(desired.settings) > 0 {
+			_, observed, err := npmObservedBag(desired.registry, authTokenMatch, settingsMatch)
+			if err != nil {
+				return err
+			}
+			rep.Observed, err = json.Marshal(observed)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return r.sendReport(ctx, rep)
 }
 
 // sendReport stamps the shared fields (agent version, platform,

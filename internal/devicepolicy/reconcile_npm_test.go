@@ -167,6 +167,52 @@ func TestNPMEnforceRendersBlockAndWrites(t *testing.T) {
 	}
 }
 
+func TestNPMSettingsDMGReportIncludesAggregateMatch(t *testing.T) {
+	w := &fakeWriter{}
+	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, newNPMStore(t))
+	r.Render = func(json.RawMessage) (string, error) { return stdSettingsBody, nil }
+	r.InitWriter = func() error {
+		r.Writer = w
+		return nil
+	}
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	r.Converged = func(expected string) (bool, error) { return w.present && w.value == expected, nil }
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+	w.value = "registry=https://drift.example/"
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("drift Reconcile: %v", err)
+	}
+	if len(w.writes) != 2 {
+		t.Fatalf("writes = %d, want apply, no-op, and drift repair", len(w.writes))
+	}
+
+	for i, got := range rep.reports {
+		wantState := StateCompliant
+		if i == 2 {
+			wantState = StateDriftDetected
+		}
+		if got.State != wantState {
+			t.Fatalf("report[%d] state = %q, want %q", i, got.State, wantState)
+		}
+		var observed map[string]json.RawMessage
+		if err := json.Unmarshal(got.Observed, &observed); err != nil {
+			t.Fatalf("report[%d] observed is not a JSON object: %v (%s)", i, err, got.Observed)
+		}
+		if len(observed) != 4 || string(observed[observedKeySettingsStatus]) != `"match"` {
+			t.Fatalf("report[%d] observed = %s, want four-key bag with matching settings", i, got.Observed)
+		}
+		for _, sensitive := range []string{"save-exact", "EXAMPLE_NPM_TOKEN", "engine-strict"} {
+			if strings.Contains(string(got.Observed), sensitive) {
+				t.Fatalf("report[%d] contains %q: %s", i, sensitive, got.Observed)
+			}
+		}
+	}
+}
+
 func TestNPMNullSettingRejectedBeforeWriterInitialization(t *testing.T) {
 	// A null settings member must fail at the policy boundary before target-user
 	// resolution or any filesystem access.
