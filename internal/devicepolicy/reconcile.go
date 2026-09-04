@@ -155,7 +155,7 @@ type Reconciler struct {
 	enforcement string
 	// evaluatedHash is the active npm policy hash fetched for this cycle.
 	evaluatedHash string
-	// renderedValue caches the trust-boundary render performed before InitWriter.
+	// renderedValue caches the trust-boundary render for the current cycle.
 	renderedValue string
 	rendered      bool
 }
@@ -724,6 +724,8 @@ func (r *Reconciler) handleEnforce(ctx context.Context, cat, tgt string, ep Effe
 		}
 		return fmt.Errorf("devicepolicy: enforce: compact policy: %w", err)
 	}
+	r.renderedValue = newValue
+	r.rendered = true
 
 	// 1. Managed-policy probe. A real managed policy outranks the value the agent
 	// would write — writing would be ineffective at best and fight the MDM at

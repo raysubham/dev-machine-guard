@@ -167,14 +167,10 @@ func TestNPMEnforceRendersBlockAndWrites(t *testing.T) {
 	}
 }
 
-func TestNPMSettingsDMGReportIncludesAggregateMatch(t *testing.T) {
+func TestNPMSettingsDMGReportIncludesAggregateMatchWithPrebuiltWriter(t *testing.T) {
 	w := &fakeWriter{}
 	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, newNPMStore(t))
 	r.Render = func(json.RawMessage) (string, error) { return stdSettingsBody, nil }
-	r.InitWriter = func() error {
-		r.Writer = w
-		return nil
-	}
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
