@@ -61,6 +61,8 @@ func fileResult(t *testing.T, scan model.RuleScan, ruleID string) model.RuleFile
 func TestScanRegexMatch(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "proj/.github/setup.js", "const x = eval(atob('benign'))\n")
+	// Decoy: same filename, wrong directory — must be rejected by the full-path check.
+	writeFile(t, dir, "proj/other/setup.js", "const x = eval(atob('benign'))\n")
 
 	rs := prep(t, RuleSet{Rules: []Rule{{
 		ID: "dropper", Revision: "rev1", FileGlobs: []string{"**/.github/setup.js"},
@@ -158,6 +160,20 @@ func TestScanExistenceOnly(t *testing.T) {
 	}
 	if fm.FileSHA256 == "" {
 		t.Error("existence-only match should still carry a hash")
+	}
+}
+
+func TestScan_WildcardFilenameGlob(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "nested/payload.mjs", "anything")
+
+	rs := prep(t, RuleSet{Rules: []Rule{{
+		ID: "wildcard", FileGlobs: []string{"**/*.mjs", "**/payload.mjs"},
+	}}})
+	scan := newTestEngine(t, DefaultCaps()).Scan(context.Background(), rs, []string{dir})
+	fm := fileResult(t, scan, "wildcard")
+	if fm.MatchedGlob != "**/*.mjs" {
+		t.Errorf("MatchedGlob got %q, want %q", fm.MatchedGlob, "**/*.mjs")
 	}
 }
 
