@@ -1226,3 +1226,28 @@ func TestNPMNeverLogsOrReportsTheToken(t *testing.T) {
 		t.Fatal("the test proved nothing — no log lines were captured")
 	}
 }
+
+func TestNPMSettingsOnlyDMGReportCarriesSettingsStatusOnly(t *testing.T) {
+	w := &fakeWriter{}
+	r, rep := newNPMRec(t, npmPolicyEP("sha256:N"), w, newNPMStore(t))
+	r.Render = func(json.RawMessage) (string, error) { return stdSettingsOnlyBody, nil }
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	got := lastReport(t, rep)
+	if got.State != StateCompliant {
+		t.Fatalf("state = %q, want %q", got.State, StateCompliant)
+	}
+	var observed map[string]json.RawMessage
+	if err := json.Unmarshal(got.Observed, &observed); err != nil {
+		t.Fatalf("observed is not a JSON object: %v (%s)", err, got.Observed)
+	}
+	if len(observed) != 2 || string(observed[observedKeyEcosystem]) != `"npm"` || string(observed[observedKeySettingsStatus]) != `"match"` {
+		t.Fatalf("observed = %s, want ecosystem and settings_status only", got.Observed)
+	}
+	for _, sensitive := range []string{"packages.example.com", "EXAMPLE_NPM_TOKEN", "save-exact"} {
+		if strings.Contains(string(got.Observed), sensitive) {
+			t.Fatalf("report contains %q: %s", sensitive, got.Observed)
+		}
+	}
+}

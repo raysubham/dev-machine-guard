@@ -243,7 +243,7 @@ func TestProbeContentNPM_FailsClosedNotUnapplied(t *testing.T) {
 func TestProbeContentNPM_RejectsUnrenderableExpected(t *testing.T) {
 	// Without a parseable desired block there is no tenant key to compare against,
 	// so the auth verdict cannot be computed. Fail rather than guess.
-	if _, _, err := probeNPMRCObserved(mdmBlock(), "registry=only-one-line"); err == nil {
+	if _, _, err := probeNPMRCObserved(mdmBlock(), "# not a rendered block"); err == nil {
 		t.Fatal("a non-rendered expected value must error")
 	}
 }
@@ -449,5 +449,94 @@ func TestDMGBlockLines(t *testing.T) {
 	two := strings.Split(strings.TrimRight(block(stdBody)+block(stdBody), "\n"), "\n")
 	if _, err := dmgBlockLines(two); !isTargetUnusable(err) {
 		t.Fatalf("two dmg blocks must fail closed with ErrTargetUnusable, got %v", err)
+	}
+}
+
+// A combined block left on disk after the policy moved to settings-only keeps
+// StepSecurity as the effective default registry even when every desired setting
+// is present, so it must not report settings_status=match.
+func TestProbeContentNPM_SettingsOnlyRejectsStaleCombinedBlock(t *testing.T) {
+	settingsOnly := strings.TrimPrefix(stdSettingsBody, stdBody+"\n")
+	present, observed, err := probeNPMRCObserved(boundedMDMBlock(stdSettingsBody), settingsOnly)
+	if err != nil || !present {
+		t.Fatalf("probeNPMRCObserved: present=%v err=%v", present, err)
+	}
+	if got := observedStrings(t, observed); got[observedKeySettingsStatus] != settingsMismatch {
+		t.Fatalf("settings_status = %q, want %q", got[observedKeySettingsStatus], settingsMismatch)
+	}
+}
+
+func TestProbeContentNPM_SettingsOnlyObserved(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "match", content: boundedMDMBlock(stdSettingsOnlyBody), want: settingsMatch},
+		{name: "match with unrelated user config", content: "engine-strict=true\n" + boundedMDMBlock(stdSettingsOnlyBody), want: settingsMatch},
+		{name: "absent under a bare fixed marker", content: npmrcMDMMarker + "\n", want: settingsAbsent},
+		{name: "fixed StepSecurity block registry mismatches", content: mdmBlock(), want: settingsMismatch},
+		{name: "partial", content: boundedMDMBlock(strings.Replace(stdSettingsOnlyBody, "\nsave-exact=true", "", 1)), want: settingsMismatch},
+		{name: "wrong registry", content: boundedMDMBlock(strings.Replace(stdSettingsOnlyBody, "packages.example.com/npm/\n", "other.example/\n", 1)), want: settingsMismatch},
+		{name: "later registry override", content: boundedMDMBlock(stdSettingsOnlyBody) + "registry=https://later.example/\n", want: settingsMismatch},
+		{name: "duplicate block", content: boundedMDMBlock(stdSettingsOnlyBody) + boundedMDMBlock(stdSettingsOnlyBody), want: settingsMismatch},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			present, observed, err := probeNPMRCObserved(tc.content, stdSettingsOnlyBody)
+			if err != nil {
+				t.Fatalf("probeNPMRCObserved: %v", err)
+			}
+			if !present {
+				t.Fatal("MDM ownership was not recognized")
+			}
+			got := observedStrings(t, observed)
+			if len(got) != 2 || got[observedKeyEcosystem] != "npm" {
+				t.Fatalf("settings-only observed = %v, want ecosystem and settings_status only", got)
+			}
+			if got[observedKeySettingsStatus] != tc.want {
+				t.Fatalf("settings_status = %q, want %q", got[observedKeySettingsStatus], tc.want)
+			}
+			raw, err := json.Marshal(observed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, sensitive := range []string{"packages.example.com", "EXAMPLE_NPM_TOKEN", "save-exact", "registry_url", "auth_token_status"} {
+				if strings.Contains(string(raw), sensitive) {
+					t.Fatalf("observed evidence contains %q: %s", sensitive, raw)
+				}
+			}
+		})
+	}
+
+	for _, content := range []string{"", "registry=https://packages.example.com/npm/\n", block(stdSettingsOnlyBody)} {
+		present, observed, err := probeNPMRCObserved(content, stdSettingsOnlyBody)
+		if err != nil || present || observed != nil {
+			t.Fatalf("content %q: present=%v observed=%v err=%v, want not applied", content, present, observed, err)
+		}
+	}
+	if _, _, err := probeNPMRCObserved(boundedMDMBlock(stdSettingsOnlyBody)+"registry[]=https://evil.example/\n", stdSettingsOnlyBody); err == nil {
+		t.Fatal("managed registry array must fail closed")
+	}
+}
+
+func TestNPMCompliantObserved(t *testing.T) {
+	observed, err := npmCompliantObserved(stdBody)
+	if err != nil || observed != nil {
+		t.Fatalf("StepSecurity-only compliant report must carry no bag, got %v err=%v", observed, err)
+	}
+	observed, err = npmCompliantObserved(stdSettingsBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := observedStrings(t, observed); len(got) != 4 || got[observedKeyRegistryURL] != stdRegistry || got[observedKeyAuthTokenStatus] != authTokenMatch || got[observedKeySettingsStatus] != settingsMatch {
+		t.Fatalf("combined compliant bag = %v", got)
+	}
+	observed, err = npmCompliantObserved(stdSettingsOnlyBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := observedStrings(t, observed); len(got) != 2 || got[observedKeyEcosystem] != "npm" || got[observedKeySettingsStatus] != settingsMatch {
+		t.Fatalf("settings-only compliant bag = %v", got)
 	}
 }

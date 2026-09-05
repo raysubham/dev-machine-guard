@@ -26,7 +26,9 @@ import (
 // This file backs the package_config#npm policy category: it converges a
 // managed block inside the console user's ~/.npmrc so npm (and the pnpm / yarn
 // v1 / bun tools that read the same file) resolves packages through the
-// tenant's StepSecurity secure registry. It parallels the VS Code
+// tenant's StepSecurity secure registry and/or a policy-managed set of scalar
+// npm settings (a third-party default or scoped registry with an
+// environment-referenced token, plus ordinary options). It parallels the VS Code
 // settings.json writer (settings_writer.go) but the target is a file the agent
 // may run as root against a user-owned tree, so every file operation goes
 // through os.Root rather than atomicfile — see the security notes on
@@ -58,9 +60,10 @@ const NPMOwnedKey = "npmrc"
 const NPMOwnershipValue = "dmg_marker_v1"
 
 // The observed-bag keys and verdicts of the MDM verify-only report. They are
-// WIRE-PERMANENT: the backend accepts the base three-key shape and the
-// settings-aware four-key shape. Both secret-bearing domains are reduced to
-// status enums on-device.
+// WIRE-PERMANENT: the backend accepts the base three-key StepSecurity shape, the
+// four-key combined shape, and the two-key settings-only shape (ecosystem plus
+// settings_status). Both secret-bearing domains are reduced to status enums
+// on-device.
 const (
 	observedKeyEcosystem   = "ecosystem"
 	observedKeyRegistryURL = "registry_url"
@@ -1161,14 +1164,23 @@ func randomSuffix() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
+// parseNPMDesired parses a rendered body into the one form shared by rewrite,
+// convergence, MDM verification, and observation. It accepts exactly what
+// RenderNPMRCBlock produces: an optional leading StepSecurity pair followed by
+// the byte-sorted settings, or the sorted settings alone. The pair is
+// recognized by the two-line shape RenderNPMRCBlock emits, a bare `registry=`
+// line immediately followed by a `//…:_authToken=` line, not by the bare
+// `registry` key alone: a settings-only body may carry `registry` as an
+// ordinary setting, but never in that position, because byte order sorts every
+// `//`-scoped key before it.
 func parseNPMDesired(body string) (npmDesired, bool) {
-	lines := strings.Split(body, "\n")
-	if len(lines) < 2 || strings.HasSuffix(body, "\n") {
+	if strings.HasSuffix(body, "\n") {
 		return npmDesired{}, false
 	}
+	lines := strings.Split(body, "\n")
 	values := make(map[string]string, len(lines))
-	settings := make([]npmSetting, 0, len(lines)-2)
-	for i, line := range lines {
+	entries := make([]npmSetting, 0, len(lines))
+	for _, line := range lines {
 		// Compare the desired body using the same semantics npm applies when it
 		// reads the rendered bytes, notably doubled backslashes.
 		key, value, ok := activeKV(line)
@@ -1179,26 +1191,25 @@ func parseNPMDesired(body string) (npmDesired, bool) {
 			return npmDesired{}, false
 		}
 		values[key] = value
-		if i >= 2 {
-			settings = append(settings, npmSetting{key: key, value: value})
-		}
+		entries = append(entries, npmSetting{key: key, value: value})
 	}
-	registryKey, registryValue, _ := activeKV(lines[0])
-	if registryKey != "registry" || registryValue == "" {
-		return npmDesired{}, false
+	desired := npmDesired{body: body, settings: entries, values: values}
+	if len(entries) >= 2 && isStepSecurityPair(entries[0], entries[1]) {
+		desired.registry = entries[0].value
+		desired.tokenKey = entries[1].key
+		desired.tokenValue = entries[1].value
+		desired.settings = entries[2:]
 	}
-	tokenKey, tokenValue, _ := activeKV(lines[1])
-	if tokenValue == "" || tokenKey == "registry" || !strings.HasPrefix(tokenKey, "//") || !strings.HasSuffix(tokenKey, ":_authToken") {
-		return npmDesired{}, false
-	}
-	return npmDesired{
-		body:       body,
-		registry:   registryValue,
-		tokenKey:   tokenKey,
-		tokenValue: tokenValue,
-		settings:   settings,
-		values:     values,
-	}, true
+	return desired, true
+}
+
+// isStepSecurityPair reports whether two leading rendered lines have the shape
+// of the StepSecurity registry and device-token pair. Only the shape is judged,
+// not the values: an observed MDM body with a drifted registry or a shared
+// tenant token must still parse so its settings can be compared.
+func isStepSecurityPair(registry, token npmSetting) bool {
+	return registry.key == "registry" && registry.value != "" &&
+		strings.HasPrefix(token.key, "//") && strings.HasSuffix(token.key, ":_authToken") && token.value != ""
 }
 
 // ---------------------------------------------------------------------------
@@ -1207,8 +1218,9 @@ func parseNPMDesired(body string) (npmDesired, bool) {
 
 // rewriteContent produces the new file bytes from the current bytes and the
 // rendered block body: strip any existing managed block, fail closed on an INI
-// section header, comment out active bare `registry=` lines, and append a fresh
-// block at the very bottom on its own line. Preserves all other bytes exactly.
+// section header, comment out active bare `registry=` lines when the
+// StepSecurity registry is desired, and append a fresh block at the very bottom
+// on its own line. Preserves all other bytes exactly.
 func (w *NPMRCWriter) rewriteContent(current []byte, body string) ([]byte, error) {
 	desired, ok := parseNPMDesired(body)
 	if !ok {
@@ -1244,7 +1256,14 @@ func (w *NPMRCWriter) rewriteContent(current []byte, body string) ([]byte, error
 		// arrays are order-independent), so refuse the transform.
 		return nil, fmt.Errorf("npmrc: file uses npm array-append syntax on a managed key; cannot safely transform: %w", ErrTargetUnusable)
 	}
-	lines = commentBareRegistry(lines)
+	if desired.stepSecurity() {
+		lines = commentBareRegistry(lines)
+	} else {
+		// A settings-only policy treats `registry` as an ordinary last-wins
+		// setting, so a bare registry line the StepSecurity shape had previously
+		// commented out is handed back to the user before the new block lands.
+		lines = unprefixDMG(lines)
+	}
 
 	base := strings.Join(lines, "\n")
 	var buf bytes.Buffer
@@ -2066,6 +2085,16 @@ func probeNPMRCObserved(content, expected string) (bool, map[string]json.RawMess
 		return false, nil, nil
 	}
 
+	settingsStatus := ""
+	if len(desired.settings) > 0 {
+		settingsStatus = observedSettingsStatus(lines, inDMGBlock, markers, desired)
+	}
+	if !desired.stepSecurity() {
+		// A settings-only policy has no StepSecurity registry or credential axis to
+		// report; the aggregate settings verdict is the whole observation.
+		return npmObservedBag("", "", settingsStatus)
+	}
+
 	// Effective precedence over the WHOLE file: npm takes the LAST active
 	// assignment, so a line below the MDM block wins. Report what npm would
 	// actually use — an override surfaces as drift at the backend, which is the
@@ -2108,42 +2137,48 @@ func probeNPMRCObserved(content, expected string) (bool, map[string]json.RawMess
 		}
 	}
 
-	settingsStatus := ""
-	if len(desired.settings) > 0 {
-		lastSettings := make(map[string]string, len(desired.settings))
-		for _, line := range lines {
-			key, value, ok := activeKV(line)
-			if !ok || key == "registry" || key == desired.tokenKey {
-				continue
-			}
-			if _, managed := desired.values[key]; managed {
-				lastSettings[key] = value
-			}
-		}
-		settingsStatus = settingsAbsent
-		if len(lastSettings) > 0 {
-			settingsStatus = settingsMismatch
-			body, valid := boundedMDMBody(lines, inDMGBlock, markers)
-			if len(markers.fixed) == 0 && valid && boundedSettingsMatch(body, desired) {
-				matches := true
-				for _, setting := range desired.settings {
-					if lastSettings[setting.key] != setting.value {
-						matches = false
-						break
-					}
-				}
-				if matches {
-					settingsStatus = settingsMatch
-				}
-			}
-		}
-	}
 	return npmObservedBag(lastReg, status, settingsStatus)
 }
 
+// observedSettingsStatus reduces the desired settings to one secret-free
+// verdict: absent when no desired settings key has an active assignment, match
+// when exactly one bounded MDM block carries precisely the desired settings and
+// every one of them is the last-effective value, mismatch for any other readable
+// state (partial, wrong, overridden, duplicated, or a fixed-marker block).
+func observedSettingsStatus(lines []string, inDMG []bool, markers npmMDMMarkers, desired npmDesired) string {
+	last := make(map[string]string, len(desired.settings))
+	for _, line := range lines {
+		key, value, ok := activeKV(line)
+		if !ok || desired.stepSecurityKey(key) {
+			continue
+		}
+		if _, managed := desired.values[key]; managed {
+			last[key] = value
+		}
+	}
+	if len(last) == 0 {
+		return settingsAbsent
+	}
+	body, valid := boundedMDMBody(lines, inDMG, markers)
+	if len(markers.fixed) != 0 || !valid || !boundedSettingsMatch(body, desired) {
+		return settingsMismatch
+	}
+	for _, setting := range desired.settings {
+		if last[setting.key] != setting.value {
+			return settingsMismatch
+		}
+	}
+	return settingsMatch
+}
+
+// boundedSettingsMatch compares only the settings entries of a bounded MDM body,
+// so registry or token drift in a combined block is reported on its own axes
+// rather than as a settings mismatch. The block must still be the desired SHAPE:
+// a stale combined block left behind after a policy moved to settings-only keeps
+// StepSecurity as the effective default registry, and must not read as match.
 func boundedSettingsMatch(body string, desired npmDesired) bool {
 	observed, ok := parseNPMDesired(body)
-	if !ok || len(observed.settings) != len(desired.settings) {
+	if !ok || observed.stepSecurity() != desired.stepSecurity() || len(observed.settings) != len(desired.settings) {
 		return false
 	}
 	for i, setting := range desired.settings {
@@ -2227,50 +2262,74 @@ func tenantKeyPrefix(token string) string {
 	return strings.SplitN(token, "::dev:", 2)[0]
 }
 
-// npmObservedBag builds the base three-key or settings-aware four-key observed
-// bag. Nothing derived from a token or setting beyond its aggregate verdict is
-// included.
+// npmObservedBag builds the observed bag for the desired shape: ecosystem always,
+// registry_url and auth_token_status when the StepSecurity registry is desired
+// (authStatus non-empty), and settings_status when settings are desired
+// (non-empty). Nothing derived from a token or setting beyond its aggregate
+// verdict is included.
 func npmObservedBag(registryURL, authStatus, settingsStatus string) (bool, map[string]json.RawMessage, error) {
-	reg, err := json.Marshal(registryURL)
-	if err != nil {
-		return false, nil, fmt.Errorf("npmrc: encode observed registry_url: %w", err)
+	observed := make(map[string]json.RawMessage, 4)
+	put := func(key, value string) error {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return fmt.Errorf("npmrc: encode observed %s: %w", key, err)
+		}
+		observed[key] = raw
+		return nil
 	}
-	eco, err := json.Marshal("npm")
-	if err != nil {
-		return false, nil, fmt.Errorf("npmrc: encode observed ecosystem: %w", err)
+	if err := put(observedKeyEcosystem, "npm"); err != nil {
+		return false, nil, err
 	}
-	status, err := json.Marshal(authStatus)
-	if err != nil {
-		return false, nil, fmt.Errorf("npmrc: encode observed auth_token_status: %w", err)
-	}
-	observed := map[string]json.RawMessage{
-		observedKeyEcosystem:       eco,
-		observedKeyRegistryURL:     reg,
-		observedKeyAuthTokenStatus: status,
+	if authStatus != "" {
+		if err := put(observedKeyRegistryURL, registryURL); err != nil {
+			return false, nil, err
+		}
+		if err := put(observedKeyAuthTokenStatus, authStatus); err != nil {
+			return false, nil, err
+		}
 	}
 	if settingsStatus != "" {
-		value, err := json.Marshal(settingsStatus)
-		if err != nil {
-			return false, nil, fmt.Errorf("npmrc: encode observed settings_status: %w", err)
+		if err := put(observedKeySettingsStatus, settingsStatus); err != nil {
+			return false, nil, err
 		}
-		observed[observedKeySettingsStatus] = value
 	}
 	return true, observed, nil
+}
+
+// npmCompliantObserved is the observed bag a converged DMG-enforced file reports
+// for a policy with settings: every desired axis reads match. A StepSecurity-only
+// policy reports no bag, preserving its existing wire shape.
+func npmCompliantObserved(rendered string) (map[string]json.RawMessage, error) {
+	desired, ok := parseNPMDesired(rendered)
+	if !ok || len(desired.settings) == 0 {
+		return nil, nil
+	}
+	authStatus := ""
+	if desired.stepSecurity() {
+		authStatus = authTokenMatch
+	}
+	_, observed, err := npmObservedBag(desired.registry, authStatus, settingsMatch)
+	return observed, err
 }
 
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
-// npmPolicy is the run-config policy payload for the npm ecosystem.
+// npmPolicy is the run-config policy payload for the npm ecosystem. The
+// StepSecurity fields stay raw so an explicit null is distinguishable from an
+// absent member: registry_url and auth are a pair that is either both present
+// (StepSecurity-backed) or both absent (settings-only).
 type npmPolicy struct {
-	Ecosystem   string `json:"ecosystem"`
-	RegistryURL string `json:"registry_url"`
-	Auth        struct {
-		Scheme string `json:"scheme"`
-		APIKey string `json:"api_key"`
-	} `json:"auth"`
-	Settings json.RawMessage `json:"settings"`
+	Ecosystem   string          `json:"ecosystem"`
+	RegistryURL json.RawMessage `json:"registry_url"`
+	Auth        json.RawMessage `json:"auth"`
+	Settings    json.RawMessage `json:"settings"`
+}
+
+type npmAuth struct {
+	Scheme string `json:"scheme"`
+	APIKey string `json:"api_key"`
 }
 
 type npmSetting struct {
@@ -2279,9 +2338,11 @@ type npmSetting struct {
 }
 
 // npmDesired is the one parsed form shared by rewrite, convergence, MDM
-// verification, and observation. The first two assignments are always the
-// StepSecurity registry and token; settings contains only optional policy
-// settings, already sorted by key.
+// verification, and observation. registry, tokenKey, and tokenValue describe
+// the leading StepSecurity pair and are empty for a settings-only policy;
+// settings holds the policy settings in byte-sorted key order (a settings-only
+// `registry` is one of them); values maps every managed scalar key, StepSecurity
+// pair included, to its desired value.
 type npmDesired struct {
 	body       string
 	registry   string
@@ -2291,14 +2352,25 @@ type npmDesired struct {
 	values     map[string]string
 }
 
+// stepSecurity reports whether the desired body carries the StepSecurity
+// registry and device-token pair.
+func (d npmDesired) stepSecurity() bool { return d.tokenKey != "" }
+
+// stepSecurityKey reports whether key is one of the two product-owned
+// StepSecurity lines rather than a policy setting.
+func (d npmDesired) stepSecurityKey(key string) bool {
+	return d.stepSecurity() && (key == "registry" || key == d.tokenKey)
+}
+
 // RenderNPMRCBlock validates a policy and returns the content lines the writer
-// wraps in its markers: the StepSecurity registry/token pair followed by any
-// settings in byte-sorted key order, with no markers or trailing newline. It
-// fully validates the policy (the HTTP layer only checks "is a JSON object"):
-// the token line's host and path derive from registry_url, and the composed
-// device token is `<api_key>::dev:<serial>`. Any validation failure returns an
-// error the reconciler reports as policy_not_applied; error messages never echo
-// the key or the policy.
+// wraps in its markers, with no markers or trailing newline: the StepSecurity
+// registry/token pair when the policy carries one, followed by any settings in
+// byte-sorted key order. It fully validates the policy (the HTTP layer only
+// checks "is a JSON object"): the token line's host and path derive from
+// registry_url, the composed device token is `<api_key>::dev:<serial>`, and a
+// settings-only policy must declare a default or scoped registry. Any
+// validation failure returns an error the reconciler reports as
+// policy_not_applied; error messages never echo the key or the policy.
 func RenderNPMRCBlock(policy json.RawMessage, serial string) (string, error) {
 	if !utf8.Valid(policy) {
 		return "", errors.New("npmrc: policy is not valid UTF-8")
@@ -2319,46 +2391,27 @@ func RenderNPMRCBlock(policy json.RawMessage, serial string) (string, error) {
 	if p.Ecosystem != "npm" {
 		return "", errors.New("npmrc: policy ecosystem is not npm")
 	}
-	if p.Auth.Scheme != "stepsecurity_device_token" {
-		return "", errors.New("npmrc: unsupported auth scheme")
+
+	var lines []string
+	productTokenKey := ""
+	switch {
+	case len(p.RegistryURL) > 0 || len(p.Auth) > 0:
+		var err error
+		if lines, productTokenKey, err = renderStepSecurityPair(p, serial); err != nil {
+			return "", err
+		}
+	case len(p.Settings) == 0:
+		return "", errors.New("npmrc: policy has neither a StepSecurity registry nor settings")
+	default:
+		if err := validateDeviceSerial(serial); err != nil {
+			return "", err
+		}
 	}
 
-	key := p.Auth.APIKey
-	if key == "" {
-		return "", errors.New("npmrc: policy api_key is empty")
-	}
-	if len(key) > npmrcMaxKeyBytes {
-		return "", errors.New("npmrc: policy api_key too long")
-	}
-	if !isNPMSafe(key) {
-		return "", errors.New("npmrc: policy api_key contains unsupported characters")
-	}
-	if serial == "" {
-		return "", errors.New("npmrc: device serial is empty")
-	}
-	if len(serial) > npmrcMaxSerialBytes {
-		return "", errors.New("npmrc: device serial too long")
-	}
-	if !isNPMSafe(serial) {
-		return "", errors.New("npmrc: device serial contains unsupported characters")
-	}
-
-	host, path, err := validateRegistryURL(p.RegistryURL)
+	settings, err := validateNPMSettings(p.Settings, productTokenKey)
 	if err != nil {
 		return "", err
 	}
-
-	token := key + "::dev:" + serial
-	// npm's _authToken key is `//host/path/:_authToken` with a trailing slash
-	// before the colon.
-	tokenKey := "//" + host + path + "/:_authToken"
-
-	settings, err := validateNPMSettings(p.Settings, tokenKey)
-	if err != nil {
-		return "", err
-	}
-	lines := make([]string, 0, 2+len(settings))
-	lines = append(lines, "registry="+p.RegistryURL, tokenKey+"="+token)
 	for _, setting := range settings {
 		lines = append(lines, setting.key+"="+setting.value)
 	}
@@ -2369,6 +2422,70 @@ func RenderNPMRCBlock(policy json.RawMessage, serial string) (string, error) {
 	return body, nil
 }
 
+// renderStepSecurityPair validates the StepSecurity registry_url/auth pair and
+// returns its two rendered lines plus the derived token key the settings must
+// not collide with.
+func renderStepSecurityPair(p npmPolicy, serial string) (lines []string, tokenKey string, err error) {
+	if len(p.RegistryURL) == 0 || len(p.Auth) == 0 {
+		return nil, "", errors.New("npmrc: policy registry_url and auth must be present together")
+	}
+	var registryURL string
+	if err := json.Unmarshal(p.RegistryURL, &registryURL); err != nil {
+		return nil, "", errors.New("npmrc: policy registry_url is not a string")
+	}
+	var auth npmAuth
+	authDecoder := json.NewDecoder(bytes.NewReader(p.Auth))
+	authDecoder.DisallowUnknownFields()
+	if err := authDecoder.Decode(&auth); err != nil {
+		return nil, "", errors.New("npmrc: policy auth is not a well-formed object")
+	}
+	if auth.Scheme != "stepsecurity_device_token" {
+		return nil, "", errors.New("npmrc: unsupported auth scheme")
+	}
+
+	key := auth.APIKey
+	if key == "" {
+		return nil, "", errors.New("npmrc: policy api_key is empty")
+	}
+	if len(key) > npmrcMaxKeyBytes {
+		return nil, "", errors.New("npmrc: policy api_key too long")
+	}
+	if !isNPMSafe(key) {
+		return nil, "", errors.New("npmrc: policy api_key contains unsupported characters")
+	}
+	if err := validateDeviceSerial(serial); err != nil {
+		return nil, "", err
+	}
+
+	host, path, err := validateRegistryURL(registryURL)
+	if err != nil {
+		return nil, "", err
+	}
+
+	token := key + "::dev:" + serial
+	// npm's _authToken key is `//host/path/:_authToken` with a trailing slash
+	// before the colon.
+	tokenKey = "//" + host + path + "/:_authToken"
+	return []string{"registry=" + registryURL, tokenKey + "=" + token}, tokenKey, nil
+}
+
+func validateDeviceSerial(serial string) error {
+	if serial == "" {
+		return errors.New("npmrc: device serial is empty")
+	}
+	if len(serial) > npmrcMaxSerialBytes {
+		return errors.New("npmrc: device serial too long")
+	}
+	if !isNPMSafe(serial) {
+		return errors.New("npmrc: device serial contains unsupported characters")
+	}
+	return nil
+}
+
+// validateNPMSettings decodes and validates the optional settings map and
+// returns it sorted by key. productTokenKey is the derived StepSecurity token
+// key for a StepSecurity-backed policy and empty for a settings-only policy,
+// which must instead declare a default `registry` or `@scope:registry`.
 func validateNPMSettings(raw json.RawMessage, productTokenKey string) ([]npmSetting, error) {
 	if len(raw) == 0 {
 		return nil, nil
@@ -2389,6 +2506,7 @@ func validateNPMSettings(raw json.RawMessage, productTokenKey string) ([]npmSett
 		return nil, fmt.Errorf("npmrc: policy settings must contain 1 through %d entries", npmrcMaxSettings)
 	}
 
+	stepSecurity := productTokenKey != ""
 	keys := make([]string, 0, len(settings))
 	registryAuthKeys := make(map[string]struct{})
 	for key, value := range settings {
@@ -2401,19 +2519,28 @@ func validateNPMSettings(raw json.RawMessage, productTokenKey string) ([]npmSett
 		if key == productTokenKey {
 			return nil, errors.New("npmrc: policy setting collides with the StepSecurity token key")
 		}
-		if scope, ok := npmScopedRegistryKey(key); ok {
+		scope, scoped := npmScopedRegistryKey(key)
+		if scoped || key == "registry" && !stepSecurity {
 			authKey, canonical, err := canonicalNPMRegistry(value)
-			if err != nil || canonical != value || scope == "" {
-				return nil, errors.New("npmrc: policy contains a non-canonical scoped registry")
+			if err != nil || canonical != value || scoped && scope == "" {
+				return nil, errors.New("npmrc: policy contains a non-canonical registry setting")
+			}
+			if authKey == productTokenKey {
+				// StepSecurity authentication is expressed only through the compiled
+				// registry_url/auth pair, never as a managed setting.
+				return nil, errors.New("npmrc: policy registry setting targets the StepSecurity registry")
 			}
 			registryAuthKeys[authKey] = struct{}{}
 		}
 		keys = append(keys, key)
 	}
+	if !stepSecurity && len(registryAuthKeys) == 0 {
+		return nil, errors.New("npmrc: settings-only policy must declare a default or scoped registry")
+	}
 
 	for _, key := range keys {
 		value := settings[key]
-		if isReservedNPMSetting(key) {
+		if isReservedNPMSetting(key, !stepSecurity) {
 			return nil, errors.New("npmrc: policy contains a reserved setting key")
 		}
 		credential, scoped := npmURLScopedCredential(key)
@@ -2511,12 +2638,19 @@ func isExactEnvReference(value string) bool {
 	return len(value) >= 4 && strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}") && validEnvName(value[2:len(value)-1])
 }
 
-func isReservedNPMSetting(key string) bool {
+// isReservedNPMSetting reports whether key is a product-owned or
+// credential-bearing npm config name a policy may not manage. The exact
+// lowercase `registry` is the third-party default registry of a settings-only
+// policy and is released when allowDefaultRegistry is set; its case variants
+// stay reserved so they cannot evade the registry rules.
+func isReservedNPMSetting(key string, allowDefaultRegistry bool) bool {
 	if strings.HasPrefix(key, "//") {
 		return false
 	}
 	switch strings.ToLower(key) {
-	case "registry", "_authtoken", "_auth", "_password", "username", "tokenhelper", "cert", "key":
+	case "registry":
+		return !allowDefaultRegistry || key != "registry"
+	case "_authtoken", "_auth", "_password", "username", "tokenhelper", "cert", "key":
 		return true
 	default:
 		return false

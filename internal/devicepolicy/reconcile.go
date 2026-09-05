@@ -1177,11 +1177,11 @@ func (r *Reconciler) report(ctx context.Context, cat, tgt, state, appliedHash st
 		AppliedHash: appliedHash,
 	}
 	if cat == CategoryPackageConfig && tgt == TargetNPM && (state == StateCompliant || state == StateDriftDetected) {
-		if desired, ok := parseNPMDesired(r.renderedValue); ok && len(desired.settings) > 0 {
-			_, observed, err := npmObservedBag(desired.registry, authTokenMatch, settingsMatch)
-			if err != nil {
-				return err
-			}
+		observed, err := npmCompliantObserved(r.renderedValue)
+		if err != nil {
+			return err
+		}
+		if observed != nil {
 			rep.Observed, err = json.Marshal(observed)
 			if err != nil {
 				return err

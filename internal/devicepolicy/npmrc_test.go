@@ -1010,3 +1010,238 @@ func TestSymlinkTargetPredicates(t *testing.T) {
 func isTargetUnusable(err error) bool {
 	return errors.Is(err, ErrTargetUnusable)
 }
+
+// ---------------------------------------------------------------------------
+// settings-only policy (no StepSecurity registry_url/auth pair)
+// ---------------------------------------------------------------------------
+
+const stdSettingsOnlyBody = "//packages.example.com/npm/:_authToken=${EXAMPLE_NPM_TOKEN}\nregistry=https://packages.example.com/npm/\nsave-exact=true"
+
+func npmSettingsOnlyPolicy(t *testing.T, settings any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{"ecosystem": "npm", "settings": settings})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func stdSettingsOnlySettings() map[string]string {
+	return map[string]string{
+		"save-exact":                             "true",
+		"registry":                               "https://packages.example.com/npm/",
+		"//packages.example.com/npm/:_authToken": "${EXAMPLE_NPM_TOKEN}",
+	}
+}
+
+func TestRenderNPMRCBlock_SettingsOnly(t *testing.T) {
+	got, err := RenderNPMRCBlock(npmSettingsOnlyPolicy(t, stdSettingsOnlySettings()), stdSerial)
+	if err != nil {
+		t.Fatalf("RenderNPMRCBlock: %v", err)
+	}
+	if got != stdSettingsOnlyBody {
+		t.Fatalf("rendered body = %q, want %q", got, stdSettingsOnlyBody)
+	}
+	if strings.Contains(got, "stepsecurity") || strings.Contains(got, "::dev:") {
+		t.Fatalf("settings-only body carries StepSecurity lines: %q", got)
+	}
+
+	reordered, err := RenderNPMRCBlock(json.RawMessage(`{"settings":{"save-exact":"true","//packages.example.com/npm/:_authToken":"${EXAMPLE_NPM_TOKEN}","registry":"https://packages.example.com/npm/"},"ecosystem":"npm"}`), stdSerial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reordered != got {
+		t.Fatalf("map order changed rendering: %q != %q", reordered, got)
+	}
+
+	scopedOnly, err := RenderNPMRCBlock(npmSettingsOnlyPolicy(t, map[string]string{
+		"@example:registry":                "https://registry.npmjs.org/",
+		"//registry.npmjs.org/:_authToken": "${EXAMPLE_NPM_TOKEN}",
+	}), stdSerial)
+	if err != nil {
+		t.Fatalf("scoped-registry-only policy: %v", err)
+	}
+	if scopedOnly != "//registry.npmjs.org/:_authToken=${EXAMPLE_NPM_TOKEN}\n@example:registry=https://registry.npmjs.org/" {
+		t.Fatalf("scoped-only body = %q", scopedOnly)
+	}
+
+	desired, ok := parseNPMDesired(got)
+	if !ok {
+		t.Fatal("settings-only body did not parse")
+	}
+	if desired.stepSecurity() || desired.registry != "" || desired.tokenKey != "" {
+		t.Fatalf("settings-only body parsed as StepSecurity-backed: %+v", desired)
+	}
+	if len(desired.settings) != 3 || desired.values["registry"] != "https://packages.example.com/npm/" {
+		t.Fatalf("settings-only registry is not an ordinary setting: %+v", desired)
+	}
+	withPair, ok := parseNPMDesired(stdSettingsBody)
+	if !ok || !withPair.stepSecurity() || withPair.registry != stdRegistry || withPair.tokenKey != stdTokenKey || len(withPair.settings) != 4 {
+		t.Fatalf("StepSecurity pair not recognized: %+v", withPair)
+	}
+}
+
+func TestRenderNPMRCBlock_SettingsOnlyRejections(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{name: "neither registry nor settings", raw: json.RawMessage(`{"ecosystem":"npm"}`)},
+		{name: "registry_url without auth", raw: json.RawMessage(`{"ecosystem":"npm","registry_url":"` + stdRegistry + `","settings":{"save-exact":"true"}}`)},
+		{name: "auth without registry_url", raw: json.RawMessage(`{"ecosystem":"npm","auth":{"scheme":"stepsecurity_device_token","api_key":"ssabc123"},"settings":{"save-exact":"true"}}`)},
+		{name: "null registry_url and auth", raw: json.RawMessage(`{"ecosystem":"npm","registry_url":null,"auth":null,"settings":{"registry":"https://packages.example.com/npm/"}}`)},
+		{name: "non-string registry_url", raw: json.RawMessage(`{"ecosystem":"npm","registry_url":1,"auth":{"scheme":"stepsecurity_device_token","api_key":"ssabc123"}}`)},
+		{name: "ordinary settings without a registry", raw: npmSettingsOnlyPolicy(t, map[string]string{"save-exact": "true"})},
+		{name: "case-variant registry is not a registry", raw: npmSettingsOnlyPolicy(t, map[string]string{"Registry": "https://packages.example.com/npm/"})},
+		{name: "non-canonical default registry", raw: npmSettingsOnlyPolicy(t, map[string]string{"registry": "https://packages.example.com/npm"})},
+		{name: "http default registry", raw: npmSettingsOnlyPolicy(t, map[string]string{"registry": "http://packages.example.com/npm/"})},
+		{name: "token unpaired with the default registry", raw: npmSettingsOnlyPolicy(t, map[string]string{"registry": "https://packages.example.com/npm/", "//other.example/:_authToken": "${TOKEN}"})},
+		{name: "literal default registry token", raw: npmSettingsOnlyPolicy(t, map[string]string{"registry": "https://packages.example.com/npm/", "//packages.example.com/npm/:_authToken": "literal"})},
+		{name: "empty settings", raw: npmSettingsOnlyPolicy(t, map[string]string{})},
+		{name: "null settings", raw: npmSettingsOnlyPolicy(t, nil)},
+		{name: "settings.registry with StepSecurity registry", raw: npmSettingsPolicy(t, map[string]string{"registry": "https://packages.example.com/npm/"})},
+		{name: "scoped registry targeting the StepSecurity registry", raw: npmSettingsPolicy(t, map[string]string{"@team:registry": stdRegistry + "/"})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := RenderNPMRCBlock(tc.raw, stdSerial); err == nil {
+				t.Fatal("expected rejection")
+			}
+		})
+	}
+	if _, err := RenderNPMRCBlock(npmSettingsOnlyPolicy(t, stdSettingsOnlySettings()), ""); err == nil {
+		t.Fatal("settings-only policy accepted an empty device serial")
+	}
+}
+
+func TestRenderNPMRCBlock_SettingsOnlySizeBoundary(t *testing.T) {
+	const registry = "registry=https://packages.example.com/npm/\n"
+	key := "x"
+	atLimit := strings.Repeat("v", npmrcMaxRenderedBytes-len(registry)-len(key)-1)
+	settings := map[string]string{"registry": "https://packages.example.com/npm/", key: atLimit}
+	body, err := RenderNPMRCBlock(npmSettingsOnlyPolicy(t, settings), stdSerial)
+	if err != nil {
+		t.Fatalf("body at limit: %v", err)
+	}
+	if len(body) != npmrcMaxRenderedBytes {
+		t.Fatalf("rendered length = %d, want %d", len(body), npmrcMaxRenderedBytes)
+	}
+	settings[key] = atLimit + "v"
+	if _, err := RenderNPMRCBlock(npmSettingsOnlyPolicy(t, settings), stdSerial); err == nil {
+		t.Fatal("body above limit was accepted")
+	}
+}
+
+func TestRewrite_SettingsOnlyRegistryIsAnOrdinarySetting(t *testing.T) {
+	initial := "registry=https://old.example/\nsave-exact=false\n"
+	w := &NPMRCWriter{}
+	applied, err := w.rewriteContent([]byte(initial), stdSettingsOnlyBody)
+	if err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	if string(applied) != initial+block(stdSettingsOnlyBody) {
+		t.Fatalf("settings-only rewrite = %q, want user lines untouched and block appended", applied)
+	}
+	if !blockIsLastEffective(strings.Split(string(applied), "\n"), stdSettingsOnlyBody) {
+		t.Fatal("appended settings-only block was not last-effective")
+	}
+	again, err := w.rewriteContent(applied, stdSettingsOnlyBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != string(applied) {
+		t.Fatalf("repeated rewrite changed bytes: %q", again)
+	}
+
+	overridden := append(append([]byte(nil), applied...), []byte("registry=https://later.example/\n")...)
+	if blockIsLastEffective(strings.Split(string(overridden), "\n"), stdSettingsOnlyBody) {
+		t.Fatal("later registry override must defeat convergence")
+	}
+	repaired, err := w.rewriteContent(overridden, stdSettingsOnlyBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(repaired), "\nregistry=https://later.example/\n") || strings.Contains(string(repaired), npmrcDMGPrefix) {
+		t.Fatalf("settings-only repair must keep the user registry line unprefixed: %q", repaired)
+	}
+	if !strings.HasSuffix(string(repaired), block(stdSettingsOnlyBody)) {
+		t.Fatal("repair did not move the managed block last")
+	}
+
+	if _, err := w.rewriteContent([]byte("registry[]=https://evil.example/\n"), stdSettingsOnlyBody); !errors.Is(err, ErrTargetUnusable) {
+		t.Fatalf("settings-only registry array error = %v, want target unusable", err)
+	}
+
+	cleared, err := w.clearContent(applied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(cleared) != initial {
+		t.Fatalf("clear = %q, want %q", cleared, initial)
+	}
+}
+
+func TestRewrite_StepSecurityToSettingsOnlyTransition(t *testing.T) {
+	initial := "registry=https://old.example/\n"
+	w := &NPMRCWriter{}
+	stepSecurity, err := w.rewriteContent([]byte(initial), stdSettingsBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(stepSecurity), npmrcDMGPrefix+"registry=https://old.example/\n") {
+		t.Fatalf("StepSecurity shape did not prefix the bare registry: %q", stepSecurity)
+	}
+
+	settingsOnly, err := w.rewriteContent(stepSecurity, stdSettingsOnlyBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(settingsOnly) != initial+block(stdSettingsOnlyBody) {
+		t.Fatalf("transition to settings-only = %q, want restored registry line then block", settingsOnly)
+	}
+
+	back, err := w.rewriteContent(settingsOnly, stdBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(back) != npmrcDMGPrefix+initial+block(stdBody) {
+		t.Fatalf("transition back to StepSecurity = %q, want re-prefixed registry then block", back)
+	}
+	restored, err := w.clearContent(back)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != initial {
+		t.Fatalf("clear after round trip = %q, want %q", restored, initial)
+	}
+}
+
+func TestProbeContent_SettingsOnlyBoundedMDMBlock(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		managed bool
+	}{
+		{name: "exact bounded block", content: boundedMDMBlock(stdSettingsOnlyBody), managed: true},
+		{name: "exact block after unrelated user config", content: "save-exact=false\n" + boundedMDMBlock(stdSettingsOnlyBody), managed: true},
+		{name: "fixed StepSecurity block", content: mdmBlock()},
+		{name: "wrong registry", content: boundedMDMBlock(strings.Replace(stdSettingsOnlyBody, "packages.example.com/npm/\n", "other.example/\n", 1))},
+		{name: "partial block", content: boundedMDMBlock(strings.Replace(stdSettingsOnlyBody, "\nsave-exact=true", "", 1))},
+		{name: "later registry override", content: boundedMDMBlock(stdSettingsOnlyBody) + "registry=https://later.example/\n"},
+		{name: "registry array", content: boundedMDMBlock(stdSettingsOnlyBody) + "registry[]=https://later.example/\n"},
+		{name: "duplicate bounded block", content: boundedMDMBlock(stdSettingsOnlyBody) + boundedMDMBlock(stdSettingsOnlyBody)},
+		{name: "section", content: "[team]\n" + boundedMDMBlock(stdSettingsOnlyBody)},
+		{name: "marker planted in dmg block", content: block(npmrcMDMBeginMarker + "\n" + stdSettingsOnlyBody + "\n" + npmrcMDMEndMarker)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			managed, _ := probeNPMRCContent(tc.content, stdSettingsOnlyBody)
+			if managed != tc.managed {
+				t.Fatalf("managed = %v, want %v", managed, tc.managed)
+			}
+		})
+	}
+	if managed, _ := probeNPMRCContent(boundedMDMBlock(stdSettingsOnlyBody), stdBody); managed {
+		t.Fatal("settings-only bounded block must not satisfy a StepSecurity-only policy")
+	}
+}
