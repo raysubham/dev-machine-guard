@@ -834,7 +834,7 @@ func runIDEExtensionEnforce(exec executor.Executor, log *progress.Logger) {
 	}
 }
 
-// runPackageConfigEnforce runs npm and PyPI independently after resolving their
+// runPackageConfigEnforce runs npm, PyPI, and Go independently after resolving their
 // shared enterprise and device identity once. Failures never crash main.
 func runPackageConfigEnforce(exec executor.Executor, log *progress.Logger) {
 	cfg, ok := ingest.Snapshot()
@@ -881,6 +881,15 @@ func runPackageConfigLanes(exec executor.Executor, log *progress.Logger, fetcher
 		log.Warn("%v", wrapped)
 		aiagentscli.AppendError("devicepolicy", "enforce_failed", wrapped.Error(), "")
 	}
+
+	goCtx, goCancel := context.WithTimeout(context.Background(), devicePolicyEnforceTimeout)
+	goErr := runGoPackageConfigLane(goCtx, exec, log, fetcher, reporter, customerID, serial, platform)
+	goCancel()
+	if goErr != nil {
+		wrapped := fmt.Errorf("go package-config enforce: %w", goErr)
+		log.Warn("%v", wrapped)
+		aiagentscli.AppendError("devicepolicy", "enforce_failed", wrapped.Error(), "")
+	}
 }
 
 func runNPMPackageConfigLane(ctx context.Context, exec executor.Executor, log *progress.Logger, fetcher devicepolicy.Fetcher, reporter devicepolicy.Reporter, customerID, serial, platform string) error {
@@ -920,6 +929,19 @@ func runNPMPackageConfigLane(ctx context.Context, exec executor.Executor, log *p
 
 func runPyPIPackageConfigLane(ctx context.Context, exec executor.Executor, log *progress.Logger, fetcher devicepolicy.Fetcher, reporter devicepolicy.Reporter, customerID, serial, platform string) error {
 	coordinator := &devicepolicy.PyPICoordinator{
+		Fetcher:    fetcher,
+		Reporter:   reporter,
+		Exec:       exec,
+		CustomerID: customerID,
+		DeviceID:   serial,
+		Platform:   platform,
+		Logf:       func(format string, args ...any) { log.Debug(format, args...) },
+	}
+	return coordinator.Reconcile(ctx)
+}
+
+func runGoPackageConfigLane(ctx context.Context, exec executor.Executor, log *progress.Logger, fetcher devicepolicy.Fetcher, reporter devicepolicy.Reporter, customerID, serial, platform string) error {
+	coordinator := &devicepolicy.GoCoordinator{
 		Fetcher:    fetcher,
 		Reporter:   reporter,
 		Exec:       exec,
