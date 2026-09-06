@@ -1495,6 +1495,43 @@ func TestAICLIAgents_TCCGuard(t *testing.T) {
 			want:  []aicliWant{{tool: "pi", binary: "/Users/u/Documents/bin/pi", version: "0.83.0"}},
 		})
 	})
+
+	t.Run("(t6) a corroborator derived beside an accepted candidate is guarded after it resolves", func(t *testing.T) {
+		t.Run("a .muse-version symlinked into ~/Downloads is rejected before it is read", func(t *testing.T) {
+			requireDarwinHost(t)
+			runAICLICase(t, aicliCase{
+				name:    "~/.local/bin/.muse-version -> ~/Downloads/.muse-version",
+				goos:    model.PlatformDarwin,
+				skipper: true,
+				setup: func(m *executor.Mock, home string) {
+					bin := joinPath(home, ".local", "bin")
+					addFile(m, joinPath(bin, "muse"), []byte("#!/usr/bin/env bash\n"))
+					sidecar := joinPath(bin, ".muse-version")
+					addFile(m, sidecar, []byte(museVersion+"\n"))
+					m.SetSymlink(sidecar, joinPath(home, "Downloads", ".muse-version"))
+					addBinary(m, joinPath(bin, "muse-bin-"+museVersion), 90<<20)
+				},
+				noReadPrefix: []string{"/Users/u/Downloads"},
+				wantDebug:    []string{"under a macOS TCC-protected path"},
+			})
+		})
+		t.Run("a hermes venv symlinked into ~/Documents is rejected before it is globbed", func(t *testing.T) {
+			requireDarwinHost(t)
+			runAICLICase(t, aicliCase{
+				name:    "~/.hermes/hermes-agent/venv -> ~/Documents/venv",
+				goos:    model.PlatformDarwin,
+				skipper: true,
+				setup: func(m *executor.Mock, home string) {
+					addFile(m, joinPath(home, ".local", "bin", "hermes"), []byte("#!/bin/bash\n"))
+					venv := joinPath(home, ".hermes", "hermes-agent", "venv")
+					m.SetDir(venv)
+					m.SetSymlink(venv, joinPath(home, "Documents", "venv"))
+				},
+				noReadPrefix: []string{"/Users/u/Documents"},
+				wantDebug:    []string{"under a macOS TCC-protected path"},
+			})
+		})
+	})
 }
 
 // tccDocumentsFixture is one Pi install under ~/Documents that satisfies rule 2
@@ -1995,6 +2032,26 @@ func TestAICLIAgents_Muse(t *testing.T) {
 			want:       []aicliWant{{tool: "muse-code", binary: "/home/u/.local/bin/muse", version: "unknown"}},
 		},
 		{
+			name: "(m3r) a single muse-bin-* sibling without a Muse release suffix proves nothing",
+			setup: func(m *executor.Mock, home string) {
+				bin := joinPath(home, ".local", "bin")
+				addFile(m, joinPath(bin, "muse"), []byte("#!/usr/bin/env bash\n"))
+				m.SetGlob(joinPath(bin, "muse-bin-*"), []string{joinPath(bin, "muse-bin-readme")})
+			},
+			allowGlobs: []string{"/home/u/.local/bin/muse-bin-*"},
+			wantDebug:  []string{"no Muse Code channel claims it"},
+		},
+		{
+			name: "(m3c) one release payload beside an unversioned sibling accepts with the payload version",
+			setup: func(m *executor.Mock, home string) {
+				bin := joinPath(home, ".local", "bin")
+				addFile(m, joinPath(bin, "muse"), []byte("#!/usr/bin/env bash\n"))
+				m.SetGlob(joinPath(bin, "muse-bin-*"), []string{joinPath(bin, "muse-bin-readme"), joinPath(bin, "muse-bin-"+museVersion)})
+			},
+			allowGlobs: []string{"/home/u/.local/bin/muse-bin-*"},
+			want:       []aicliWant{{tool: "muse-code", binary: "/home/u/.local/bin/muse", version: museVersion}},
+		},
+		{
 			name: "(m4) the homebrew cask accepts and its version comes from the Caskroom segment",
 			goos: model.PlatformDarwin,
 			setup: func(m *executor.Mock, _ string) {
@@ -2230,6 +2287,16 @@ func TestAICLIAgents_OMP(t *testing.T) {
 				addBinary(m, joinPath(real, "omp"), ompRealBytes)
 			},
 			want: []aicliWant{{tool: "oh-my-pi", binary: "/home/u/.local/share/mise/installs/github-can1357-oh-my-pi/18.1.10/omp", version: ompVersion}},
+		},
+		{
+			name: "(o4r) a non-version directory under the mise root is rejected",
+			setup: func(m *executor.Mock, home string) {
+				root := joinPath(home, ".local", "share", "mise", "installs", "github-can1357-oh-my-pi")
+				dev := joinPath(root, "dev")
+				m.SetGlob(joinPath(root, "*"), []string{dev})
+				addBinary(m, joinPath(dev, "omp"), ompRealBytes)
+			},
+			wantDebug: []string{"under the mise install root but not in a version directory"},
 		},
 		{
 			name: "(o5) the standalone ~/.local/bin/omp at or above the floor accepts with version unknown",

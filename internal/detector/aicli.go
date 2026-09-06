@@ -769,6 +769,21 @@ func (g candidateGuard) protected(path string) bool {
 	return g.skipper.WithinProtected(cleaned)
 }
 
+// resolveDerived follows a corroborator a ladder derives beside an accepted
+// candidate (a sidecar, a venv) through EvalSymlinks and applies the same TCC
+// guard resolveVerified applied to the candidate itself. It returns the
+// resolved path, and false when that target is protected.
+func resolveDerived(exec executor.Executor, homeDir string, skipper *tcc.Skipper, path string) (string, bool) {
+	resolved, err := exec.EvalSymlinks(path)
+	if err != nil || resolved == "" {
+		resolved = path
+	}
+	if newCandidateGuard(exec, homeDir, skipper).protected(resolved) {
+		return resolved, false
+	}
+	return resolved, true
+}
+
 // aiCLIBinaryCandidateDirs is pmBinaryCandidateDirs plus the directories a
 // global *agent* install can land in that a Node package-manager probe has no
 // reason to know about.
@@ -1774,9 +1789,14 @@ func resolveMuse(_ context.Context, exec executor.Executor, log *progress.Logger
 		// MUSE_INSTALL_DIR on PATH still resolves. The sidecar is read only
 		// under the size cap, and it accepts only when the muse-bin-<v> it
 		// names is actually there. Without a sidecar, a single muse-bin-*
-		// sibling still identifies the install.
+		// sibling carrying a Muse release version still identifies the
+		// install.
 		dir := pathDir(resolved)
-		sidecar := joinPath(dir, ".muse-version")
+		sidecar, ok := resolveDerived(exec, homeDir, skipper, joinPath(dir, ".muse-version"))
+		if !ok {
+			log.Debug("muse-code: rejecting %s — its .muse-version resolves to %s, under a macOS TCC-protected path", found, sidecar)
+			return "", false
+		}
 		if info, err := exec.Stat(sidecar); err == nil {
 			if info.Size() > museVersionMaxBytes {
 				log.Debug("muse-code: rejecting %s — %s is %d bytes, over the %d-byte cap", found, sidecar, info.Size(), museVersionMaxBytes)
@@ -1794,12 +1814,21 @@ func resolveMuse(_ context.Context, exec executor.Executor, log *progress.Logger
 			}
 			return v, true
 		}
-		if bins, err := exec.Glob(joinPath(dir, "muse-bin-*")); err == nil && len(bins) > 0 {
-			if len(bins) == 1 {
-				return versionFromFilename(pathBase(bins[0]), "muse-bin-"), true
+		if bins, err := exec.Glob(joinPath(dir, "muse-bin-*")); err == nil {
+			var versions []string
+			for _, b := range bins {
+				if v, _ := strings.CutPrefix(pathBase(b), "muse-bin-"); museVersionRE.MatchString(v) {
+					versions = append(versions, v)
+				}
 			}
-			log.Debug("muse-code: %d muse-bin-* siblings beside %s and no .muse-version; version unknown", len(bins), found)
-			return "", true
+			switch len(versions) {
+			case 0:
+			case 1:
+				return versions[0], true
+			default:
+				log.Debug("muse-code: %d muse-bin-* siblings beside %s and no .muse-version; version unknown", len(versions), found)
+				return "", true
+			}
 		}
 
 		// Rule 2 — homebrew/cask muse-code. No version here: getVersion
@@ -1841,7 +1870,11 @@ func resolveHermes(_ context.Context, exec executor.Executor, log *progress.Logg
 			if !underHomeDir(exec, homeDir, resolved, layout.launcher) {
 				continue
 			}
-			venv := expandTildePath(layout.venv, homeDir)
+			venv, ok := resolveDerived(exec, homeDir, skipper, expandTildePath(layout.venv, homeDir))
+			if !ok {
+				log.Debug("hermes-agent: rejecting %s — its venv resolves to %s, under a macOS TCC-protected path", found, venv)
+				return "", false
+			}
 			if exec.DirExists(venv) {
 				return distInfoVersion(exec, log, venv, "hermes_agent"), true
 			}
@@ -1906,7 +1939,11 @@ func resolveOMP(_ context.Context, exec executor.Executor, log *progress.Logger,
 		// candidate from aiCLIBinaryCandidateDirs through EvalSymlinks, so an
 		// alias dir (18, 18.1, latest) arrives as its real version dir.
 		if underHomeDir(exec, homeDir, resolved, ompMiseRoot) {
-			return miseVersionSegment(resolved), true
+			if v := miseVersionSegment(resolved); v != "" {
+				return v, true
+			}
+			log.Debug("oh-my-pi: rejecting %s — under the mise install root but not in a version directory (resolved %s)", found, resolved)
+			return "", false
 		}
 
 		// Rule 5 — standalone anchors with the floor; no version on disk.
