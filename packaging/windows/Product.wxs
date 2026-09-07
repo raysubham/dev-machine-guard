@@ -10,6 +10,11 @@
     -d LauncherPath=<path>    path to stepsecurity-dev-machine-guard-task.exe
                               (GUI-subsystem launcher Task Scheduler invokes
                               so the agent doesn't flash a console window)
+    -d LinuxBinaryPath=<path> path to the LINUX build of the agent, installed
+                              as dmg-linux so a Windows host can scan inside
+                              its WSL distributions. Must match the MSI's
+                              architecture: Windows on ARM runs an aarch64
+                              WSL2 kernel. Windows never executes it.
     -d Arch=<x64|arm64>       selects InstallScope + UpgradeCode
 
   Designed for SCCM/Intune deployment under environments where PowerShell

@@ -103,6 +103,12 @@ func (r *Real) StartDetached(name string, args ...string) error {
 	attrs := detachAttrs()
 	var err error
 	for _, attr := range attrs {
+		// #nosec G204 -- argv is passed to CreateProcess directly, with no
+		// shell interposed, so a value containing metacharacters becomes one
+		// argv element rather than another command. The only caller is the WSL
+		// scan phase, whose name is the literal "wsl.exe" and whose arguments
+		// come from the local Lxss registry and this agent's own install
+		// directory — writable only by the user the scan is already running as.
 		cmd := exec.Command(name, args...)
 		cmd.SysProcAttr = attr
 		if err = cmd.Start(); err != nil {
