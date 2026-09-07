@@ -14,15 +14,15 @@ import (
 )
 
 const (
-	dmgNetrcBegin = "#stepsecurity-pypi-credential-dmg-begin"
-	dmgNetrcEnd   = "#stepsecurity-pypi-credential-end"
+	dmgNetrcBegin = "#stepsecurity-secure-registry-credential-dmg-begin"
+	dmgNetrcEnd   = "#stepsecurity-secure-registry-credential-end"
 
-	mdmNetrcBegin = "#stepsecurity-pypi-credential-mdm-begin"
-	mdmNetrcEnd   = "#stepsecurity-pypi-credential-end"
+	mdmNetrcBegin = "#stepsecurity-secure-registry-credential-mdm-begin"
+	mdmNetrcEnd   = "#stepsecurity-secure-registry-credential-end"
 
-	dmgNetrcDisabledPrefix = "#stepsecurity-pypi-credential-dmg-disabled:"
-	mdmNetrcDisabledPrefix = "#stepsecurity-pypi-credential-mdm-disabled:"
-	mdmNetrcCreated        = "#stepsecurity-pypi-credential-mdm-created"
+	dmgNetrcDisabledPrefix = "#stepsecurity-secure-registry-credential-dmg-disabled:"
+	mdmNetrcDisabledPrefix = "#stepsecurity-secure-registry-credential-mdm-disabled:"
+	mdmNetrcCreated        = "#stepsecurity-secure-registry-credential-mdm-created"
 	netrcBackupPrefix      = ".dmg-"
 )
 
@@ -51,6 +51,18 @@ func NewNetrcWriter(home *secureuserfile.Home, policy PyPIPolicy) (*NetrcWriter,
 		!isValidHost(host) || !isNetrcCredential(token) {
 		return nil, errors.New("netrc: policy cannot render a safe credential entry")
 	}
+	return newNetrcWriter(home, host, token)
+}
+
+// newNetrcWriter builds the shared exact-host credential writer after the
+// ecosystem-specific policy parser has validated and derived its inputs.
+func newNetrcWriter(home *secureuserfile.Home, host, token string) (*NetrcWriter, error) {
+	if home == nil {
+		return nil, errors.New("netrc: nil secure user home")
+	}
+	if !isValidHost(host) || !isNetrcCredential(token) {
+		return nil, errors.New("netrc: cannot render a safe credential entry")
+	}
 	expected := renderNetrcEntry(host, token)
 
 	primary, err := home.Open(".netrc", netrcBackupPrefix, secureuserfile.MaxBytes)
@@ -66,18 +78,27 @@ func NewNetrcWriter(home *secureuserfile.Home, policy PyPIPolicy) (*NetrcWriter,
 	if err != nil {
 		return nil, err
 	}
-	_, primaryExists, _, err := primary.Read()
+	if _, _, _, err := primary.Read(); err != nil {
+		return nil, err
+	}
+	if _, _, _, err := alternate.Read(); err != nil {
+		return nil, err
+	}
+	w.alternate = alternate
+	return w, nil
+}
+
+func newGoNetrcWriter(home *secureuserfile.Home, host, token string) (*NetrcWriter, error) {
+	w, err := newNetrcWriter(home, host, token)
+	if err != nil || home.GOOS() != model.PlatformWindows {
+		return w, err
+	}
+	_, underscoreExists, _, err := w.alternate.Read()
 	if err != nil {
 		return nil, err
 	}
-	_, alternateExists, _, err := alternate.Read()
-	if err != nil {
-		return nil, err
-	}
-	if !primaryExists && alternateExists {
-		w.file, w.alternate = alternate, primary
-	} else {
-		w.alternate = alternate
+	if underscoreExists {
+		w.file, w.alternate = w.alternate, w.file
 	}
 	return w, nil
 }
@@ -192,17 +213,16 @@ func (w *NetrcWriter) Clear() (bool, error) {
 			if err != nil || len(exactHostEntries(entries, w.host)) != 1 {
 				return false, fmt.Errorf("netrc: managed credential host conflicts with ownership state: %w", ErrTargetUnusable)
 			}
-			if owned >= 0 {
-				return false, fmt.Errorf("netrc: multiple managed credential files: %w", ErrTargetUnusable)
+			if owned < 0 || file == w.file {
+				owned = len(candidates) - 1
 			}
-			owned = len(candidates) - 1
 		} else if analysis.markers.mdm || len(exactHostEntries(analysis.entries, w.host)) != 0 {
 			conflict = true
 		}
 	}
 	if owned >= 0 {
 		for i, candidate := range candidates {
-			if i != owned && (candidate.analysis.markers.dmg != nil || candidate.analysis.markers.mdm || len(exactHostEntries(candidate.analysis.entries, w.host)) != 0) {
+			if i != owned && (candidate.analysis.markers.mdm || candidate.analysis.markers.dmg == nil && len(exactHostEntries(candidate.analysis.entries, w.host)) != 0) {
 				return false, fmt.Errorf("netrc: alternate credential file conflicts with managed file: %w", ErrTargetUnusable)
 			}
 		}
@@ -265,17 +285,18 @@ func discoverDMGNetrcHost(home *secureuserfile.Home) (string, error) {
 		if markers.dmg == nil {
 			continue
 		}
-		if host != "" {
-			return "", fmt.Errorf("netrc: multiple managed credential files: %w", ErrTargetUnusable)
-		}
 		entries, err := parseNetrc([]byte(markers.dmg.body))
 		if err != nil || len(entries) != 1 || entries[0].isDefault || !isValidHost(entries[0].host) {
 			return "", fmt.Errorf("netrc: cannot derive a trusted managed host: %w", ErrTargetUnusable)
 		}
-		host = entries[0].host
-		if _, err := analyzeNetrc(data, host); err != nil {
+		managedHost := entries[0].host
+		if host != "" && (home.GOOS() != model.PlatformWindows || host != managedHost) {
+			return "", fmt.Errorf("netrc: conflicting managed credential files: %w", ErrTargetUnusable)
+		}
+		if _, err := analyzeNetrc(data, managedHost); err != nil {
 			return "", err
 		}
+		host = managedHost
 	}
 	if host == "" {
 		return "", fmt.Errorf("netrc: no trusted managed host: %w", ErrTargetUnusable)
@@ -301,6 +322,34 @@ func hasManagedNetrcMarker(home *secureuserfile.Home) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func hasSingleManagedNetrc(home *secureuserfile.Home) (bool, error) {
+	if home == nil {
+		return false, errors.New("netrc: nil secure user home")
+	}
+	count := 0
+	for _, name := range []string{".netrc", "_netrc"} {
+		file, err := home.Open(name, netrcBackupPrefix, secureuserfile.MaxBytes)
+		if err != nil {
+			return false, err
+		}
+		data, existed, _, err := file.Read()
+		if err != nil {
+			return false, err
+		}
+		if !existed {
+			continue
+		}
+		markers, err := scanNetrcMarkers(data)
+		if err != nil {
+			return false, err
+		}
+		if markers.dmg != nil {
+			count++
+		}
+	}
+	return count == 1, nil
 }
 
 func (w *NetrcWriter) RestoreSnapshot() error { return w.file.RestoreSnapshot() }
@@ -383,26 +432,11 @@ func (w *NetrcWriter) MDMOwned() (bool, error) {
 }
 
 func (w *NetrcWriter) HasMDMMarker() (bool, error) {
-	for _, file := range []*secureuserfile.File{w.file, w.alternate} {
-		if file == nil {
-			continue
-		}
-		data, existed, _, err := file.Read()
-		if err != nil {
-			return false, err
-		}
-		if !existed {
-			continue
-		}
-		analysis, err := analyzeNetrc(data, w.host)
-		if err != nil {
-			return false, err
-		}
-		if analysis.markers.mdm {
-			return true, nil
-		}
+	analysis, err := w.readSelected()
+	if err != nil || !analysis.existed {
+		return false, err
 	}
-	return false, nil
+	return analysis.markers.mdm, nil
 }
 
 // ValidateEffectivePath fails closed when NETRC redirects credential lookup
@@ -416,11 +450,7 @@ func (w *NetrcWriter) ValidateEffectivePath() error {
 		return nil
 	}
 	if !filepath.IsAbs(override) {
-		absolute, err := filepath.Abs(override)
-		if err != nil {
-			return fmt.Errorf("netrc: resolve NETRC override: %w", ErrTargetUnusable)
-		}
-		override = absolute
+		return fmt.Errorf("netrc: NETRC override must be absolute: %w", ErrTargetUnusable)
 	}
 	override, managed := filepath.Clean(override), filepath.Clean(w.Location())
 	if override != managed && (w.goos != model.PlatformWindows || !strings.EqualFold(override, managed)) {
@@ -441,7 +471,18 @@ func (w *NetrcWriter) checkAlternateConflict() error {
 	if err != nil {
 		return err
 	}
-	if analysis.markers.dmg != nil || analysis.markers.mdm || len(exactHostEntries(analysis.entries, w.host)) != 0 {
+	exact := exactHostEntries(analysis.entries, w.host)
+	managedBlock := analysis.markers.dmg
+	if managedBlock == nil {
+		managedBlock = analysis.markers.mdmBlock
+	}
+	if managedBlock != nil {
+		managed, err := parseNetrc([]byte(managedBlock.body))
+		if err == nil && len(exactHostEntries(managed, w.host)) == 1 && len(exact) == 1 {
+			return nil
+		}
+	}
+	if analysis.markers.dmg != nil || analysis.markers.mdm || len(exact) != 0 {
 		return fmt.Errorf("netrc: alternate credential file conflicts with selected file: %w", ErrTargetUnusable)
 	}
 	return nil

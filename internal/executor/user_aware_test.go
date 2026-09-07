@@ -137,10 +137,11 @@ func TestUserAwareExecutor_GetenvUsesAllowlistedUserSnapshot(t *testing.T) {
 	inner := &userContextExecutor{
 		Executor: service,
 		runAsUser: func(_ context.Context, _, command string) (string, error) {
-			if !strings.Contains(command, "XDG_CONFIG_HOME") || !strings.Contains(command, "UV_INDEX_URL") {
+			if !strings.Contains(command, "XDG_CONFIG_HOME") || !strings.Contains(command, "UV_INDEX_URL") ||
+				!strings.Contains(command, "GOPROXY") || !strings.Contains(command, "GOENV") || !strings.Contains(command, "GOAUTH") {
 				t.Fatalf("environment snapshot command = %q", command)
 			}
-			return "XDG_CONFIG_HOME=/home/alice/.xdg\x00PIP_EXTRA_INDEX_URL=https://pip-extra.example/simple\x00UV_INDEX_URL=https://user.example/simple\x00UV_NO_INDEX=true\x00", nil
+			return "XDG_CONFIG_HOME=/home/alice/.xdg\x00PIP_EXTRA_INDEX_URL=https://pip-extra.example/simple\x00UV_INDEX_URL=https://user.example/simple\x00UV_NO_INDEX=true\x00GOPROXY=https://proxy.example/go\x00GOENV=off\x00GOAUTH=netrc\x00", nil
 		},
 	}
 	exec := NewUserAwareExecutor(inner, "alice")
@@ -155,6 +156,15 @@ func TestUserAwareExecutor_GetenvUsesAllowlistedUserSnapshot(t *testing.T) {
 	}
 	if got := exec.Getenv("UV_NO_INDEX"); got != "true" {
 		t.Fatalf("UV_NO_INDEX = %q, want resolved user value", got)
+	}
+	if got := exec.Getenv("GOPROXY"); got != "https://proxy.example/go" {
+		t.Fatalf("GOPROXY = %q, want resolved user value", got)
+	}
+	if got := exec.Getenv("GOENV"); got != "off" {
+		t.Fatalf("GOENV = %q, want resolved user value", got)
+	}
+	if got := exec.Getenv("GOAUTH"); got != "netrc" {
+		t.Fatalf("GOAUTH = %q, want resolved user value", got)
 	}
 }
 

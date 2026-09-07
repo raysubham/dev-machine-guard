@@ -27,13 +27,13 @@ func TestNetrcMarkers_Canonical(t *testing.T) {
 		got  string
 		want string
 	}{
-		{"DMG begin", dmgNetrcBegin, "#stepsecurity-pypi-credential-dmg-begin"},
-		{"DMG end", dmgNetrcEnd, "#stepsecurity-pypi-credential-end"},
-		{"MDM begin", mdmNetrcBegin, "#stepsecurity-pypi-credential-mdm-begin"},
-		{"MDM end", mdmNetrcEnd, "#stepsecurity-pypi-credential-end"},
-		{"DMG disabled prefix", dmgNetrcDisabledPrefix, "#stepsecurity-pypi-credential-dmg-disabled:"},
-		{"MDM disabled prefix", mdmNetrcDisabledPrefix, "#stepsecurity-pypi-credential-mdm-disabled:"},
-		{"MDM created", mdmNetrcCreated, "#stepsecurity-pypi-credential-mdm-created"},
+		{"DMG begin", dmgNetrcBegin, "#stepsecurity-secure-registry-credential-dmg-begin"},
+		{"DMG end", dmgNetrcEnd, "#stepsecurity-secure-registry-credential-end"},
+		{"MDM begin", mdmNetrcBegin, "#stepsecurity-secure-registry-credential-mdm-begin"},
+		{"MDM end", mdmNetrcEnd, "#stepsecurity-secure-registry-credential-end"},
+		{"DMG disabled prefix", dmgNetrcDisabledPrefix, "#stepsecurity-secure-registry-credential-dmg-disabled:"},
+		{"MDM disabled prefix", mdmNetrcDisabledPrefix, "#stepsecurity-secure-registry-credential-mdm-disabled:"},
+		{"MDM created", mdmNetrcCreated, "#stepsecurity-secure-registry-credential-mdm-created"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -82,7 +82,7 @@ func TestNetrcWriter_CredentialOwnershipLinesAreSingleTokens(t *testing.T) {
 				t.Fatalf("credential ownership lines = %q, want %d", ownershipLines, tc.wantLines)
 			}
 			for _, line := range ownershipLines {
-				if !strings.HasPrefix(line, "#stepsecurity-pypi-credential") || strings.ContainsAny(line, " \t\r") {
+				if !strings.HasPrefix(line, "#stepsecurity-secure-registry-credential") || strings.ContainsAny(line, " \t\r") {
 					t.Errorf("credential ownership line %q is not one whitespace-free token", line)
 				}
 			}
@@ -535,19 +535,20 @@ func TestNetrcWriter_NETRCOverrideRefusesWriteWithoutMutation(t *testing.T) {
 	}
 }
 
-func TestNetrcWriter_NETRCRelativeDefaultPathIsEquivalent(t *testing.T) {
+func TestNetrcWriter_NETRCRelativeOverrideIsUnusable(t *testing.T) {
 	w, _ := newNetrcTestWriter(t, nil)
 	t.Chdir(filepath.Dir(w.Location()))
 	t.Setenv("NETRC", filepath.Base(w.Location()))
-	if err := w.ValidateEffectivePath(); err != nil {
-		t.Fatalf("ValidateEffectivePath: %v", err)
+	if err := w.ValidateEffectivePath(); !errors.Is(err, ErrTargetUnusable) {
+		t.Fatalf("ValidateEffectivePath error = %v, want target unusable", err)
 	}
 }
 
-func TestNetrcWriter_UsesResolvedPlatformForWindowsAlternate(t *testing.T) {
+func TestNetrcWriter_UsesResolvedPlatformForWindowsAlternateValidation(t *testing.T) {
 	homeDir := t.TempDir()
+	dot := filepath.Join(homeDir, ".netrc")
 	underscore := filepath.Join(homeDir, "_netrc")
-	if err := os.WriteFile(underscore, []byte("machine other.example login u password p\n"), 0o600); err != nil {
+	if err := os.WriteFile(underscore, []byte("machine registry.stepsecurity.io login stale password old-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	u, err := user.Current()
@@ -567,8 +568,11 @@ func TestNetrcWriter_UsesResolvedPlatformForWindowsAlternate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if w.Location() != underscore {
-		t.Fatalf("Location = %q, want Windows alternate %q", w.Location(), underscore)
+	if w.Location() != dot {
+		t.Fatalf("Location = %q, want %q", w.Location(), dot)
+	}
+	if _, err := w.Write(netrcExpected); !errors.Is(err, ErrTargetUnusable) {
+		t.Fatalf("Write error = %v, want alternate conflict", err)
 	}
 }
 

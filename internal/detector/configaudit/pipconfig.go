@@ -315,6 +315,12 @@ func pipAllowedUserPaths(exec executor.Executor, home string) []string {
 	return out
 }
 
+// TrustedPipUserPaths returns the static home-confined pip user paths without
+// locating or executing a package manager.
+func TrustedPipUserPaths(exec executor.Executor, home string) []string {
+	return pipAllowedUserPaths(exec, home)
+}
+
 type pipUserConfigPath struct {
 	path  string
 	layer string

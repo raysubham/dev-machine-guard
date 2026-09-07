@@ -30,6 +30,9 @@ type UserAwareExecutor struct {
 
 var userEnvironmentKeys = []string{
 	"APPDATA",
+	"GOAUTH",
+	"GOENV",
+	"GOPROXY",
 	"NETRC",
 	"PIP_CONFIG_FILE",
 	"PIP_EXTRA_INDEX_URL",
