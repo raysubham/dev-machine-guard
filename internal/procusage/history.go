@@ -11,9 +11,11 @@ import (
 	"time"
 )
 
-// maxHistoryRecords caps run-metrics.jsonl. At roughly 300 bytes a
-// record that holds the file well under 100KB while still covering
-// weeks of scheduled runs.
+// maxHistoryRecords caps run-metrics.jsonl. An enterprise record with
+// its full phase list measures ~1.3KB, so the file tops out near 250KB
+// and stays there — the trim runs on every append, not on a schedule.
+// At a 4h cadence that is over a month of history.
+// TestHistoryDiskFootprintAtCap pins the ceiling.
 const maxHistoryRecords = 200
 
 // Phase is one analysis phase's cost. Declared here rather than reusing

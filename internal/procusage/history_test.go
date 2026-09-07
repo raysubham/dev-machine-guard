@@ -154,3 +154,95 @@ func TestAppendHistoryUnwritablePathErrors(t *testing.T) {
 		t.Error("AppendHistory into a non-directory = nil, want error")
 	}
 }
+
+// enterpriseRecord mirrors the largest shape a real run produces: the
+// 14 phases an enterprise telemetry run tracks, every usage field
+// populated. Community records are ~3x smaller.
+func enterpriseRecord(id string) Record {
+	names := []string{
+		"scheduler_info", "device_info", "ide_scan", "extension_scan",
+		"ai_tools_scan", "mcp_config_scan", "malicious_file_scan", "brew_scan",
+		"python_scan", "syspkg_scan", "node_scan", "agent_skills_scan",
+		"credentials_scan", "browser_extensions_scan",
+	}
+	phases := make([]Phase, 0, len(names))
+	for i, n := range names {
+		phases = append(phases, Phase{Name: n, DurationMs: int64(1000 + i), CPUMs: int64(900 + i)})
+	}
+	return Record{
+		Timestamp:        time.Unix(1_700_000_000, 0).UTC(),
+		AgentVersion:     "1.16.0",
+		Command:          "send-telemetry",
+		InvocationMethod: "install",
+		OS:               "linux",
+		ExecutionID:      id,
+		Usage: Sample{
+			WallMs: 54063, CPUUserMs: 40399, CPUSysMs: 6912,
+			CPUChildUserMs: 16912, CPUChildSysMs: 3120,
+			PeakRSSBytes: 61 << 20, MaxChildRSSBytes: 107 << 20,
+			GoHeapBytes: 22 << 20, GoSysBytes: 64 << 20,
+			Goroutines: 8, NumGC: 855, LogicalCores: 12,
+			ChildrenAttributed: true,
+		},
+		Phases: phases,
+	}
+}
+
+// TestHistoryDiskFootprintAtCap bounds what this file can cost on disk.
+// The cap is a record count, so the only thing standing between it and
+// unbounded growth is per-record size — worth pinning, since adding
+// phases or usage fields silently inflates every record.
+func TestHistoryDiskFootprintAtCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "run-metrics.jsonl")
+
+	for i := range maxHistoryRecords + 50 {
+		if err := AppendHistory(path, enterpriseRecord(fmt.Sprintf("run-%04d", i))); err != nil {
+			t.Fatalf("AppendHistory(%d) = %v", i, err)
+		}
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	const maxBytes = 512 * 1024
+	if info.Size() > maxBytes {
+		t.Errorf("history at cap = %d bytes, want <= %d — per-record size grew, revisit maxHistoryRecords",
+			info.Size(), maxBytes)
+	}
+	t.Logf("at cap: %d records, %d bytes (%.1f KB), %d bytes/record",
+		maxHistoryRecords, info.Size(), float64(info.Size())/1024, info.Size()/int64(maxHistoryRecords))
+
+	// The trim must actually be enforcing the cap, or the bound above
+	// would be measuring the wrong thing.
+	got, err := LoadHistory(path)
+	if err != nil {
+		t.Fatalf("LoadHistory: %v", err)
+	}
+	if len(got) != maxHistoryRecords {
+		t.Errorf("records = %d, want %d", len(got), maxHistoryRecords)
+	}
+}
+
+// TestAppendHistoryLeavesNoTempFiles guards the temp-and-rename write:
+// a leaked temp per run would grow the directory without bound.
+func TestAppendHistoryLeavesNoTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "run-metrics.jsonl")
+	for i := range 5 {
+		if err := AppendHistory(path, testRecord(fmt.Sprintf("r%d", i))); err != nil {
+			t.Fatalf("AppendHistory: %v", err)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 1 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("directory holds %v, want only run-metrics.jsonl", names)
+	}
+}
