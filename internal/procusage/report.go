@@ -13,7 +13,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/progress"
 )
 
-// topPhasesLogged caps how many phases the debug line names, so a run
+// topPhasesLogged caps how many phases the logged line names, so a run
 // with 20 phases still emits one readable line.
 const topPhasesLogged = 5
 
@@ -69,8 +69,8 @@ func Report(log *progress.Logger, wall time.Duration, meta Meta, phases []Phase)
 	}
 }
 
-// formatPhaseCPU names the costliest phases, so the debug line points at
-// what to optimise rather than only what the run totalled.
+// formatPhaseCPU names the costliest phases, so the logged line points
+// at what to optimise rather than only what the run totalled.
 func formatPhaseCPU(phases []Phase) string {
 	ranked := slices.Clone(phases)
 	slices.SortStableFunc(ranked, func(a, b Phase) int { return cmp.Compare(b.CPUMs, a.CPUMs) })

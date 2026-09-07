@@ -67,8 +67,9 @@ var readUsageFn = readUsage
 func Capture(wall time.Duration) Sample {
 	ru := readUsageFn()
 
-	// ReadMemStats stops the world briefly. Fine once per run and once
-	// per phase boundary; never call it in a loop.
+	// ReadMemStats stops the world (~65us measured). Tolerable because
+	// Capture runs once per run; phase boundaries call CPUMillis, which
+	// deliberately skips this.
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 
@@ -133,7 +134,7 @@ func (s Sample) CPUPercent() float64 {
 	return float64(s.TotalCPUMs()) / (float64(s.WallMs) * float64(s.LogicalCores)) * 100
 }
 
-// String renders the one-line debug summary.
+// String renders the one-line summary logged at info.
 func (s Sample) String() string {
 	children := fmt.Sprintf("children %s", ms(s.ChildCPUMs()))
 	if !s.ChildrenAttributed {
