@@ -33,13 +33,18 @@ type Meta struct {
 // Both dispatch paths (community scan and enterprise telemetry) call
 // this so the two produce comparable records.
 //
+// Emitted at info, not debug: the enterprise ExecutionLogs payload
+// carries whatever the run wrote to stderr at the configured level, and
+// installs run at log_level=info, so a debug line would be absent from
+// every log we can actually download.
+//
 // Wholly best-effort — a failure here is logged at debug and never
 // affects the run's outcome.
 func Report(log *progress.Logger, wall time.Duration, meta Meta, phases []Phase) {
 	sample := Capture(wall)
-	log.Debug("resource usage: %s", sample)
+	log.Progress("resource usage: %s", sample)
 	if len(phases) > 0 {
-		log.Debug("phase cpu: %s", formatPhaseCPU(phases))
+		log.Progress("phase cpu: %s", formatPhaseCPU(phases))
 	}
 
 	command := meta.Command

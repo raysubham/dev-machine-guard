@@ -199,11 +199,20 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		fmt.Fprintf(os.Stderr, "[warn] failed to generate execution id, using fallback: %v\n", idErr)
 	}
 
-	// Resource accounting for the run. Registered here so it runs on every
-	// exit path, including errors and the deadline trip — a run that blew
-	// its budget is exactly the one worth measuring. Registered early means
-	// it runs late (defers are LIFO), so the reading covers scan and upload.
-	defer func() {
+	// Resource accounting for the run. Runs exactly once: normally at the
+	// call site just before the execution-log snapshot, so the line lands
+	// inside the ExecutionLogs payload we can download; the defer is the
+	// fallback for runs that error out or trip the deadline before
+	// reaching that point.
+	//
+	// It cannot be deferred alone. capture.Finalize() is deferred later in
+	// this function, so LIFO makes it run FIRST — a deferred report would
+	// write to already-restored stderr and never reach the payload.
+	var usageReported atomic.Bool
+	reportUsageOnce := func() {
+		if !usageReported.CompareAndSwap(false, true) {
+			return
+		}
 		snapshot := tracker.Snapshot()
 		phases := make([]procusage.Phase, 0, len(snapshot.PhasesCompleted))
 		for _, p := range snapshot.PhasesCompleted {
@@ -216,7 +225,8 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 			InvocationMethod: invocationMethod,
 			ExecutionID:      executionID,
 		}, phases)
-	}()
+	}
+	defer reportUsageOnce()
 
 	// deviceID is populated once device.Gather completes; the closure below
 	// captures it by reference so the deferred failure report uses whatever is
@@ -1114,6 +1124,11 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	// otherwise outruns the async capture tee and truncates this log. The upload
 	// path re-snapshots after the upload-intent lines (see uploadToS3); this drain
 	// also covers the --telemetry-out dev dump below, which skips that re-snapshot.
+	// Emit the resource-usage line before the snapshot so it ships inside
+	// ExecutionLogs. This measures scan and audit work but not the upload
+	// that follows — a payload cannot contain the log of its own upload.
+	reportUsageOnce()
+
 	capture.Sync()
 	execLogsBase64 := capture.SnapshotBase64()
 	endTime := time.Now()
