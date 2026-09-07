@@ -31,6 +31,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/lock"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/paths"
+	"github.com/step-security/dev-machine-guard/internal/procusage"
 	"github.com/step-security/dev-machine-guard/internal/progress"
 	"github.com/step-security/dev-machine-guard/internal/rungate"
 	"github.com/step-security/dev-machine-guard/internal/schedinfo"
@@ -197,6 +198,25 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		executionID = fmt.Sprintf("nouuid-%d", time.Now().UnixNano())
 		fmt.Fprintf(os.Stderr, "[warn] failed to generate execution id, using fallback: %v\n", idErr)
 	}
+
+	// Resource accounting for the run. Registered here so it runs on every
+	// exit path, including errors and the deadline trip — a run that blew
+	// its budget is exactly the one worth measuring. Registered early means
+	// it runs late (defers are LIFO), so the reading covers scan and upload.
+	defer func() {
+		snapshot := tracker.Snapshot()
+		phases := make([]procusage.Phase, 0, len(snapshot.PhasesCompleted))
+		for _, p := range snapshot.PhasesCompleted {
+			phases = append(phases, procusage.Phase{
+				Name: p.Name, DurationMs: p.DurationMs, CPUMs: p.CPUMs,
+			})
+		}
+		procusage.Report(log, time.Since(startTime), procusage.Meta{
+			Command:          cfg.Command,
+			InvocationMethod: invocationMethod,
+			ExecutionID:      executionID,
+		}, phases)
+	}()
 
 	// deviceID is populated once device.Gather completes; the closure below
 	// captures it by reference so the deferred failure report uses whatever is
