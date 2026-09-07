@@ -40,6 +40,11 @@ type Sample struct {
 	Goroutines  int    `json:"goroutines"`
 	NumGC       uint32 `json:"num_gc"`
 
+	// LogicalCores is what CPU time has to be divided by to mean
+	// anything. Recorded per sample because the history is compared
+	// across machines with different core counts.
+	LogicalCores int `json:"logical_cores,omitempty"`
+
 	// Deliberately not omitempty: false is the meaningful value.
 	ChildrenAttributed bool `json:"children_attributed"`
 }
@@ -79,6 +84,7 @@ func Capture(wall time.Duration) Sample {
 		GoSysBytes:         ms.Sys,
 		Goroutines:         runtime.NumGoroutine(),
 		NumGC:              ms.NumGC,
+		LogicalCores:       runtime.NumCPU(),
 		ChildrenAttributed: ru.childrenAttributed,
 	}
 }
@@ -102,14 +108,29 @@ func (s Sample) ChildCPUMs() int64 { return s.CPUChildUserMs + s.CPUChildSysMs }
 // TotalCPUMs is all CPU this run is known to have consumed.
 func (s Sample) TotalCPUMs() int64 { return s.SelfCPUMs() + s.ChildCPUMs() }
 
-// CPUPercent is total CPU over wall time. Exceeds 100 when work ran on
-// several cores at once, so it reads as "cores busy x100", not a
-// saturation figure. Zero when wall time is unknown.
-func (s Sample) CPUPercent() float64 {
+// CoresBusy is total CPU over wall time: the average number of cores the
+// run kept busy. 1.0 means one core saturated for the whole run; above
+// 1.0 means genuine parallelism. Zero when wall time is unknown.
+//
+// Not expressed as a percentage on purpose — "96% of wall" reads as
+// "used 96% of the CPU" when it actually meant 0.96 of one core, which
+// on a 12-core box is 8% of the machine. Use CPUPercent for that.
+func (s Sample) CoresBusy() float64 {
 	if s.WallMs <= 0 {
 		return 0
 	}
-	return float64(s.TotalCPUMs()) / float64(s.WallMs) * 100
+	return float64(s.TotalCPUMs()) / float64(s.WallMs)
+}
+
+// CPUPercent is the share of the whole machine's CPU capacity the run
+// consumed: CPU time over (wall time x cores). This is the "how much of
+// the box did we eat" number, and it cannot exceed 100. Zero when wall
+// time or the core count is unknown.
+func (s Sample) CPUPercent() float64 {
+	if s.WallMs <= 0 || s.LogicalCores <= 0 {
+		return 0
+	}
+	return float64(s.TotalCPUMs()) / (float64(s.WallMs) * float64(s.LogicalCores)) * 100
 }
 
 // String renders the one-line debug summary.
@@ -118,9 +139,9 @@ func (s Sample) String() string {
 	if !s.ChildrenAttributed {
 		children = "children not attributed on this platform"
 	}
-	out := fmt.Sprintf("wall=%s cpu=%s (self %s + %s, %.0f%% of wall) peak_rss=%s",
+	out := fmt.Sprintf("wall=%s cpu=%s (self %s + %s) cpu_pct=%.1f%% of %d cores (%.2f cores busy) peak_rss=%s",
 		ms(s.WallMs), ms(s.TotalCPUMs()), ms(s.SelfCPUMs()), children,
-		s.CPUPercent(), mib(s.PeakRSSBytes))
+		s.CPUPercent(), s.LogicalCores, s.CoresBusy(), mib(s.PeakRSSBytes))
 	if s.MaxChildRSSBytes > 0 {
 		out += fmt.Sprintf(" max_child_rss=%s", mib(s.MaxChildRSSBytes))
 	}
