@@ -9,6 +9,7 @@ import (
 
 	"github.com/tailscale/hujson"
 
+	"github.com/step-security/dev-machine-guard/internal/aiagents/redact"
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/tcc"
@@ -288,7 +289,12 @@ func filterProjectScopedMCPServers(projectsRaw json.RawMessage) map[string]any {
 	return filtered
 }
 
-// filterServerFields keeps only command, args, serverUrl, url from each server entry.
+// filterServerFields keeps only command, args, serverUrl, url from each server
+// entry. env and headers are dropped outright since those are the fields
+// vendors document for credentials. But command/args/url/serverUrl are
+// real-world credential locations too (a bearer token or API key in a query
+// string, an --api-key flag baked into args), so the kept values still pass
+// through redact.Value before being uploaded.
 func filterServerFields(serversRaw json.RawMessage) map[string]any {
 	var servers map[string]map[string]any
 	if err := json.Unmarshal(serversRaw, &servers); err != nil {
@@ -302,7 +308,7 @@ func filterServerFields(serversRaw json.RawMessage) map[string]any {
 		filtered := make(map[string]any)
 		for k, v := range serverConfig {
 			if allowedKeys[k] {
-				filtered[k] = v
+				filtered[k] = redact.Value(v)
 			}
 		}
 		result[name] = filtered

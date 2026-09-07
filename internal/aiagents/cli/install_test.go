@@ -20,6 +20,7 @@ import (
 // in parallel — config vars are package-level state.
 func withEnterpriseConfig(t *testing.T) {
 	t.Helper()
+	clearEnterpriseConfigOverrides(t)
 	prevCID, prevEP, prevAK := config.CustomerID, config.APIEndpoint, config.APIKey
 	config.CustomerID = "cust-test"
 	config.APIEndpoint = "https://api.example.com"
@@ -29,6 +30,13 @@ func withEnterpriseConfig(t *testing.T) {
 		config.APIEndpoint = prevEP
 		config.APIKey = prevAK
 	})
+}
+
+func clearEnterpriseConfigOverrides(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{"DMG_CUSTOMER_ID", "DMG_API_ENDPOINT", "DMG_API_KEY"} {
+		t.Setenv(name, "")
+	}
 }
 
 // withResolveBinary overrides the install-time selfpath resolver with a
@@ -60,6 +68,7 @@ func newInstallMock(t *testing.T, home string) *executor.Mock {
 }
 
 func TestRunInstall_NoEnterpriseConfig_Exit1(t *testing.T) {
+	clearEnterpriseConfigOverrides(t)
 	logPath := withErrorLog(t)
 	// Leave config vars as their default placeholders ({{...}}) — no
 	// withEnterpriseConfig call. ingest.Snapshot returns ok=false on
@@ -84,6 +93,7 @@ func TestRunInstall_NoEnterpriseConfig_Exit1(t *testing.T) {
 }
 
 func TestRunInstall_PlaceholderConfig_Exit1(t *testing.T) {
+	clearEnterpriseConfigOverrides(t)
 	withErrorLog(t)
 	// Explicitly stage a placeholder in one field — the stricter gate
 	// must reject build-time placeholders even when the other two

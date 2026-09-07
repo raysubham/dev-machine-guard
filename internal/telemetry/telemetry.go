@@ -21,6 +21,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/cli"
 	"github.com/step-security/dev-machine-guard/internal/config"
 	"github.com/step-security/dev-machine-guard/internal/detector"
+	"github.com/step-security/dev-machine-guard/internal/detector/browserext"
 	"github.com/step-security/dev-machine-guard/internal/detector/configaudit"
 	"github.com/step-security/dev-machine-guard/internal/detector/credentials"
 	"github.com/step-security/dev-machine-guard/internal/detector/rules"
@@ -35,6 +36,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/schedinfo"
 	"github.com/step-security/dev-machine-guard/internal/state"
 	"github.com/step-security/dev-machine-guard/internal/tcc"
+	"github.com/step-security/dev-machine-guard/internal/wslguest"
 )
 
 // s3UploadBackoffUnit is multiplied by attempt-number to compute the
@@ -60,6 +62,8 @@ type Payload struct {
 	Platform             string                 `json:"platform"`
 	OSVersion            string                 `json:"os_version"`
 	Resources            model.MachineResources `json:"resources"`
+	WSL                  *model.WSLInfo         `json:"wsl,omitempty"`
+	WSLGuest             *model.WSLGuest        `json:"wsl_guest,omitempty"`
 	AgentVersion         string                 `json:"agent_version"`
 	CollectedAt          int64                  `json:"collected_at"`
 	NoUserLoggedIn       bool                   `json:"no_user_logged_in"`
@@ -108,6 +112,10 @@ type Payload struct {
 	AgentSkills             []model.AgentSkill              `json:"agent_skills,omitempty"`
 	AgentSkillScan          *model.AgentSkillScanInfo       `json:"agent_skill_scan,omitempty"`
 	CredentialScan          *model.CredentialScanInfo       `json:"credential_scan,omitempty"`
+	// Nil means the phase did not run, and that is the only signal a reader has
+	// for it: a section carrying zero findings is the positive claim that this
+	// machine's browsers hold no extensions.
+	BrowserExtensionScan *model.BrowserExtensionScanInfo `json:"browser_extension_scan,omitempty"`
 
 	ExecutionLogs      *ExecutionLogs      `json:"execution_logs,omitempty"`
 	PerformanceMetrics *PerformanceMetrics `json:"performance_metrics,omitempty"`
@@ -424,6 +432,11 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	phaseCtx, phaseCancel := startPhase(ctx, tracker, "device_info")
 	log.Progress("Gathering device information...")
 	dev := device.Gather(phaseCtx, exec)
+	// WSL detection (Windows host-side; feature-gated until the backend
+	// consumes device.wsl). No-op off Windows.
+	if featuregate.IsEnabled(featuregate.FeatureWSLDetection) {
+		dev.WSL = device.GatherWSL(phaseCtx, exec)
+	}
 	deviceID = dev.SerialNumber
 	// Single source of truth for "is this a real developer or a daemon
 	// context?" — same predicate the payload uses below, so the warning,
@@ -446,6 +459,18 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		log.Warn("no real developer identity (UserIdentity=%q, root=%v) — telemetry will be marked no_user_logged_in", dev.UserIdentity, exec.IsRoot())
 	}
 	endPhase(phaseCtx, phaseCancel, tracker, log, "device_info")
+
+	// Trigger a scan inside each running WSL distribution. Gated on the
+	// tenant's wsl_directive (fetched by the run gate before this run) and on
+	// the host having reported WSL at all, so a machine without it costs
+	// nothing. Launch-only: the distros report their own findings, so this
+	// phase never waits for a scan and cannot extend the run.
+	if cfg != nil && cfg.WSLScanEnabled {
+		wslCtx, wslCancel := startPhase(ctx, tracker, "wsl_scan")
+		log.Progress("Triggering WSL distribution scans (%s)...", cfg.WSLScanReason)
+		triggerWSLScans(exec, log, cfg, &dev)
+		endPhase(wslCtx, wslCancel, tracker, log, "wsl_scan")
+	}
 
 	// Per-device scan state for the delta-upload protocol. Gated OFF by
 	// default (config.UseLegacyPackageScan defaults true) until the agent-api
@@ -1002,6 +1027,30 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	endPhase(phaseCtx, phaseCancel, tracker, log, "credentials_scan")
 	postPhase()
 
+	// Browser extension inventory — which extensions are installed in this
+	// machine's browsers, whether they are enabled and why not, where they came
+	// from, and what they are permitted to touch. The browsers' own state files
+	// and nothing else: no browser is launched, no store is called, and the
+	// browsers' databases (cookies, history, passwords) are never opened.
+	//
+	// The target account is passed explicitly and the phase declines when it is a
+	// service identity: scanning the wrong home would find no browser and report
+	// every one of them missing, which a reader honours by deleting the device's
+	// real inventory. A nil section is that decline, and it must stay nil.
+	phaseCtx, phaseCancel = startPhase(ctx, tracker, "browser_extensions_scan")
+	log.Progress("Inventorying browser extensions...")
+	browserTarget, _ := exec.LoggedInUser()
+	browserExtensionScan := browserext.New(userExec).WithSkipper(tccSkipper).Detect(phaseCtx, browserTarget)
+	if browserExtensionScan == nil {
+		log.Progress("  Skipped: no interactive user to describe")
+	} else {
+		log.Progress("  Found %d browser extensions across %d browsers",
+			len(browserExtensionScan.Findings), len(browserExtensionScan.Browsers))
+	}
+	fmt.Fprintln(os.Stderr)
+	endPhase(phaseCtx, phaseCancel, tracker, log, "browser_extensions_scan")
+	postPhase()
+
 	// npm + pip configuration audits — surface-only inventory of every
 	// .npmrc and pip.conf on the host, plus the merged effective views
 	// each tool would resolve. We use the user-aware executor so npm and
@@ -1092,17 +1141,31 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 			scanStateFullSync)
 	}
 
+	// A run inside a WSL distro identifies itself by its host + distro pair.
+	// Its own identity is unusable: the hostname is the Windows host's, and a
+	// minimal or WSL1 distro has no machine-id, so dev.SerialNumber reads
+	// "unknown" and every such distro would collide on one record.
+	wslGuest := wslGuestFromConfig(cfg)
+	deviceIdentity := dev.SerialNumber
+	if wslGuest != nil {
+		deviceIdentity = wslguest.DeviceID(wslGuest.HostDeviceID, wslGuest.DistroID)
+		log.Progress("WSL guest: distro %s on host %s — device id %s",
+			wslGuest.DistroID, wslGuest.HostDeviceID, deviceIdentity)
+	}
+
 	// Build payload
 	payload := &Payload{
 		PayloadSchemaVersion: schemaVersion,
 		CustomerID:           config.CustomerID,
-		DeviceID:             dev.SerialNumber,
-		SerialNumber:         dev.SerialNumber,
+		DeviceID:             deviceIdentity,
+		SerialNumber:         deviceIdentity,
 		UserIdentity:         dev.UserIdentity,
 		Hostname:             dev.Hostname,
 		Platform:             dev.Platform,
 		OSVersion:            dev.OSVersion,
 		Resources:            dev.Resources,
+		WSL:                  dev.WSL,
+		WSLGuest:             wslGuest,
 		AgentVersion:         buildinfo.Version,
 		CollectedAt:          endTime.Unix(),
 		NoUserLoggedIn:       noUserLoggedIn,
@@ -1141,6 +1204,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		AgentSkills:             agentSkills,
 		AgentSkillScan:          agentSkillScan,
 		CredentialScan:          credentialScan,
+		BrowserExtensionScan:    browserExtensionScan,
 
 		ExecutionLogs: &ExecutionLogs{
 			OutputBase64: execLogsBase64,

@@ -147,6 +147,20 @@ Plugins are classified as `bundled`, `marketplace`, or `dropins` based on their 
 
 Discovered via `pluginkit -mAD -p com.apple.dt.Xcode.extension.source-editor`. Returns bundle ID, version, and publisher for Xcode Source Editor extensions.
 
+## Browser Extensions
+
+Extensions are read from the browsers' own state files under the logged-in user's home directory. On Linux, Firefox is also scanned under its snap and flatpak roots, and Edge under its flatpak root. A browser installed anywhere other than the paths below, including under a packaging not listed here or with a custom data directory, is reported as not present.
+
+| Browser        | Engine   | macOS                                          | Windows                                  | Linux                   |
+|----------------|----------|------------------------------------------------|------------------------------------------|-------------------------|
+| Google Chrome  | Chromium | `~/Library/Application Support/Google/Chrome`   | `%LOCALAPPDATA%\Google\Chrome\User Data`  | `~/.config/google-chrome` |
+| Microsoft Edge | Chromium | `~/Library/Application Support/Microsoft Edge`  | `%LOCALAPPDATA%\Microsoft\Edge\User Data` | `~/.config/microsoft-edge` |
+| Mozilla Firefox | Gecko   | `~/Library/Application Support/Firefox`         | `%APPDATA%\Mozilla\Firefox`               | `~/.mozilla/firefox`    |
+
+Per extension, the scan records identity (id, name, version, manifest version), enabled state and why it is disabled, where it was installed from, its store and listing status, signature state, and the permissions the browser is currently honouring for it.
+
+**Privacy: only these state files are read. Browsing history, cookies, saved passwords, page content, and profile names are never collected.** No browser is launched and no extension store is contacted.
+
 ## Node.js Package Scanning (Optional)
 
 | Package Manager | Global Packages | Project Packages              |
@@ -220,6 +234,22 @@ Detected if `snap` is installed. Metadata: name, version, revision, tracking cha
 ### Flatpak Packages
 
 Detected if `flatpak` is installed. Metadata: app ID, name, version, arch, branch, origin, active commit, runtime.
+
+## WSL Detection (Windows)
+
+Host-side detection of Windows Subsystem for Linux, reported by the **Windows agent** under `device.wsl`. Answers "is WSL present, and is a distribution actively running right now?" so a fleet dashboard can flag machines with WSL environments that the Linux agent has not yet scanned. It does **not** mount or scan distro filesystems — run the Linux binary inside a distro for that.
+
+| Signal | Source | Notes |
+|--------|--------|-------|
+| Registered distros | `HKU\<SID>\...\CurrentVersion\Lxss` (all loaded user hives) | Enumerating HKU (not just HKCU) lets a SYSTEM-context scan still see a signed-in user's distros. Name, WSL version, default flag, owning SID, base path. |
+| Distro ID | the Lxss subkey name (a GUID) | The only stable per-distro identifier: survives restarts and renames, changes on unregister/re-import. **Not** derivable from the base path — imported distros have no GUID in theirs. |
+| Default user | per-distro `DefaultUid` | The uid `wsl -d <name>` runs as. `0` means the distro has no non-root user; absent means unreadable, and the two are kept distinct. |
+| WSL version per distro | registry `Flags & 0x8` | The per-distro `Version` DWORD is unreliable (reads 2 on WSL1). Flags `0x7` → WSL1, `0xF` → WSL2 — both measured (WSL1 EC2 box + WSL2 metal VM). |
+| Installed | `WslService` (Store/MSI) or `LxssManager` (legacy) service key | `System32\wsl.exe` is **not** a signal — it ships with stock Windows even when WSL is disabled. |
+| Package version | `Uninstall\...` `DisplayVersion` for "Windows Subsystem for Linux" | Floors to `unknown`. |
+| Actively used | `wsl.exe --list --running --quiet` | The only subprocess; UTF-16LE output decoded defensively. Registry carries no runtime state. Skipped entirely unless a WSL service is *running* (native SCM query, no process) — that probe **starts** `WslService` when stopped, so on an idle machine it would wake a service to learn nothing. |
+
+Presence is tri-state (`yes` / `no` / `unknown`): a probe that cannot read the registry reports `unknown` rather than a false `no`. Gated behind the `wsl-detection` feature flag until the backend consumes the payload. Limitation: users whose hive is not loaded (never signed in this boot) are not counted.
 
 ---
 

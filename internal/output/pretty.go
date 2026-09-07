@@ -50,6 +50,9 @@ func Pretty(w io.Writer, result *model.ScanResult, colorMode string) error {
 	if result.Device.Resources.DiskTotalBytes > 0 {
 		fmt.Fprintf(w, "    %-16s %s\n", "Disk", formatBytes(result.Device.Resources.DiskTotalBytes))
 	}
+	if wsl := result.Device.WSL; wsl != nil {
+		fmt.Fprintf(w, "    %-16s %s\n", "WSL", formatWSL(wsl))
+	}
 	fmt.Fprintln(w)
 
 	// SUMMARY
@@ -173,6 +176,9 @@ func Pretty(w io.Writer, result *model.ScanResult, colorMode string) error {
 		fmt.Fprintf(w, "    %sNone detected%s\n", c.dim, c.reset)
 	}
 	fmt.Fprintln(w)
+
+	// BROWSER EXTENSIONS
+	printBrowserExtensions(w, c, result)
 
 	// NODE.JS PACKAGE MANAGERS (only if npm scan was enabled)
 	if len(result.NodePkgManagers) > 0 {
@@ -434,7 +440,59 @@ func printPipAuditSummary(w io.Writer, c *colors, a *model.PipAudit) {
 	fmt.Fprintln(w)
 }
 
+// printBrowserExtensions renders the inventory in three states: the phase not having
+// run, the phase having run and found nothing, and a list. The first two mean opposite
+// things and are easy to confuse.
+//
 //nolint:errcheck // terminal output
+func printBrowserExtensions(w io.Writer, c *colors, result *model.ScanResult) {
+	scan := result.BrowserExtensionScan
+	count := 0
+	if scan != nil {
+		count = len(scan.Findings)
+	}
+	printSectionHeader(w, c, "BROWSER EXTENSIONS", count)
+
+	switch {
+	case scan == nil:
+		fmt.Fprintf(w, "    %sNot scanned%s\n", c.dim, c.reset)
+	case count == 0:
+		fmt.Fprintf(w, "    %sNone detected%s\n", c.dim, c.reset)
+	default:
+		for _, f := range scan.Findings {
+			tag := ""
+			if f.EnabledState != model.BrowserExtEnabled {
+				tag = " [" + f.EnabledState
+				if f.DisabledBy != "" {
+					tag += " by " + f.DisabledBy
+				}
+				tag += "]"
+			}
+			if f.StoreListing == model.BrowserExtStoreListingDelisted {
+				tag += " [delisted]"
+			}
+			name := f.Name
+			if name == "" {
+				// A finding whose metadata could not be recovered still has an
+				// identity to look it up by.
+				name = f.ExtensionID
+			}
+			fmt.Fprintf(w, "    %-30s %s%-10s %-12s %s%s%s\n",
+				truncate(name, 30), c.dim, truncate(f.BrowserID, 10),
+				truncate(f.InstallSource, 12), truncate(f.Version, 12), tag, c.reset)
+		}
+	}
+	// A browser that could not be read is why a list is shorter than expected.
+	if scan != nil {
+		for _, b := range scan.Browsers {
+			if b.Status == model.BrowserCoverageFailed || b.Status == model.BrowserCoveragePartial {
+				fmt.Fprintf(w, "    %s%s: %s (%s)%s\n", c.dim, b.BrowserID, b.Status, b.ReasonCode, c.reset)
+			}
+		}
+	}
+	fmt.Fprintln(w)
+}
+
 func printSectionHeader(w io.Writer, c *colors, title string, count int) {
 	padding := 35 - len(title)
 	if padding < 1 {
@@ -481,6 +539,38 @@ func setupColors(mode string) *colors {
 func truncate(s string, max int) string {
 	if len(s) > max {
 		return s[:max-3] + "..."
+	}
+	return s
+}
+
+// formatWSL renders the WSL summary line for the DEVICE block, e.g.
+// "present — 2 distros, 1 running (WSL 2.7.11.0)". Presence is tri-state:
+// "unknown" (probe couldn't read the registry) is shown as-is rather than
+// collapsed to "not present".
+func formatWSL(w *model.WSLInfo) string {
+	switch w.Presence {
+	case model.WSLPresenceNo:
+		return "not present"
+	case model.WSLPresenceUnknown:
+		return "unknown"
+	}
+	running := 0
+	for _, d := range w.Distros {
+		if d.Running {
+			running++
+		}
+	}
+	s := fmt.Sprintf("present — %d distro", len(w.Distros))
+	if len(w.Distros) != 1 {
+		s += "s"
+	}
+	if w.Active {
+		s += fmt.Sprintf(", %d running", running)
+	} else {
+		s += ", none running"
+	}
+	if w.Version != "" && w.Version != "unknown" {
+		s += " (WSL " + w.Version + ")"
 	}
 	return s
 }

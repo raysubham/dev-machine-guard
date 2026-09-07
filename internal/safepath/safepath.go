@@ -37,6 +37,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -53,6 +54,11 @@ const (
 	// concrete file: a symlink cycle, more hops than the budget allows, a
 	// relative path, or a component swapped between resolution and open.
 	ReasonUnresolved = "location_unresolved"
+	// ReasonSymlink is a symlink on the path, reported only by a resolver that
+	// follows none. A caller that reads a fixed set of directories owned by one
+	// application has no legitimate link to follow, and refusing is the only
+	// answer that cannot be talked into reading somewhere else.
+	ReasonSymlink = "symlink_rejected"
 )
 
 // maxHops bounds symlink indirection. Each hop restarts resolution at the
@@ -98,6 +104,9 @@ type Guard func(path string) string
 type Resolver struct {
 	home  string
 	guard Guard
+	// noFollow refuses a path with a symlink anywhere on it instead of resolving
+	// the link. See NewNoFollow.
+	noFollow bool
 
 	// rootsOnce resolves the containment roots once: the home as written plus its own
 	// resolved form. A home behind a symlink is an ordinary layout, and containment
@@ -113,6 +122,29 @@ func New(home string, guard Guard) *Resolver {
 		home = filepath.Clean(home)
 	}
 	return &Resolver{home: home, guard: guard}
+}
+
+// NewNoFollow returns a Resolver that refuses any path with a symlink on it —
+// above or below the root, leaf or ancestor — rather than resolving the link and
+// deciding about its target.
+//
+// It is for a caller whose paths are all fixed locations owned by one
+// application: there is no legitimate link on such a path, so a link is either a
+// layout this build does not support or an attempt to redirect a privileged read,
+// and the two are indistinguishable from the outside. Refusing is also the only
+// rule with no exempt path class to reason about, which is what makes it
+// auditable. A caller that must tolerate a symlinked home or a dotfile-managed
+// directory wants New instead.
+//
+// The strength of the refusal follows the platform's open. On unix every
+// component is opened with O_NOFOLLOW, so no link on the path is ever traversed.
+// Windows has no openat: the leaf is opened without following a reparse point and
+// the handle's own final path is compared against the resolved one, so a junction
+// swapped in above the leaf is caught after the traversal rather than before it.
+func NewNoFollow(home string, guard Guard) *Resolver {
+	r := New(home, guard)
+	r.noFollow = true
+	return r
 }
 
 // containmentRoots returns the home as written plus its resolved form, computed
@@ -140,14 +172,27 @@ func (r *Resolver) containmentRoots() []string {
 func (r *Resolver) Contains(path string) bool {
 	cleaned := filepath.Clean(path)
 	for _, root := range r.containmentRoots() {
-		if cleaned == root {
+		if pathEqual(cleaned, root) {
 			return true
 		}
-		if strings.HasPrefix(cleaned, root) && cleaned[len(root)] == filepath.Separator {
+		if len(cleaned) > len(root) && cleaned[len(root)] == filepath.Separator &&
+			pathEqual(cleaned[:len(root)], root) {
 			return true
 		}
 	}
 	return false
+}
+
+// pathEqual compares two paths the way the filesystem underneath them resolves
+// names. Windows matches without regard to case, so a root taken from the account
+// record and a path taken from an application's own config file can name the same
+// directory in different casing; comparing byte for byte there refuses a file the
+// user owns. Elsewhere case is part of the name.
+func pathEqual(a, b string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }
 
 // Resolve returns the concrete path that path refers to, following symlinks
@@ -170,6 +215,14 @@ func (r *Resolver) resolveChain(path string, checkRoots bool) (string, os.FileIn
 		return "", nil, refuse(ReasonUnresolved)
 	}
 	current := filepath.Clean(path)
+	if checkRoots && r.noFollow && !r.Contains(current) {
+		// Nothing on this path may redirect, so where it lies is where it ends and
+		// the lexical answer is the final one. Refusing here rather than at the end
+		// of the walk is what keeps a target outside the roots from being stat'd on
+		// the way down — a component on a dead network mount blocks whether or not
+		// the path would have been refused once reached.
+		return "", nil, refuse(ReasonOutsideRoots)
+	}
 
 	for hop := 0; ; hop++ {
 		if hop > maxHops {
@@ -205,6 +258,12 @@ func (r *Resolver) resolveChain(path string, checkRoots bool) (string, os.FileIn
 			if !isLink(info) {
 				leaf = info
 				continue
+			}
+			if r.noFollow {
+				// Advisory: the open below refuses the same component without a
+				// window to swap in. Catching it here keeps the refusal specific,
+				// since the open reports one code for every redirection.
+				return "", nil, refuse(ReasonSymlink)
 			}
 			target, err := os.Readlink(prefix)
 			if err != nil {
@@ -287,7 +346,7 @@ func (r *Resolver) Read(path string, max int64) (data []byte, resolved string, i
 	if err != nil {
 		return nil, "", nil, false, err
 	}
-	f, info, err := openVerified(resolved, false)
+	f, info, err := openVerified(resolved, false, r.noFollow)
 	if err != nil {
 		return nil, "", nil, false, err
 	}
@@ -319,7 +378,7 @@ func (r *Resolver) ReadDirNames(path string, max int) (names []string, resolved 
 	if err != nil {
 		return nil, "", false, err
 	}
-	f, _, err := openVerified(resolved, true)
+	f, _, err := openVerified(resolved, true, r.noFollow)
 	if err != nil {
 		return nil, "", false, err
 	}

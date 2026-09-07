@@ -335,6 +335,79 @@ func TestResolve_Guard(t *testing.T) {
 	})
 }
 
+// TestNewNoFollow_RefusesEverySymlinkOnThePath covers the stricter resolver: for a
+// caller whose paths are all fixed locations owned by one application there is no
+// legitimate link to follow, so a link is refused wherever it sits rather than
+// resolved and judged by its target. The refusal carries its own reason, because
+// the caller reports an unsupported layout differently from a denied read.
+func TestNewNoFollow_RefusesEverySymlinkOnThePath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs a privilege the test host may not hold")
+	}
+	tests := []struct {
+		name string
+		// setup returns the path to read, having planted a link on it.
+		setup func(t *testing.T, home string) string
+	}{
+		{
+			name: "the leaf is a link",
+			setup: func(t *testing.T, home string) string {
+				writeFile(t, filepath.Join(home, "real", "state"), "{}\n")
+				link := filepath.Join(home, "app", "state")
+				if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+				symlink(t, filepath.Join(home, "real", "state"), link)
+				return link
+			},
+		},
+		{
+			name: "a directory above it is a link",
+			setup: func(t *testing.T, home string) string {
+				writeFile(t, filepath.Join(home, "real", "state"), "{}\n")
+				symlink(t, filepath.Join(home, "real"), filepath.Join(home, "app"))
+				return filepath.Join(home, "app", "state")
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			home := tempHome(t)
+			path := tc.setup(t, home)
+
+			if _, err := NewNoFollow(home, nil).Resolve(path); ReasonOf(err) != ReasonSymlink {
+				t.Errorf("reason = %q (err %v), want %q", ReasonOf(err), err, ReasonSymlink)
+			}
+			// The ordinary resolver still follows it: the two modes differ only
+			// in this, and the contained target is a layout it supports.
+			if _, err := New(home, nil).Resolve(path); err != nil {
+				t.Errorf("the following resolver refused a contained target: %v", err)
+			}
+		})
+	}
+}
+
+// TestNewNoFollow_RefusesOutsideTheRootBeforeTouchingIt pins when containment is
+// decided. A resolver that follows nothing cannot be redirected back into the
+// root, so where a path lies is where it ends and the answer is available before
+// the first syscall — which is the point: walking to a target on a dead network
+// mount to discover it was never allowed blocks on the way there. A path that does
+// not exist is the case that separates the two orders, since walking to it returns
+// "missing" and deciding first returns "refused".
+func TestNewNoFollow_RefusesOutsideTheRootBeforeTouchingIt(t *testing.T) {
+	home := tempHome(t)
+	outside := filepath.Join(t.TempDir(), "elsewhere", "state")
+
+	if _, err := NewNoFollow(home, nil).Resolve(outside); ReasonOf(err) != ReasonOutsideRoots {
+		t.Errorf("reason = %q (err %v), want %q", ReasonOf(err), err, ReasonOutsideRoots)
+	}
+	// Inside the root the answer is unchanged: absence is not a refusal.
+	missing := filepath.Join(home, "app", "state")
+	if _, err := NewNoFollow(home, nil).Resolve(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("err = %v, want a missing file inside the root reported as missing", err)
+	}
+}
+
 // A parent component swapped for a symlink between resolution and open must not
 // redirect the read — the property O_NOFOLLOW on the leaf alone does not deliver:
 // every directory above the leaf was validated by an earlier syscall, so a local
@@ -364,7 +437,7 @@ func TestOpenVerified_RefusesAComponentSwappedAfterResolution(t *testing.T) {
 	}
 	symlink(t, elsewhere, real)
 
-	f, _, err := openVerified(resolved, false)
+	f, _, err := openVerified(resolved, false, false)
 	if err == nil {
 		_ = f.Close()
 		t.Fatal("openVerified followed a component swapped after resolution")

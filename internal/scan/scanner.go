@@ -9,6 +9,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/cli"
 	"github.com/step-security/dev-machine-guard/internal/config"
 	"github.com/step-security/dev-machine-guard/internal/detector"
+	"github.com/step-security/dev-machine-guard/internal/detector/browserext"
 	"github.com/step-security/dev-machine-guard/internal/detector/configaudit"
 	"github.com/step-security/dev-machine-guard/internal/detector/credentials"
 	"github.com/step-security/dev-machine-guard/internal/device"
@@ -54,6 +55,16 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	start := time.Now()
 	dev := device.Gather(ctx, exec)
 	log.StepDone(time.Since(start))
+
+	// WSL detection — host-side "is WSL present and actively used" on Windows.
+	// Feature-gated until the backend consumes device.wsl; GatherWSL is a no-op
+	// (nil) off Windows. Populates dev.WSL in place so it flows through Device.
+	if featuregate.IsEnabled(featuregate.FeatureWSLDetection) {
+		log.StepStart("Detecting WSL")
+		start = time.Now()
+		dev.WSL = device.GatherWSL(ctx, exec)
+		log.StepDone(time.Since(start))
+	}
 
 	// Detect IDE installations
 	log.StepStart("Detecting IDE installations")
@@ -263,6 +274,18 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	credentialScan := credentials.New(exec).WithSkipper(tccSkipper).Detect(ctx)
 	log.StepDone(time.Since(start))
 
+	// Browser extension inventory — which extensions the machine's browsers hold,
+	// whether they are enabled and why not, where they came from, and what they
+	// can touch. The browsers' own state files only: nothing is executed and the
+	// browsers' databases are never opened. A nil result means the phase declined,
+	// which is what a service context or a root caller produces, so the pointer is
+	// passed through untouched.
+	log.StepStart("Inventorying browser extensions")
+	start = time.Now()
+	browserTarget, _ := exec.LoggedInUser()
+	browserExtensionScan := browserext.New(exec).WithSkipper(tccSkipper).Detect(ctx, browserTarget)
+	log.StepDone(time.Since(start))
+
 	// npm config audit — surface-only inventory of every .npmrc on the host
 	// plus the merged effective view npm itself would resolve. The audit is
 	// cheap (a few stat calls and at most two npm invocations) but stays
@@ -393,6 +416,8 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 		AgentSkills:       agentSkills,
 		AgentSkillScan:    agentSkillScan,
 		CredentialScan:    credentialScan,
+
+		BrowserExtensionScan: browserExtensionScan,
 		Summary: model.Summary{
 			AIAgentsAndToolsCount: len(aiTools),
 			IDEInstallationsCount: len(ides),

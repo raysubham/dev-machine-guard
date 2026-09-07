@@ -19,7 +19,11 @@ import (
 // metadata comes back with the handle because it is read from the handle: a
 // caller that stat'd the path instead would be describing whatever is at that
 // name now, not what it is holding open.
-func openVerified(resolved string, wantDir bool) (*os.File, os.FileInfo, error) {
+//
+// noFollow only changes how a rejected component is reported: the open is
+// no-follow either way, so a resolver that tolerates links sees a swap as an
+// unresolvable path while one that tolerates none sees the symlink it refuses.
+func openVerified(resolved string, wantDir, noFollow bool) (*os.File, os.FileInfo, error) {
 	_, comps := split(resolved)
 	if len(comps) == 0 {
 		return nil, nil, refuse(ReasonUnresolved)
@@ -42,7 +46,7 @@ func openVerified(resolved string, wantDir bool) (*os.File, os.FileInfo, error) 
 	for _, comp := range comps[:len(comps)-1] {
 		next, oerr := unix.Openat(dirfd, comp, dirFlags, 0)
 		if oerr != nil {
-			return nil, nil, openErr(oerr)
+			return nil, nil, openErr(oerr, noFollow)
 		}
 		_ = unix.Close(dirfd)
 		dirfd = next
@@ -57,7 +61,7 @@ func openVerified(resolved string, wantDir bool) (*os.File, os.FileInfo, error) 
 	// would return nothing useful either way.
 	fd, err := unix.Openat(dirfd, comps[len(comps)-1], leafFlags|unix.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, nil, openErr(err)
+		return nil, nil, openErr(err, noFollow)
 	}
 	// #nosec G115 -- fd is the descriptor openat just returned on success: a small
 	// non-negative int, which is what uintptr carries for the rest of its life. A
@@ -74,9 +78,14 @@ func openVerified(resolved string, wantDir bool) (*os.File, os.FileInfo, error) 
 // openErr maps an openat failure to a refusal. ELOOP means O_NOFOLLOW hit a
 // symlink where resolution had seen a real directory or file — the component
 // changed underneath us, so the read is abandoned rather than retried.
-func openErr(err error) error {
+func openErr(err error, noFollow bool) error {
 	switch err {
-	case unix.ELOOP, unix.EMLINK, unix.ENOTDIR:
+	case unix.ELOOP, unix.EMLINK:
+		if noFollow {
+			return refuse(ReasonSymlink)
+		}
+		return refuse(ReasonUnresolved)
+	case unix.ENOTDIR:
 		return refuse(ReasonUnresolved)
 	case unix.ENOENT:
 		return os.ErrNotExist

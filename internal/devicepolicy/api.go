@@ -306,6 +306,7 @@ type ComplianceReport struct {
 	Target               string          `json:"target"`
 	State                string          `json:"state"`
 	AppliedHash          string          `json:"applied_hash"`
+	EvaluatedHash        string          `json:"evaluated_hash,omitempty"`
 	AgentVersion         string          `json:"agent_version"`
 	Platform             string          `json:"platform"`
 	Observed             json.RawMessage `json:"observed,omitempty"`
