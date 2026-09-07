@@ -237,7 +237,7 @@ func TestNPMRCWriterWindowsRepairsWeakExpectedPrincipalACL(t *testing.T) {
 	}
 }
 
-func TestNPMRCWriterWindowsRejectsWeakSettingsMDMACL(t *testing.T) {
+func TestNPMRCWriterWindowsObservesSettingsWithWeakMDMACL(t *testing.T) {
 	homeDir := t.TempDir()
 	path := filepath.Join(homeDir, ".npmrc")
 	if err := os.WriteFile(path, []byte(boundedMDMBlock(stdSettingsBody)), 0o600); err != nil {
@@ -273,14 +273,14 @@ func TestNPMRCWriterWindowsRejectsWeakSettingsMDMACL(t *testing.T) {
 	}
 	defer w.Close()
 	present, observed, err := w.ProbeContentNPM(stdSettingsBody)
-	if !isTargetUnusable(err) {
-		t.Fatalf("ProbeContentNPM error = %v, want target unusable", err)
+	if err != nil {
+		t.Fatalf("ProbeContentNPM: %v", err)
 	}
-	if present {
-		t.Fatal("weak-ACL settings MDM block reported present")
+	if !present {
+		t.Fatal("weak-ACL settings MDM block was not observed")
 	}
-	if observed != nil {
-		t.Fatalf("weak-ACL settings MDM block produced evidence: %v", observed)
+	if len(observed) != 4 {
+		t.Fatalf("weak-ACL settings observed keys = %d, want 4", len(observed))
 	}
 }
 

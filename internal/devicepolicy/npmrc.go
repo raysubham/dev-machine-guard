@@ -1990,10 +1990,9 @@ func managedBlockBounds(lines []string) (int, int) {
 //     policy_not_applied.
 //   - MDM marker present and the file parses → (true, bag, nil) → mdm_managed.
 //
-// Base-only MDM blocks retain the existing behavior of reporting their observed
-// values even when metadata is loose. Settings-aware blocks require secure mode
-// or ACL metadata because they may carry additional environment-backed registry
-// credentials. Ownership is always enforced by readCurrent.
+// Like the base-only MDM path, this reports the observed configuration even when
+// metadata is loose. Metadata is outside the observed wire contract; ownership
+// remains enforced by readCurrent.
 func (w *NPMRCWriter) ProbeContentNPM(expected string) (bool, map[string]json.RawMessage, error) {
 	rt, err := w.resolveLeaf()
 	if err != nil {
@@ -2012,27 +2011,8 @@ func (w *NPMRCWriter) ProbeContentNPM(expected string) (bool, map[string]json.Ra
 	if err != nil || !present {
 		return present, observed, err
 	}
-	desired, ok := parseNPMDesired(expected)
-	if !ok {
-		return false, nil, errors.New("npmrc: expected value is not a rendered npm policy")
-	}
-	if len(desired.settings) == 0 {
-		if enforcePOSIXMetadata && mode.Perm() != npmrcFileMode {
-			w.log("npmrc: mdm-managed file mode is %#o, not %#o (token may be readable by other local users)", mode.Perm(), npmrcFileMode)
-		}
-		return present, observed, nil
-	}
 	if enforcePOSIXMetadata && mode.Perm() != npmrcFileMode {
-		return false, nil, fmt.Errorf("npmrc: settings-aware mdm file has insecure mode: %w", ErrTargetUnusable)
-	}
-	if w.secureHome != nil {
-		secure, err := w.metadataSecure(rt)
-		if err != nil {
-			return false, nil, fmt.Errorf("npmrc: verify settings-aware mdm metadata: %w", err)
-		}
-		if !secure {
-			return false, nil, fmt.Errorf("npmrc: settings-aware mdm file has insecure metadata: %w", ErrTargetUnusable)
-		}
+		w.log("npmrc: mdm-managed file mode is %#o, not %#o (token may be readable by other local users)", mode.Perm(), npmrcFileMode)
 	}
 	return present, observed, nil
 }

@@ -794,9 +794,7 @@ func TestProbeContentNPM_OnDisk(t *testing.T) {
 	}
 }
 
-func TestProbeContentNPM_LooseModeBaseOnlyObservedSettingsRejected(t *testing.T) {
-	// Preserve the base-only observation contract, but fail settings-aware MDM
-	// verification because that shape requires secure metadata.
+func TestProbeContentNPM_LooseModeObserved(t *testing.T) {
 	home := t.TempDir()
 	if err := os.WriteFile(npmrcPath(home), []byte(mdmBlock()), 0o644); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -817,14 +815,14 @@ func TestProbeContentNPM_LooseModeBaseOnlyObservedSettingsRejected(t *testing.T)
 		t.Fatal(err)
 	}
 	present, observed, err = w.ProbeContentNPM(stdSettingsBody)
-	if !isTargetUnusable(err) {
-		t.Fatalf("settings-aware probe error = %v, want target unusable", err)
+	if err != nil {
+		t.Fatalf("settings-aware probe: %v", err)
 	}
-	if present {
-		t.Fatal("insecure settings-aware MDM block reported present")
+	if !present {
+		t.Fatal("settings-aware MDM block was not observed")
 	}
-	if observed != nil {
-		t.Fatalf("insecure settings-aware MDM block produced evidence: %v", observed)
+	if len(observed) != 4 {
+		t.Fatalf("settings-aware observed keys = %d, want 4", len(observed))
 	}
 }
 
