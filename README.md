@@ -310,6 +310,8 @@ Compromised packages most often reach a machine because that machine resolves di
 
 Configuration is read from `.npmrc` (npm), pnpm config, `bunfig.toml` (bun), `.yarnrc` / `.yarnrc.yml` (yarn classic and berry), and `pip.conf` (pip). In enterprise mode this rolls up into the **Package Configs** view in the dashboard, where you can spot machines that are unprotected or pointed at the wrong registry.
 
+Enterprise Device Policy can also set StepSecurity Secure Registry as the sole user-level Python index for pip and uv. It manages only the resolved developer's user configuration and shared StepSecurity `.netrc` entry, keeps pip and uv results independent, and restores owned settings on an explicit policy clear. Project files, virtual environments, system configuration, environment variables, direct URLs, and Poetry are not modified.
+
 ### Suspicious file detection
 
 Some supply chain attacks plant files that trigger code execution outside the package lifecycle scripts most tools watch — for example a malicious `binding.gyp` that runs during `npm install`, or an editor configuration file that runs when a project is opened. Dev Machine Guard ships a rules-engine scanner that flags these files as IOCs and wires the results into scan telemetry. The detector streams one file at a time, so scan memory stays bounded regardless of repository size.

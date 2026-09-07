@@ -11,6 +11,9 @@ import (
 // tests must restore-on-exit to stay independent.
 func withConfig(t *testing.T, customerID, apiEndpoint, apiKey string) {
 	t.Helper()
+	t.Setenv(envCustomerID, "")
+	t.Setenv(envAPIEndpoint, "")
+	t.Setenv(envAPIKey, "")
 	prevCustomer, prevEndpoint, prevKey := config.CustomerID, config.APIEndpoint, config.APIKey
 	t.Cleanup(func() {
 		config.CustomerID = prevCustomer
@@ -20,6 +23,18 @@ func withConfig(t *testing.T, customerID, apiEndpoint, apiKey string) {
 	config.CustomerID = customerID
 	config.APIEndpoint = apiEndpoint
 	config.APIKey = apiKey
+}
+
+func TestSnapshot_ConfigTestsIgnoreAmbientOverrides(t *testing.T) {
+	t.Setenv(envCustomerID, "hostile-customer")
+	t.Setenv(envAPIEndpoint, "https://hostile.example")
+	t.Setenv(envAPIKey, "hostile-key")
+	withConfig(t, "file-customer", "https://file.example", "file-key")
+
+	cfg, ok := Snapshot()
+	if !ok || cfg.CustomerID != "file-customer" || cfg.APIEndpoint != "https://file.example" || cfg.APIKey != "file-key" {
+		t.Fatalf("Snapshot() = %+v, %v; want staged config without ambient overrides", cfg, ok)
+	}
 }
 
 func TestSnapshot_AllValid(t *testing.T) {

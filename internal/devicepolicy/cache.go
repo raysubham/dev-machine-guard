@@ -5,9 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/model"
+	"github.com/step-security/dev-machine-guard/internal/secureuserfile"
 )
 
 // CacheFilename is the basename of the enforcement state file — the ONE file
@@ -59,21 +64,15 @@ type AppliedCategoryState struct {
 	Targets map[string]AppliedTargetState `json:"targets"`
 }
 
-// AppliedTargetState records what the agent last wrote to the user-scope
-// settings for one (category, target). Value-based ownership drives both drift
-// and clear: a key is converged or removed only while its on-disk value still
-// equals what the agent recorded writing (a differing value — e.g. the user's
-// own — is left untouched).
+// AppliedTargetState records the non-secret facts needed to verify and safely
+// clear one target. WrittenSettings holds exact values only for non-secret
+// settings; marker-owned credential lanes store fixed ownership markers plus
+// the minimum path/creation/host metadata needed for restoration.
 //
 //   - AppliedHash is the backend's content hash, stored VERBATIM (never
 //     recomputed). Compared against the freshly-fetched hash for idempotency.
-//   - WrittenSettings is the ONLY ownership field, for every lane: the managed
-//     multi-key path records setting id → the exact compacted value the agent
-//     wrote for each managed key (the VS Code allowlist and the gallery service
-//     URL), and a single-value path records exactly one entry under its own
-//     ownership key (npmOwnedKey for the ~/.npmrc block, the allowlist setting id
-//     for a degraded VS Code writer). A key absent from the map is one the agent
-//     does not own.
+//   - WrittenSettings records setting id to written value for ordinary settings,
+//     or a fixed non-secret marker for credential-bearing managed blocks.
 //
 // A zero-value entry means "the agent owns nothing on disk" for that
 // category/target.
@@ -88,6 +87,10 @@ type AppliedCategoryState struct {
 type AppliedTargetState struct {
 	AppliedHash     string            `json:"applied_hash"`
 	WrittenSettings map[string]string `json:"written_settings,omitempty"`
+	FileCreated     bool              `json:"file_created,omitempty"`
+	ResolvedPath    string            `json:"resolved_path,omitempty"`
+	ResolvedPaths   map[string]string `json:"resolved_paths,omitempty"`
+	RegistryHost    string            `json:"registry_host,omitempty"`
 	FetchedAt       time.Time         `json:"fetched_at"`
 }
 
@@ -104,6 +107,64 @@ var cacheMu sync.Mutex
 // cachePathOverride lets tests redirect reads/writes to a tempdir. Production
 // leaves it empty. Same pattern as state.cachePathOverride.
 var cachePathOverride string
+var cacheStateFile *secureuserfile.File
+var cacheLockFile *secureuserfile.File
+
+type targetUserExecutor struct {
+	executor.Executor
+	user *user.User
+}
+
+func (e targetUserExecutor) LoggedInUser() (*user.User, error) {
+	u := *e.user
+	return &u, nil
+}
+
+// ConfigureCacheTarget pins Windows state to the same active target user used
+// by package writers. Other platforms retain their existing process-user path.
+func ConfigureCacheTarget(exec executor.Executor) (executor.Executor, func(), error) {
+	if exec == nil || exec.GOOS() != model.PlatformWindows {
+		return exec, func() {}, nil
+	}
+	home, err := secureuserfile.OpenUserHome(exec)
+	if err != nil {
+		return nil, nil, err
+	}
+	stateRelative := filepath.Join(".stepsecurity", CacheFilename)
+	stateFile, err := home.Open(stateRelative, ".dmg-state-", secureuserfile.MaxBytes)
+	if err != nil {
+		_ = home.Close()
+		return nil, nil, err
+	}
+	if err := stateFile.RequireResolvedPath(stateRelative); err != nil {
+		_ = home.Close()
+		return nil, nil, err
+	}
+	lockRelative := stateRelative + stateLockSuffix
+	lockFile, err := home.Open(lockRelative, ".dmg-lock-", secureuserfile.MaxBytes)
+	if err != nil {
+		_ = home.Close()
+		return nil, nil, err
+	}
+	if err := lockFile.RequireResolvedPath(lockRelative); err != nil {
+		_ = home.Close()
+		return nil, nil, err
+	}
+	target := targetUserExecutor{Executor: exec, user: home.User()}
+	cacheMu.Lock()
+	previousPath, previousStateFile, previousLockFile := cachePathOverride, cacheStateFile, cacheLockFile
+	cachePathOverride = filepath.Join(home.Path(), ".stepsecurity", CacheFilename)
+	cacheStateFile = stateFile
+	cacheLockFile = lockFile
+	cacheMu.Unlock()
+	return target, func() {
+		cacheMu.Lock()
+		cachePathOverride = previousPath
+		cacheStateFile, cacheLockFile = previousStateFile, previousLockFile
+		cacheMu.Unlock()
+		_ = home.Close()
+	}, nil
+}
 
 // SetCachePathForTest redirects CachePath() to the given absolute path and
 // returns a restore function. Test-only.
@@ -177,14 +238,40 @@ func readStateFile() (AppliedStateFile, readStatus, error) {
 	if path == "" {
 		return AppliedStateFile{}, stateUnreadable, errNoHomeDir
 	}
-	// #nosec G304 -- path is CachePath(): a test override or os.UserHomeDir()
-	// joined with the package constant CacheFilename. Never external input.
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return AppliedStateFile{}, stateAbsentOrCorrupt, nil
-	}
-	if err != nil {
-		return AppliedStateFile{}, stateUnreadable, fmt.Errorf("devicepolicy: read %s: %w", path, err)
+	var b []byte
+	if cacheStateFile != nil {
+		parentPresent, err := cacheStateFile.ParentPresent()
+		if err != nil {
+			return AppliedStateFile{}, stateUnreadable, err
+		}
+		if !parentPresent {
+			return AppliedStateFile{}, stateAbsentOrCorrupt, nil
+		}
+		var existed bool
+		b, existed, _, err = cacheStateFile.Read()
+		if err != nil {
+			return AppliedStateFile{}, stateUnreadable, err
+		}
+		if !existed {
+			return AppliedStateFile{}, stateAbsentOrCorrupt, nil
+		}
+		secure, err := cacheStateFile.MetadataSecure(cacheFileMode)
+		if err != nil || !secure {
+			if err == nil {
+				err = fmt.Errorf("devicepolicy: insecure cache metadata: %w", secureuserfile.ErrTargetUnusable)
+			}
+			return AppliedStateFile{}, stateUnreadable, err
+		}
+	} else {
+		var err error
+		// #nosec G304 -- CachePath is a test override or the fixed user-home state path.
+		b, err = os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return AppliedStateFile{}, stateAbsentOrCorrupt, nil
+		}
+		if err != nil {
+			return AppliedStateFile{}, stateUnreadable, fmt.Errorf("devicepolicy: read %s: %w", path, err)
+		}
 	}
 	ver, ok := peekSchemaVersion(b)
 	if !ok {
@@ -293,6 +380,49 @@ func WriteAppliedState(category, target string, s AppliedTargetState) error {
 	})
 }
 
+// ProbeAppliedStateWritable verifies that the shared state store can be read,
+// locked, and atomically replaced without committing an ownership record.
+func ProbeAppliedStateWritable() error {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+
+	return withStateLock(func() error {
+		_, status, err := readStateFile()
+		switch status {
+		case stateUnreadable:
+			return err
+		case stateFuture:
+			return errFutureSchema
+		}
+		if cacheStateFile != nil {
+			return cacheStateFile.ProbeWritable(cacheFileMode)
+		}
+		path := CachePath()
+		if path == "" {
+			return errNoHomeDir
+		}
+		parent := filepath.Dir(path)
+		if err := ensureCacheParent(parent); err != nil {
+			return err
+		}
+		tmp, err := os.CreateTemp(parent, "."+CacheFilename+".probe-*")
+		if err != nil {
+			return err
+		}
+		name := tmp.Name()
+		if err := tmp.Chmod(cacheFileMode); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(name)
+			return err
+		}
+		if err := tmp.Close(); err != nil {
+			_ = os.Remove(name)
+			return err
+		}
+		return os.Remove(name)
+	})
+}
+
 // ClearAppliedState drops one (category, target) ownership record, PRESERVING
 // every other category AND every sibling target, then atomically rewrites the
 // file. An empty target defaults to vscode. When the cleared target was the
@@ -343,6 +473,9 @@ func ClearAppliedState(category, target string) error {
 		} else {
 			f.Categories[category] = cat
 		}
+		if len(f.Categories) == 0 {
+			return removeStateFile()
+		}
 		return persistStateFile(f)
 	})
 }
@@ -353,6 +486,16 @@ func ClearAppliedState(category, target string) error {
 // and the file lock. A symlink at the path is unlinked itself, not followed, so it
 // cannot redirect the delete.
 func removeStateFile() error {
+	if cacheStateFile != nil {
+		parentPresent, err := cacheStateFile.ParentPresent()
+		if err != nil || !parentPresent {
+			return err
+		}
+		if err := cacheStateFile.Remove(); err != nil {
+			return err
+		}
+		return cacheStateFile.PurgeBackups()
+	}
 	path := CachePath()
 	if path == "" {
 		return nil
@@ -380,9 +523,19 @@ func persistStateFile(f AppliedStateFile) error {
 		return err
 	}
 	data = append(data, '\n')
+	if cacheStateFile != nil {
+		if err := cacheStateFile.EnsureParent(); err != nil {
+			return err
+		}
+		if err := cacheStateFile.Commit(data, cacheFileMode); err != nil {
+			return err
+		}
+		_ = cacheStateFile.PurgeBackups()
+		return nil
+	}
 
 	parent := filepath.Dir(path)
-	if err := os.MkdirAll(parent, cacheParentDirMode); err != nil {
+	if err := ensureCacheParent(parent); err != nil {
 		return err
 	}
 
@@ -401,6 +554,11 @@ func persistStateFile(f AppliedStateFile) error {
 		_ = tmp.Close()
 		return err
 	}
+	err = tmp.Chmod(cacheFileMode)
+	if err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		return err
@@ -408,10 +566,17 @@ func persistStateFile(f AppliedStateFile) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Chmod(tmpPath, cacheFileMode); err != nil {
+	if err := os.Rename(tmpPath, path); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	return nil
+}
+
+func ensureCacheParent(path string) error {
+	if err := os.MkdirAll(path, cacheParentDirMode); err != nil {
+		return err
+	}
+	return os.Chmod(path, cacheParentDirMode)
 }
 
 type cacheError string

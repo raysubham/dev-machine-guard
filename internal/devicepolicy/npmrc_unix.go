@@ -23,11 +23,6 @@ func nonblockOpenFlag() int { return syscall.O_NONBLOCK }
 // so the operation cannot be redirected through a swapped symlink.
 func chownHandle(f *os.File, uid, gid int) error { return f.Chown(uid, gid) }
 
-// interactiveSessionOK is the Windows-only session guard. On Unix the console
-// user was already resolved by the executor, so there is nothing further to
-// gate here.
-func interactiveSessionOK() bool { return true }
-
 func newOwnerReader() ownerReader { return unixOwnerReader{} }
 
 // unixOwnerReader reads the owning uid/gid from an open handle's stat.
