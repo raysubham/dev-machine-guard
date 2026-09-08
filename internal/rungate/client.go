@@ -120,9 +120,11 @@ func Checkin(ctx context.Context, endpoint, apiKey, customerID, deviceID string,
 		directive = decoded
 	}
 	// wsl_directive is optional and fails closed: a backend that does not send
-	// it yields the zero value, i.e. distro scanning off.
+	// it yields the zero value, i.e. distro scanning off. It is also read only
+	// alongside a usable scan_directive, as before the two were decoded apart:
+	// a response with no cadence answer never switches on distro scanning.
 	var wsl WSLDirective
-	if env.WSLDirective != nil {
+	if directive.Mode != "" && env.WSLDirective != nil {
 		wsl = *env.WSLDirective
 	}
 	return directive, wsl, credentialScanning, nil

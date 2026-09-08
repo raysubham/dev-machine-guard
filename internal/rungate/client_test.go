@@ -258,3 +258,30 @@ func TestCheckinValidatesInputs(t *testing.T) {
 		})
 	}
 }
+
+// TestCheckinWSLNeedsDirective: wsl_directive rides a usable scan_directive.
+// Without one the response cannot enable distro scanning, while the
+// credential answer in the same response is still returned.
+func TestCheckinWSLNeedsDirective(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing directive": `{"wsl_directive":{"enabled":true,"reason":"tenant"},"scanners":{"credentials":{"enabled":false}}}`,
+		"null directive":    `{"scan_directive":null,"wsl_directive":{"enabled":true},"scanners":{"credentials":{"enabled":false}}}`,
+		"mode-less":         `{"scan_directive":{"reason":"due"},"wsl_directive":{"enabled":true},"scanners":{"credentials":{"enabled":false}}}`,
+		"wrong type":        `{"scan_directive":{"mode":7},"wsl_directive":{"enabled":true},"scanners":{"credentials":{"enabled":false}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+			defer srv.Close()
+			d, wsl, cred, err := Checkin(context.Background(), srv.URL, "k", "acme", "SER1", 0)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if d.Mode != "" || wsl.Enabled || wsl.Reason != "" {
+				t.Errorf("directive = %+v wsl = %+v, want both zero", d, wsl)
+			}
+			if cred == nil || *cred {
+				t.Errorf("cred = %v, want false", deref(cred))
+			}
+		})
+	}
+}
