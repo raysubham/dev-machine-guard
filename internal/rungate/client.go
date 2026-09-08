@@ -30,6 +30,10 @@ const checkinTimeout = 5 * time.Second
 // device-policy client's run-config limit; anything larger is not our backend.
 const maxDirectiveBytes = 4 << 20
 
+// maxErrorSnippetBytes bounds the body quoted in a non-200 error. It stays at
+// the pre-rules cap so a large error page cannot inflate one log line.
+const maxErrorSnippetBytes = 64 << 10
+
 // Checkin asks the backend whether this device is due for a full run. The
 // gating decision rides the existing run-config response (its scan_directive
 // block), so there is no dedicated endpoint:
@@ -85,7 +89,7 @@ func Checkin(ctx context.Context, endpoint, apiKey, customerID, deviceID string,
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxDirectiveBytes))
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorSnippetBytes))
 		return Directive{}, WSLDirective{}, nil, fmt.Errorf("rungate: unexpected status %d: %s",
 			resp.StatusCode, redact.String(strings.TrimSpace(string(snippet))))
 	}
