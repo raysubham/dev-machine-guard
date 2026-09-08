@@ -687,9 +687,12 @@ func findLegacyLeftovers(legacy string) []string {
 // due yet, or another instance is already mid-scan. One Progress line is the
 // skip's entire footprint: no beacon, no run-status row, no phases. Every
 // gate failure returns false (fail-open), so this can never suppress a scan
-// on error.
+// on error. The gate also resolves the tenant's credential-scanning setting;
+// it is copied onto cfg so every managed entry point hands the same answer to
+// telemetry.Run.
 func gateSkipsRun(exec executor.Executor, log *progress.Logger, cfg *cli.Config) bool {
 	res := rungate.Evaluate(context.Background(), exec, log, cfg.ForceScan)
+	cfg.CredentialScanningDisabled = res.CredentialScanningDisabled
 	if !res.Skip {
 		log.Progress("Run gate: proceeding with this run (%s)", res.Reason)
 		// Carry the decision into telemetry.Run so it echoes a line inside the

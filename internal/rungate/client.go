@@ -25,9 +25,10 @@ import (
 // an offline laptop pays this once per wakeup.
 const checkinTimeout = 5 * time.Second
 
-// maxDirectiveBytes bounds the response read. A directive is ~200 bytes;
-// anything near the cap is not our backend.
-const maxDirectiveBytes = 64 << 10
+// maxDirectiveBytes bounds the response read. The run-config envelope carries
+// the tenant's detection rules alongside the directive, so the cap matches the
+// device-policy client's run-config limit; anything larger is not our backend.
+const maxDirectiveBytes = 4 << 20
 
 // Checkin asks the backend whether this device is due for a full run. The
 // gating decision rides the existing run-config response (its scan_directive
@@ -35,21 +36,28 @@ const maxDirectiveBytes = 64 << 10
 // GET /v1/{customer}/developer-mdm-agent/run-config?device_id=…[&last_run_at=…]
 // lastRunAt (unix seconds, 0 = unknown) is the agent's own last successful
 // upload stamp, sent as insurance against lost or laggy ingest on the backend
-// side. Only scan_directive is read here; detection_rules/policy in the same
-// response are ignored (the scan path fetches run-config for those in its own
-// phase). Errors are redacted (the URL embeds the customer id and the header
-// carries the tenant key). A near-verbatim sibling of rules/fetch.go.
-func Checkin(ctx context.Context, endpoint, apiKey, customerID, deviceID string, lastRunAt int64) (Directive, error) {
+// side. Only scan_directive and scanners.credentials are read here;
+// detection_rules/policy in the same response are ignored (the scan path
+// fetches run-config for those in its own phase). Errors are redacted (the URL
+// embeds the customer id and the header carries the tenant key). A
+// near-verbatim sibling of rules/fetch.go.
+//
+// The two answers are independent. The directive is the zero value when the
+// response carries no usable scan_directive (an older backend, or a rules-only
+// answer); callers fall back to the cadence cache. credentialScanning is nil
+// unless the response carried an explicit boolean; missing, null or a
+// non-boolean never reads as false. Any error means neither answer is usable.
+func Checkin(ctx context.Context, endpoint, apiKey, customerID, deviceID string, lastRunAt int64) (directive Directive, credentialScanning *bool, err error) {
 	endpoint = strings.TrimSpace(endpoint)
 	apiKey = strings.TrimSpace(apiKey)
 	if endpoint == "" || apiKey == "" {
-		return Directive{}, errors.New("rungate: missing endpoint or api key")
+		return Directive{}, nil, errors.New("rungate: missing endpoint or api key")
 	}
 	if strings.TrimSpace(customerID) == "" {
-		return Directive{}, errors.New("rungate: empty customer_id")
+		return Directive{}, nil, errors.New("rungate: empty customer_id")
 	}
 	if strings.TrimSpace(deviceID) == "" {
-		return Directive{}, errors.New("rungate: empty device_id")
+		return Directive{}, nil, errors.New("rungate: empty device_id")
 	}
 
 	target := strings.TrimRight(endpoint, "/") +
@@ -64,7 +72,7 @@ func Checkin(ctx context.Context, endpoint, apiKey, customerID, deviceID string,
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		return Directive{}, fmt.Errorf("rungate: build request: %w", err)
+		return Directive{}, nil, fmt.Errorf("rungate: build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
@@ -72,31 +80,45 @@ func Checkin(ctx context.Context, endpoint, apiKey, customerID, deviceID string,
 
 	resp, err := (&http.Client{Timeout: checkinTimeout}).Do(req)
 	if err != nil {
-		return Directive{}, fmt.Errorf("rungate: transport: %s", redact.String(err.Error()))
+		return Directive{}, nil, fmt.Errorf("rungate: transport: %s", redact.String(err.Error()))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxDirectiveBytes))
-		return Directive{}, fmt.Errorf("rungate: unexpected status %d: %s",
+		return Directive{}, nil, fmt.Errorf("rungate: unexpected status %d: %s",
 			resp.StatusCode, redact.String(strings.TrimSpace(string(snippet))))
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDirectiveBytes))
+	// One byte past the cap tells an oversized body apart from one that is
+	// exactly at it; a truncated document must never decode as a valid answer.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDirectiveBytes+1))
 	if err != nil {
-		return Directive{}, fmt.Errorf("rungate: read body: %w", err)
+		return Directive{}, nil, fmt.Errorf("rungate: read body: %w", err)
+	}
+	if len(body) > maxDirectiveBytes {
+		return Directive{}, nil, fmt.Errorf("rungate: response exceeds %d bytes", maxDirectiveBytes)
 	}
 	var env runConfigEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
-		return Directive{}, fmt.Errorf("rungate: decode body: %w", err)
+		return Directive{}, nil, fmt.Errorf("rungate: decode body: %w", err)
 	}
-	// A 200 with no scan_directive is an unknown shape (or an older backend
-	// that predates run gating) — surface it as an error so the caller fails
-	// open rather than trusting a zero value.
-	if env.ScanDirective == nil || env.ScanDirective.Mode == "" {
-		return Directive{}, errors.New("rungate: response carried no scan_directive")
+	// Each block is decoded on its own. A scanners block that is missing, null,
+	// or carries a non-boolean enabled leaves credentialScanning nil (the caller
+	// keeps its cached setting) and does not touch the directive.
+	var scanners runConfigScanners
+	if json.Unmarshal(env.Scanners, &scanners) == nil && scanners.Credentials != nil {
+		credentialScanning = scanners.Credentials.Enabled
 	}
-	return *env.ScanDirective, nil
+	// A missing, null, malformed or mode-less scan_directive (a rules-only
+	// answer, or a backend that predates run gating) leaves the directive zero;
+	// the caller falls back to its cadence cache. It is not an error, because
+	// the same response can still carry a valid credentials setting.
+	var d Directive
+	if json.Unmarshal(env.ScanDirective, &d) == nil && d.Mode != "" {
+		directive = d
+	}
+	return directive, credentialScanning, nil
 }
 
 // skipBeaconTimeout bounds the gated-skip heartbeat POST. Kept short: it is

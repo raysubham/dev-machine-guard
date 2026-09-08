@@ -19,43 +19,48 @@ const serialProbeTimeout = 10 * time.Second
 
 // Result is what main acts on: skip (exit 0 quietly) or proceed. Detail is a
 // preformatted human fragment for the single skip log line.
+// CredentialScanningDisabled is the tenant's resolved credential-scanning
+// setting for this invocation; the zero value keeps the scan, so callers that
+// never learn it behave as before.
 type Result struct {
-	Skip   bool
-	Reason string
-	Detail string
+	Skip                       bool
+	Reason                     string
+	Detail                     string
+	CredentialScanningDisabled bool
 }
 
 // Evaluate runs the whole gate ahead of telemetry.Run: explicit escapes,
 // cached-or-probed device id, the backend check-in, the decision, and state
-// persistence. It makes one or two network calls — the backend check-in, plus
-// a best-effort gated-skip heartbeat on an online skip (and none at all when an
-// escape short-circuits) — and NEVER fails the run: every error path degrades
-// to Skip=false. Lock contention is deliberately NOT handled here: a not-due
-// wakeup skips on the directive before the run ever tries the lock, and a due
-// wakeup that collides with a running scan is left to telemetry.Run's
-// lock.Acquire so it reports the contention as before.
+// persistence. It makes one or two network calls (the backend check-in, plus
+// a best-effort gated-skip heartbeat on an online skip) and NEVER fails the
+// run: every error path degrades to Skip=false. Lock contention is deliberately
+// NOT handled here: a not-due wakeup skips on the directive before the run ever
+// tries the lock, and a due wakeup that collides with a running scan is left to
+// telemetry.Run's lock.Acquire so it reports the contention as before.
+//
+// The force and kill-switch escapes decide cadence only. The check-in still
+// happens because it also carries the tenant's credential-scanning setting,
+// which a forced run must honour.
 func Evaluate(ctx context.Context, exec executor.Executor, log *progress.Logger, forceScan bool) Result {
 	in := Inputs{
 		ForceScan:  forceScan || os.Getenv("STEPSEC_FORCE_SCAN") == "1",
 		KillSwitch: os.Getenv("STEPSEC_DISABLE_RUN_GATE") == "1",
 		Now:        time.Now(),
 	}
-
-	// Local escapes need no I/O at all; resolve them before touching disk or
-	// network. Everything else defers to the backend's scan directive — there
-	// is no agent-side feature flag, so the feature is turned on or off
-	// entirely from the backend.
-	if in.ForceScan || in.KillSwitch {
-		if in.ForceScan {
-			log.Progress("Run gate: bypassed (--force-scan)")
-		}
-		return Result{Skip: false, Reason: Decide(in).Reason}
+	if in.ForceScan {
+		log.Progress("Run gate: cadence bypassed (--force-scan)")
 	}
+
+	// The cache is read before any early return so the last known credential
+	// setting governs this invocation even when the backend cannot be asked.
+	// No usable cache means scan: the setting only ever arrives from a check-in.
+	st, stOK := readState()
+	cached := st.CredentialScanning()
+	credentialDisabled := stOK && cached != nil && !*cached
 
 	// Device id: cached from a prior run when possible, else a bounded local
 	// probe. Without a real serial the backend can't be asked anything
 	// meaningful — fail open rather than gate on a bogus id.
-	st, stOK := readState()
 	deviceID := st.DeviceID
 	if deviceID == "" || deviceID == "unknown" {
 		probeCtx, cancel := context.WithTimeout(ctx, serialProbeTimeout)
@@ -64,21 +69,29 @@ func Evaluate(ctx context.Context, exec executor.Executor, log *progress.Logger,
 	}
 	if deviceID == "" || deviceID == "unknown" {
 		log.Debug("run-gate: no usable device id — failing open")
-		return Result{Skip: false, Reason: "no_device_id"}
+		return Result{Skip: false, Reason: "no_device_id", CredentialScanningDisabled: credentialDisabled}
 	}
 
 	log.Progress("Run gate: checking scan cadence with the dashboard...")
-	directive, err := Checkin(ctx, config.APIEndpoint, config.APIKey, config.CustomerID, deviceID, st.LastFullRunAt)
+	directive, credentialScanning, err := Checkin(ctx, config.APIEndpoint, config.APIKey, config.CustomerID, deviceID, st.LastFullRunAt)
 	if err != nil {
 		log.Progress("Run gate: dashboard check-in failed, using cached cadence: %v", err)
 	} else {
-		in.Directive = &directive
-		log.Progress("Run gate: dashboard directive: mode=%s reason=%s interval=%dm",
-			directive.Mode, directive.Reason, directive.EffectiveIntervalMinutes)
-		// Persist the resolved id + gating fields even on "full" answers so
-		// skipped wakeups never re-probe and the offline fallback stays
-		// current. Best-effort.
-		if perr := recordCheckin(deviceID, directive, in.Now); perr != nil {
+		if directive.Mode != "" {
+			in.Directive = &directive
+			log.Progress("Run gate: dashboard directive: mode=%s reason=%s interval=%dm",
+				directive.Mode, directive.Reason, directive.EffectiveIntervalMinutes)
+		} else {
+			log.Debug("run-gate: response carried no scan_directive; using cached cadence")
+		}
+		if credentialScanning != nil {
+			credentialDisabled = !*credentialScanning
+		}
+		// Persist the resolved id, gating fields and credential setting even
+		// on "full" answers so skipped wakeups never re-probe and the offline
+		// fallback stays current. Best-effort: the fresh answer still governs
+		// this invocation when the write fails; only the offline memory is lost.
+		if perr := recordCheckin(deviceID, directive, credentialScanning, in.Now); perr != nil {
 			log.Debug("run-gate: could not persist check-in state: %v", perr)
 		}
 	}
@@ -87,7 +100,7 @@ func Evaluate(ctx context.Context, exec executor.Executor, log *progress.Logger,
 	}
 
 	dec := Decide(in)
-	res := Result{Skip: dec.Skip, Reason: dec.Reason}
+	res := Result{Skip: dec.Skip, Reason: dec.Reason, CredentialScanningDisabled: credentialDisabled}
 	if dec.Skip {
 		// Online skip: best-effort heartbeat so the console shows the agent
 		// checked in and was told not to scan (a gated skip otherwise leaves no

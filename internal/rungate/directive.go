@@ -12,6 +12,8 @@
 // fallback, and the quiet back-off while another instance holds the lock.
 package rungate
 
+import "encoding/json"
+
 // Wire contract for GET /developer-mdm-agent/run-directive. Mode and reason
 // strings are wire-permanent and mirrored by the backend's
 // run_directive_handler.go.
@@ -35,9 +37,21 @@ type Directive struct {
 // runConfigEnvelope is the subset of the run-config response the gate reads.
 // The scan directive rides run-config alongside detection_rules and policy;
 // those siblings are intentionally ignored here (the scan path fetches them
-// itself). A pointer so a missing field is distinguishable from a zero value.
+// itself). Both members are kept raw and decoded one at a time, so a
+// malformed block on one side cannot discard a valid answer on the other.
 type runConfigEnvelope struct {
-	ScanDirective *Directive `json:"scan_directive"`
+	ScanDirective json.RawMessage `json:"scan_directive"`
+	Scanners      json.RawMessage `json:"scanners"`
+}
+
+// runConfigScanners is the tenant's per-scanner controls. Only the credentials
+// scanner is read; other scanners under the same object are ignored. Pointers
+// at every level so a missing or null field is distinguishable from false:
+// only an explicit boolean may change the cached setting.
+type runConfigScanners struct {
+	Credentials *struct {
+		Enabled *bool `json:"enabled"`
+	} `json:"credentials"`
 }
 
 // ShouldSkip is the single reader of Mode. Anything that is not exactly

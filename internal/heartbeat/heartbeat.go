@@ -63,12 +63,37 @@ type Record struct {
 // successful check-in. Everything here is advisory — a missing, corrupt, or
 // future-schema file only costs one serial probe and one fail-open run, never
 // a wrong skip. Fields mirror the wire directive; see internal/rungate.
+//
+// The tenant's last known credential-scanning setting also lives here. It is
+// what keeps a tenant's "off" in force while the backend is unreachable; losing
+// the file loses that memory, and the next successful check-in restores it.
 type RunGate struct {
 	DeviceID                 string `json:"device_id,omitempty"`
 	LastFullRunAt            int64  `json:"last_full_run_at,omitempty"` // unix sec; stamped on upload success
 	GatingEnabled            bool   `json:"gating_enabled,omitempty"`
 	EffectiveIntervalMinutes int    `json:"effective_interval_minutes,omitempty"`
 	DirectiveFetchedAt       int64  `json:"directive_fetched_at,omitempty"` // unix sec of the last successful check-in
+	// Scanners is the tenant's last known per-scanner controls, in the same
+	// hierarchy the run-config response uses. Nil until the backend states one.
+	Scanners *RunGateScanners `json:"scanners,omitempty"`
+}
+
+// RunGateScanners is the cached per-scanner controls. Credentials.Enabled is a
+// pointer so "never told" (nil, scan) is distinct from an explicit false; only
+// an explicit answer from the backend writes it.
+type RunGateScanners struct {
+	Credentials struct {
+		Enabled *bool `json:"enabled,omitempty"`
+	} `json:"credentials"`
+}
+
+// CredentialScanning returns the cached credential-scanning setting, nil when
+// the backend has never stated one.
+func (rg *RunGate) CredentialScanning() *bool {
+	if rg == nil || rg.Scanners == nil {
+		return nil
+	}
+	return rg.Scanners.Credentials.Enabled
 }
 
 // mu serializes the read-modify-write writers (Write for the breadcrumb,

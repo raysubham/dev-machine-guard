@@ -1,6 +1,7 @@
 package rungate
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -20,12 +21,15 @@ func TestCheckinParsesDirectiveAndSendsParams(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	d, err := Checkin(context.Background(), srv.URL, "tenant-key", "acme corp", "SER 123", 1753150000)
+	d, cred, err := Checkin(context.Background(), srv.URL, "tenant-key", "acme corp", "SER 123", 1753150000)
 	if err != nil {
 		t.Fatalf("Checkin: %v", err)
 	}
 	if !d.ShouldSkip() || d.Reason != "not_due" || d.EffectiveIntervalMinutes != 240 || d.NextEligibleAt != 1753164400 {
 		t.Fatalf("directive = %+v", d)
+	}
+	if cred != nil {
+		t.Fatalf("credential setting = %v, want nil when the response omits it", *cred)
 	}
 	if gotPath != "/v1/acme%20corp/developer-mdm-agent/run-config" && gotPath != "/v1/acme corp/developer-mdm-agent/run-config" {
 		t.Errorf("path = %q (customer id must be path-escaped)", gotPath)
@@ -49,7 +53,7 @@ func TestCheckinOmitsZeroLastRunAt(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, err := Checkin(context.Background(), srv.URL, "k", "acme", "SER1", 0); err != nil {
+	if _, _, err := Checkin(context.Background(), srv.URL, "k", "acme", "SER1", 0); err != nil {
 		t.Fatalf("Checkin: %v", err)
 	}
 	if strings.Contains(gotQuery, "last_run_at") {
@@ -66,22 +70,108 @@ func TestCheckinErrorPaths(t *testing.T) {
 		{name: "404 old backend", handler: func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotFound) }},
 		{name: "500", handler: func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) }},
 		{name: "garbage body", handler: func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("<html>nope")) }},
-		{name: "no scan_directive (rules-only / old backend)", handler: func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte(`{"detection_rules":{"rules":[]}}`))
-		}},
-		{name: "empty mode", handler: func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte(`{"scan_directive":{"reason":"x"}}`))
+		{name: "oversized body", handler: func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`{"scanners":{"credentials":{"enabled":false}},"pad":"`))
+			_, _ = w.Write(bytes.Repeat([]byte("x"), maxDirectiveBytes))
+			_, _ = w.Write([]byte(`"}`))
 		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			srv := httptest.NewServer(tt.handler)
 			defer srv.Close()
-			if _, err := Checkin(context.Background(), srv.URL, "k", "acme", "SER1", 0); err == nil {
+			_, cred, err := Checkin(context.Background(), srv.URL, "k", "acme", "SER1", 0)
+			if err == nil {
 				t.Fatal("Checkin must error so the gate fails open")
+			}
+			if cred != nil {
+				t.Fatalf("credential setting = %v on error, want nil so the cache is kept", *cred)
 			}
 		})
 	}
+}
+
+// TestCheckinWithoutDirectiveIsNotAnError: a rules-only answer or one from a
+// backend that predates gating yields a zero directive (cadence falls back to
+// the cache) but is still a valid response; it may carry the credential
+// setting, which must not be lost behind a cadence complaint.
+func TestCheckinWithoutDirectiveIsNotAnError(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		body string
+		want *bool
+	}{
+		{name: "no scan_directive", body: `{"detection_rules":{"rules":[]}}`},
+		{name: "empty mode", body: `{"scan_directive":{"reason":"x"}}`},
+		{name: "no scan_directive, credentials off", body: `{"scanners":{"credentials":{"enabled":false}}}`, want: boolPtr(false)},
+		{name: "empty mode, credentials off", body: `{"scan_directive":{"reason":"x"},"scanners":{"credentials":{"enabled":false}}}`, want: boolPtr(false)},
+		{name: "null directive, credentials off", body: `{"scan_directive":null,"scanners":{"credentials":{"enabled":false}}}`, want: boolPtr(false)},
+		{name: "wrong-typed directive field, credentials off", body: `{"scan_directive":{"mode":"full","effective_interval_minutes":"invalid"},"scanners":{"credentials":{"enabled":false}}}`, want: boolPtr(false)},
+		{name: "directive not an object, credentials off", body: `{"scan_directive":"full","scanners":{"credentials":{"enabled":false}}}`, want: boolPtr(false)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(tt.body)) }))
+			defer srv.Close()
+			d, cred, err := Checkin(context.Background(), srv.URL, "k", "acme", "SER1", 0)
+			if err != nil {
+				t.Fatalf("Checkin: %v", err)
+			}
+			if d.Mode != "" {
+				t.Fatalf("directive = %+v, want zero", d)
+			}
+			if (cred == nil) != (tt.want == nil) || (cred != nil && *cred != *tt.want) {
+				t.Fatalf("credential setting = %v, want %v", deref(cred), deref(tt.want))
+			}
+		})
+	}
+}
+
+// TestCheckinCredentialScanning covers the decode rule: only an explicit
+// boolean is an answer. Omission, null (object or member) and unknown siblings
+// leave the setting nil so the caller keeps whatever it already knows.
+func TestCheckinCredentialScanning(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		body string
+		want *bool
+	}{
+		{name: "explicit false", body: `{"scan_directive":{"mode":"full"},"scanners":{"credentials":{"enabled":false}}}`, want: boolPtr(false)},
+		{name: "explicit true", body: `{"scan_directive":{"mode":"full"},"scanners":{"credentials":{"enabled":true}}}`, want: boolPtr(true)},
+		{name: "object omitted", body: `{"scan_directive":{"mode":"full"}}`},
+		{name: "scanners null", body: `{"scan_directive":{"mode":"full"},"scanners":null}`},
+		{name: "scanners empty", body: `{"scan_directive":{"mode":"full"},"scanners":{}}`},
+		{name: "credentials null", body: `{"scan_directive":{"mode":"full"},"scanners":{"credentials":null}}`},
+		{name: "credentials empty", body: `{"scan_directive":{"mode":"full"},"scanners":{"credentials":{}}}`},
+		{name: "other scanner only", body: `{"scan_directive":{"mode":"full"},"scanners":{"browser":{"enabled":false}}}`},
+		{name: "enabled null", body: `{"scan_directive":{"mode":"full"},"scanners":{"credentials":{"enabled":null}}}`},
+		{name: "enabled not a boolean", body: `{"scan_directive":{"mode":"full"},"scanners":{"credentials":{"enabled":"false"}}}`},
+		{name: "scanners not an object", body: `{"scan_directive":{"mode":"full"},"scanners":[1]}`},
+		{name: "unknown sibling fields", body: `{"scan_directive":{"mode":"full"},"scanners":{"credentials":{"enabled":false,"future":{"x":1}},"browser":{"enabled":true}},"extra":[1,2]}`, want: boolPtr(false)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(tt.body)) }))
+			defer srv.Close()
+			d, cred, err := Checkin(context.Background(), srv.URL, "k", "acme", "SER1", 0)
+			if err != nil {
+				t.Fatalf("Checkin: %v", err)
+			}
+			if d.Mode != ModeFull {
+				t.Fatalf("directive = %+v, want the full directive alongside the setting", d)
+			}
+			if (cred == nil) != (tt.want == nil) || (cred != nil && *cred != *tt.want) {
+				t.Fatalf("credential setting = %v, want %v", deref(cred), deref(tt.want))
+			}
+		})
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+func deref(b *bool) any {
+	if b == nil {
+		return nil
+	}
+	return *b
 }
 
 func TestCheckinRespectsContextDeadline(t *testing.T) {
@@ -95,7 +185,7 @@ func TestCheckinRespectsContextDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := Checkin(ctx, srv.URL, "k", "acme", "SER1", 0)
+	_, _, err := Checkin(ctx, srv.URL, "k", "acme", "SER1", 0)
 	if err == nil {
 		t.Fatal("Checkin must error on deadline")
 	}
@@ -115,7 +205,7 @@ func TestCheckinValidatesInputs(t *testing.T) {
 		{name: "no device", endpoint: "http://x", key: "k", customerID: "c", deviceID: ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := Checkin(context.Background(), tt.endpoint, tt.key, tt.customerID, tt.deviceID, 0); err == nil {
+			if _, _, err := Checkin(context.Background(), tt.endpoint, tt.key, tt.customerID, tt.deviceID, 0); err == nil {
 				t.Fatal("want validation error")
 			}
 		})
