@@ -36,16 +36,15 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/tcc"
 	"github.com/step-security/dev-machine-guard/internal/telemetry"
 	"github.com/step-security/dev-machine-guard/internal/winproc"
+	"github.com/step-security/dev-machine-guard/internal/wslguest"
 )
 
-// auditSkipper builds a TCC skipper if scanning into TCC-protected dirs is
-// not opted in. Mirrors scan.Run / telemetry.Run so the focused *Only audits
-// don't accidentally prompt the user on macOS.
+// auditSkipper builds the TCC skipper for the focused *Only audits from the
+// same two toggles the full scan uses (protected dirs, network volumes), so
+// they don't accidentally prompt the user on macOS. Mirrors scan.Run /
+// telemetry.Run; nil when neither class has anything to skip.
 func auditSkipper(exec executor.Executor, cfg *cli.Config) *tcc.Skipper {
-	if !tcc.Enabled(cfg.IncludeTCCProtected) {
-		return nil
-	}
-	return tcc.New(executor.ResolveHome(exec))
+	return tcc.ForRun(executor.ResolveHome(exec), cfg.IncludeTCCProtected, cfg.IncludeNetworkVolumes)
 }
 
 // hookReconcileTimeout caps the entire reconcile step (fetch + cache
@@ -74,6 +73,11 @@ func main() {
 	}
 
 	// Load persisted config (~/.stepsecurity/config.json) before parsing CLI
+	// --config must be honoured before Load(), which runs ahead of flag
+	// parsing and keeps the first values it reads.
+	if p := cli.ConfigPathFromArgs(os.Args[1:]); p != "" {
+		config.SetFileOverride(p)
+	}
 	config.Load()
 
 	cfg, err := cli.Parse(os.Args[1:])
@@ -112,6 +116,9 @@ func main() {
 	}
 	if cfg.IncludeTCCProtected == nil && config.IncludeTCCProtected != nil {
 		cfg.IncludeTCCProtected = config.IncludeTCCProtected
+	}
+	if cfg.IncludeNetworkVolumes == nil && config.IncludeNetworkVolumes != nil {
+		cfg.IncludeNetworkVolumes = config.IncludeNetworkVolumes
 	}
 	if cfg.ColorMode == "auto" && config.ColorMode != "" {
 		cfg.ColorMode = config.ColorMode
@@ -691,13 +698,20 @@ func findLegacyLeftovers(legacy string) []string {
 // it is copied onto cfg so every managed entry point hands the same answer to
 // telemetry.Run.
 func gateSkipsRun(exec executor.Executor, log *progress.Logger, cfg *cli.Config) bool {
-	res := rungate.Evaluate(context.Background(), exec, log, cfg.ForceScan)
+	// A run inside a WSL distro gates under the identity its host gave it, not
+	// under the distro's own (absent) serial.
+	res := rungate.Evaluate(context.Background(), exec, log, cfg.ForceScan,
+		wslguest.DeviceID(cfg.WSLHostSerial, cfg.WSLDistroID))
 	cfg.CredentialScanningDisabled = res.CredentialScanningDisabled
 	if !res.Skip {
 		log.Progress("Run gate: proceeding with this run (%s)", res.Reason)
 		// Carry the decision into telemetry.Run so it echoes a line inside the
 		// captured execution log (the gate runs before log capture starts).
 		cfg.GateProceedReason = res.Reason
+		// Carry the tenant's WSL switch into the run. Only set on the proceed
+		// path: a skipped run scans nothing at all.
+		cfg.WSLScanEnabled = res.WSL.Enabled
+		cfg.WSLScanReason = res.WSL.Reason
 		return false
 	}
 	if res.Detail != "" {

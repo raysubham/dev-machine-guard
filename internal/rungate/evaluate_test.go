@@ -43,7 +43,7 @@ func staticServer(body string) *httptest.Server {
 
 func evaluate(t *testing.T, forceScan bool) Result {
 	t.Helper()
-	return Evaluate(context.Background(), executor.NewMock(), progress.NewNoop(), forceScan)
+	return Evaluate(context.Background(), executor.NewMock(), progress.NewNoop(), forceScan, "")
 }
 
 func storedSetting(t *testing.T) *bool {
@@ -202,7 +202,7 @@ func TestEvaluateFreshFalseAppliesWhenPersistenceFails(t *testing.T) {
 	exec.SetGOOS("darwin")
 	exec.SetCommand(`    "IOPlatformSerialNumber" = "SER-PROBED"`, "", 0, "ioreg", "-l")
 
-	res := Evaluate(context.Background(), exec, progress.NewNoop(), false)
+	res := Evaluate(context.Background(), exec, progress.NewNoop(), false, "")
 	if res.Skip || !res.CredentialScanningDisabled {
 		t.Fatalf("result = %+v, want proceed with credentials disabled", res)
 	}

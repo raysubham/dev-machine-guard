@@ -76,8 +76,25 @@ Binaries are found via `$PATH` lookup (cross-platform). LM Studio is additionall
 |-----------------------|------------|---------------------------------------------------------------------------------|
 | Ollama                | `ollama`   | Checks if process is running                                                    |
 | LocalAI               | `local-ai` | Checks if process is running                                                    |
-| LM Studio             | `lm-studio`| GUI: `/Applications/LM Studio.app` (macOS) or `%LOCALAPPDATA%\Programs\LM Studio` (Windows) |
+| LM Studio             | `lm-studio`| GUI: `/Applications/LM Studio.app` (macOS), `%LOCALAPPDATA%\Programs\LM Studio` (Windows), `~/.local/share/LM Studio` or `/opt/LM Studio` (Linux). Never executed for its version — see below |
 | Text Generation WebUI | `textgen`  | Checks if process is running                                                    |
+
+### Version probes never launch a desktop app
+
+`lm-studio` names the desktop application's launcher, not a CLI (LM Studio's CLI is a
+separate binary, `lms`). A packaged Electron app does not implement `--version`, so probing
+it that way opens the app's window instead of printing a version. Its version therefore comes
+only from on-disk metadata — the macOS bundle `Info.plist`, the Windows uninstall registry, or
+on Linux the dpkg entry for the `.deb`, the snap manifest, or the version in an AppImage
+filename — and reads `unknown` when none of those resolve. The tool is still reported as
+installed either way.
+
+This is also enforced generically: before any version probe execs a binary, the agent checks
+whether it is a packaged Electron app's entry point, which is visible on disk
+(`resources/app.asar` and the Chromium runtime sit beside the executable; a CLI shim's
+directory holds neither). On macOS the equivalent check is Gatekeeper quarantine assessment.
+A refused probe reports `unknown`. Only Electron apps are detected — a GTK or Qt application
+on `$PATH` is not.
 
 ## MCP Configuration Sources
 
@@ -172,6 +189,8 @@ Per extension, the scan records identity (id, name, version, manifest version), 
 
 Node.js scanning is **off by default** in community mode (it can be slow). Enable with `--enable-npm-scan`.
 
+**Projects inside dev containers are covered on macOS.** Container runtimes (OrbStack, Docker Desktop, Colima) expose the guest filesystem through a mount under `$HOME` — `~/OrbStack`, for example — so a project living inside a running container is walked like any other. macOS classifies those mounts as *network volumes* and gates the first access behind a TCC prompt; the agent walks them anyway, because that inventory is not reachable any other way. Fleets that would rather not see the prompt turn the walk off with `include_network_volumes: false`, or pre-approve it via PPPC — see [macos-tcc-permissions.md](docs/macos-tcc-permissions.md).
+
 ## Homebrew Package Scanning (Optional)
 
 Homebrew scanning detects installed formulae and casks with rich metadata. Enable with `--enable-brew-scan`.
@@ -209,6 +228,7 @@ Discovered by scanning the **search directories** for virtual environments (`pyv
 
 - **TCC-protected user directories** — the project/venv walk skips `~/Documents`, `~/Desktop`, `~/Downloads`, and `~/Library` to avoid macOS permission prompts. (The macOS global user-site `~/Library/Python/*` is the exception: it is scanned as its own explicit global root, so global user-site packages are still covered.) A **project virtual environment** kept under one of these directories is missed unless `include_tcc_protected: true` is set **and** the agent has Full Disk Access (see [macos-tcc-permissions.md](docs/macos-tcc-permissions.md)).
 - **Locations outside `$HOME`** — e.g. `/opt`, `/srv`, `/data`, `/Users/Shared`, or a separate repos volume. Add them via `search_dirs`.
+- **macOS network volumes when a fleet opts out** — venvs under a container-runtime mount (`~/OrbStack`, Docker Desktop / Colima shares) *are* covered by default; they're missed only where an admin set `include_network_volumes: false` to suppress the TCC prompt. The mounts given up are named in the run's warning log.
 - **Global interpreters at non-standard prefixes** not under any tree listed above. Add the prefix (or a parent) via `search_dirs`.
 
 The set of global install roots scanned is logged once per scan at info level (full paths at debug), so field logs show exactly where the agent looked.
@@ -231,6 +251,22 @@ Detected if `snap` is installed. Metadata: name, version, revision, tracking cha
 ### Flatpak Packages
 
 Detected if `flatpak` is installed. Metadata: app ID, name, version, arch, branch, origin, active commit, runtime.
+
+## WSL Detection (Windows)
+
+Host-side detection of Windows Subsystem for Linux, reported by the **Windows agent** under `device.wsl`. Answers "is WSL present, and is a distribution actively running right now?" so a fleet dashboard can flag machines with WSL environments that the Linux agent has not yet scanned. It does **not** mount or scan distro filesystems — run the Linux binary inside a distro for that.
+
+| Signal | Source | Notes |
+|--------|--------|-------|
+| Registered distros | `HKU\<SID>\...\CurrentVersion\Lxss` (all loaded user hives) | Enumerating HKU (not just HKCU) lets a SYSTEM-context scan still see a signed-in user's distros. Name, WSL version, default flag, owning SID, base path. |
+| Distro ID | the Lxss subkey name (a GUID) | The only stable per-distro identifier: survives restarts and renames, changes on unregister/re-import. **Not** derivable from the base path — imported distros have no GUID in theirs. |
+| Default user | per-distro `DefaultUid` | The uid `wsl -d <name>` runs as. `0` means the distro has no non-root user; absent means unreadable, and the two are kept distinct. |
+| WSL version per distro | registry `Flags & 0x8` | The per-distro `Version` DWORD is unreliable (reads 2 on WSL1). Flags `0x7` → WSL1, `0xF` → WSL2 — both measured (WSL1 EC2 box + WSL2 metal VM). |
+| Installed | `WslService` (Store/MSI) or `LxssManager` (legacy) service key | `System32\wsl.exe` is **not** a signal — it ships with stock Windows even when WSL is disabled. |
+| Package version | `Uninstall\...` `DisplayVersion` for "Windows Subsystem for Linux" | Floors to `unknown`. |
+| Actively used | `wsl.exe --list --running --quiet` | The only subprocess; UTF-16LE output decoded defensively. Registry carries no runtime state. Skipped entirely unless a WSL service is *running* (native SCM query, no process) — that probe **starts** `WslService` when stopped, so on an idle machine it would wake a service to learn nothing. |
+
+Presence is tri-state (`yes` / `no` / `unknown`): a probe that cannot read the registry reports `unknown` rather than a false `no`. Gated behind the `wsl-detection` feature flag until the backend consumes the payload. Limitation: users whose hive is not loaded (never signed in this boot) are not counted.
 
 ---
 
