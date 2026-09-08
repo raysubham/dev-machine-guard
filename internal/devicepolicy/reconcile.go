@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/step-security/dev-machine-guard/internal/aiagents/redact"
 	"github.com/step-security/dev-machine-guard/internal/secureuserfile"
 )
 
@@ -141,6 +142,8 @@ type Reconciler struct {
 	// no-op.
 	Now  func() time.Time
 	Logf func(format string, args ...any)
+	// Warnf records actionable failures at the default log level. Logf stays diagnostic-only.
+	Warnf func(format string, args ...any)
 
 	// writeState and clearState are test seams over the ownership store
 	// (WriteAppliedState / ClearAppliedState). nil → the real implementation.
@@ -302,6 +305,12 @@ func (r *Reconciler) logf(format string, args ...any) {
 	}
 }
 
+func (r *Reconciler) warnf(format string, args ...any) {
+	if r.Warnf != nil {
+		r.Warnf("devicepolicy: category=%s target=%s %s", r.category(), r.target(), redact.String(fmt.Sprintf(format, args...)))
+	}
+}
+
 func (r *Reconciler) category() string {
 	if r.Category != "" {
 		return r.Category
@@ -441,7 +450,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		if ep.present() && !ep.Clear {
 			if err := r.prepareRenderedValue(ep.Policy); err != nil {
 				if r.enforcement == enforcementMDM {
-					r.logf("devicepolicy: mdm render desired value failed: %v → verification_failed", err)
+					r.warnf("mdm render desired value failed: %v; verification_failed", err)
 					return r.sendReport(ctx, ComplianceReport{Category: cat, Target: tgt, State: StateVerificationFailed})
 				}
 				_ = r.report(ctx, cat, tgt, StatePolicyNotApplied, "")
@@ -499,13 +508,13 @@ func (r *Reconciler) verifyMDM(ctx context.Context, cat, tgt string, ep Effectiv
 
 	expected, err := r.renderValue(ep.Policy)
 	if err != nil {
-		r.logf("devicepolicy: mdm render desired value failed: %v → verification_failed", err)
+		r.warnf("mdm render desired value failed: %v; verification_failed", err)
 		return r.sendReport(ctx, ComplianceReport{Category: cat, Target: tgt, State: StateVerificationFailed})
 	}
 
 	present, observed, err := r.probeContent(expected)
 	if err != nil {
-		r.logf("devicepolicy: mdm content probe failed: %v → verification_failed", err)
+		r.warnf("mdm content probe failed: %v; verification_failed", err)
 		return r.sendReport(ctx, ComplianceReport{Category: cat, Target: tgt, State: StateVerificationFailed})
 	}
 
@@ -517,7 +526,7 @@ func (r *Reconciler) verifyMDM(ctx context.Context, cat, tgt string, ep Effectiv
 	raw, err := json.Marshal(observed)
 	if err != nil {
 		// observed is built from our own parsers; a marshal failure is not expected.
-		r.logf("devicepolicy: mdm marshal observed failed: %v → verification_failed", err)
+		r.warnf("mdm marshal observed failed: %v; verification_failed", err)
 		return r.sendReport(ctx, ComplianceReport{Category: cat, Target: tgt, State: StateVerificationFailed})
 	}
 	r.logf("devicepolicy: mdm managed policy present → mdm_managed (%d observed key(s))", len(observed))
@@ -836,7 +845,7 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 			return fmt.Errorf("devicepolicy: complete adopted state: %w", serr)
 		}
 		if perr := r.persistState(cat, state); perr != nil {
-			r.logf("devicepolicy: could not adopt already-converged state at %s: %v", r.Writer.Location(), perr)
+			r.warnf("could not record ownership at %s: %v; file unchanged", r.Writer.Location(), perr)
 		}
 		r.logf("devicepolicy: %s already holds the desired block (adopted) — no write", r.Writer.Location())
 		return r.report(ctx, cat, tgt, StateCompliant, ep.Hash)
@@ -874,6 +883,9 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 		return fmt.Errorf("devicepolicy: enforce: write %s: %w", r.Writer.Location(), werr)
 	}
 	readbackMatch := rb == newValue
+	if !readbackMatch {
+		r.warnf("readback mismatch at %s; policy not verified", r.Writer.Location())
+	}
 
 	// Ownership is recorded on EVERY successful write. By default it records the
 	// rendered value; a fixed-state marker component records its non-secret
@@ -890,7 +902,7 @@ func (r *Reconciler) enforceSingle(ctx context.Context, cat, tgt string, ep Effe
 		// cleanly undone → write_failed; restore failed/aborted → verification_failed.
 		state, rbErr := r.rollback(onDisk, present)
 		if rbErr != nil {
-			r.logf("devicepolicy: rollback at %s failed: %v", r.Writer.Location(), rbErr)
+			r.warnf("rollback at %s failed: %v", r.Writer.Location(), rbErr)
 		}
 		_ = r.report(ctx, cat, tgt, state, "")
 		return fmt.Errorf("devicepolicy: enforce: update state: %w", stateErr)
@@ -1043,6 +1055,9 @@ func (r *Reconciler) enforceManaged(ctx context.Context, cat, tgt string, ep Eff
 		_ = r.report(ctx, cat, tgt, StateWriteFailed, "")
 		return fmt.Errorf("devicepolicy: enforce: update state: %w", err)
 	}
+	if !readbackMatch {
+		r.warnf("readback mismatch at %s; policy not verified", r.Writer.Location())
+	}
 	r.logf("devicepolicy: wrote policy to %s (readback_match=%v)", r.Writer.Location(), readbackMatch)
 
 	state := Verify(VerifyInput{WriteOK: true, ReadbackMatch: readbackMatch})
@@ -1164,7 +1179,7 @@ func (r *Reconciler) rollbackWrite(prevOnDisk string, prevPresent bool) {
 		_, err = r.Writer.Clear()
 	}
 	if err != nil {
-		r.logf("devicepolicy: rollback at %s failed: %v", r.Writer.Location(), err)
+		r.warnf("rollback at %s failed: %v", r.Writer.Location(), err)
 	}
 }
 

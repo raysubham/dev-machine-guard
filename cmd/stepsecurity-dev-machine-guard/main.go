@@ -13,6 +13,7 @@ import (
 
 	aiagentscli "github.com/step-security/dev-machine-guard/internal/aiagents/cli"
 	"github.com/step-security/dev-machine-guard/internal/aiagents/ingest"
+	"github.com/step-security/dev-machine-guard/internal/aiagents/redact"
 	"github.com/step-security/dev-machine-guard/internal/aiagents/state"
 	"github.com/step-security/dev-machine-guard/internal/buildinfo"
 	"github.com/step-security/dev-machine-guard/internal/cli"
@@ -826,11 +827,11 @@ func runIDEExtensionEnforce(exec executor.Executor, log *progress.Logger) {
 		DeviceID:   dev.SerialNumber,
 		Platform:   dev.Platform,
 		// Probe defaults to devicepolicy.ProbeManagedPolicy (per-OS) when nil.
-		Logf: func(format string, args ...any) { log.Debug(format, args...) },
+		Logf:  func(format string, args ...any) { log.Debug(format, args...) },
+		Warnf: log.Warn,
 	}
 	if err := r.Reconcile(ctx); err != nil {
-		log.Warn("ide-extension enforce: %v", err)
-		aiagentscli.AppendError("devicepolicy", "enforce_failed", err.Error(), "")
+		log.Warn("ide-extension enforce: %s", redact.String(err.Error()))
 	}
 }
 
@@ -869,8 +870,7 @@ func runPackageConfigLanes(exec executor.Executor, log *progress.Logger, fetcher
 	npmCancel()
 	if npmErr != nil {
 		wrapped := fmt.Errorf("npm package-config enforce: %w", npmErr)
-		log.Warn("%v", wrapped)
-		aiagentscli.AppendError("devicepolicy", "enforce_failed", wrapped.Error(), "")
+		log.Warn("%s", redact.String(wrapped.Error()))
 	}
 
 	pypiCtx, pypiCancel := context.WithTimeout(context.Background(), devicePolicyEnforceTimeout)
@@ -878,8 +878,7 @@ func runPackageConfigLanes(exec executor.Executor, log *progress.Logger, fetcher
 	pypiCancel()
 	if pypiErr != nil {
 		wrapped := fmt.Errorf("PyPI package-config enforce: %w", pypiErr)
-		log.Warn("%v", wrapped)
-		aiagentscli.AppendError("devicepolicy", "enforce_failed", wrapped.Error(), "")
+		log.Warn("%s", redact.String(wrapped.Error()))
 	}
 
 	goCtx, goCancel := context.WithTimeout(context.Background(), devicePolicyEnforceTimeout)
@@ -887,8 +886,7 @@ func runPackageConfigLanes(exec executor.Executor, log *progress.Logger, fetcher
 	goCancel()
 	if goErr != nil {
 		wrapped := fmt.Errorf("go package-config enforce: %w", goErr)
-		log.Warn("%v", wrapped)
-		aiagentscli.AppendError("devicepolicy", "enforce_failed", wrapped.Error(), "")
+		log.Warn("%s", redact.String(wrapped.Error()))
 	}
 }
 
@@ -909,6 +907,7 @@ func runNPMPackageConfigLane(ctx context.Context, exec executor.Executor, log *p
 		OwnershipKey:        devicepolicy.NPMOwnedKey,
 		OwnershipStateValue: devicepolicy.NPMOwnershipValue,
 		Logf:                func(format string, args ...any) { log.Debug(format, args...) },
+		Warnf:               log.Warn,
 	}
 	r.InitWriter = func() error {
 		var err error
@@ -942,6 +941,7 @@ func runPyPIPackageConfigLane(ctx context.Context, exec executor.Executor, log *
 		DeviceID:   serial,
 		Platform:   platform,
 		Logf:       func(format string, args ...any) { log.Debug(format, args...) },
+		Warnf:      log.Warn,
 	}
 	return coordinator.Reconcile(ctx)
 }
@@ -955,6 +955,7 @@ func runGoPackageConfigLane(ctx context.Context, exec executor.Executor, log *pr
 		DeviceID:   serial,
 		Platform:   platform,
 		Logf:       func(format string, args ...any) { log.Debug(format, args...) },
+		Warnf:      log.Warn,
 	}
 	return coordinator.Reconcile(ctx)
 }

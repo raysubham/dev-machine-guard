@@ -143,7 +143,8 @@ func TestNPMPackageConfigLane_ValidatesSettingsBeforeResolvingTargetUser(t *test
 }
 
 func TestPackageConfigLanes_FailureDoesNotSuppressSibling(t *testing.T) {
-	t.Setenv("STEPSECURITY_HOME", t.TempDir())
+	logDir := t.TempDir()
+	t.Setenv("STEPSECURITY_HOME", logDir)
 	tests := []struct {
 		name       string
 		failTarget string
@@ -162,6 +163,9 @@ func TestPackageConfigLanes_FailureDoesNotSuppressSibling(t *testing.T) {
 
 			if got, want := strings.Join(fetcher.calls, ","), devicepolicy.TargetNPM+","+devicepolicy.TargetPyPI+","+devicepolicy.TargetGo; got != want {
 				t.Errorf("lane calls = %q, want %q", got, want)
+			}
+			if _, err := os.Stat(filepath.Join(logDir, "ai-agent-hook-errors.jsonl")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("device-policy failure wrote to hook error log: stat error = %v", err)
 			}
 		})
 	}
