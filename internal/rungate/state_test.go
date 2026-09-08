@@ -1,12 +1,9 @@
 package rungate
 
 import (
-	"bytes"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -62,7 +59,7 @@ func TestStampAndRecordPreserveEachOther(t *testing.T) {
 		t.Fatalf("stamp: %v", err)
 	}
 	d := Directive{Mode: ModeSkip, Reason: "not_due", GatingEnabled: true, EffectiveIntervalMinutes: 240}
-	if err := recordCheckin("SER123", d, nil, now.Add(time.Minute)); err != nil {
+	if err := recordCheckin("SER123", d, now.Add(time.Minute)); err != nil {
 		t.Fatalf("recordCheckin: %v", err)
 	}
 
@@ -95,7 +92,7 @@ func TestHeartbeatAndGateShareFile(t *testing.T) {
 
 	// A prior run left a check-in cache.
 	d := Directive{Mode: ModeSkip, Reason: "not_due", GatingEnabled: true, EffectiveIntervalMinutes: 240}
-	if err := recordCheckin("SER123", d, nil, now); err != nil {
+	if err := recordCheckin("SER123", d, now); err != nil {
 		t.Fatalf("recordCheckin: %v", err)
 	}
 	// This run's heartbeat stamps the breadcrumb first.
@@ -147,67 +144,5 @@ func TestCorruptFileIsRecreated(t *testing.T) {
 	st, ok := readState()
 	if !ok || st.LastFullRunAt != now.Unix() {
 		t.Fatalf("state not recreated cleanly: %+v ok=%v", st, ok)
-	}
-}
-
-// TestRecordCheckinCredentialSetting pins the persistence rule for the tenant's
-// credential-scanning setting: only an explicit answer writes it, a check-in
-// without one leaves the stored value alone, and a response without a directive
-// leaves the cadence fields alone. Heartbeat and run stamps never touch it.
-func TestRecordCheckinCredentialSetting(t *testing.T) {
-	path := withTempState(t)
-	now := time.Unix(1_753_160_800, 0)
-	d := Directive{Mode: ModeFull, Reason: "due", GatingEnabled: true, EffectiveIntervalMinutes: 240}
-
-	if err := recordCheckin("SER123", d, boolPtr(false), now); err != nil {
-		t.Fatalf("recordCheckin false: %v", err)
-	}
-	st, ok := readState()
-	if !ok || st.CredentialScanning() == nil || *st.CredentialScanning() {
-		t.Fatalf("explicit false not persisted: %+v ok=%v", st, ok)
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var compact bytes.Buffer
-	if err := json.Compact(&compact, raw); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(compact.String(), `"scanners":{"credentials":{"enabled":false}}`) {
-		t.Fatalf("cache shape: %s", raw)
-	}
-
-	// A later check-in that says nothing about credentials, and carries no
-	// directive, must preserve both the setting and the cadence cache.
-	if err := recordCheckin("SER123", Directive{}, nil, now.Add(time.Hour)); err != nil {
-		t.Fatalf("recordCheckin nil: %v", err)
-	}
-	st, _ = readState()
-	if st.CredentialScanning() == nil || *st.CredentialScanning() {
-		t.Errorf("nil answer changed the stored setting: %+v", st)
-	}
-	if st.EffectiveIntervalMinutes != 240 || !st.GatingEnabled || st.DirectiveFetchedAt != now.Unix() {
-		t.Errorf("directive-less check-in changed the cadence cache: %+v", st)
-	}
-
-	if err := StampLastFullRun(now.Add(2 * time.Hour)); err != nil {
-		t.Fatalf("stamp: %v", err)
-	}
-	if err := heartbeat.Write(path, "send-telemetry", "one_time"); err != nil {
-		t.Fatalf("heartbeat write: %v", err)
-	}
-	st, _ = readState()
-	if st.CredentialScanning() == nil || *st.CredentialScanning() {
-		t.Errorf("stamp or heartbeat changed the stored setting: %+v", st)
-	}
-
-	// Only an explicit true re-enables.
-	if err := recordCheckin("SER123", d, boolPtr(true), now.Add(3*time.Hour)); err != nil {
-		t.Fatalf("recordCheckin true: %v", err)
-	}
-	st, _ = readState()
-	if st.CredentialScanning() == nil || !*st.CredentialScanning() {
-		t.Errorf("explicit true not persisted: %+v", st)
 	}
 }

@@ -64,7 +64,7 @@ type runConfigEnvelope struct {
 // runConfigScanners is the tenant's per-scanner controls. Only the credentials
 // scanner is read; other scanners under the same object are ignored. Pointers
 // at every level so a missing or null field is distinguishable from false:
-// only an explicit boolean may change the cached setting.
+// only an explicit false turns the scanner off.
 type runConfigScanners struct {
 	Credentials *struct {
 		Enabled *bool `json:"enabled"`

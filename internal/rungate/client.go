@@ -105,7 +105,7 @@ func Checkin(ctx context.Context, endpoint, apiKey, customerID, deviceID string,
 	}
 	// Each block is decoded on its own. A scanners block that is missing, null,
 	// or carries a non-boolean enabled leaves the credential setting nil (the
-	// caller keeps its cached setting) and does not touch the directive.
+	// caller keeps credential scanning on) and does not touch the directive.
 	var credentialScanning *bool
 	var scanners runConfigScanners
 	if json.Unmarshal(env.Scanners, &scanners) == nil && scanners.Credentials != nil {

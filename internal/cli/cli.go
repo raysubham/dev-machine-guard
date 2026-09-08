@@ -62,10 +62,10 @@ type Config struct {
 	GateProceedReason string
 
 	// CredentialScanningDisabled is populated at runtime (not a CLI flag) by
-	// the run gate from the tenant's dashboard setting, last known value when
-	// the dashboard is unreachable. True means telemetry.Run must not build,
-	// probe with, or run the credential detector. The zero value scans, so a
-	// caller that never consulted the gate behaves as before.
+	// the run gate from this invocation's dashboard check-in. True means
+	// telemetry.Run must not build, probe with, or run the credential detector.
+	// The zero value scans, so a caller that never consulted the gate, or one
+	// whose check-in failed, behaves as before.
 	CredentialScanningDisabled bool
 
 	// WSLScanEnabled and WSLScanReason are populated at runtime (not CLI flags)

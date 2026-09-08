@@ -28,9 +28,9 @@ type Result struct {
 	// check-in. Zero (disabled) on every path that does not reach a backend
 	// answer — see WSLDirective: this one fails closed.
 	WSL WSLDirective
-	// CredentialScanningDisabled is the tenant's resolved credential-scanning
-	// setting for this invocation; the zero value keeps the scan, so callers
-	// that never learn it behave as before.
+	// CredentialScanningDisabled is true only when this invocation's check-in
+	// answered with an explicit false. Nothing is remembered between runs, so
+	// every other path (no answer, failure, older backend) scans as before.
 	CredentialScanningDisabled bool
 }
 
@@ -45,7 +45,7 @@ type Result struct {
 //
 // The force and kill-switch escapes decide cadence only. The check-in still
 // happens because it also carries the tenant's credential-scanning setting,
-// which a forced run must honour.
+// which a forced run must honour; nothing else from that answer is applied.
 //
 // guestDeviceID, when non-empty, is the identity of an agent running inside a
 // WSL distribution, derived by the host that triggered it. It must be used in
@@ -59,21 +59,18 @@ func Evaluate(ctx context.Context, exec executor.Executor, log *progress.Logger,
 		Now:        time.Now(),
 	}
 
+	// Local escapes decide cadence on their own, but the check-in below still
+	// runs: it is the only source of the tenant's credential-scanning setting.
+	escape := in.ForceScan || in.KillSwitch
 	if in.ForceScan {
-		log.Progress("Run gate: cadence bypassed (--force-scan)")
+		log.Progress("Run gate: bypassed (--force-scan)")
 	}
-
-	// The cache is read before any early return so the last known credential
-	// setting governs this invocation even when the backend cannot be asked.
-	// No usable cache means scan: the setting only ever arrives from a check-in.
-	st, stOK := readState()
-	cached := st.CredentialScanning()
-	credentialDisabled := stOK && cached != nil && !*cached
 
 	// Device id: the guest identity when we were given one, else cached from a
 	// prior run, else a bounded local probe. Without a real id the backend
 	// can't be asked anything meaningful — fail open rather than gate on a
 	// bogus one.
+	st, stOK := readState()
 	deviceID := strings.TrimSpace(guestDeviceID)
 	if deviceID != "" {
 		log.Debug("run-gate: gating as WSL guest %s", deviceID)
@@ -87,12 +84,25 @@ func Evaluate(ctx context.Context, exec executor.Executor, log *progress.Logger,
 	}
 	if deviceID == "" || deviceID == "unknown" {
 		log.Debug("run-gate: no usable device id — failing open")
-		return Result{Skip: false, Reason: "no_device_id", WSL: wslWithOverride(WSLDirective{}),
-			CredentialScanningDisabled: credentialDisabled}
+		reason := "no_device_id"
+		if escape {
+			reason = Decide(in).Reason
+		}
+		return Result{Skip: false, Reason: reason, WSL: wslWithOverride(WSLDirective{})}
 	}
 
 	log.Progress("Run gate: checking scan cadence with the dashboard...")
 	directive, wslDirective, credentialScanning, err := Checkin(ctx, config.APIEndpoint, config.APIKey, config.CustomerID, deviceID, st.LastFullRunAt)
+	// Only an explicit false in this invocation's answer turns credential
+	// scanning off. A failed or silent check-in scans.
+	credentialDisabled := err == nil && credentialScanning != nil && !*credentialScanning
+	if escape {
+		// Bypassing the cadence gate applies nothing else from the answer: no
+		// directive, no persistence, and no WSL scanning. Without a directive
+		// we never scan inside a distro.
+		return Result{Skip: false, Reason: Decide(in).Reason, WSL: wslWithOverride(WSLDirective{}),
+			CredentialScanningDisabled: credentialDisabled}
+	}
 	if err != nil {
 		log.Progress("Run gate: dashboard check-in failed, using cached cadence: %v", err)
 	} else {
@@ -103,18 +113,14 @@ func Evaluate(ctx context.Context, exec executor.Executor, log *progress.Logger,
 			in.Directive = &directive
 			log.Progress("Run gate: dashboard directive: mode=%s reason=%s interval=%dm",
 				directive.Mode, directive.Reason, directive.EffectiveIntervalMinutes)
+			// Persist the resolved id + gating fields even on "full" answers so
+			// skipped wakeups never re-probe and the offline fallback stays
+			// current. Best-effort.
+			if perr := recordCheckin(deviceID, directive, in.Now); perr != nil {
+				log.Debug("run-gate: could not persist check-in state: %v", perr)
+			}
 		} else {
 			log.Debug("run-gate: response carried no scan_directive; using cached cadence")
-		}
-		if credentialScanning != nil {
-			credentialDisabled = !*credentialScanning
-		}
-		// Persist the resolved id, gating fields and credential setting even
-		// on "full" answers so skipped wakeups never re-probe and the offline
-		// fallback stays current. Best-effort: the fresh answer still governs
-		// this invocation when the write fails; only the offline memory is lost.
-		if perr := recordCheckin(deviceID, directive, credentialScanning, in.Now); perr != nil {
-			log.Debug("run-gate: could not persist check-in state: %v", perr)
 		}
 	}
 	if stOK {

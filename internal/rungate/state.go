@@ -45,25 +45,12 @@ func StampLastFullRun(now time.Time) error {
 // gating fields after a successful check-in, preserving LastFullRunAt. The
 // interval — never the skip itself — is what the offline fallback replays, so
 // a stale cache can only delay a scan by one interval, not suppress it.
-//
-// Fields the answer left out are preserved: the cadence fields are written only
-// when a directive came back, the credential setting only when the backend
-// stated it. The credential setting has no expiry: a cached false stands until
-// the backend explicitly says true.
-func recordCheckin(deviceID string, d Directive, credentialScanning *bool, fetchedAt time.Time) error {
+func recordCheckin(deviceID string, d Directive, fetchedAt time.Time) error {
 	return heartbeat.UpdateRunGate(statePath(), func(rg *heartbeat.RunGate) {
 		rg.DeviceID = deviceID
-		if d.Mode != "" {
-			rg.GatingEnabled = d.GatingEnabled
-			rg.EffectiveIntervalMinutes = d.EffectiveIntervalMinutes
-			rg.DirectiveFetchedAt = fetchedAt.Unix()
-		}
-		if credentialScanning != nil {
-			if rg.Scanners == nil {
-				rg.Scanners = &heartbeat.RunGateScanners{}
-			}
-			rg.Scanners.Credentials.Enabled = credentialScanning
-		}
+		rg.GatingEnabled = d.GatingEnabled
+		rg.EffectiveIntervalMinutes = d.EffectiveIntervalMinutes
+		rg.DirectiveFetchedAt = fetchedAt.Unix()
 	})
 }
 
