@@ -17,6 +17,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/featuregate"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/output"
+	"github.com/step-security/dev-machine-guard/internal/procusage"
 	"github.com/step-security/dev-machine-guard/internal/progress"
 	"github.com/step-security/dev-machine-guard/internal/tcc"
 )
@@ -24,6 +25,14 @@ import (
 // Run executes a community-mode scan and outputs results.
 func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	ctx := context.Background()
+
+	// Resource accounting for the run, on every exit path including the
+	// output-write errors below. No phase list here: phase tracking is
+	// enterprise-only (telemetry.PhaseTracker).
+	runStart := time.Now()
+	defer func() {
+		procusage.Report(log, time.Since(runStart), procusage.Meta{Command: cfg.Command}, nil)
+	}()
 
 	// Resolve search directories
 	searchDirs := resolveSearchDirs(exec, cfg.SearchDirs)
