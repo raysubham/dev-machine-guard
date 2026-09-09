@@ -39,12 +39,20 @@ type Config struct {
 	// an MDM-pushed PPPC profile) flip this to true to opt back into
 	// full scan coverage. See docs/macos-tcc-permissions.md.
 	IncludeTCCProtected *bool
-	NPMRCOnly           bool     // --npmrc: run only the npmrc audit and render verbose pretty output
-	PipConfigOnly       bool     // --pipconfig: run only the pip config audit and render verbose pretty output
-	PnpmRCOnly          bool     // --pnpmrc: run only the pnpm config audit and render verbose pretty output
-	BunfigOnly          bool     // --bunfig: run only the bun config audit and render verbose pretty output
-	YarnRCOnly          bool     // --yarnrc: run only the yarn config audit (both flavors) and render verbose pretty output
-	SearchDirs          []string // defaults to ["$HOME"]
+	// IncludeNetworkVolumes is tristate with the OPPOSITE default to
+	// IncludeTCCProtected: nil or true = walk macOS network volumes
+	// (container-runtime mounts — OrbStack, Docker Desktop, Colima — are
+	// Network Volumes to macOS), false = skip them. Walking them is what
+	// inventories packages inside dev containers, at the cost of a one-time
+	// TCC prompt on machines with no PPPC pre-approval. Fleets that can't
+	// pre-approve set this to false. See docs/macos-tcc-permissions.md.
+	IncludeNetworkVolumes *bool
+	NPMRCOnly             bool     // --npmrc: run only the npmrc audit and render verbose pretty output
+	PipConfigOnly         bool     // --pipconfig: run only the pip config audit and render verbose pretty output
+	PnpmRCOnly            bool     // --pnpmrc: run only the pnpm config audit and render verbose pretty output
+	BunfigOnly            bool     // --bunfig: run only the bun config audit and render verbose pretty output
+	YarnRCOnly            bool     // --yarnrc: run only the yarn config audit (both flavors) and render verbose pretty output
+	SearchDirs            []string // defaults to ["$HOME"]
 
 	// GateProceedReason is populated at runtime (not a CLI flag) by the run
 	// gate when it lets a run proceed, so telemetry.Run can echo the gate
@@ -52,6 +60,28 @@ type Config struct {
 	// The gate itself runs before log capture starts, so its live lines never
 	// reach the downloadable log without this.
 	GateProceedReason string
+
+	// WSLScanEnabled and WSLScanReason are populated at runtime (not CLI flags)
+	// from the run-config check-in's wsl_directive. They gate scanning INSIDE
+	// WSL distros — a tenant-wide switch with no per-device granularity. Both
+	// stay zero on every path that never reached a backend answer, so distro
+	// scanning fails closed; host-side WSL detection does not consult them.
+	WSLScanEnabled bool
+	WSLScanReason  string
+
+	// WSLHostSerial and WSLDistroID identify this run as happening INSIDE a WSL
+	// distribution, and are passed by the Windows host that triggered it
+	// (--wsl-host-serial, --wsl-distro-id). A distro cannot discover either for
+	// itself. When both are set the agent derives a stable device id from them,
+	// because a distro's own identity is unusable: it inherits the host's
+	// hostname, and a minimal or WSL1 distro has no machine-id.
+	WSLHostSerial string
+	WSLDistroID   string
+
+	// ConfigFile is --config: the exact config.json to read. Applied by a
+	// pre-scan of argv before config.Load(), so this field is informational
+	// once parsing is done.
+	ConfigFile string
 
 	// HooksAgent is the --agent value on `hooks install` / `hooks uninstall`;
 	// "" means "every detected agent".
@@ -219,6 +249,12 @@ func Parse(args []string) (*Config, error) {
 		case arg == "--no-include-tcc-protected":
 			v := false
 			cfg.IncludeTCCProtected = &v
+		case arg == "--include-network-volumes":
+			v := true
+			cfg.IncludeNetworkVolumes = &v
+		case arg == "--no-include-network-volumes":
+			v := false
+			cfg.IncludeNetworkVolumes = &v
 		case arg == "--npmrc":
 			cfg.NPMRCOnly = true
 		case arg == "--pipconfig":
@@ -298,6 +334,30 @@ func Parse(args []string) (*Config, error) {
 			cfg.Verbose = true
 		case arg == "--override-gate":
 			cfg.OverrideGate = true
+		case strings.HasPrefix(arg, "--config="):
+			cfg.ConfigFile = strings.TrimPrefix(arg, "--config=")
+		case arg == "--config":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--config requires a file path argument")
+			}
+			cfg.ConfigFile = args[i]
+		case strings.HasPrefix(arg, "--wsl-host-serial="):
+			cfg.WSLHostSerial = strings.TrimPrefix(arg, "--wsl-host-serial=")
+		case arg == "--wsl-host-serial":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--wsl-host-serial requires a value")
+			}
+			cfg.WSLHostSerial = args[i]
+		case strings.HasPrefix(arg, "--wsl-distro-id="):
+			cfg.WSLDistroID = strings.TrimPrefix(arg, "--wsl-distro-id=")
+		case arg == "--wsl-distro-id":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--wsl-distro-id requires a value")
+			}
+			cfg.WSLDistroID = args[i]
 		case arg == "--force-scan":
 			cfg.ForceScan = true
 		case strings.HasPrefix(arg, "--rules-file="):
@@ -518,6 +578,17 @@ Options:
                                 Settings — see docs/macos-tcc-permissions.md.
   --no-include-tcc-protected    Skip macOS TCC-protected dirs even if config has
                                 include_tcc_protected: true.
+  --no-include-network-volumes  Skip macOS network volumes — which is how macOS
+                                classifies container-runtime mounts (OrbStack,
+                                Docker Desktop, Colima). Suppresses the one-time
+                                "access files on a network volume" prompt at the
+                                cost of the package inventory inside dev
+                                containers. Default: walked. Fleets that can
+                                pre-approve the prompt with a PPPC profile
+                                should keep the default — see
+                                docs/macos-tcc-permissions.md.
+  --include-network-volumes     Walk macOS network volumes even if config has
+                                include_network_volumes: false.
   --npmrc                       Run ONLY the npm config audit (verbose pretty view; --json supported)
   --pipconfig                   Run ONLY the pip config audit (verbose pretty view; --json supported)
   --pnpmrc                      Run ONLY the pnpm config audit (verbose pretty view; --json supported)
@@ -570,4 +641,23 @@ Configuration:
 		name, name, name, name, name, name, name, name,
 		name, name, name,
 		buildinfo.AgentURL)
+}
+
+// ConfigPathFromArgs pre-scans argv for --config so main can pin the config
+// path before config.Load() runs. Parse() happens after Load(), and Load()
+// keeps whatever it read first, so the flag cannot be honoured any later.
+// Deliberately forgiving: an unparseable argv is Parse()'s problem to report,
+// not this helper's.
+func ConfigPathFromArgs(args []string) string {
+	for i, arg := range args {
+		switch {
+		case strings.HasPrefix(arg, "--config="):
+			return strings.TrimPrefix(arg, "--config=")
+		case arg == "--config":
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+		}
+	}
+	return ""
 }

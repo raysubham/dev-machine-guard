@@ -31,11 +31,13 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/lock"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/paths"
+	"github.com/step-security/dev-machine-guard/internal/procusage"
 	"github.com/step-security/dev-machine-guard/internal/progress"
 	"github.com/step-security/dev-machine-guard/internal/rungate"
 	"github.com/step-security/dev-machine-guard/internal/schedinfo"
 	"github.com/step-security/dev-machine-guard/internal/state"
 	"github.com/step-security/dev-machine-guard/internal/tcc"
+	"github.com/step-security/dev-machine-guard/internal/wslguest"
 )
 
 // s3UploadBackoffUnit is multiplied by attempt-number to compute the
@@ -61,6 +63,8 @@ type Payload struct {
 	Platform             string                 `json:"platform"`
 	OSVersion            string                 `json:"os_version"`
 	Resources            model.MachineResources `json:"resources"`
+	WSL                  *model.WSLInfo         `json:"wsl,omitempty"`
+	WSLGuest             *model.WSLGuest        `json:"wsl_guest,omitempty"`
 	AgentVersion         string                 `json:"agent_version"`
 	CollectedAt          int64                  `json:"collected_at"`
 	NoUserLoggedIn       bool                   `json:"no_user_logged_in"`
@@ -194,6 +198,35 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		executionID = fmt.Sprintf("nouuid-%d", time.Now().UnixNano())
 		fmt.Fprintf(os.Stderr, "[warn] failed to generate execution id, using fallback: %v\n", idErr)
 	}
+
+	// Resource accounting for the run. Runs exactly once: normally at the
+	// call site just before the execution-log snapshot, so the line lands
+	// inside the ExecutionLogs payload we can download; the defer is the
+	// fallback for runs that error out or trip the deadline before
+	// reaching that point.
+	//
+	// It cannot be deferred alone. capture.Finalize() is deferred later in
+	// this function, so LIFO makes it run FIRST — a deferred report would
+	// write to already-restored stderr and never reach the payload.
+	var usageReported atomic.Bool
+	reportUsageOnce := func() {
+		if !usageReported.CompareAndSwap(false, true) {
+			return
+		}
+		snapshot := tracker.Snapshot()
+		phases := make([]procusage.Phase, 0, len(snapshot.PhasesCompleted))
+		for _, p := range snapshot.PhasesCompleted {
+			phases = append(phases, procusage.Phase{
+				Name: p.Name, DurationMs: p.DurationMs, CPUMs: p.CPUMs,
+			})
+		}
+		procusage.Report(log, time.Since(startTime), procusage.Meta{
+			Command:          cfg.Command,
+			InvocationMethod: invocationMethod,
+			ExecutionID:      executionID,
+		}, phases)
+	}
+	defer reportUsageOnce()
 
 	// deviceID is populated once device.Gather completes; the closure below
 	// captures it by reference so the deferred failure report uses whatever is
@@ -429,6 +462,11 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	phaseCtx, phaseCancel := startPhase(ctx, tracker, "device_info")
 	log.Progress("Gathering device information...")
 	dev := device.Gather(phaseCtx, exec)
+	// WSL detection (Windows host-side; feature-gated until the backend
+	// consumes device.wsl). No-op off Windows.
+	if featuregate.IsEnabled(featuregate.FeatureWSLDetection) {
+		dev.WSL = device.GatherWSL(phaseCtx, exec)
+	}
 	deviceID = dev.SerialNumber
 	// Single source of truth for "is this a real developer or a daemon
 	// context?" — same predicate the payload uses below, so the warning,
@@ -451,6 +489,18 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		log.Warn("no real developer identity (UserIdentity=%q, root=%v) — telemetry will be marked no_user_logged_in", dev.UserIdentity, exec.IsRoot())
 	}
 	endPhase(phaseCtx, phaseCancel, tracker, log, "device_info")
+
+	// Trigger a scan inside each running WSL distribution. Gated on the
+	// tenant's wsl_directive (fetched by the run gate before this run) and on
+	// the host having reported WSL at all, so a machine without it costs
+	// nothing. Launch-only: the distros report their own findings, so this
+	// phase never waits for a scan and cannot extend the run.
+	if cfg != nil && cfg.WSLScanEnabled {
+		wslCtx, wslCancel := startPhase(ctx, tracker, "wsl_scan")
+		log.Progress("Triggering WSL distribution scans (%s)...", cfg.WSLScanReason)
+		triggerWSLScans(exec, log, cfg, &dev)
+		endPhase(wslCtx, wslCancel, tracker, log, "wsl_scan")
+	}
 
 	// Per-device scan state for the delta-upload protocol. Gated OFF by
 	// default (config.UseLegacyPackageScan defaults true) until the agent-api
@@ -558,14 +608,14 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 
 	// Build a TCC skipper so directory walks avoid macOS-protected dirs and
 	// don't trigger system permission prompts when the agent runs without
-	// Full Disk Access. Nil when --include-tcc-protected is set; ShouldSkip
-	// is nil-safe.
-	var tccSkipper *tcc.Skipper
-	if tcc.Enabled(cfg.IncludeTCCProtected) {
-		tccSkipper = tcc.New(executor.ResolveHome(exec))
-		if cands := tccSkipper.Candidates(); len(cands) > 0 {
-			log.Debug("tcc skip list (%d): %v", len(cands), cands)
-		}
+	// Full Disk Access. Nil when --include-tcc-protected is set and network
+	// volumes are walked (the default); every method is nil-safe.
+	tccSkipper := tcc.ForRun(executor.ResolveHome(exec), cfg.IncludeTCCProtected, cfg.IncludeNetworkVolumes)
+	if cands := tccSkipper.Candidates(); len(cands) > 0 {
+		log.Debug("tcc skip list (%d): %v", len(cands), cands)
+	}
+	if vols := tccSkipper.NetworkVolumes(); len(vols) > 0 {
+		log.Debug("tcc network volumes skipped (%d): %v", len(vols), vols)
 	}
 
 	// Detect IDEs
@@ -1074,6 +1124,11 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	// otherwise outruns the async capture tee and truncates this log. The upload
 	// path re-snapshots after the upload-intent lines (see uploadToS3); this drain
 	// also covers the --telemetry-out dev dump below, which skips that re-snapshot.
+	// Emit the resource-usage line before the snapshot so it ships inside
+	// ExecutionLogs. This measures scan and audit work but not the upload
+	// that follows — a payload cannot contain the log of its own upload.
+	reportUsageOnce()
+
 	capture.Sync()
 	execLogsBase64 := capture.SnapshotBase64()
 	endTime := time.Now()
@@ -1121,17 +1176,31 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 			scanStateFullSync)
 	}
 
+	// A run inside a WSL distro identifies itself by its host + distro pair.
+	// Its own identity is unusable: the hostname is the Windows host's, and a
+	// minimal or WSL1 distro has no machine-id, so dev.SerialNumber reads
+	// "unknown" and every such distro would collide on one record.
+	wslGuest := wslGuestFromConfig(cfg)
+	deviceIdentity := dev.SerialNumber
+	if wslGuest != nil {
+		deviceIdentity = wslguest.DeviceID(wslGuest.HostDeviceID, wslGuest.DistroID)
+		log.Progress("WSL guest: distro %s on host %s — device id %s",
+			wslGuest.DistroID, wslGuest.HostDeviceID, deviceIdentity)
+	}
+
 	// Build payload
 	payload := &Payload{
 		PayloadSchemaVersion: schemaVersion,
 		CustomerID:           config.CustomerID,
-		DeviceID:             dev.SerialNumber,
-		SerialNumber:         dev.SerialNumber,
+		DeviceID:             deviceIdentity,
+		SerialNumber:         deviceIdentity,
 		UserIdentity:         dev.UserIdentity,
 		Hostname:             dev.Hostname,
 		Platform:             dev.Platform,
 		OSVersion:            dev.OSVersion,
 		Resources:            dev.Resources,
+		WSL:                  dev.WSL,
+		WSLGuest:             wslGuest,
 		AgentVersion:         buildinfo.Version,
 		CollectedAt:          endTime.Unix(),
 		NoUserLoggedIn:       noUserLoggedIn,
