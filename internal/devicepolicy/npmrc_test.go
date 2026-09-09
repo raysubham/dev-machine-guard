@@ -187,6 +187,16 @@ func TestRenderNPMRCBlock_SettingsRejections(t *testing.T) {
 	}
 }
 
+func TestRenderNPMRCBlock_RejectsNormalizedKeyCollisions(t *testing.T) {
+	body, err := RenderNPMRCBlock(npmSettingsPolicy(t, map[string]string{
+		`foo\bar`:  "first",
+		`foo\\bar`: "second",
+	}), stdSerial)
+	if err == nil || body != "" {
+		t.Fatal("expected normalized key collision to return an error and no rendered body")
+	}
+}
+
 func TestRenderNPMRCBlock_SettingsErrorsDoNotLeakValues(t *testing.T) {
 	const literalSecret = "literal-private-token"
 	const envName = "CUSTOMER_PRIVATE_TOKEN"

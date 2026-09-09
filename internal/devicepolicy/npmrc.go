@@ -2399,6 +2399,9 @@ func RenderNPMRCBlock(policy json.RawMessage, serial string) (string, error) {
 	if len(body) > npmrcMaxRenderedBytes {
 		return "", errors.New("npmrc: rendered block exceeds size limit")
 	}
+	if _, ok := parseNPMDesired(body); !ok {
+		return "", errors.New("npmrc: policy settings are ambiguous after normalization")
+	}
 	return body, nil
 }
 
