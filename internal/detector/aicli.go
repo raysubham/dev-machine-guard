@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -772,11 +774,19 @@ func (g candidateGuard) protected(path string) bool {
 // resolveDerived follows a corroborator a ladder derives beside an accepted
 // candidate (a sidecar, a venv) through EvalSymlinks and applies the same TCC
 // guard resolveVerified applied to the candidate itself. It returns the
-// resolved path, and false when that target is protected.
+// resolved path, and false when that target is protected or when resolution
+// failed for any reason other than the path being absent: an absent sidecar
+// or venv is a legitimate state the caller's Stat or DirExists decides, but a
+// symlink loop or a permission error must not fall back to touching the
+// unresolved spelling.
 func resolveDerived(exec executor.Executor, homeDir string, skipper *tcc.Skipper, path string) (string, bool) {
 	resolved, err := exec.EvalSymlinks(path)
-	if err != nil || resolved == "" {
+	switch {
+	case err == nil && resolved != "":
+	case err == nil || errors.Is(err, fs.ErrNotExist):
 		resolved = path
+	default:
+		return path, false
 	}
 	if newCandidateGuard(exec, homeDir, skipper).protected(resolved) {
 		return resolved, false
@@ -1794,10 +1804,14 @@ func resolveMuse(_ context.Context, exec executor.Executor, log *progress.Logger
 		dir := pathDir(resolved)
 		sidecar, ok := resolveDerived(exec, homeDir, skipper, joinPath(dir, ".muse-version"))
 		if !ok {
-			log.Debug("muse-code: rejecting %s — its .muse-version resolves to %s, under a macOS TCC-protected path", found, sidecar)
+			log.Debug("muse-code: rejecting %s — its .muse-version %s could not be safely resolved or is under a macOS TCC-protected path", found, sidecar)
 			return "", false
 		}
 		if info, err := exec.Stat(sidecar); err == nil {
+			if !info.Mode().IsRegular() {
+				log.Debug("muse-code: rejecting %s — %s is not a regular file", found, sidecar)
+				return "", false
+			}
 			if info.Size() > museVersionMaxBytes {
 				log.Debug("muse-code: rejecting %s — %s is %d bytes, over the %d-byte cap", found, sidecar, info.Size(), museVersionMaxBytes)
 				return "", false
@@ -1808,7 +1822,12 @@ func resolveMuse(_ context.Context, exec executor.Executor, log *progress.Logger
 				log.Debug("muse-code: rejecting %s — %s does not carry a Muse release version", found, sidecar)
 				return "", false
 			}
-			if !exec.FileExists(joinPath(dir, "muse-bin-"+v)) {
+			payload, ok := resolveDerived(exec, homeDir, skipper, joinPath(dir, "muse-bin-"+v))
+			if !ok {
+				log.Debug("muse-code: rejecting %s — muse-bin-%s %s could not be safely resolved or is under a macOS TCC-protected path", found, v, payload)
+				return "", false
+			}
+			if !exec.FileExists(payload) {
 				log.Debug("muse-code: rejecting %s — %s names %s but no muse-bin-%s sits beside it", found, sidecar, v, v)
 				return "", false
 			}
@@ -1872,7 +1891,7 @@ func resolveHermes(_ context.Context, exec executor.Executor, log *progress.Logg
 			}
 			venv, ok := resolveDerived(exec, homeDir, skipper, expandTildePath(layout.venv, homeDir))
 			if !ok {
-				log.Debug("hermes-agent: rejecting %s — its venv resolves to %s, under a macOS TCC-protected path", found, venv)
+				log.Debug("hermes-agent: rejecting %s — its venv %s could not be safely resolved or is under a macOS TCC-protected path", found, venv)
 				return "", false
 			}
 			if exec.DirExists(venv) {

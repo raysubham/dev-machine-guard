@@ -1610,6 +1610,24 @@ func TestDetect_WindowsCodexAdmin(t *testing.T) {
 	}
 }
 
+func TestDetect_WindowsHermesUser(t *testing.T) {
+	m, fs := newSkillsMock()
+	m.SetGOOS(model.PlatformWindows)
+	m.SetEnv("LOCALAPPDATA", `C:\Users\u\AppData\Local`)
+	base := resolveEnvPath(m, `%LOCALAPPDATA%\hermes\skills`)
+	fs.addSkill(filepath.Join(base, "winherm"), "SKILL.md", validFrontmatter("winherm", "d"), nil)
+	fs.commit()
+
+	records, _ := NewSkillsDetector(m).Detect(context.Background(), nil, nil)
+	rec := findSkill(records, "hermes_user", "winherm")
+	if rec == nil {
+		t.Fatalf("windows hermes_user skill not found; records=%+v", records)
+	}
+	if rec.Scope != "global" || rec.Agent != "hermes-agent" {
+		t.Errorf("scope=%q agent=%q, want global/hermes-agent", rec.Scope, rec.Agent)
+	}
+}
+
 func TestDetect_ProjectRootFromClaudeRegistry(t *testing.T) {
 	m, fs := newSkillsMock()
 	proj := testHome + "/work/myproj"

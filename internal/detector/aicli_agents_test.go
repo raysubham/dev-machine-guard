@@ -3,7 +3,9 @@ package detector
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1515,6 +1517,24 @@ func TestAICLIAgents_TCCGuard(t *testing.T) {
 				wantDebug:    []string{"under a macOS TCC-protected path"},
 			})
 		})
+		t.Run("a muse-bin payload symlinked into ~/Downloads is rejected before it is stat'd", func(t *testing.T) {
+			requireDarwinHost(t)
+			runAICLICase(t, aicliCase{
+				name:    "~/.local/bin/muse-bin-<v> -> ~/Downloads/muse-bin-<v>",
+				goos:    model.PlatformDarwin,
+				skipper: true,
+				setup: func(m *executor.Mock, home string) {
+					bin := joinPath(home, ".local", "bin")
+					addFile(m, joinPath(bin, "muse"), []byte("#!/usr/bin/env bash\n"))
+					addFile(m, joinPath(bin, ".muse-version"), []byte(museVersion+"\n"))
+					payload := joinPath(bin, "muse-bin-"+museVersion)
+					addFile(m, payload, []byte{})
+					m.SetSymlink(payload, joinPath(home, "Downloads", "muse-bin-"+museVersion))
+				},
+				noReadPrefix: []string{"/Users/u/Downloads"},
+				wantDebug:    []string{"under a macOS TCC-protected path"},
+			})
+		})
 		t.Run("a hermes venv symlinked into ~/Documents is rejected before it is globbed", func(t *testing.T) {
 			requireDarwinHost(t)
 			runAICLICase(t, aicliCase{
@@ -2011,12 +2031,44 @@ func TestAICLIAgents_Muse(t *testing.T) {
 			wantDebug: []string{"over the 64-byte cap"},
 		},
 		{
+			name: "(m2d) a FIFO sidecar is refused before it is read; its zero size must not pass the cap",
+			setup: func(m *executor.Mock, home string) {
+				bin := joinPath(home, ".local", "bin")
+				addFile(m, joinPath(bin, "muse"), []byte("#!/usr/bin/env bash\n"))
+				m.SetFileInfo(joinPath(bin, ".muse-version"), pipeFileInfo{name: ".muse-version"})
+				addBinary(m, joinPath(bin, "muse-bin-"+museVersion), 90<<20)
+			},
+			wantDebug: []string{"is not a regular file"},
+		},
+		{
+			name: "(m2e) a sidecar whose resolution fails for a reason other than absence rejects instead of touching the unresolved path",
+			setup: func(m *executor.Mock, home string) {
+				bin := joinPath(home, ".local", "bin")
+				addMuseInstall(m, bin, museVersion)
+				m.SetSymlinkError(joinPath(bin, ".muse-version"), errors.New("too many levels of symbolic links"))
+			},
+			noReadPrefix: []string{"/home/u/.local/bin/.muse-version"},
+			wantDebug:    []string{"could not be safely resolved"},
+		},
+		{
 			name: "(m3) launcher with a single muse-bin and no sidecar accepts from the filename",
 			setup: func(m *executor.Mock, home string) {
 				bin := joinPath(home, ".local", "bin")
 				addFile(m, joinPath(bin, "muse"), []byte("#!/usr/bin/env bash\n"))
 				addBinary(m, joinPath(bin, "muse-bin-"+museVersion), 90<<20)
 				m.SetGlob(joinPath(bin, "muse-bin-*"), []string{joinPath(bin, "muse-bin-"+museVersion)})
+			},
+			allowGlobs: []string{"/home/u/.local/bin/muse-bin-*"},
+			want:       []aicliWant{{tool: "muse-code", binary: "/home/u/.local/bin/muse", version: museVersion}},
+		},
+		{
+			name: "(m3a) an absent sidecar reported by EvalSymlinks still falls through to the muse-bin-* sibling",
+			setup: func(m *executor.Mock, home string) {
+				bin := joinPath(home, ".local", "bin")
+				addFile(m, joinPath(bin, "muse"), []byte("#!/usr/bin/env bash\n"))
+				addBinary(m, joinPath(bin, "muse-bin-"+museVersion), 90<<20)
+				m.SetGlob(joinPath(bin, "muse-bin-*"), []string{joinPath(bin, "muse-bin-"+museVersion)})
+				m.SetSymlinkError(joinPath(bin, ".muse-version"), fs.ErrNotExist)
 			},
 			allowGlobs: []string{"/home/u/.local/bin/muse-bin-*"},
 			want:       []aicliWant{{tool: "muse-code", binary: "/home/u/.local/bin/muse", version: museVersion}},
