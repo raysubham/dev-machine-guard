@@ -21,7 +21,11 @@ import (
 // EvalSymlinks through a junction) compose on Windows. Roots are temp dirs,
 // not the scanning user's home, so the test is hermetic.
 func TestReal_SkillsJunctionFolds(t *testing.T) {
-	home := t.TempDir()
+	// Match the real user-home spelling even when CI's TEMP uses an 8.3 alias.
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	mkskill := func(dir string) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
