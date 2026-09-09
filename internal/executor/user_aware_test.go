@@ -10,7 +10,11 @@ import (
 )
 
 func TestReal_GuardedFiles(t *testing.T) {
-	root := t.TempDir()
+	// CI's Windows TEMP can use an 8.3 alias; verified opens use the full path.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, content := range map[string]string{"small": "ok", "large": "oversize", "blocked": "no"} {
 		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o600); err != nil {
 			t.Fatal(err)
