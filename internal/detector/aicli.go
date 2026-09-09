@@ -91,23 +91,19 @@ var cliToolDefinitions = []cliToolSpec{
 		ConfigDirs: []string{"~/.gemini"},
 	},
 	{
-		Name:       "amazon-q-cli",
-		Vendor:     "Amazon",
-		Binaries:   []string{"kiro-cli", "kiro", "q"},
-		ConfigDirs: []string{"~/.q", "~/.kiro", "~/.aws/q"},
-		VerifyFunc: func(ctx context.Context, exec executor.Executor, log *progress.Logger, binary string) bool {
-			if safe, reason := execguard.SafeToExec(ctx, exec, binary); !safe {
-				log.Warn("skipping %s: %s — cannot verify identity", binary, reason)
-				return false
-			}
-			log.Progress("exec fallback: running %s --version (amazon-q identity check)", binary)
-			stdout, _, _, err := exec.RunWithTimeout(ctx, 10*time.Second, binary, "--version")
-			if err != nil {
-				return false
-			}
-			lower := strings.ToLower(stdout)
-			return strings.Contains(lower, "amazon") || strings.Contains(lower, "kiro") || strings.Contains(lower, "q developer")
+		Name:   "amazon-q-cli",
+		Vendor: "Amazon",
+		// PATH names first, then the fixed macOS bundle and Windows installer
+		// paths. `kiro` (the IDE launcher) and `q` (a shell wrapper) are listed
+		// so their resolved targets are examined; the ladder rejects them.
+		Binaries: []string{
+			"kiro-cli", "kiro", "q",
+			"/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli",
+			"~/AppData/Local/Kiro-Cli/kiro-cli.exe",
 		},
+		ConfigDirs:        []string{"~/.q", "~/.kiro", "~/.aws/q"},
+		ResolveFunc:       resolveKiroCLI,
+		StaticVersionOnly: true, // identity and version come from install metadata; never launched
 	},
 	{
 		Name:   "github-copilot-cli",
@@ -771,15 +767,19 @@ func (g candidateGuard) protected(path string) bool {
 	return g.skipper.WithinProtected(cleaned)
 }
 
-// resolveDerived follows a corroborator a ladder derives beside an accepted
-// candidate (a sidecar, a venv) through EvalSymlinks and applies the same TCC
-// guard resolveVerified applied to the candidate itself. It returns the
-// resolved path, and false when that target is protected or when resolution
-// failed for any reason other than the path being absent: an absent sidecar
-// or venv is a legitimate state the caller's Stat or DirExists decides, but a
-// symlink loop or a permission error must not fall back to touching the
-// unresolved spelling.
+// resolveDerived vets a corroborator a ladder derives from an accepted
+// candidate (a sidecar, a manifest, a venv). A corroborator that is itself a
+// link is rejected unread — seen with Readlink, never followed, since its
+// target could lie anywhere. What remains is resolved through EvalSymlinks (a
+// venv path derived from $HOME may still have linked ancestors) and the result
+// gets the same TCC guard resolveVerified applied to the candidate. An absent
+// path passes for the caller's Stat or DirExists to decide, but a symlink loop
+// or a permission error must not fall back to touching the unresolved
+// spelling.
 func resolveDerived(exec executor.Executor, homeDir string, skipper *tcc.Skipper, path string) (string, bool) {
+	if _, err := exec.Readlink(path); err == nil {
+		return path, false
+	}
 	resolved, err := exec.EvalSymlinks(path)
 	switch {
 	case err == nil && resolved != "":
@@ -1295,6 +1295,16 @@ func fileAtLeast(exec executor.Executor, path string, minBytes int64) bool {
 	return info.Size() >= minBytes
 }
 
+// regularFileWithin reports whether path is a regular file (not a directory,
+// FIFO or device) of at most maxBytes; maxBytes <= 0 disables the size check.
+func regularFileWithin(exec executor.Executor, path string, maxBytes int64) bool {
+	info, err := exec.Stat(path)
+	if err != nil || info == nil || !info.Mode().IsRegular() {
+		return false
+	}
+	return maxBytes <= 0 || info.Size() <= maxBytes
+}
+
 // nonEmptyDir reports whether dir exists and holds at least one entry, without
 // a ReadDir: these ladders never walk, and a one-level Glob is the targeted
 // equivalent. Call it after the cheaper checks so the Glob rarely runs.
@@ -1500,6 +1510,106 @@ func resolveAmp(_ context.Context, exec executor.Executor, log *progress.Logger,
 		log.Debug("amp: rejecting %s — no Amp channel claims it (resolved %s)", found, resolved)
 		return "", false
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Kiro CLI (amazon-q-cli). Identity comes from installer metadata, per
+// platform; the binary is never launched. (The previous VerifyFunc ran every
+// `kiro-cli`/`kiro`/`q` on PATH with --version, which the IDE's own `kiro`
+// launcher answers by opening a window.)
+// ---------------------------------------------------------------------------
+
+// kiroCLIBundleID is "Kiro CLI.app"'s CFBundleIdentifier — still the
+// CodeWhisperer id it inherited from Amazon Q. The IDE is dev.kiro.desktop.
+const kiroCLIBundleID = "com.amazon.codewhisperer"
+
+// kiroCLIDpkgPackage is the .deb name; the `kiro`/`q` aliases do not share it.
+const kiroCLIDpkgPackage = "kiro-cli"
+
+func resolveKiroCLI(ctx context.Context, exec executor.Executor, log *progress.Logger, skipper *tcc.Skipper, spec cliToolSpec, homeDir string) (cliResolution, bool) {
+	switch exec.GOOS() {
+	case model.PlatformDarwin:
+		return resolveVerified(exec, log, skipper, spec, homeDir, func(found, resolved string) (string, bool) {
+			return kiroCLIDarwinAccept(exec, log, skipper, homeDir, found, resolved)
+		})
+	case model.PlatformWindows:
+		// The installer key is the only identity source (the PE has no
+		// version resources, the Uninstall row no InstallLocation). No key,
+		// nothing to prove. Its InstallPath joins the candidates so a
+		// non-default install is found by the same walk.
+		installPath, productVersion, ok := readKiroCLIRegistry(ctx, exec)
+		if !ok {
+			log.Debug("amazon-q-cli: HKCU\\SOFTWARE\\Kiro\\CLI is absent; no Kiro CLI can be proven on this machine")
+			return cliResolution{}, false
+		}
+		spec.Binaries = append(slices.Clone(spec.Binaries), joinPath(installPath, "kiro-cli.exe"))
+		return resolveVerified(exec, log, skipper, spec, homeDir, func(found, resolved string) (string, bool) {
+			if !strings.EqualFold(pathBase(resolved), "kiro-cli.exe") ||
+				!strings.EqualFold(cleanPath(pathDir(resolved)), cleanPath(installPath)) {
+				log.Debug("amazon-q-cli: rejecting %s — resolves to %s, not kiro-cli.exe under the registered InstallPath %s", found, resolved, installPath)
+				return "", false
+			}
+			return productVersion, true // "2.21.1.0" as recorded; CliVersion ("v2") is a protocol marker
+		})
+	default:
+		return resolveVerified(exec, log, skipper, spec, homeDir, func(found, resolved string) (string, bool) {
+			return kiroCLILinuxAccept(exec, log, skipper, homeDir, found, resolved)
+		})
+	}
+}
+
+// kiroCLIDarwinAccept: the candidate must resolve to <bundle>.app/Contents/
+// MacOS/kiro-cli and the bundle's Info.plist must carry the CLI's identifier.
+// Version is CFBundleShortVersionString or unknown; CFBundleVersion is a build
+// counter and is never used.
+func kiroCLIDarwinAccept(exec executor.Executor, log *progress.Logger, skipper *tcc.Skipper, homeDir, found, resolved string) (string, bool) {
+	macos := pathDir(resolved)
+	contents := pathDir(macos)
+	if pathBase(resolved) != "kiro-cli" || pathBase(macos) != "MacOS" || pathBase(contents) != "Contents" || !strings.HasSuffix(pathDir(contents), ".app") {
+		log.Debug("amazon-q-cli: rejecting %s — resolves to %s, not <bundle>.app/Contents/MacOS/kiro-cli", found, resolved)
+		return "", false
+	}
+	plistPath, ok := resolveDerived(exec, homeDir, skipper, joinPath(contents, "Info.plist"))
+	if !ok {
+		log.Debug("amazon-q-cli: rejecting %s — bundle Info.plist is unreadable or under a macOS TCC-protected path", found)
+		return "", false
+	}
+	bundleID, shortVersion, ok := readBundleInfo(exec, plistPath)
+	if !ok || bundleID != kiroCLIBundleID {
+		log.Debug("amazon-q-cli: rejecting %s — bundle identifier is %q, not %s", found, bundleID, kiroCLIBundleID)
+		return "", false
+	}
+	if !versionmeta.IsVersionLike(shortVersion) {
+		shortVersion = ""
+	}
+	return shortVersion, true
+}
+
+// kiroCLILinuxAccept: rule 1, dpkg owns the binary (and carries the version).
+// Rule 2, the installer layout — kiro-cli beside kiro-cli-chat and
+// kiro-cli-term, all regular files — with version unknown. The IDE's
+// /usr/bin/kiro launcher and the `q` wrapper resolve to other basenames.
+func kiroCLILinuxAccept(exec executor.Executor, log *progress.Logger, skipper *tcc.Skipper, homeDir, found, resolved string) (string, bool) {
+	if v := versionmeta.DpkgPackageVersion(exec, kiroCLIDpkgPackage, found, resolved); v != "" {
+		return v, true
+	}
+	if pathBase(resolved) != "kiro-cli" {
+		log.Debug("amazon-q-cli: rejecting %s — resolves to %s, whose basename is not kiro-cli", found, resolved)
+		return "", false
+	}
+	if !regularFileWithin(exec, resolved, 0) {
+		log.Debug("amazon-q-cli: rejecting %s — %s is not a regular file", found, resolved)
+		return "", false
+	}
+	dir := pathDir(resolved)
+	for _, sibling := range []string{"kiro-cli-chat", "kiro-cli-term"} {
+		p, ok := resolveDerived(exec, homeDir, skipper, joinPath(dir, sibling))
+		if !ok || !regularFileWithin(exec, p, 0) {
+			log.Debug("amazon-q-cli: rejecting %s — no %s beside it; the Kiro installer always ships the trio", found, sibling)
+			return "", false
+		}
+	}
+	return "", true
 }
 
 // ---------------------------------------------------------------------------

@@ -54,7 +54,10 @@ func TestDetect_HomeWalkMarkerConventions(t *testing.T) {
 		{".cursor", "skills", "cursor_project", "cursor"},      // Cursor-only non-node repo
 		{".pi", "skills", "pi_project", "pi"},
 		{".factory", "skills", "factory_project", "factory"},
-		{".agent", "skills", "factory_agent_project", "factory"}, // singular .agent
+		{".agent", "skills", "factory_agent_project", "shared"}, // singular .agent — Factory and Antigravity both read it
+		{".kiro", "skills", "kiro_project", "kiro"},
+		{".windsurf", "skills", "windsurf_project", "windsurf"},
+		{".codex", "skills", "codex_project", "codex"},
 		{".github", "skills", "github_project", "copilot"},
 		{".gemini", "skills", "gemini_project", "gemini-cli"},
 		{".aider", "skills", "aider_project", "aider"},

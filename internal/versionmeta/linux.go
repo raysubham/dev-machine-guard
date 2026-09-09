@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/model"
 )
 
 const (
@@ -183,4 +184,17 @@ func versionFromSnap(exec executor.Executor, binaryPath string) string {
 		return ""
 	}
 	return strings.TrimPrefix(version, "v")
+}
+
+// DpkgPackageVersion returns the installed version of the Debian package pkg
+// when that package's own file manifest lists one of paths, "" otherwise. It
+// is versionFromDpkg with the package name supplied by the caller instead of
+// derived from the binary's basename, for ladders that already know which
+// package they are proving (kiro-cli, whose binary and package share a name
+// but whose PATH aliases `kiro` and `q` do not).
+func DpkgPackageVersion(exec executor.Executor, pkg string, paths ...string) string {
+	if exec.GOOS() != model.PlatformLinux {
+		return ""
+	}
+	return versionFromDpkg(exec, pkg, paths)
 }

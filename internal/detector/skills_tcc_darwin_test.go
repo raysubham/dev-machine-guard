@@ -298,3 +298,38 @@ func TestDetect_HomeWalkRejectsSymlinkedAncestorRoot(t *testing.T) {
 		t.Errorf("no filesystem access may occur under ~/Documents, got: %v", hits)
 	}
 }
+
+// TestDetect_LinkIntoProtectedNeverFollowed closes the residual the old
+// handleSymlinkEntry documented: a symlink from a safe skill root into
+// ~/Documents used to be EvalSymlink'd (statting inside the protected tree)
+// before its target was guarded. The target is now read with Readlink and
+// guarded lexically first, so nothing under ~/Documents is touched — for an
+// absolute target and for a relative one that only resolves there once joined.
+func TestDetect_LinkIntoProtectedNeverFollowed(t *testing.T) {
+	protected := testHome + "/Documents"
+	for name, raw := range map[string]string{
+		"absolute target": protected + "/secret/skill",
+		"relative target": "../../Documents/secret/skill",
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, fs := newSkillsMock()
+			fs.addSkill(protected+"/secret/skill", "SKILL.md", validFrontmatter("secret", "d"), nil)
+			link := testHome + "/.claude/skills/decoy"
+			fs.addSymlink(link, protected+"/secret/skill")
+			m.SetReadlink(link, raw)
+			fs.commit()
+
+			rec := &tccAccessRecorder{Mock: m}
+			records, info := NewSkillsDetector(rec).WithSkipper(tcc.New(testHome)).Detect(context.Background(), nil, nil)
+			if len(records) != 0 {
+				t.Errorf("a link into ~/Documents must not surface the protected skill, got %+v", records)
+			}
+			if len(info.Errors) != 0 {
+				t.Errorf("skipping a protected target is not an error: %v", info.Errors)
+			}
+			if hits := rec.accessedUnder(protected); len(hits) > 0 {
+				t.Errorf("no filesystem access may occur under %q (would fire a TCC prompt), got: %v", protected, hits)
+			}
+		})
+	}
+}
