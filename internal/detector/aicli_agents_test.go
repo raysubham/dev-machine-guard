@@ -50,14 +50,26 @@ type recExec struct {
 	t        *testing.T
 	trapExec bool
 
-	execs   []aicliExecCall
-	globs   []string
-	reads   []string // ReadFile + Stat + FileExists, i.e. every path touched
-	lookups []string
+	execs []aicliExecCall
+	// regReads counts the Kiro CLI registry reads. On Windows that is a native
+	// registry API call; only the non-Windows test twin (registry_other.go)
+	// spells it as `reg query`, so it is kept out of execs and never trips the
+	// trap — but it is fatal off Windows, where the registry must not exist.
+	regReads int
+	globs    []string
+	reads    []string // ReadFile + Stat + FileExists, i.e. every path touched
+	lookups  []string
 }
 
 // No mutex: Detect is single-goroutine and AGENTS.md §15.5 forbids t.Parallel.
 func (e *recExec) recordExec(name string, args []string) {
+	if name == "reg" && slices.Equal(args, []string{"query", `HKCU\SOFTWARE\Kiro\CLI`}) {
+		if e.GOOS() != model.PlatformWindows {
+			e.t.Fatalf("Kiro CLI registry read on %s: the registry is Windows-only", e.GOOS())
+		}
+		e.regReads++
+		return
+	}
 	e.execs = append(e.execs, aicliExecCall{name: name, args: slices.Clone(args)})
 	if e.trapExec {
 		e.t.Fatalf("unexpected exec: %s %v", name, args)
@@ -107,6 +119,12 @@ func (e *recExec) Stat(path string) (os.FileInfo, error) {
 func (e *recExec) FileExists(path string) bool {
 	e.reads = append(e.reads, path)
 	return e.Mock.FileExists(path)
+}
+
+// EvalSymlinks follows every component, so it counts as touching the path.
+func (e *recExec) EvalSymlinks(path string) (string, error) {
+	e.reads = append(e.reads, path)
+	return e.Mock.EvalSymlinks(path)
 }
 
 func (e *recExec) LookPath(name string) (string, error) {
@@ -252,7 +270,7 @@ func captureStderr(t *testing.T, fn func()) (out string) {
 // aicliNewSpecs are the specs this file owns. Every case asserts one row for
 // each spec it names in want and ZERO rows for the others, so a fixture built
 // for one agent cannot quietly start reporting another.
-var aicliNewSpecs = []string{"pi", "factory", "amp"}
+var aicliNewSpecs = []string{"pi", "factory", "amp", "amazon-q-cli"}
 
 type aicliWant struct {
 	tool      string
@@ -388,6 +406,15 @@ func runAICLICase(t *testing.T, tc aicliCase) {
 		return a.name == b.name && slices.Equal(a.args, b.args)
 	}) {
 		t.Errorf("execs: got %+v, want %+v", rec.execs, tc.wantExecs)
+	}
+	// The Kiro ladder reads its registry key once per resolve, whether or not a
+	// candidate exists (the key is also how a non-default InstallPath is found).
+	wantRegReads := 0
+	if goos == model.PlatformWindows {
+		wantRegReads = 1
+	}
+	if rec.regReads != wantRegReads {
+		t.Errorf("Kiro registry reads: got %d, want %d", rec.regReads, wantRegReads)
 	}
 	for _, prefix := range tc.noReadPrefix {
 		for _, read := range rec.reads {
@@ -1509,16 +1536,19 @@ func tccDocumentsFixture(m *executor.Mock, home string) {
 // Executor.ReadDir on either implementation, so the two claims are asserted
 // separately: recExec.ReadDir fails the test unconditionally (across this whole
 // file, not just here), and the glob budget is pinned exactly — one call per
-// targeted install-tree pattern per resolver, three resolvers.
+// targeted install-tree pattern per resolver. Four resolvers on Unix; on
+// Windows the Kiro ladder returns before any candidate walk when its registry
+// key is absent, so three.
 func TestAICLIAgents_NoWalkAndGlobBudget(t *testing.T) {
 	tests := []struct {
 		goos           string
 		wantDistinct   int
+		wantPerPattern int
 		wantTotalGlobs int
 	}{
-		{model.PlatformLinux, 6, 18},
-		{model.PlatformDarwin, 7, 21},
-		{model.PlatformWindows, 2, 6},
+		{model.PlatformLinux, 6, 4, 24},
+		{model.PlatformDarwin, 7, 4, 28},
+		{model.PlatformWindows, 2, 3, 6},
 	}
 	for _, tc := range tests {
 		t.Run(tc.goos, func(t *testing.T) {
@@ -1543,8 +1573,8 @@ func TestAICLIAgents_NoWalkAndGlobBudget(t *testing.T) {
 				t.Errorf("distinct patterns: got %d (%v), want %d", len(counts), counts, tc.wantDistinct)
 			}
 			for pattern, n := range counts {
-				if n != 3 {
-					t.Errorf("Glob(%q) called %d times, want 3 (once per resolver)", pattern, n)
+				if n != tc.wantPerPattern {
+					t.Errorf("Glob(%q) called %d times, want %d (once per resolver)", pattern, n, tc.wantPerPattern)
 				}
 			}
 		})
@@ -1558,7 +1588,7 @@ func TestAICLIAgents_NoWalkAndGlobBudget(t *testing.T) {
 func TestResolveGlobalRoots_AmpConfigAndFactoryAgentRoots(t *testing.T) {
 	cases := []struct{ dir, source, agent string }{
 		{testHome + "/.config/amp/skills/ampcfg", "amp_user", "amp"},
-		{testHome + "/.agent/skills/facag", "factory_agent_user", "factory"},
+		{testHome + "/.agent/skills/facag", "factory_agent_user", "shared"}, // read by Factory and Antigravity
 	}
 	m, fs := newSkillsMock()
 	for _, c := range cases {
@@ -1595,3 +1625,319 @@ func TestResolveGlobalRoots_NewRootsAbsentWhenDirsAbsent(t *testing.T) {
 		t.Errorf("roots_scanned: got %v, want %v (the two new roots must not appear when absent)", info.RootsScanned, want)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Kiro CLI (amazon-q-cli). Runs under the aicli harness: the exec trap is on
+// unless a case says otherwise, so every accept below is proven without
+// launching the candidate. Fixture values are the ones measured on real
+// installs (bundle id com.amazon.codewhisperer, version 2.21.1, Windows
+// ProductVersion 2.21.1.0).
+// ---------------------------------------------------------------------------
+
+const kiroCLIBundle = "/Applications/Kiro CLI.app"
+
+// kiroPlist is a minimal XML Info.plist; short == "" omits
+// CFBundleShortVersionString. CFBundleVersion is always present and never the
+// answer.
+func kiroPlist(bundleID, short string) []byte {
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` +
+		`<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">` +
+		`<plist version="1.0"><dict>`)
+	b.WriteString(`<key>CFBundleIdentifier</key><string>` + bundleID + `</string>`)
+	if short != "" {
+		b.WriteString(`<key>CFBundleShortVersionString</key><string>` + short + `</string>`)
+	}
+	b.WriteString(`<key>CFBundleVersion</key><string>999</string>` +
+		`<key>CFBundleExecutable</key><string>kiro_cli_desktop</string></dict></plist>`)
+	return []byte(b.String())
+}
+
+// kiroDarwinBundle installs the CLI bundle with the given plist.
+func kiroDarwinBundle(m *executor.Mock, plist []byte) {
+	addFile(m, kiroCLIBundle+"/Contents/MacOS/kiro-cli", []byte{})
+	addFile(m, kiroCLIBundle+"/Contents/Info.plist", plist)
+}
+
+// kiroLinuxTrio drops the installer's three binaries into dir.
+func kiroLinuxTrio(m *executor.Mock, dir string) {
+	for _, name := range []string{"kiro-cli", "kiro-cli-chat", "kiro-cli-term"} {
+		addFile(m, joinPath(dir, name), []byte{})
+	}
+}
+
+// kiroRegistry stubs the installer key as the non-Windows twin queries it.
+func kiroRegistry(m *executor.Mock, installPath string) {
+	m.SetCommand("\r\nHKEY_CURRENT_USER\\SOFTWARE\\Kiro\\CLI\r\n"+
+		"    InstallPath    REG_SZ    "+installPath+"\r\n"+
+		"    ProductVersion    REG_SZ    2.21.1.0\r\n"+
+		"    CliVersion    REG_SZ    v2\r\n", "", 0,
+		"reg", "query", `HKCU\SOFTWARE\Kiro\CLI`)
+}
+
+func TestAICLIAgents_Kiro_Darwin(t *testing.T) {
+	bin := kiroCLIBundle + "/Contents/MacOS/kiro-cli"
+	plistBuddy := aicliExecCall{name: "/usr/libexec/PlistBuddy", args: []string{"-c", "Print :CFBundleShortVersionString", kiroCLIBundle + "/Contents/Info.plist"}}
+	runAICLICases(t, []aicliCase{
+		{
+			name: "PATH symlink into the bundle: identity and version from the plist",
+			goos: model.PlatformDarwin,
+			setup: func(m *executor.Mock, home string) {
+				kiroDarwinBundle(m, kiroPlist(kiroCLIBundleID, "2.21.1"))
+				link := joinPath(home, ".local", "bin", "kiro-cli")
+				m.SetPath("kiro-cli", link)
+				addFile(m, link, []byte{})
+				m.SetSymlink(link, bin)
+				setConfigDir(m, home, "~/.kiro")
+			},
+			want: []aicliWant{{tool: "amazon-q-cli", binary: "/Users/u/.local/bin/kiro-cli", version: "2.21.1", install: bin, configRel: "~/.kiro"}},
+		},
+		{
+			name: "nothing on PATH: the fixed bundle path is the anchor",
+			goos: model.PlatformDarwin,
+			setup: func(m *executor.Mock, home string) {
+				kiroDarwinBundle(m, kiroPlist(kiroCLIBundleID, "2.21.1"))
+			},
+			want: []aicliWant{{tool: "amazon-q-cli", binary: bin, version: "2.21.1"}},
+		},
+		{
+			name: "PATH alias and fixed path resolve to one file: one row",
+			goos: model.PlatformDarwin,
+			setup: func(m *executor.Mock, home string) {
+				kiroDarwinBundle(m, kiroPlist(kiroCLIBundleID, "2.21.1"))
+				m.SetPath("kiro-cli", bin)
+				m.SetPath("q", bin)
+			},
+			want: []aicliWant{{tool: "amazon-q-cli", binary: bin, version: "2.21.1"}},
+		},
+		{
+			// The only exec is Apple's PlistBuddy, from the shared static
+			// version ladder every bundle-shipped tool goes through; the CLI
+			// itself is never launched (StaticVersionOnly).
+			name: "plist without a short version: unknown, CLI never launched",
+			goos: model.PlatformDarwin,
+			setup: func(m *executor.Mock, home string) {
+				kiroDarwinBundle(m, kiroPlist(kiroCLIBundleID, ""))
+			},
+			allowExec: true,
+			wantExecs: []aicliExecCall{plistBuddy},
+			want:      []aicliWant{{tool: "amazon-q-cli", binary: bin, version: "unknown"}},
+			wantDebug: []string{"reporting version unknown (never launched)"},
+		},
+		{
+			name: "a bundle with another identifier is rejected",
+			goos: model.PlatformDarwin,
+			setup: func(m *executor.Mock, home string) {
+				other := "/Applications/Other.app/Contents/MacOS/kiro-cli"
+				addFile(m, other, []byte{})
+				addFile(m, "/Applications/Other.app/Contents/Info.plist", kiroPlist("com.example.other", "9.9.9"))
+				m.SetPath("kiro-cli", other)
+			},
+			wantDebug: []string{`bundle identifier is "com.example.other", not com.amazon.codewhisperer`},
+		},
+		{
+			name: "the Kiro IDE bundle is not the CLI",
+			goos: model.PlatformDarwin,
+			setup: func(m *executor.Mock, home string) {
+				ide := "/Applications/Kiro.app/Contents/Resources/app/bin/code"
+				addFile(m, ide, []byte{})
+				addFile(m, "/Applications/Kiro.app/Contents/Info.plist", kiroPlist("dev.kiro.desktop", "1.0.437"))
+				m.SetPath("kiro", ide)
+			},
+			wantDebug: []string{"not <bundle>.app/Contents/MacOS/kiro-cli"},
+		},
+		{
+			// The link is seen with Readlink and never followed: neither its
+			// target nor the link path itself is stat'd, resolved or read.
+			name: "a plist symlinked into ~/Downloads is never followed",
+			goos: model.PlatformDarwin,
+			setup: func(m *executor.Mock, home string) {
+				addFile(m, bin, []byte{})
+				m.SetSymlink(kiroCLIBundle+"/Contents/Info.plist", joinPath(home, "Downloads", "Info.plist"))
+				addFile(m, joinPath(home, "Downloads", "Info.plist"), kiroPlist(kiroCLIBundleID, "2.21.1"))
+			},
+			skipper:      true,
+			noReadPrefix: []string{"/Users/u/Downloads", kiroCLIBundle + "/Contents/Info.plist"},
+			wantDebug:    []string{"under a macOS TCC-protected path"},
+		},
+	})
+}
+
+func TestAICLIAgents_Kiro_Linux(t *testing.T) {
+	const dpkgStatus = "Package: kiro-cli\nStatus: install ok installed\nVersion: 2.21.1\n\n"
+	runAICLICases(t, []aicliCase{
+		{
+			name: "dpkg: the package owns the binary and carries the version",
+			setup: func(m *executor.Mock, home string) {
+				m.SetPath("kiro-cli", "/usr/bin/kiro-cli")
+				addFile(m, "/usr/bin/kiro-cli", []byte{})
+				addFile(m, "/var/lib/dpkg/info/kiro-cli.list", []byte("/usr\n/usr/bin\n/usr/bin/kiro-cli\n"))
+				addFile(m, "/var/lib/dpkg/status", []byte(dpkgStatus))
+			},
+			want: []aicliWant{{tool: "amazon-q-cli", binary: "/usr/bin/kiro-cli", version: "2.21.1"}},
+		},
+		{
+			name: "installer trio in ~/.local/bin, archive gone: unknown version, never launched",
+			setup: func(m *executor.Mock, home string) {
+				dir := joinPath(home, ".local", "bin")
+				kiroLinuxTrio(m, dir)
+				m.SetPath("kiro-cli", joinPath(dir, "kiro-cli"))
+			},
+			want:      []aicliWant{{tool: "amazon-q-cli", binary: "/home/u/.local/bin/kiro-cli", version: "unknown"}},
+			wantDebug: []string{"reporting version unknown (never launched)"},
+		},
+		{
+			name: "trio symlinked from the retained kirocli/bin tree: detected, version unknown",
+			setup: func(m *executor.Mock, home string) {
+				archive := joinPath(home, "kirocli")
+				kiroLinuxTrio(m, joinPath(archive, "bin"))
+				link := joinPath(home, ".local", "bin", "kiro-cli")
+				addFile(m, link, []byte{})
+				m.SetSymlink(link, joinPath(archive, "bin", "kiro-cli"))
+			},
+			want: []aicliWant{{tool: "amazon-q-cli", binary: "/home/u/.local/bin/kiro-cli", version: "unknown", install: "/home/u/kirocli/bin/kiro-cli"}},
+		},
+		{
+			name: "kiro-cli without its siblings is not a Kiro install",
+			setup: func(m *executor.Mock, home string) {
+				m.SetPath("kiro-cli", "/usr/local/bin/kiro-cli")
+				addFile(m, "/usr/local/bin/kiro-cli", []byte{})
+			},
+			wantDebug: []string{"no kiro-cli-chat beside it"},
+		},
+		{
+			name: "the IDE's /usr/bin/kiro launcher and a `q` wrapper alone prove nothing",
+			setup: func(m *executor.Mock, home string) {
+				m.SetPath("kiro", "/usr/bin/kiro")
+				addFile(m, "/usr/bin/kiro", []byte{})
+				m.SetSymlink("/usr/bin/kiro", "/usr/share/kiro/bin/kiro")
+				m.SetPath("q", "/usr/local/bin/q")
+				addFile(m, "/usr/local/bin/q", []byte("#!/bin/sh\nexec kiro-cli chat \"$@\"\n"))
+			},
+			wantDebug: []string{"resolves to /usr/share/kiro/bin/kiro, whose basename is not kiro-cli", "resolves to /usr/local/bin/q, whose basename is not kiro-cli"},
+		},
+		{
+			// kiro-cli is listed first, so the installer trio off PATH is
+			// found before either alias is examined.
+			name: "the same colliders on PATH do not hide the trio in ~/.local/bin",
+			setup: func(m *executor.Mock, home string) {
+				m.SetPath("kiro", "/usr/bin/kiro")
+				addFile(m, "/usr/bin/kiro", []byte{})
+				m.SetSymlink("/usr/bin/kiro", "/usr/share/kiro/bin/kiro")
+				m.SetPath("q", "/usr/local/bin/q")
+				addFile(m, "/usr/local/bin/q", []byte{})
+				kiroLinuxTrio(m, joinPath(home, ".local", "bin"))
+			},
+			want:     []aicliWant{{tool: "amazon-q-cli", binary: "/home/u/.local/bin/kiro-cli"}},
+			noLookup: []string{"q"},
+		},
+		{
+			name: "a sibling that is a symlink is not followed",
+			setup: func(m *executor.Mock, home string) {
+				dir := joinPath(home, ".local", "bin")
+				kiroLinuxTrio(m, dir)
+				m.SetSymlink(joinPath(dir, "kiro-cli-chat"), "/home/u/Documents/kiro-cli-chat")
+				addFile(m, "/home/u/Documents/kiro-cli-chat", []byte{})
+			},
+			noReadPrefix: []string{"/home/u/Documents", "/home/u/.local/bin/kiro-cli-chat"},
+			wantDebug:    []string{"no kiro-cli-chat beside it"},
+		},
+		{
+			name: "a sibling that is a directory does not count",
+			setup: func(m *executor.Mock, home string) {
+				dir := joinPath(home, ".local", "bin")
+				addFile(m, joinPath(dir, "kiro-cli"), []byte{})
+				addFile(m, joinPath(dir, "kiro-cli-chat"), []byte{})
+				m.SetFileInfo(joinPath(dir, "kiro-cli-term"), &dirInfo{n: "kiro-cli-term"})
+				m.SetPath("kiro-cli", joinPath(dir, "kiro-cli"))
+			},
+			wantDebug: []string{"no kiro-cli-term beside it"},
+		},
+	})
+}
+
+func TestAICLIAgents_Kiro_Windows(t *testing.T) {
+	const defaultInstall = `C:\Users\u\AppData\Local\Kiro-Cli`
+	exe := defaultInstall + `\kiro-cli.exe`
+	runAICLICases(t, []aicliCase{
+		{
+			name: "default install: the fixed path is bound to the registry InstallPath",
+			goos: model.PlatformWindows,
+			setup: func(m *executor.Mock, home string) {
+				kiroRegistry(m, defaultInstall)
+				addFile(m, exe, []byte{})
+			},
+			allowExec: true,
+			wantExecs: []aicliExecCall{},
+			want:      []aicliWant{{tool: "amazon-q-cli", binary: exe, version: "2.21.1.0", install: exe}},
+		},
+		{
+			name: "PATH hit inside the registered InstallPath, spelled in another case",
+			goos: model.PlatformWindows,
+			setup: func(m *executor.Mock, home string) {
+				kiroRegistry(m, `c:\users\u\appdata\local\kiro-cli\`)
+				m.SetPath("kiro-cli", exe)
+				addFile(m, exe, []byte{})
+			},
+			allowExec: true,
+			wantExecs: []aicliExecCall{},
+			want:      []aicliWant{{tool: "amazon-q-cli", binary: exe, version: "2.21.1.0"}},
+		},
+		{
+			name: "non-default InstallPath, on no PATH: the key's path joins the candidates",
+			goos: model.PlatformWindows,
+			setup: func(m *executor.Mock, home string) {
+				kiroRegistry(m, `D:\Tools\KiroCli`)
+				addFile(m, `D:\Tools\KiroCli\kiro-cli.exe`, []byte{})
+			},
+			allowExec: true,
+			wantExecs: []aicliExecCall{},
+			want:      []aicliWant{{tool: "amazon-q-cli", binary: `D:\Tools\KiroCli\kiro-cli.exe`, version: "2.21.1.0"}},
+		},
+		{
+			name: "a kiro-cli.exe outside the registered InstallPath is rejected",
+			goos: model.PlatformWindows,
+			setup: func(m *executor.Mock, home string) {
+				kiroRegistry(m, `D:\Tools\KiroCli`)
+				m.SetPath("kiro-cli", `C:\stray\kiro-cli.exe`)
+				addFile(m, `C:\stray\kiro-cli.exe`, []byte{})
+			},
+			allowExec: true,
+			wantExecs: []aicliExecCall{},
+			wantDebug: []string{`not kiro-cli.exe under the registered InstallPath D:\Tools\KiroCli`},
+		},
+		{
+			name: "registry key present but the executable is gone",
+			goos: model.PlatformWindows,
+			setup: func(m *executor.Mock, home string) {
+				kiroRegistry(m, defaultInstall)
+			},
+			allowExec: true,
+			wantExecs: []aicliExecCall{},
+		},
+		{
+			// With no key nothing can be proven, so no candidate is even looked
+			// up — the PATH kiro-cli.exe stays untouched.
+			name: "no registry key: no candidate is examined",
+			goos: model.PlatformWindows,
+			setup: func(m *executor.Mock, home string) {
+				m.SetPath("kiro-cli", exe)
+				addFile(m, exe, []byte{})
+			},
+			allowExec: true,
+			wantExecs: []aicliExecCall{},
+			noLookup:  []string{"kiro"},
+			wantDebug: []string{`HKCU\SOFTWARE\Kiro\CLI is absent`},
+		},
+	})
+}
+
+// dirInfo is an os.FileInfo for a directory, for the sibling-is-a-directory case.
+type dirInfo struct{ n string }
+
+func (d *dirInfo) Name() string       { return d.n }
+func (d *dirInfo) Size() int64        { return 0 }
+func (d *dirInfo) Mode() os.FileMode  { return os.ModeDir | 0o755 }
+func (d *dirInfo) ModTime() time.Time { return time.Time{} }
+func (d *dirInfo) IsDir() bool        { return true }
+func (d *dirInfo) Sys() any           { return nil }

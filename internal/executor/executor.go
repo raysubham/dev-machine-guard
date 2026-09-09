@@ -62,6 +62,10 @@ type Executor interface {
 	// EvalSymlinks resolves symbolic links in a path. Returns the resolved
 	// canonical path. If the path is not a symlink, returns it unchanged.
 	EvalSymlinks(path string) (string, error)
+	// Readlink returns the stored target of the symlink (or Windows directory
+	// junction) at path without following it — possibly relative, possibly an
+	// NT-namespace spelling (\??\C:\...). A non-link path is an error.
+	Readlink(path string) (string, error)
 	// LoggedInUser returns the actual logged-in console user.
 	// When running as root on macOS (e.g., via LaunchDaemon), this detects the
 	// real console user via /dev/console rather than returning root.
@@ -228,6 +232,10 @@ func (r *Real) Glob(pattern string) ([]string, error) {
 
 func (r *Real) EvalSymlinks(path string) (string, error) {
 	return filepath.EvalSymlinks(path)
+}
+
+func (r *Real) Readlink(path string) (string, error) {
+	return os.Readlink(path)
 }
 
 func (r *Real) LoggedInUser() (*user.User, error) {
