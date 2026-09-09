@@ -117,7 +117,7 @@ func normalizeDebianVersion(v string) string {
 	if i := strings.LastIndex(v, "-"); i > 0 {
 		v = v[:i]
 	}
-	if !isVersionLike(v) {
+	if !IsVersionLike(v) {
 		return ""
 	}
 	return v
@@ -138,7 +138,7 @@ func versionFromAppImage(resolved, base string) string {
 
 	parts := strings.Split(stem, "-")
 	for i := 1; i < len(parts); i++ {
-		if !isVersionLike(parts[i]) {
+		if !IsVersionLike(parts[i]) {
 			continue
 		}
 		if matchesTool(strings.Join(parts[:i], "-"), base) {
@@ -179,7 +179,7 @@ func versionFromSnap(exec executor.Executor, binaryPath string) string {
 			version = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "version:")), `"'`)
 		}
 	}
-	if name != snapName || !isVersionLike(version) {
+	if name != snapName || !IsVersionLike(version) {
 		return ""
 	}
 	return strings.TrimPrefix(version, "v")
