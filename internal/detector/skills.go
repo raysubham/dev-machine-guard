@@ -892,11 +892,9 @@ func (d *SkillsDetector) enumerateRoot(ctx context.Context, root skillsRoot, inf
 // into the physical skill's record by collapseSymlinkShadows. Links are never
 // descended through — cycles and ~/ escapes are impossible.
 //
-// The link's stored target is read with Readlink and guarded before it is
-// followed, then the EvalSymlinks result is guarded again. Residual: a
-// symlink in an intervening ancestor of the stored target is only seen by
-// EvalSymlinks, which stats through it; a link whose stored spelling is safe
-// but whose ancestor points into a protected tree can still prompt.
+// Linked targets are resolved and read through safepath, checking each link's
+// destination before traversal. Normal shared links inside the user's home or
+// declared project remain supported; unrelated external targets are refused.
 func (d *SkillsDetector) handleSymlinkEntry(ctx context.Context, records *[]discoveredSkill, root skillsRoot, linkPath, rel string, isSymlink bool, info *model.AgentSkillScanInfo, memo map[string]*skillScan, rootTruncated *bool) {
 	target, ok := linkTarget(d.exec, linkPath)
 	if !ok {
@@ -911,7 +909,14 @@ func (d *SkillsDetector) handleSymlinkEntry(ctx context.Context, records *[]disc
 	if d.skipper.WithinProtected(target) {
 		return
 	}
-	resolved, err := d.exec.EvalSymlinks(target)
+	guarded := *d
+	guarded.exec = d.exec.GuardedFiles([]string{getHomeDir(d.exec), root.path, root.projectPath}, func(p string) string {
+		if d.skipper.WithinProtected(p) {
+			return "tcc_protected"
+		}
+		return ""
+	}, maxSkillMDReadBytes)
+	resolved, err := guarded.exec.EvalSymlinks(target)
 	if err != nil || resolved == "" {
 		d.addError(info, fmt.Sprintf("dangling symlink %s: %v", linkPath, err))
 		return
@@ -920,10 +925,7 @@ func (d *SkillsDetector) handleSymlinkEntry(ctx context.Context, records *[]disc
 	if d.skipper.WithinProtected(target) {
 		return
 	}
-	if !d.exec.DirExists(target) {
-		return
-	}
-	entries, err := d.exec.ReadDir(target)
+	entries, err := guarded.exec.ReadDir(target)
 	if err != nil {
 		d.addError(info, fmt.Sprintf("read symlink target %s: %v", target, err))
 		return
@@ -932,7 +934,7 @@ func (d *SkillsDetector) handleSymlinkEntry(ctx context.Context, records *[]disc
 	if !ok {
 		return // symlink to a non-skill dir — not descended
 	}
-	if !d.emitSkill(ctx, records, root, target, rel, mdName, true, info, memo) {
+	if !guarded.emitSkill(ctx, records, root, target, rel, mdName, true, info, memo) {
 		*rootTruncated = true
 	}
 }

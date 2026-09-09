@@ -28,6 +28,10 @@ type UserAwareExecutor struct {
 	envErr  error
 }
 
+func (e *UserAwareExecutor) GuardedFiles(roots []string, guard func(string) string, maxReadBytes int64) Executor {
+	return NewUserAwareExecutor(e.inner.GuardedFiles(roots, guard, maxReadBytes), e.username)
+}
+
 var userEnvironmentKeys = []string{
 	"APPDATA",
 	"GOAUTH",

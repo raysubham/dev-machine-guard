@@ -5,6 +5,7 @@ package detector
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +14,62 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/tcc"
 )
+
+// ancestorTraversalRecorder uses real filesystem resolution in a temporary
+// fake home; its Documents directory is not a user's TCC-protected directory.
+type ancestorTraversalRecorder struct {
+	*executor.Real
+	protected string
+	traversed []string
+	guarded   []string
+}
+
+func (r *ancestorTraversalRecorder) GuardedFiles(roots []string, guard func(string) string, maxReadBytes int64) executor.Executor {
+	return r.Real.GuardedFiles(roots, func(p string) string {
+		if p == r.protected {
+			r.guarded = append(r.guarded, p)
+		}
+		return guard(p)
+	}, maxReadBytes)
+}
+
+func (r *ancestorTraversalRecorder) EvalSymlinks(p string) (string, error) {
+	resolved, err := r.Real.EvalSymlinks(p)
+	if err == nil && (resolved == r.protected || strings.HasPrefix(resolved, r.protected+"/")) {
+		r.traversed = append(r.traversed, p)
+	}
+	return resolved, err
+}
+
+func TestSkillsAncestorLinkRejectedBeforeResolution(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	protected := filepath.Join(home, "Documents")
+	root := filepath.Join(home, ".kiro", "skills")
+	for _, dir := range []string{root, filepath.Join(protected, "skill")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alias := filepath.Join(home, "ordinary-alias")
+	if err := os.Symlink(protected, alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(alias, "skill"), filepath.Join(root, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	rec := &ancestorTraversalRecorder{Real: executor.NewReal(), protected: protected}
+	d := NewSkillsDetector(rec).WithSkipper(tcc.New(home))
+	d.enumerateRoot(context.Background(), skillsRoot{path: root, source: "kiro_project", agent: "kiro", scope: "project", projectPath: home}, &model.AgentSkillScanInfo{}, map[string]*skillScan{})
+	if len(rec.traversed) != 0 {
+		t.Fatalf("protected ancestor was already traversed by EvalSymlinks before rejection: %v", rec.traversed)
+	}
+	if len(rec.guarded) == 0 {
+		t.Fatal("protected link destination was not checked by the guard")
+	}
+}
 
 // tccAccessRecorder wraps the mock executor and records every path handed to a
 // filesystem call that stats/reads on a real machine — the calls that fire a

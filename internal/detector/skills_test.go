@@ -1957,7 +1957,7 @@ func TestDetect_DotDotAfterSymlinkResolvesThroughIt(t *testing.T) {
 	}
 
 	d := NewSkillsDetector(executor.NewReal())
-	records := d.enumerateRoot(context.Background(), skillsRoot{path: root, source: "claude_user", agent: "claude", scope: "global"}, &model.AgentSkillScanInfo{}, map[string]*skillScan{})
+	records := d.enumerateRoot(context.Background(), skillsRoot{path: root, source: "claude_project", agent: "claude", scope: "project", projectPath: base}, &model.AgentSkillScanInfo{}, map[string]*skillScan{})
 
 	want, _ := filepath.EvalSymlinks(filepath.Join(elsewhere, "skill"))
 	var linked *discoveredSkill

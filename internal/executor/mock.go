@@ -64,6 +64,12 @@ type Mock struct {
 	loggedInUserErr error
 }
 
+// GuardedFiles retains the in-memory filesystem. Native guarded I/O is covered
+// by real-filesystem tests; mocks never access the host filesystem.
+func (m *Mock) GuardedFiles(_ []string, _ func(string) string, _ int64) Executor {
+	return m
+}
+
 type cmdResult struct {
 	Stdout   string
 	Stderr   string
