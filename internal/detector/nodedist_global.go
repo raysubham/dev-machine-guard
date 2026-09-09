@@ -121,18 +121,13 @@ func pnpmGlobalHomes(exec executor.Executor, home string) []string {
 }
 
 // nodeHomeDir returns the user's home directory via the platform-appropriate
-// source: macOS resolves the console user; Linux honors HOME before falling
-// back to the current account. Windows keeps USERPROFILE.
+// source: macOS resolves the console user; Windows keeps USERPROFILE;
+// other platforms keep HOME.
 func nodeHomeDir(exec executor.Executor) string {
 	switch exec.GOOS() {
 	case model.PlatformWindows:
 		return exec.Getenv("USERPROFILE")
 	case model.PlatformDarwin:
-		return executor.ResolveHome(exec)
-	case model.PlatformLinux:
-		if home := exec.Getenv("HOME"); home != "" {
-			return home
-		}
 		return executor.ResolveHome(exec)
 	default:
 		return exec.Getenv("HOME")

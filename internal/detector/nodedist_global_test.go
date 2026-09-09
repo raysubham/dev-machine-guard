@@ -62,8 +62,8 @@ func TestNodeHomeDir_Linux(t *testing.T) {
 		{"user override", "/custom/home", "/home/testuser", "/custom/home", false},
 		{"root override", "/home/testuser", "/root", "/home/testuser", true},
 		{"root home", "/root", "/root", "/root", true},
-		{"user fallback", "", "/home/testuser", "/home/testuser", false},
-		{"root fallback", "", "/root", "/root", true},
+		{"user unset home", "", "/home/testuser", "", false},
+		{"root unset home", "", "/root", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mock := executor.NewMock()
