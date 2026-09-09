@@ -42,7 +42,7 @@ Detection is cross-platform — binaries are located via `$PATH` lookup and home
 | Claude Code           | Anthropic | `claude`                    | `~/.claude`                     |
 | Codex                 | OpenAI    | `codex`                     | `~/.codex`                      |
 | Gemini CLI            | Google    | `gemini`                    | `~/.gemini`                     |
-| Amazon Q / Kiro CLI   | Amazon    | `kiro-cli`, `kiro`, `q`§    | `~/.q`, `~/.kiro`, `~/.aws/q`  |
+| Kiro CLI              | Amazon    | `kiro-cli`, `kiro`, `q`§    | `~/.q`, `~/.kiro`, `~/.aws/q`  |
 | GitHub Copilot CLI    | Microsoft | `copilot`, `gh-copilot`†    | `~/.config/github-copilot`, `~/.copilot` |
 | Microsoft AI Shell    | Microsoft | `aish`, `ai`                | `~/.aish`                       |
 | Aider                 | OpenSource| `aider`                     | `~/.aider`                      |
