@@ -263,15 +263,17 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	// internal 60s budget and per-root caps. Project roots surfaced by the
 	// node/python scanners feed per-project discovery on top of the detector's
 	// own ~/.claude.json registry.
-	var agentSkills []model.AgentSkill
-	var agentSkillScan *model.AgentSkillScanInfo
-	if featuregate.IsEnabled(featuregate.FeatureAgentSkillsScan) {
-		log.StepStart("Collecting AI agent skills")
-		start = time.Now()
-		skillsDetector := detector.NewSkillsDetector(exec).WithSkipper(tccSkipper)
-		agentSkills, agentSkillScan = skillsDetector.Detect(ctx, detector.CollectProjectRoots(nodeProjects, pythonProjects), searchDirs)
-		log.StepDone(time.Since(start))
-	}
+	// The same phase inventories agent plugins, standalone Claude commands and
+	// Claude's recorded skill usage; plugin-owned MCP configs leave the ordinary
+	// list. Community output never carries MCP content, nested or not.
+	log.StepStart("Collecting AI agent skills and plugins")
+	start = time.Now()
+	skillsDetector := detector.NewSkillsDetector(exec).WithSkipper(tccSkipper).WithAgentVersions(detector.AgentVersions(cliTools))
+	skillsResult := skillsDetector.DetectAll(ctx, detector.CollectProjectRoots(nodeProjects, pythonProjects), searchDirs)
+	agentSkills, agentSkillScan := skillsResult.Skills, skillsResult.Info
+	mcpConfigs = skillsResult.ReconcilePluginMCPCommunity(mcpConfigs)
+	detector.StripNestedMCPContent(skillsResult.Plugins)
+	log.StepDone(time.Since(start))
 
 	// Credential-location inventory — where this machine's developer tools keep
 	// credentials, and how well guarded each location is. Exact paths only, never a
@@ -393,38 +395,40 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	// Build result
 	now := time.Now()
 	result := &model.ScanResult{
-		AgentVersion:      buildinfo.Version,
-		AgentURL:          buildinfo.AgentURL,
-		ScanTimestamp:     now.Unix(),
-		ScanTimestampISO:  now.UTC().Format(time.RFC3339),
-		Device:            dev,
-		AIAgentsAndTools:  aiTools,
-		IDEInstallations:  ides,
-		IDEExtensions:     extensions,
-		MCPConfigs:        mcpConfigsToCommunity(mcpConfigs),
-		NodePkgManagers:   pkgManagers,
-		NodePackages:      []any{},
-		NodeProjects:      nodeProjects,
-		BrewPkgManager:    brewPkgManager,
-		BrewFormulae:      brewFormulae,
-		BrewCasks:         brewCasks,
-		PythonPkgManagers: pythonPkgManagers,
-		PythonPackages:    pythonPackages,
-		PythonProjects:    pythonProjects,
-		SystemPkgManager:  systemPkgManager,
-		SystemPackages:    systemPackages,
-		SnapPkgManager:    snapPkgManager,
-		SnapPackages:      snapPackages,
-		FlatpakPkgManager: flatpakPkgManager,
-		FlatpakPackages:   flatpakPackages,
-		NPMRCAudit:        &npmrcAudit,
-		PipAudit:          &pipAudit,
-		PnpmAudit:         pnpmAudit,
-		BunAudit:          bunAudit,
-		YarnAudit:         yarnAudit,
-		AgentSkills:       agentSkills,
-		AgentSkillScan:    agentSkillScan,
-		CredentialScan:    credentialScan,
+		AgentVersion:        buildinfo.Version,
+		AgentURL:            buildinfo.AgentURL,
+		ScanTimestamp:       now.Unix(),
+		ScanTimestampISO:    now.UTC().Format(time.RFC3339),
+		Device:              dev,
+		AIAgentsAndTools:    aiTools,
+		IDEInstallations:    ides,
+		IDEExtensions:       extensions,
+		MCPConfigs:          mcpConfigsToCommunity(mcpConfigs),
+		NodePkgManagers:     pkgManagers,
+		NodePackages:        []any{},
+		NodeProjects:        nodeProjects,
+		BrewPkgManager:      brewPkgManager,
+		BrewFormulae:        brewFormulae,
+		BrewCasks:           brewCasks,
+		PythonPkgManagers:   pythonPkgManagers,
+		PythonPackages:      pythonPackages,
+		PythonProjects:      pythonProjects,
+		SystemPkgManager:    systemPkgManager,
+		SystemPackages:      systemPackages,
+		SnapPkgManager:      snapPkgManager,
+		SnapPackages:        snapPackages,
+		FlatpakPkgManager:   flatpakPkgManager,
+		FlatpakPackages:     flatpakPackages,
+		NPMRCAudit:          &npmrcAudit,
+		PipAudit:            &pipAudit,
+		PnpmAudit:           pnpmAudit,
+		BunAudit:            bunAudit,
+		YarnAudit:           yarnAudit,
+		AgentSkills:         agentSkills,
+		AgentSkillScan:      agentSkillScan,
+		AgentPluginScan:     skillsResult.Plugins,
+		AgentSkillUsageScan: skillsResult.Usage,
+		CredentialScan:      credentialScan,
 
 		BrowserExtensionScan: browserExtensionScan,
 		Summary: model.Summary{
@@ -440,6 +444,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 			SnapPackagesCount:     len(snapPackages),
 			FlatpakPackagesCount:  len(flatpakPackages),
 			AgentSkillsCount:      len(agentSkills),
+			AgentPluginsCount:     skillsResult.Plugins.PluginCount(),
 		},
 	}
 

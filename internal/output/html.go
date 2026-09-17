@@ -11,23 +11,25 @@ import (
 )
 
 type htmlData struct {
-	ScanTime          string
-	Version           string
-	Device            model.Device
-	AITools           []model.AITool
-	IDEInstallations  []model.IDE
-	IDEExtensions     []model.Extension
-	MCPConfigs        []model.MCPConfig
-	NodePkgManagers   []model.PkgManager
-	NodeProjects      []model.ProjectInfo
-	BrewPkgManager    *model.PkgManager
-	BrewFormulae      []model.BrewPackage
-	BrewCasks         []model.BrewPackage
-	PythonPkgManagers []model.PkgManager
-	PythonPackages    []model.PythonPackage
-	PythonProjects    []model.ProjectInfo
-	AgentSkills       []model.AgentSkill
-	AgentSkillScan    *model.AgentSkillScanInfo
+	ScanTime            string
+	Version             string
+	Device              model.Device
+	AITools             []model.AITool
+	IDEInstallations    []model.IDE
+	IDEExtensions       []model.Extension
+	MCPConfigs          []model.MCPConfig
+	NodePkgManagers     []model.PkgManager
+	NodeProjects        []model.ProjectInfo
+	BrewPkgManager      *model.PkgManager
+	BrewFormulae        []model.BrewPackage
+	BrewCasks           []model.BrewPackage
+	PythonPkgManagers   []model.PkgManager
+	PythonPackages      []model.PythonPackage
+	PythonProjects      []model.ProjectInfo
+	AgentSkills         []model.AgentSkill
+	AgentSkillScan      *model.AgentSkillScanInfo
+	AgentPluginScan     *model.AgentPluginScan
+	AgentSkillUsageScan *model.AgentSkillUsageScan
 	// Nil means the phase did not run, which the template shows differently from a
 	// scan that ran and found nothing.
 	BrowserExtensionScan *model.BrowserExtensionScanInfo
@@ -49,6 +51,7 @@ func typeLabel(t string) string {
 
 // HTML generates a self-contained HTML report file.
 func HTML(outputFile string, result *model.ScanResult) error {
+	result = communityInventory(result)
 	f, err := os.Create(outputFile)
 	if err != nil {
 		return fmt.Errorf("creating HTML file: %w", err)
@@ -58,23 +61,25 @@ func HTML(outputFile string, result *model.ScanResult) error {
 	scanTime := time.Unix(result.ScanTimestamp, 0).Format("2006-01-02 15:04:05")
 
 	data := htmlData{
-		ScanTime:          scanTime,
-		Version:           buildinfo.Version,
-		Device:            result.Device,
-		AITools:           result.AIAgentsAndTools,
-		IDEInstallations:  result.IDEInstallations,
-		IDEExtensions:     result.IDEExtensions,
-		MCPConfigs:        result.MCPConfigs,
-		NodePkgManagers:   result.NodePkgManagers,
-		NodeProjects:      result.NodeProjects,
-		BrewPkgManager:    result.BrewPkgManager,
-		BrewFormulae:      result.BrewFormulae,
-		BrewCasks:         result.BrewCasks,
-		PythonPkgManagers: result.PythonPkgManagers,
-		PythonPackages:    result.PythonPackages,
-		PythonProjects:    result.PythonProjects,
-		AgentSkills:       result.AgentSkills,
-		AgentSkillScan:    result.AgentSkillScan,
+		ScanTime:            scanTime,
+		Version:             buildinfo.Version,
+		Device:              result.Device,
+		AITools:             result.AIAgentsAndTools,
+		IDEInstallations:    result.IDEInstallations,
+		IDEExtensions:       result.IDEExtensions,
+		MCPConfigs:          result.MCPConfigs,
+		NodePkgManagers:     result.NodePkgManagers,
+		NodeProjects:        result.NodeProjects,
+		BrewPkgManager:      result.BrewPkgManager,
+		BrewFormulae:        result.BrewFormulae,
+		BrewCasks:           result.BrewCasks,
+		PythonPkgManagers:   result.PythonPkgManagers,
+		PythonPackages:      result.PythonPackages,
+		PythonProjects:      result.PythonProjects,
+		AgentSkills:         result.AgentSkills,
+		AgentSkillScan:      result.AgentSkillScan,
+		AgentPluginScan:     result.AgentPluginScan,
+		AgentSkillUsageScan: result.AgentSkillUsageScan,
 
 		BrowserExtensionScan: result.BrowserExtensionScan,
 		Summary:              result.Summary,
@@ -83,6 +88,7 @@ func HTML(outputFile string, result *model.ScanResult) error {
 	funcMap := template.FuncMap{
 		"ideDisplayName":      ideDisplayName,
 		"typeLabel":           typeLabel,
+		"pluginState":         pluginState,
 		"platformDisplayName": model.PlatformDisplayName,
 		"add":                 func(a, b int) int { return a + b },
 		"formatBytes":         formatBytes,
@@ -201,6 +207,7 @@ const htmlTemplate = `<!DOCTYPE html>
 <p class="scan-meta">Scanned at {{.ScanTime}} &middot; Agent v{{.Version}}</p>
 
 <div class="summary-cards">
+ <div class="card"><div class="number">{{.Summary.AgentPluginsCount}}</div><div class="label">Agent Plugins</div></div>
   <div class="card"><div class="number">{{.Summary.AIAgentsAndToolsCount}}</div><div class="label">AI Agents & Tools</div></div>
   <div class="card"><div class="number">{{.Summary.IDEInstallationsCount}}</div><div class="label">IDEs & Apps</div></div>
   <div class="card"><div class="number">{{.Summary.IDEExtensionsCount}}</div><div class="label">IDE Extensions</div></div>
@@ -272,10 +279,37 @@ const htmlTemplate = `<!DOCTYPE html>
   <div class="section-body">
   <table>
     <tr><th>Skill</th><th>Agent</th><th>Source</th><th>Scope</th><th>Managed By</th><th>Linked Into</th></tr>
-    {{if .AgentSkillScan}}{{if .AgentSkills}}{{range .AgentSkills}}<tr><td>{{.SkillName}}</td><td>{{.Agent}}</td><td>{{.Source}}</td><td>{{.Scope}}</td><td>{{if .ManagedBy}}{{.ManagedBy}}{{else}}&mdash;{{end}}</td><td>{{if .SymlinkSources}}{{range $i, $s := .SymlinkSources}}{{if $i}}, {{end}}{{$s}}{{end}}{{else}}&mdash;{{end}}</td></tr>
+    {{if .AgentSkillScan}}{{if .AgentSkills}}{{range .AgentSkills}}<tr><td>{{.SkillName}}{{if eq .DefinitionKind "command"}} (command){{end}}</td><td>{{.Agent}}</td><td>{{.Source}}</td><td>{{.Scope}}</td><td>{{if .ManagedBy}}{{.ManagedBy}}{{else}}&mdash;{{end}}</td><td>{{if .SymlinkSources}}{{range $i, $s := .SymlinkSources}}{{if $i}}, {{end}}{{$s}}{{end}}{{else}}&mdash;{{end}}</td></tr>
     {{end}}{{else}}<tr><td colspan="6" style="text-align:center;color:#8a94a6;">None detected</td></tr>{{end}}{{else}}<tr><td colspan="6" style="text-align:center;color:#8a94a6;">Not scanned</td></tr>{{end}}
   </table>
   </div>
+</div>
+
+<div class="section">
+ <h2>Agent Plugins</h2>
+ {{if .AgentPluginScan}}
+ {{range .AgentPluginScan.Contexts}}
+ <p>{{.Agent}} — marketplaces: {{.MarketplaceStatus}}; installations: {{.InstallationStatus}}</p>
+ {{if .Marketplaces}}<table>
+ <tr><th>Marketplace</th><th>Source</th><th>Registered</th><th>Auto-update</th></tr>
+ {{range .Marketplaces}}<tr><td>{{.Name}}</td><td>{{with .Source}}{{.Kind}} {{.Location}}{{else}}unknown{{end}}</td><td>{{.Registered}}</td><td>{{pluginState .AutoUpdateEnabled}}</td></tr>{{end}}
+ </table>{{end}}
+ <table>
+ <tr><th>Plugin</th><th>Scope / source</th><th>Manifest / cache version</th><th>Installed / files present</th><th>Configured / effective enabled</th><th>Declared components</th></tr>
+ {{range .Plugins}}
+ <tr><td>{{.Name}}<div>{{.NativeID}}</div>{{if .InstallPath}}<div>{{.InstallPath}}</div>{{end}}{{if .SourcePath}}<div>Source: {{.SourcePath}}</div>{{end}}</td><td>{{.Scope}} / {{.InstallationKind}}{{with .Source}}<div>Payload: {{.Kind}} {{.Location}} {{.PackageName}}</div>{{end}}</td><td>{{.ManifestVersion}} / {{.CacheVersion}}</td><td>{{pluginState .Installed}} / {{pluginState .FilesPresent}}</td><td>{{pluginState .ConfiguredEnabled}} / {{pluginState .EffectiveEnabled}}</td><td>Coverage: {{.ComponentStatus}}{{range .Components}}<div>{{.Kind}}: {{.Name}} ({{.Status}})</div>{{end}}</td></tr>
+ {{else}}<tr><td colspan="6">{{if eq .InstallationStatus "complete"}}None detected{{else}}Inventory incomplete{{end}}</td></tr>{{end}}
+ </table>
+ {{else}}<p>No agent contexts detected</p>{{end}}
+ {{else}}<p>Not scanned</p>{{end}}
+</div>
+<div class="section">
+ <h2>Recorded Skill Use</h2>
+ {{if .AgentSkillUsageScan}}{{range .AgentSkillUsageScan.Sources}}
+ <p>{{.Agent}} — {{.SourcePath}} ({{.Status}})</p>
+ <table><tr><th>Native key</th><th>Cumulative recorded uses</th><th>Last recorded use (Unix ms)</th></tr>
+ {{range .Counters}}<tr><td>{{.RawKey}}</td><td>{{.RecordedUses}}</td><td>{{if .LastRecordedUseAtMs}}{{.LastRecordedUseAtMs}}{{else}}unknown{{end}}</td></tr>{{else}}<tr><td colspan="3">{{if eq .Status "complete"}}No recorded uses{{else}}Inventory incomplete{{end}}</td></tr>{{end}}</table>
+ {{else}}<p>No recorded-use sources detected</p>{{end}}{{else}}<p>Not scanned</p>{{end}}
 </div>
 
 <div class="section">

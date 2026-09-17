@@ -53,3 +53,19 @@ func TestScanResult_BrowserExtensionScan_OmittedWhenNil(t *testing.T) {
 		t.Errorf("zero ScanResult should omit \"browser_extension_scan\", got: %s", s)
 	}
 }
+
+// TestScanResult_AgentPlugins_OmittedWhenNil guards the two new envelopes the
+// same way: absent means unreported, and a section rendered with an empty
+// contexts or sources array would read as "this machine has no plugins" and let
+// a reader retire state a real scan wrote.
+func TestScanResult_AgentPlugins_OmittedWhenNil(t *testing.T) {
+	b, err := json.Marshal(&ScanResult{})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{`"agent_plugin_scan"`, `"agent_skill_usage_scan"`} {
+		if s := string(b); strings.Contains(s, key) {
+			t.Errorf("zero ScanResult should omit %s, got: %s", key, s)
+		}
+	}
+}

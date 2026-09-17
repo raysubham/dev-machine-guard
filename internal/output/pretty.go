@@ -15,6 +15,7 @@ import (
 //
 //nolint:errcheck // fmt.Fprint* to io.Writer; errors surface through the writer
 func Pretty(w io.Writer, result *model.ScanResult, colorMode string) error {
+	result = communityInventory(result)
 	c := setupColors(colorMode)
 
 	scanTime := time.Unix(result.ScanTimestamp, 0).Format("2006-01-02 15:04:05")
@@ -62,6 +63,7 @@ func Pretty(w io.Writer, result *model.ScanResult, colorMode string) error {
 	fmt.Fprintf(w, "    %-24s %s%d%s\n", "IDE Extensions", c.green, result.Summary.IDEExtensionsCount, c.reset)
 	fmt.Fprintf(w, "    %-24s %s%d%s\n", "MCP Servers", c.green, result.Summary.MCPConfigsCount, c.reset)
 	fmt.Fprintf(w, "    %-24s %s%d%s\n", "Agent Skills", c.green, result.Summary.AgentSkillsCount, c.reset)
+	fmt.Fprintf(w, "    %-24s %s%d%s\n", "Agent Plugins", c.green, result.Summary.AgentPluginsCount, c.reset)
 	if len(result.NodePkgManagers) > 0 {
 		fmt.Fprintf(w, "    %-24s %s%d%s\n", "Node.js Projects", c.green, result.Summary.NodeProjectsCount, c.reset)
 	}
@@ -140,6 +142,9 @@ func Pretty(w io.Writer, result *model.ScanResult, colorMode string) error {
 			if s.ManagedBy != "" {
 				tag = " [" + s.ManagedBy + "]"
 			}
+			if s.DefinitionKind == model.AgentDefinitionCommand {
+				tag += " [command]"
+			}
 			if n := len(s.SymlinkSources); n > 0 {
 				tag += fmt.Sprintf(" [+%d linked]", n)
 			}
@@ -176,6 +181,9 @@ func Pretty(w io.Writer, result *model.ScanResult, colorMode string) error {
 		fmt.Fprintf(w, "    %sNone detected%s\n", c.dim, c.reset)
 	}
 	fmt.Fprintln(w)
+
+	// AGENT PLUGINS
+	printAgentPlugins(w, c, result)
 
 	// BROWSER EXTENSIONS
 	printBrowserExtensions(w, c, result)
@@ -699,4 +707,157 @@ func ideDisplayName(ideType string) string {
 	default:
 		return ideType
 	}
+}
+
+func pluginState(value *bool) string {
+	if value == nil {
+		return "unknown"
+	}
+	if *value {
+		return "yes"
+	}
+	return "no"
+}
+
+//nolint:errcheck // terminal output
+func printAgentPlugins(w io.Writer, c *colors, result *model.ScanResult) {
+	scan := result.AgentPluginScan
+	printSectionHeader(w, c, "AGENT PLUGINS", scan.PluginCount())
+	if scan == nil {
+		fmt.Fprintln(w, "    Not scanned")
+	} else {
+		if len(scan.Contexts) == 0 {
+			fmt.Fprintln(w, "    No agent contexts detected")
+		}
+		for _, context := range scan.Contexts {
+			fmt.Fprintf(w, "    %s — marketplaces: %s; installations: %s\n", context.Agent, context.MarketplaceStatus, context.InstallationStatus)
+			if len(context.Plugins) == 0 && context.InstallationStatus == model.AgentScanStatusComplete {
+				fmt.Fprintln(w, "      None detected")
+			}
+			for _, market := range context.Marketplaces {
+				fmt.Fprintf(w, "      marketplace: %s; registered: %t; auto-update: %s\n", market.Name, market.Registered, pluginState(market.AutoUpdateEnabled))
+				if market.Source != nil {
+					fmt.Fprintf(w, "        source: %s %s\n", market.Source.Kind, market.Source.Location)
+				}
+			}
+			for _, p := range context.Plugins {
+				fmt.Fprintf(w, "      %s (%s, %s)\n", p.NativeID, p.Scope, p.InstallationKind)
+				fmt.Fprintf(w, "        installed: %s; files present: %s; configured enabled: %s; effective enabled: %s\n", pluginState(p.Installed), pluginState(p.FilesPresent), pluginState(p.ConfiguredEnabled), pluginState(p.EffectiveEnabled))
+				if p.ManifestVersion != "" || p.CacheVersion != "" {
+					fmt.Fprintf(w, "        manifest version: %s; cache version: %s\n", p.ManifestVersion, p.CacheVersion)
+				}
+				if p.InstallPath != "" {
+					fmt.Fprintf(w, "        path: %s\n", p.InstallPath)
+				}
+				if p.Source != nil {
+					fmt.Fprintf(w, "        payload source: %s %s %s\n", p.Source.Kind, p.Source.Location, p.Source.PackageName)
+				}
+				if p.SourcePath != "" {
+					fmt.Fprintf(w, "        source path: %s\n", p.SourcePath)
+				}
+				fmt.Fprintf(w, "        declared components: %d; coverage: %s\n", len(p.Components), p.ComponentStatus)
+				for _, component := range p.Components {
+					fmt.Fprintf(w, "          %s: %s (%s)\n", component.Kind, component.Name, component.Status)
+				}
+			}
+		}
+	}
+	fmt.Fprintln(w)
+	usage := result.AgentSkillUsageScan
+	printSectionHeader(w, c, "RECORDED SKILL USE", usageCounterCount(usage))
+	if usage == nil {
+		fmt.Fprintln(w, "    Not scanned")
+	} else {
+		if len(usage.Sources) == 0 {
+			fmt.Fprintln(w, "    No recorded-use sources detected")
+		}
+		for _, source := range usage.Sources {
+			fmt.Fprintf(w, "    %s — %s (%s)\n", source.Agent, source.SourcePath, source.Status)
+			for _, counter := range source.Counters {
+				fmt.Fprintf(w, "      %s: %d recorded uses\n", counter.RawKey, counter.RecordedUses)
+			}
+		}
+	}
+	fmt.Fprintln(w)
+}
+
+func usageCounterCount(scan *model.AgentSkillUsageScan) int {
+	count := 0
+	if scan != nil {
+		for _, source := range scan.Sources {
+			count += len(source.Counters)
+		}
+	}
+	return count
+}
+
+// communityInventory combines display rows without duplicating the wire inventory.
+// MCP counts remain configuration-file counts, not server or component counts.
+func communityInventory(result *model.ScanResult) *model.ScanResult {
+	if result.AgentPluginScan == nil {
+		return result
+	}
+	view := *result
+	view.AgentSkills = append([]model.AgentSkill(nil), result.AgentSkills...)
+	view.MCPConfigs = append([]model.MCPConfig(nil), result.MCPConfigs...)
+	skillPaths, mcpPaths := map[string]bool{}, map[string]bool{}
+	skillPath := func(skill model.AgentSkill) string {
+		if skill.SkillDirPath != "" {
+			return skill.SkillDirPath
+		}
+		if skill.DefinitionPath != "" {
+			return skill.DefinitionPath
+		}
+		return skill.SkillMDPath
+	}
+	for _, skill := range result.AgentSkills {
+		if key := skillPath(skill); key != "" {
+			skillPaths[key] = true
+		}
+	}
+	for _, mcp := range result.MCPConfigs {
+		if mcp.ConfigPath != "" {
+			mcpPaths[mcp.ConfigPath] = true
+		}
+	}
+	for _, context := range result.AgentPluginScan.Contexts {
+		for _, plugin := range context.Plugins {
+			for _, component := range plugin.Components {
+				var skill *model.AgentSkill
+				if component.Skill != nil {
+					skill = component.Skill
+				} else if command := component.Command; command != nil {
+					skill = &model.AgentSkill{SkillName: command.Name, Agent: context.Agent, Source: "plugin", Scope: plugin.Scope, ProjectPath: plugin.ProjectPath,
+						DefinitionKind: model.AgentDefinitionCommand, DefinitionPath: command.DefinitionPath}
+				}
+				if skill != nil {
+					key := skillPath(*skill)
+					if component.Kind == model.PluginComponentCommand && component.ResolvedDefinitionPath != "" {
+						key = component.ResolvedDefinitionPath
+					}
+					if key == "" || !skillPaths[key] {
+						view.AgentSkills = append(view.AgentSkills, *skill)
+						if key != "" {
+							skillPaths[key] = true
+						}
+					}
+				}
+				if mcp := component.MCPConfig; mcp != nil {
+					key := mcp.ConfigPath
+					if component.ResolvedDefinitionPath != "" {
+						key = component.ResolvedDefinitionPath
+					}
+					if key == "" || !mcpPaths[key] {
+						view.MCPConfigs = append(view.MCPConfigs, model.MCPConfig{ConfigSource: mcp.ConfigSource, ConfigPath: mcp.ConfigPath, Vendor: mcp.Vendor})
+						if key != "" {
+							mcpPaths[key] = true
+						}
+					}
+				}
+			}
+		}
+	}
+	view.Summary.AgentSkillsCount = len(view.AgentSkills)
+	view.Summary.MCPConfigsCount = len(view.MCPConfigs)
+	return &view
 }
