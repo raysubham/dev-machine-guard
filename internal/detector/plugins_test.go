@@ -9,6 +9,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/safepath"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -575,14 +576,41 @@ func TestClaudeSeedRelocationAndPriority(t *testing.T) {
 }
 
 func TestClaudeUsageFailurePreservesProjectDiscovery(t *testing.T) {
-	m, _ := newPluginMock()
-	m.SetFile(filepath.Join(testHome, ".claude.json"), []byte(`{"projects":{"/Users/testuser/test-repo":{}},"skillUsage":42}`))
+	m, fs := newPluginMock()
+	project := filepath.Join(testHome, "test-repo")
+	state, err := json.Marshal(map[string]any{"projects": map[string]any{project: map[string]any{}}, "skillUsage": 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.addFile(filepath.Join(testHome, ".claude.json"), string(state))
+	mcpPath := filepath.Join(project, ".mcp.json")
+	fs.addFile(mcpPath, `{"mcpServers":{"test-server":{"command":"test-mcp","args":["--stdio"]}}}`)
+	fs.addSkill(filepath.Join(project, ".claude/skills/check"), "SKILL.md", validFrontmatter("check", "test"), nil)
+	fs.commit()
 	st := readClaudeState(m, nil, testHome)
-	if !slices.Equal(st.projects, []string{"/Users/testuser/test-repo"}) || st.usageCode != model.AgentScanErrParseFailed || st.code != "" || st.projectsCode != "" {
+	if !slices.Equal(st.projects, []string{project}) || st.usageCode != model.AgentScanErrParseFailed || st.code != "" || st.projectsCode != "" {
 		t.Fatalf("unrelated project discovery changed: %+v", st)
 	}
 	if got := discoverClaudeProjects(m); !slices.Equal(got, st.projects) {
-		t.Fatalf("legacy MCP project discovery = %v, want %v", got, st.projects)
+		t.Fatalf("MCP project discovery = %v, want %v", got, st.projects)
+	}
+	result := NewSkillsDetector(m).DetectAll(context.Background(), nil, nil)
+	if len(result.Skills) != 1 || result.Skills[0].ProjectPath != project || result.Info.Truncated {
+		t.Fatalf("invalid usage changed project skills: %+v", result)
+	}
+	if result.Usage == nil || len(result.Usage.Sources) != 1 || result.Usage.Sources[0].Status != model.AgentScanStatusError {
+		t.Fatalf("usage failure not reported: %+v", result.Usage)
+	}
+	mcp := NewMCPDetector(m)
+	enterprise := mcp.DetectEnterprise(context.Background(), nil)
+	community := mcp.Detect(context.Background(), "testuser", nil, false)
+	if !slices.ContainsFunc(enterprise, func(c model.MCPConfigEnterprise) bool {
+		return c.ConfigPath == mcpPath && c.ConfigSource == "project_mcp" && c.ConfigContentBase64 != ""
+	}) || !slices.ContainsFunc(community, func(c model.MCPConfig) bool { return c.ConfigPath == mcpPath }) {
+		t.Fatalf("invalid usage hid project MCP: enterprise=%+v community=%+v", enterprise, community)
+	}
+	if !reflect.DeepEqual(result.ReconcilePluginMCP(enterprise), enterprise) || !reflect.DeepEqual(result.ReconcilePluginMCPCommunity(community), community) {
+		t.Fatal("plugin reconciliation changed standalone MCP records")
 	}
 }
 
@@ -838,10 +866,29 @@ func TestLocalPluginMCPExamplesStayOutOfStandaloneInventory(t *testing.T) {
 	p.InstallPath = root
 	a.components(p, nil, nil)
 	result := SkillsResult{evidence: s.evidence}
-	ordinary := filepath.Join(testHome, "other-project/.mcp.json")
-	got := result.ReconcilePluginMCP([]model.MCPConfigEnterprise{{ConfigPath: filepath.Join(root, "examples/.mcp.json")}, {ConfigPath: ordinary}})
-	if len(got) != 1 || got[0].ConfigPath != ordinary {
-		t.Fatalf("standalone MCP selection = %+v", got)
+	wantEnterprise := []model.MCPConfigEnterprise{
+		{ConfigSource: "project_mcp", ConfigPath: filepath.Join(testHome, "other-project/.mcp.json"), Vendor: "Project", ConfigContentBase64: "e30="},
+		{ConfigSource: "project_mcp", ConfigPath: filepath.Join(root+"-project", ".mcp.json"), Vendor: "Project", ConfigContentBase64: "e30="},
+	}
+	wantCommunity := []model.MCPConfig{}
+	for _, c := range wantEnterprise {
+		wantCommunity = append(wantCommunity, model.MCPConfig{ConfigSource: c.ConfigSource, ConfigPath: c.ConfigPath, Vendor: c.Vendor})
+	}
+	pluginPath := filepath.Join(root, "examples/.mcp.json")
+	enterprise := append([]model.MCPConfigEnterprise{{ConfigPath: pluginPath}}, wantEnterprise...)
+	community := append([]model.MCPConfig{{ConfigPath: pluginPath}}, wantCommunity...)
+	beforeEnterprise, beforeCommunity := slices.Clone(enterprise), slices.Clone(community)
+	if got := result.ReconcilePluginMCP(enterprise); !reflect.DeepEqual(got, wantEnterprise) {
+		t.Fatalf("standalone enterprise MCP changed: got=%+v want=%+v", got, wantEnterprise)
+	}
+	if got := result.ReconcilePluginMCPCommunity(community); !reflect.DeepEqual(got, wantCommunity) {
+		t.Fatalf("standalone community MCP changed: got=%+v want=%+v", got, wantCommunity)
+	}
+	if !reflect.DeepEqual(enterprise, beforeEnterprise) || !reflect.DeepEqual(community, beforeCommunity) {
+		t.Fatal("plugin reconciliation mutated the original MCP inventory")
+	}
+	if !reflect.DeepEqual((SkillsResult{}).ReconcilePluginMCP(enterprise), enterprise) || !reflect.DeepEqual((SkillsResult{}).ReconcilePluginMCPCommunity(community), community) {
+		t.Fatal("unreported plugins changed the MCP inventory")
 	}
 }
 

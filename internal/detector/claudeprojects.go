@@ -24,8 +24,7 @@ type claudeState struct {
 	usageCode    string
 }
 
-// readClaudeState reads <dir>/.claude.json through the same gate as the lock
-// files: protected-path check, regular-file check, size cap, then the read.
+// readClaudeState reads <dir>/.claude.json with path and size guards.
 func readClaudeState(exec executor.Executor, skipper *tcc.Skipper, dir string) claudeState {
 	st := claudeState{path: filepath.Join(dir, ".claude.json")}
 	if skipper.WithinProtected(st.path) {
@@ -86,8 +85,8 @@ func readClaudeState(exec executor.Executor, skipper *tcc.Skipper, dir string) c
 	return st
 }
 
-// discoverClaudeProjects returns the absolute root paths of every project the
-// user has opened in Claude Code, verbatim and unsorted. Any failure yields nil.
+// discoverClaudeProjects returns recorded project paths verbatim and unsorted.
+// Read or project-parse failures return nil; invalid usage does not affect projects.
 func discoverClaudeProjects(exec executor.Executor) []string {
 	return readClaudeState(exec, nil, getHomeDir(exec)).projects
 }

@@ -1019,20 +1019,10 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		systemPackageScans = []model.SystemPackageScanResult{}
 	}
 
-	// AI agent skills inventory — every installed SKILL.md (metadata +
-	// content hashes only, never file content). A dedicated phase between MCP
-	// and the config audits. Pure filesystem reads bounded by an internal 60s
-	// budget and per-root caps. The node/python project roots discovered above
-	// feed per-project discovery on top of the detector's own ~/.claude.json
-	// registry. A non-nil scan info always ships (the backend "scan ran"
-	// sentinel), even when zero skills are found.
-	// Standalone commands and recorded usage belong to the skills phase.
+	// Collect skill and command metadata, hashes and recorded usage without
+	// uploading definition contents. Scan info remains present for empty results.
 	phaseCtx, phaseCancel = startPhase(ctx, tracker, "agent_skills_scan")
 	log.Progress("Collecting AI agent skills...")
-	// userExec (not exec): match every other user-facing detector so home
-	// resolves to the logged-in user, not the SYSTEM/root profile, under an
-	// unattended enterprise deploy. The wrapper currently passes all read ops
-	// straight through, so this is convention + future-proofing, not a live fix.
 	skillsDetector := detector.NewSkillsDetector(userExec).WithSkipper(tccSkipper).WithAgentVersions(detector.AgentVersions(cliTools))
 	skillsResult := skillsDetector.DetectSkills(phaseCtx, collectProjectRoots(nodeProjects, pythonProjects), searchDirs)
 	agentSkills, agentSkillScan := skillsResult.Skills, skillsResult.Info

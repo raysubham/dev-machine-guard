@@ -49,11 +49,7 @@ type ScanResult struct {
 	// skipped scan from erasing a device's extensions.
 	BrowserExtensionScan *BrowserExtensionScanInfo `json:"browser_extension_scan,omitempty"`
 
-	// AgentPluginScan is the agent plugin inventory and AgentSkillUsageScan the
-	// raw recorded-use observation. They are collected in separate plugin and
-	// skills phases: usage is reported with no plugin installed, and a plugin
-	// parse failure leaves usage intact. Nil means
-	// unreported, which is the only "no information" signal a reader has.
+	// Nil plugin or usage coverage means unreported, not an empty inventory.
 	AgentPluginScan     *AgentPluginScan     `json:"agent_plugin_scan,omitempty"`
 	AgentSkillUsageScan *AgentSkillUsageScan `json:"agent_skill_usage_scan,omitempty"`
 
@@ -818,11 +814,8 @@ type AgentSkill struct {
 	// Content identity
 	SkillMDHash string `json:"skill_md_hash,omitempty"` // hex(sha256(SKILL.md)) — identity/drift key
 
-	// Definition shape. Empty DefinitionKind is the SKILL.md record above, which
-	// is what every pre-1.18.0 row carries. A "command" record describes a legacy
-	// .claude/commands Markdown file instead: DefinitionPath and DefinitionHash
-	// name the actual file, and the SKILL.md fields and census counts stay empty
-	// rather than being invented for a file that is not a skill directory.
+	// Empty DefinitionKind denotes SKILL.md. Commands use DefinitionPath and
+	// DefinitionHash; their SKILL.md fields and directory census remain empty.
 	DefinitionKind string `json:"definition_kind,omitempty"` // "" | AgentDefinitionSkill | AgentDefinitionCommand
 	DefinitionPath string `json:"definition_path,omitempty"`
 	DefinitionHash string `json:"definition_hash,omitempty"` // hex(sha256(raw definition bytes))
@@ -869,10 +862,8 @@ type AgentSkillScanInfo struct {
 	Errors          []string `json:"errors,omitempty"`            // bounded: ≤50 entries, each ≤256 chars
 	WalkDirsVisited int      `json:"walk_dirs_visited,omitempty"` // home-walk ReadDir count
 	WalkRootsFound  int      `json:"walk_roots_found,omitempty"`  // project-root candidates the home walk emitted (pre-union)
-	// CommandsStatus covers the standalone command roots inspected in this phase,
-	// separately from the SKILL.md fields above. Empty means unreported, which is
-	// what every older agent sends; only AgentScanStatusComplete lets a reader
-	// retire command rows it no longer sees.
+	// CommandsStatus covers standalone command roots. Empty means unreported;
+	// only complete coverage permits removal of unseen commands.
 	CommandsStatus string `json:"commands_status,omitempty"`
 	DurationMs     int64  `json:"duration_ms"`
 }

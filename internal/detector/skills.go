@@ -88,9 +88,7 @@ func NewSkillsDetector(exec executor.Executor) *SkillsDetector {
 	return &SkillsDetector{exec: exec, now: time.Now}
 }
 
-// WithAgentVersions supplies agent versions already collected elsewhere in the
-// run, keyed by model.AgentClaudeCode / model.AgentCodex. The skills phase never
-// launches an agent to learn one. Returns the detector for chaining.
+// WithAgentVersions supplies versions from the AI CLI inventory, keyed by agent name.
 func (d *SkillsDetector) WithAgentVersions(v map[string]string) *SkillsDetector {
 	d.agentVersions = v
 	return d
@@ -180,25 +178,13 @@ func (d *SkillsDetector) DetectSkills(ctx context.Context, extraProjectRoots []s
 	ctx, cancel := context.WithTimeout(ctx, skillsPhaseBudget)
 	defer cancel()
 
-	// Defense-in-depth: the walk is designed panic-free — every per-root and
-	// per-skill failure degrades to an Errors entry rather than a panic — but if
-	// one still escapes we must NOT leave AgentSkillScan nil. A nil scan info
-	// means "no information" and would strand the device's skill state; a non-nil
-	// info (even with partial or zero records) means "scan ran". Record the panic
-	// and finalize whatever we gathered. Registered after `defer cancel()` so it
-	// runs first (LIFO), recovering before the context is torn down; the recovery
-	// re-collapses whatever `discovered` accumulated, so partial discovery
-	// survives the unwind. Containing the panic here keeps a skills bug from
-	// failing the whole telemetry run via telemetry.Run. The recorded error also
-	// marks an early-panic "scan ran, 0 skills" result as partial rather than
-	// complete.
+	// Preserve partial discoveries and scan status if a read panics.
 	var discovered []discoveredSkill
 	defer func() {
 		if r := recover(); r != nil {
 			result.pendingPlugins = nil
 			d.addError(info, fmt.Sprintf("panic in skills detect: %v", r))
-			// A panic aborted the walk mid-flight — the inventory is partial. Mark it
-			// so the backend keeps the scan non-authoritative and suppresses deletions.
+			// Partial coverage prevents the backend from deleting unseen skills.
 			info.Truncated = true
 			result.Skills = d.finalizeSkills(discovered, info)
 			info.SkillsFound = len(result.Skills)
@@ -226,14 +212,8 @@ func (d *SkillsDetector) DetectSkills(ctx context.Context, extraProjectRoots []s
 		discovered = append(discovered, d.enumerateRoot(ctx, root, info, memo)...)
 	}
 
-	// Project roots: Claude Code registry ∪ node/python roots ∪ home-walk
-	// discoveries, deduped, capped, then the candidate skill dirs are probed on
-	// each. The walk is the only source that finds a project the user never
-	// registered in ~/.claude.json and that no node/python scanner surfaced;
-	// every candidate still flows through discoverProjects' shared TCC / home /
-	// dedupe / cap choke point.
-	// .claude.json is read once per phase: its project registry feeds discovery
-	// here and its skillUsage map feeds the usage envelope below.
+	// One state read supplies project roots and usage counters. Project discovery
+	// also includes package-scanner roots and bounded filesystem discovery.
 	state := readClaudeState(d.exec, d.skipper, home)
 	projectInfo := &model.AgentSkillScanInfo{}
 	projectCode := state.code

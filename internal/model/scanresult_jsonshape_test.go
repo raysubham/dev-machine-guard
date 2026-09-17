@@ -54,10 +54,7 @@ func TestScanResult_BrowserExtensionScan_OmittedWhenNil(t *testing.T) {
 	}
 }
 
-// TestScanResult_AgentPlugins_OmittedWhenNil guards the two new envelopes the
-// same way: absent means unreported, and a section rendered with an empty
-// contexts or sources array would read as "this machine has no plugins" and let
-// a reader retire state a real scan wrote.
+// Unreported plugin and usage coverage must not serialize as an empty scan.
 func TestScanResult_AgentPlugins_OmittedWhenNil(t *testing.T) {
 	b, err := json.Marshal(&ScanResult{})
 	if err != nil {

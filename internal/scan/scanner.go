@@ -257,13 +257,8 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 		log.StepSkip("disabled (use --enable-python-scan to enable)")
 	}
 
-	// AI agent skills inventory — every installed SKILL.md across Claude Code,
-	// Codex, OpenCode, Cursor, and skills.sh-managed roots. Metadata + content
-	// hashes only, never file content. Pure filesystem reads bounded by an
-	// internal 60s budget and per-root caps. Project roots surfaced by the
-	// node/python scanners feed per-project discovery on top of the detector's
-	// own ~/.claude.json registry.
-	// Standalone commands and recorded usage belong to the skills phase.
+	// Collect skill and command metadata, hashes and recorded usage without
+	// including definition contents in the output.
 	log.StepStart("Collecting AI agent skills")
 	start = time.Now()
 	skillsDetector := detector.NewSkillsDetector(exec).WithSkipper(tccSkipper).WithAgentVersions(detector.AgentVersions(cliTools))

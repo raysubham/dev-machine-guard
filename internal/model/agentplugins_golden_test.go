@@ -11,16 +11,10 @@ import (
 	"testing"
 )
 
-// agentPluginsGoldenPath holds one plugin/usage observation exercising every
-// vocabulary value, every optional field in both its present and absent state, and
-// the identity recipes as frozen test vectors. The same bytes are the contract the
-// reader in the other repository is tested against.
+// Shared wire fixture with Agent API, including identity test vectors.
 const agentPluginsGoldenPath = "testdata/agent_plugins_v1_golden.json"
 
-// agentPluginsGolden is the slice of the telemetry envelope this contract adds
-// or extends. The rest of the envelope is unchanged by it, so the fixture carries
-// only these four keys rather than a full payload whose other sections would
-// drown the fields under test.
+// agentPluginsGolden contains the plugin, usage and skill sections of telemetry.
 type agentPluginsGolden struct {
 	AgentPluginScan     *AgentPluginScan     `json:"agent_plugin_scan"`
 	AgentSkillUsageScan *AgentSkillUsageScan `json:"agent_skill_usage_scan"`
@@ -43,10 +37,7 @@ func loadAgentPluginsGolden(t *testing.T) ([]byte, agentPluginsGolden) {
 	return raw, doc
 }
 
-// TestAgentPluginsGolden_RoundTripsWithNoDroppedField is the contract check
-// between these structs and the reader on the other end of the wire. A field the
-// struct has no home for fails the strict decode; a field decoded but not emitted
-// back changes the re-encoded document.
+// Strict decoding and round-tripping catch missing fields in either direction.
 func TestAgentPluginsGolden_RoundTripsWithNoDroppedField(t *testing.T) {
 	raw, doc := loadAgentPluginsGolden(t)
 	encoded, err := json.Marshal(&doc)
@@ -60,9 +51,7 @@ func TestAgentPluginsGolden_RoundTripsWithNoDroppedField(t *testing.T) {
 	}
 }
 
-// TestAgentPluginsGolden_CoversTheWholeVocabulary keeps the fixture honest:
-// every exported constant must be reachable from it, or the reader on the other
-// side cannot test the branch that constant selects.
+// Every wire vocabulary value must be represented in the shared fixture.
 func TestAgentPluginsGolden_CoversTheWholeVocabulary(t *testing.T) {
 	_, doc := loadAgentPluginsGolden(t)
 	scan, usage := doc.AgentPluginScan, doc.AgentSkillUsageScan
@@ -143,7 +132,7 @@ func TestAgentPluginsGolden_CoversTheWholeVocabulary(t *testing.T) {
 		{"manifest", []string{PluginManifestClaude, PluginManifestCodex, PluginManifestCursor, PluginManifestPortable, PluginManifestCatalog, PluginManifestNone, PluginManifestUnknown}},
 		{"component", []string{PluginComponentSkill, PluginComponentCommand, PluginComponentMCP, PluginComponentAgent, PluginComponentHook, PluginComponentLSP, PluginComponentApp}},
 		{"nested source", []string{"claude_plugin", "codex_plugin"}},
-		// "" is the pre-1.18.0 row shape and must stay representable beside both kinds.
+		// An empty kind denotes SKILL.md and remains valid beside explicit kinds.
 		{"definition", []string{"", AgentDefinitionSkill, AgentDefinitionCommand}},
 	} {
 		for _, want := range tt.want {

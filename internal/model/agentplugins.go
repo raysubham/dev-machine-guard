@@ -92,8 +92,7 @@ const (
 	PluginInstallUnknown = "unknown"
 )
 
-// Installation scopes. Distinct from AgentSkill.Scope, which has its own older
-// three-value vocabulary.
+// Installation scopes, distinct from AgentSkill.Scope.
 const (
 	PluginScopeUser    = "user"
 	PluginScopeProject = "project"
@@ -138,8 +137,7 @@ const (
 	PluginComponentApp     = "app"
 )
 
-// Definition kinds for AgentSkill.DefinitionKind. An empty value is the existing
-// SKILL.md record shape, which is what every pre-1.18.0 row carries.
+// Definition kinds for AgentSkill.DefinitionKind. Empty also denotes SKILL.md.
 const (
 	AgentDefinitionSkill   = "skill"
 	AgentDefinitionCommand = "command"
@@ -278,9 +276,7 @@ type PluginObservation struct {
 	ProjectPath string `json:"project_path,omitempty"`
 
 	InstallPath string `json:"install_path,omitempty"`
-	// The original local source when it differs from the copied cache. One client
-	// was observed opening the source while the registry still named the cache, so
-	// these are two facts, not one.
+	// Original local source, retained separately from the installation's cache path.
 	SourcePath   string         `json:"source_path,omitempty"`
 	ManifestPath string         `json:"manifest_path,omitempty"`
 	Source       *SourceLocator `json:"source,omitempty"` // payload, not catalog
@@ -376,9 +372,8 @@ type AgentSkillUsageScan struct {
 	Sources       []SkillUsageSource `json:"sources"`
 }
 
-// SkillUsageSource is one native state file. Only Claude records these; a Codex
-// source is never emitted as an empty Claude-equivalent success, because
-// "unavailable" and "zero uses" are different answers.
+// SkillUsageSource is one native state file. Collection supports Claude only;
+// unsupported agents do not produce zero-use observations.
 type SkillUsageSource struct {
 	SourceID     string              `json:"source_id"`
 	Agent        string              `json:"agent"`

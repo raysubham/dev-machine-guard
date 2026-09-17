@@ -98,8 +98,7 @@ type pluginRootScan struct {
 	attr nestedAttr
 }
 
-// AgentVersions extracts the versions the AI CLI phase already collected for
-// the agents this inventory covers, so no agent is launched again for one.
+// AgentVersions selects Claude Code and Codex versions from the AI CLI inventory.
 func AgentVersions(tools []model.AITool) map[string]string {
 	out := map[string]string{}
 	for _, t := range tools {
@@ -137,8 +136,8 @@ type SkillsResult struct {
 	pendingPlugins *pluginScan
 }
 
-// DetectPlugins uses the skills phase's discovery and memo with a fresh deadline.
-// A failed collection stays unreported rather than authorizing record removal.
+// DetectPlugins collects plugin metadata using the discovery state in result.
+// A panic leaves plugin coverage unreported and preserves completed skill results.
 func (d *SkillsDetector) DetectPlugins(ctx context.Context, result *SkillsResult) (err error) {
 	if result.pendingPlugins == nil {
 		return nil
@@ -389,7 +388,7 @@ func sortedMapKeys[V any](m map[string]V) []string {
 	return keys
 }
 
-// snapshotRetry restores only the new collector's budgets and memo on retry.
+// snapshotRetry captures counters, parsed definitions and attribution for retry.
 func (s *pluginScan) snapshotRetry() func() {
 	components, servers, definitions := s.components, s.mcpServers, *s.definitions
 	memo, owned := maps.Clone(s.memo), maps.Clone(s.evidence.owned)
@@ -1059,7 +1058,7 @@ func applySkillCensus(rec *model.AgentSkill, census *skillCensus) {
 	rec.LastModified = census.lastModified
 }
 
-// nestedScope maps a plugin scope onto the older skill scope vocabulary.
+// nestedScope maps a plugin scope to the skill scope vocabulary.
 func nestedScope(pluginScope string) string {
 	switch pluginScope {
 	case model.PluginScopeUser:
