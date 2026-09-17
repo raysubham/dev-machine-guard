@@ -581,18 +581,25 @@ func TestClaudeUsageFailurePreservesProjectDiscovery(t *testing.T) {
 	if !slices.Equal(st.projects, []string{"/Users/testuser/test-repo"}) || st.usageCode != model.AgentScanErrParseFailed || st.code != "" || st.projectsCode != "" {
 		t.Fatalf("unrelated project discovery changed: %+v", st)
 	}
+	if got := discoverClaudeProjects(m); !slices.Equal(got, st.projects) {
+		t.Fatalf("legacy MCP project discovery = %v, want %v", got, st.projects)
+	}
 }
 
 type pluginReadOnlyExecutor struct {
 	executor.Executor
-	t     *testing.T
-	reads map[string]int
+	t         *testing.T
+	reads     map[string]int
+	panicPath string
 }
 
 func (e *pluginReadOnlyExecutor) GuardedFiles([]string, func(string) string, int64) executor.Executor {
 	return e
 }
 func (e *pluginReadOnlyExecutor) ReadFile(p string) ([]byte, error) {
+	if p == e.panicPath {
+		panic("injected plugin read failure")
+	}
 	if filepath.Base(p) == "auth.json" || strings.Contains(p, "remote_plugin_catalog") {
 		e.t.Fatalf("forbidden read: %s", p)
 	}
@@ -626,13 +633,30 @@ func TestPluginCollectorReadOnlyAndSharedDefinition(t *testing.T) {
 	fs.addFile(filepath.Join(root, claudeManifestRel), `{"name":"test-plugin"}`)
 	fs.addSkill(skill, "SKILL.md", validFrontmatter("check", "test"), nil)
 	fs.addSymlink(filepath.Join(home, "skills/check"), skill)
+	fs.addFile(filepath.Join(home, "commands/review.md"), "Review this project.")
 	fs.addFile(filepath.Join(testHome, ".claude.json"), `{"skillUsage":{"test-plugin:check":{"usageCount":0,"lastUsedAt":1700000000000}}}`)
 	fs.commit()
 	spy := &pluginReadOnlyExecutor{Executor: m, t: t, reads: map[string]int{}}
 	detector := NewSkillsDetector(spy)
 	detector.now = func() time.Time { return time.UnixMilli(1700000000001) }
-	result := detector.DetectAll(context.Background(), nil, nil)
-	if result.Plugins.PluginCount() != 1 || len(result.Skills) != 1 || result.Usage == nil {
+	skillsCtx, skillsCancel := context.WithCancel(context.Background())
+	defer skillsCancel()
+	result := detector.DetectSkills(skillsCtx, nil, nil)
+	if result.Plugins != nil || spy.reads[filepath.Join(home, "plugins/installed_plugins.json")] != 0 {
+		t.Fatal("skills phase read plugin installation metadata")
+	}
+	if len(result.Skills) != 2 || result.Usage == nil || result.Info.CommandsStatus != model.AgentScanStatusComplete {
+		t.Fatalf("skills phase did not finish commands and usage: %+v", result)
+	}
+	info, usage := *result.Info, result.Usage
+	skillsCancel()
+	if err := detector.DetectPlugins(context.Background(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Info.DurationMs != info.DurationMs || result.Info.Truncated != info.Truncated || result.Usage != usage {
+		t.Fatal("plugin phase changed completed skills or usage observations")
+	}
+	if result.Plugins.PluginCount() != 1 || len(result.Skills) != 2 || result.Usage == nil {
 		t.Fatalf("lost independent exposure: %+v", result)
 	}
 	if spy.reads[filepath.Join(skill, "SKILL.md")] != 1 || spy.reads[filepath.Join(testHome, ".claude.json")] != 1 {
@@ -640,6 +664,53 @@ func TestPluginCollectorReadOnlyAndSharedDefinition(t *testing.T) {
 	}
 	if result.Plugins.CollectedAtMs != result.Usage.CollectedAtMs {
 		t.Fatal("envelopes have different observation times")
+	}
+}
+
+func TestPluginPhaseFailurePreservesSkills(t *testing.T) {
+	for _, failure := range []string{"cancelled", "panic"} {
+		t.Run(failure, func(t *testing.T) {
+			m, fs := newPluginMock()
+			home := filepath.Join(testHome, ".claude")
+			registry := filepath.Join(home, "plugins/installed_plugins.json")
+			fs.addFile(registry, `{"version":2,"plugins":{}}`)
+			fs.addFile(filepath.Join(home, "commands/review.md"), "Review this project.")
+			fs.addFile(filepath.Join(testHome, ".claude.json"), `{"skillUsage":{"review":{"usageCount":2}}}`)
+			fs.commit()
+			spy := &pluginReadOnlyExecutor{Executor: m, t: t, reads: map[string]int{}}
+			d := NewSkillsDetector(spy)
+			result := d.DetectSkills(context.Background(), nil, nil)
+			before, err := json.Marshal([]any{result.Skills, result.Info, result.Usage})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if failure == "cancelled" {
+				cancel()
+			} else {
+				spy.panicPath = registry
+			}
+			err = d.DetectPlugins(ctx, &result)
+			if failure == "panic" {
+				if err == nil || result.Plugins != nil || result.evidence != nil {
+					t.Fatalf("failed plugin scan must remain unreported: err=%v result=%+v", err, result)
+				}
+			} else {
+				if err != nil || result.Plugins == nil {
+					t.Fatalf("missing interrupted coverage: err=%v result=%+v", err, result)
+				}
+				for _, c := range result.Plugins.Contexts {
+					if c.InstallationStatus == model.AgentScanStatusComplete || c.MarketplaceStatus == model.AgentScanStatusComplete {
+						t.Fatalf("cancelled plugins reported complete: %+v", c)
+					}
+				}
+			}
+			after, err := json.Marshal([]any{result.Skills, result.Info, result.Usage})
+			if err != nil || string(after) != string(before) {
+				t.Fatalf("plugin failure changed skills or usage: err=%v", err)
+			}
+		})
 	}
 }
 
@@ -1012,6 +1083,7 @@ func TestPluginProjectLimitMustDowngradeCommandCoverage(t *testing.T) {
 		fs.mkdir(p)
 	}
 	fs.addFile(filepath.Join(projects[maxProjects], ".claude/commands/check.md"), "Review this project.")
+	fs.addFile(filepath.Join(testHome, ".claude/settings.json"), "{}")
 	fs.commit()
 	got := NewSkillsDetector(m).DetectAll(context.Background(), projects, nil)
 	if !got.Info.Truncated {
@@ -1019,6 +1091,14 @@ func TestPluginProjectLimitMustDowngradeCommandCoverage(t *testing.T) {
 	}
 	if got.Info.CommandsStatus == model.AgentScanStatusComplete {
 		t.Fatalf("omitted a known project with commands but commands_status=%s, projects=%d, commands=%d", got.Info.CommandsStatus, got.Info.ProjectsScanned, len(got.Skills))
+	}
+	if got.Plugins == nil {
+		t.Fatal("missing plugin context")
+	}
+	for _, c := range got.Plugins.Contexts {
+		if c.InstallationStatus == model.AgentScanStatusComplete || c.MarketplaceStatus == model.AgentScanStatusComplete {
+			t.Fatalf("partial project discovery became authoritative in the plugin phase: %+v", c)
+		}
 	}
 }
 

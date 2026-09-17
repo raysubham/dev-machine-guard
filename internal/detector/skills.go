@@ -2,12 +2,15 @@ package detector
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -154,15 +157,22 @@ type discoveredSkill struct {
 // ~/.claude.json and that no node/python scanner surfaced are still inventoried;
 // passing nil disables the walk (the registry + extra roots still apply).
 func (d *SkillsDetector) Detect(ctx context.Context, extraProjectRoots []string, searchDirs []string) ([]model.AgentSkill, *model.AgentSkillScanInfo) {
-	r := d.DetectAll(ctx, extraProjectRoots, searchDirs)
+	r := d.DetectSkills(ctx, extraProjectRoots, searchDirs)
 	return r.Skills, r.Info
 }
 
-// DetectAll is the whole agent_skills_scan phase: ordinary skills, the plugin
-// inventory of every resolved agent context, standalone Claude commands and
-// Claude's recorded skill usage, all inside one budget. Plugin and usage
-// envelopes are nil when nothing was observed; Info is never nil.
-func (d *SkillsDetector) DetectAll(ctx context.Context, extraProjectRoots []string, searchDirs []string) (result SkillsResult) {
+// DetectAll collects both phases for callers that do not track phase progress.
+func (d *SkillsDetector) DetectAll(ctx context.Context, extraProjectRoots []string, searchDirs []string) SkillsResult {
+	result := d.DetectSkills(ctx, extraProjectRoots, searchDirs)
+	if err := d.DetectPlugins(ctx, &result); err != nil {
+		d.addError(result.Info, err.Error())
+	}
+	return result
+}
+
+// DetectSkills collects ordinary skills, standalone commands and recorded usage.
+// Project discovery and parsed definitions are retained for DetectPlugins.
+func (d *SkillsDetector) DetectSkills(ctx context.Context, extraProjectRoots []string, searchDirs []string) (result SkillsResult) {
 	start := time.Now()
 	info := &model.AgentSkillScanInfo{}
 	result.Info = info
@@ -185,6 +195,7 @@ func (d *SkillsDetector) DetectAll(ctx context.Context, extraProjectRoots []stri
 	var discovered []discoveredSkill
 	defer func() {
 		if r := recover(); r != nil {
+			result.pendingPlugins = nil
 			d.addError(info, fmt.Sprintf("panic in skills detect: %v", r))
 			// A panic aborted the walk mid-flight — the inventory is partial. Mark it
 			// so the backend keeps the scan non-authoritative and suppresses deletions.
@@ -198,6 +209,17 @@ func (d *SkillsDetector) DetectAll(ctx context.Context, extraProjectRoots []stri
 	// Per-resolved-path census+hash memo: a skill linked from N roots is hashed
 	// exactly once and all N records share the result (symlink dedup).
 	memo := map[string]*skillScan{}
+	home := getHomeDir(d.exec)
+	definitions := 0
+	now := time.Now()
+	if d.now != nil {
+		now = d.now()
+	}
+	ps := &pluginScan{
+		d: d, ctx: ctx, home: home, goos: d.exec.GOOS(), now: now, searchDirs: searchDirs,
+		memo: memo, definitions: &definitions, evidence: newPluginEvidence(),
+	}
+	result.pendingPlugins = ps
 
 	// Global + system roots.
 	for _, root := range d.resolveGlobalRoots(info) {
@@ -212,7 +234,6 @@ func (d *SkillsDetector) DetectAll(ctx context.Context, extraProjectRoots []stri
 	// dedupe / cap choke point.
 	// .claude.json is read once per phase: its project registry feeds discovery
 	// here and its skillUsage map feeds the usage envelope below.
-	home := getHomeDir(d.exec)
 	state := readClaudeState(d.exec, d.skipper, home)
 	projectInfo := &model.AgentSkillScanInfo{}
 	projectCode := state.code
@@ -225,6 +246,8 @@ func (d *SkillsDetector) DetectAll(ctx context.Context, extraProjectRoots []stri
 	}
 	walkRoots := d.walkForProjectRoots(ctx, searchDirs, projectInfo)
 	projects := d.discoverProjects(state.projects, extraProjectRoots, walkRoots, projectInfo)
+	ps.projects = projects
+	ps.projectsIncomplete = projectInfo.Truncated || len(projectInfo.Errors) > 0
 	info.Truncated = info.Truncated || projectInfo.Truncated
 	info.WalkDirsVisited, info.WalkRootsFound = projectInfo.WalkDirsVisited, projectInfo.WalkRootsFound
 	for _, err := range projectInfo.Errors {
@@ -242,25 +265,6 @@ func (d *SkillsDetector) DetectAll(ctx context.Context, extraProjectRoots []stri
 	// disk is not an install and is dropped — the inventory is on-disk skills only.
 	discovered = d.applyLocks(discovered, projects, info)
 
-	// Plugin inventory shares the SKILL.md memo, so a skill supplied by a plugin
-	// and exposed through an ordinary root is parsed once.
-	definitions := 0
-	now := time.Now()
-	if d.now != nil {
-		now = d.now()
-	}
-	ps := &pluginScan{
-		d: d, ctx: ctx, home: home, goos: d.exec.GOOS(), now: now, projects: projects, searchDirs: searchDirs,
-		memo: memo, definitions: &definitions, evidence: newPluginEvidence(),
-	}
-	var contexts []*model.AgentPluginContext
-	for _, c := range []*model.AgentPluginContext{ps.detectClaude(), ps.detectCodex()} {
-		if c != nil {
-			contexts = append(contexts, c)
-		}
-	}
-	result.Plugins = ps.finalizePluginScan(contexts)
-	result.evidence = ps.evidence
 	commands := d.enumerateCommands(ctx, home, projects, info, ps)
 	if projectInfo.Truncated || len(projectInfo.Errors) > 0 {
 		degrade(&info.CommandsStatus, model.AgentScanStatusPartial)
@@ -283,6 +287,124 @@ func (d *SkillsDetector) DetectAll(ctx context.Context, extraProjectRoots []stri
 	info.SkillsFound = len(result.Skills)
 	info.DurationMs = time.Since(start).Milliseconds()
 	return result
+}
+
+var strictUintRE = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
+
+// strictUint parses a JSON number that is a plain non-negative integer no
+// larger than max. Fractions, exponents, strings and negatives are rejected.
+func strictUint(raw json.RawMessage, max int64) (int64, bool) {
+	if !strictUintRE.Match(raw) {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(string(raw), 10, 64)
+	if err != nil || n > max {
+		return 0, false
+	}
+	return n, true
+}
+
+// usageSource projects one state file's skillUsage map into a wire source. Each
+// entry is validated on its own; a rejected entry makes the source partial
+// without touching the valid keys beside it.
+func (s *pluginScan) usageSource(st claudeState, status string) model.SkillUsageSource {
+	src := model.SkillUsageSource{
+		SourceID: s.usageSourceID(model.AgentClaudeCode, st.path), Agent: model.AgentClaudeCode, SourcePath: st.path,
+		Status: status, AgentVersion: s.d.agentVersions[model.AgentClaudeCode],
+		Counters: []model.SkillUsageCounter{}, Errors: []model.AgentScanError{},
+	}
+	code := st.code
+	if code == "" {
+		code = st.usageCode
+	}
+	if code != "" {
+		src.Status = model.AgentScanStatusError
+		scanError(&src.Errors, model.AgentScanError{Code: code, SourcePath: st.path})
+		return src
+	}
+	keys := make([]string, 0, len(st.skillUsage))
+	for k := range st.skillUsage {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if len(src.Counters) >= maxUsageCounters {
+			degrade(&src.Status, model.AgentScanStatusPartial)
+			scanError(&src.Errors, model.AgentScanError{Code: model.AgentScanErrLimitExceeded, SourcePath: st.path})
+			break
+		}
+		var entry struct {
+			UsageCount json.RawMessage `json:"usageCount"`
+			LastUsedAt json.RawMessage `json:"lastUsedAt"`
+		}
+		count, ok := int64(0), key != "" && len(key) <= maxNameBytes && json.Unmarshal(st.skillUsage[key], &entry) == nil
+		if ok {
+			count, ok = strictUint(entry.UsageCount, maxRecordedUses)
+		}
+		var last *int64
+		if ok && len(entry.LastUsedAt) > 0 && string(entry.LastUsedAt) != "null" {
+			var ms int64
+			if ms, ok = strictUint(entry.LastUsedAt, maxRecordedUses); ok {
+				last = &ms
+			}
+		}
+		if !ok {
+			degrade(&src.Status, model.AgentScanStatusPartial)
+			scanError(&src.Errors, model.AgentScanError{Code: model.AgentScanErrParseFailed, SourcePath: st.path})
+			continue
+		}
+		src.Counters = append(src.Counters, model.SkillUsageCounter{RawKey: key, RecordedUses: count, LastRecordedUseAtMs: last})
+	}
+	return src
+}
+
+// collectClaudeUsage builds the usage envelope from the home state file and,
+// when a custom configuration root is visible, that root's state file. The
+// custom layout is not a verified client fixture, so its coverage stays partial.
+func (s *pluginScan) collectClaudeUsage(homeState claudeState) *model.AgentSkillUsageScan {
+	var sources []model.SkillUsageSource
+	if !homeState.absent {
+		sources = append(sources, s.usageSource(homeState, model.AgentScanStatusComplete))
+	}
+	if cfg := s.d.exec.Getenv("CLAUDE_CONFIG_DIR"); cfg != "" {
+		if st := readClaudeState(s.d.exec, s.d.skipper, filepath.Clean(cfg)); !st.absent && st.path != homeState.path {
+			sources = append(sources, s.usageSource(st, model.AgentScanStatusPartial))
+		}
+	}
+	if len(sources) == 0 {
+		return nil
+	}
+	sort.SliceStable(sources, func(i, j int) bool { return sources[i].SourcePath < sources[j].SourcePath })
+	if len(sources) > maxUsageSources {
+		sources = sources[:maxUsageSources]
+	}
+	remaining, errors := maxUsageCounters, 0
+	for i := range sources {
+		source := &sources[i]
+		if len(source.Counters) > remaining {
+			source.Counters = source.Counters[:remaining]
+			degrade(&source.Status, model.AgentScanStatusPartial)
+			scanError(&source.Errors, model.AgentScanError{Code: model.AgentScanErrLimitExceeded, SourcePath: source.SourcePath})
+		}
+		remaining -= len(source.Counters)
+		errors = capErrors(&source.Errors, errors)
+	}
+	scan := &model.AgentSkillUsageScan{SchemaVersion: agentPluginsSchemaVersion, CollectedAtMs: s.now.UnixMilli(), Sources: sources}
+	if encodedSize(scan) > maxEnvelopeBytes {
+		for i := len(scan.Sources) - 1; i >= 0 && encodedSize(scan) > maxEnvelopeBytes; i-- {
+			source := &scan.Sources[i]
+			degrade(&source.Status, model.AgentScanStatusPartial)
+			scanError(&source.Errors, model.AgentScanError{Code: model.AgentScanErrLimitExceeded, SourcePath: source.SourcePath})
+			for len(source.Counters) > 0 && encodedSize(scan) > maxEnvelopeBytes {
+				source.Counters = source.Counters[:len(source.Counters)/2]
+			}
+		}
+	}
+	errors = 0
+	for i := range scan.Sources {
+		errors = capErrors(&scan.Sources[i].Errors, errors)
+	}
+	return scan
 }
 
 // claudeConfigRoot is ~/.claude, or CLAUDE_CONFIG_DIR when visible to this process.

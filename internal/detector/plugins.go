@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"net/url"
 	"os"
@@ -27,6 +28,7 @@ import (
 
 const (
 	agentPluginsSchemaVersion = 1
+	pluginsPhaseBudget        = 60 * time.Second
 
 	maxPluginContexts      = 32
 	maxUsageSources        = 32
@@ -54,21 +56,22 @@ const (
 // time, the SKILL.md parse memo shared with the ordinary skill walk, and the
 // envelope-wide budgets.
 type pluginScan struct {
-	d             *SkillsDetector
-	ctx           context.Context
-	home          string
-	goos          string
-	now           time.Time
-	projects      []string
-	searchDirs    []string
-	memo          map[string]*skillScan
-	commands      map[string]commandMeta
-	definitions   *int
-	mcpServers    int
-	components    int
-	evidence      *pluginEvidence
-	reads         map[string]pluginMetadataStamp
-	sourceChanged bool
+	d                  *SkillsDetector
+	ctx                context.Context
+	home               string
+	goos               string
+	now                time.Time
+	projects           []string
+	projectsIncomplete bool
+	searchDirs         []string
+	memo               map[string]*skillScan
+	commands           map[string]commandMeta
+	definitions        *int
+	mcpServers         int
+	components         int
+	evidence           *pluginEvidence
+	reads              map[string]pluginMetadataStamp
+	sourceChanged      bool
 }
 
 // pluginEvidence is what the MCP reconciliation needs after the phase: the
@@ -124,13 +127,51 @@ func StripNestedMCPContent(scan *model.AgentPluginScan) {
 	}
 }
 
-// SkillsResult is everything the agent_skills_scan phase collects.
+// SkillsResult carries the skills and plugin observations from one scan run.
 type SkillsResult struct {
-	Skills   []model.AgentSkill
-	Info     *model.AgentSkillScanInfo
-	Plugins  *model.AgentPluginScan
-	Usage    *model.AgentSkillUsageScan
-	evidence *pluginEvidence
+	Skills         []model.AgentSkill
+	Info           *model.AgentSkillScanInfo
+	Plugins        *model.AgentPluginScan
+	Usage          *model.AgentSkillUsageScan
+	evidence       *pluginEvidence
+	pendingPlugins *pluginScan
+}
+
+// DetectPlugins uses the skills phase's discovery and memo with a fresh deadline.
+// A failed collection stays unreported rather than authorizing record removal.
+func (d *SkillsDetector) DetectPlugins(ctx context.Context, result *SkillsResult) (err error) {
+	if result.pendingPlugins == nil {
+		return nil
+	}
+	s := result.pendingPlugins
+	result.pendingPlugins = nil
+	ctx, cancel := context.WithTimeout(ctx, pluginsPhaseBudget)
+	defer cancel()
+	s.ctx = ctx
+	defer func() {
+		if r := recover(); r != nil {
+			result.Plugins, result.evidence = nil, nil
+			err = fmt.Errorf("panic in plugins detect: %v", r)
+		}
+	}()
+	s.now = time.Now()
+	if d.now != nil {
+		s.now = d.now()
+	}
+	var contexts []*model.AgentPluginContext
+	for _, c := range []*model.AgentPluginContext{s.detectClaude(), s.detectCodex()} {
+		if c != nil {
+			// Missing projects can hide project settings and catalogs.
+			if s.projectsIncomplete {
+				degrade(&c.MarketplaceStatus, model.AgentScanStatusPartial)
+				degrade(&c.InstallationStatus, model.AgentScanStatusPartial)
+			}
+			contexts = append(contexts, c)
+		}
+	}
+	result.Plugins = s.finalizePluginScan(contexts)
+	result.evidence = s.evidence
+	return nil
 }
 
 // ---------------------------------------------------------------------------

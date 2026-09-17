@@ -50,9 +50,9 @@ type ScanResult struct {
 	BrowserExtensionScan *BrowserExtensionScanInfo `json:"browser_extension_scan,omitempty"`
 
 	// AgentPluginScan is the agent plugin inventory and AgentSkillUsageScan the
-	// raw recorded-use observation. Each is independent of the other and of the
-	// skills phase they are collected in: usage is reported with no plugin
-	// installed, and a plugin parse failure leaves usage intact. Nil means
+	// raw recorded-use observation. They are collected in separate plugin and
+	// skills phases: usage is reported with no plugin installed, and a plugin
+	// parse failure leaves usage intact. Nil means
 	// unreported, which is the only "no information" signal a reader has.
 	AgentPluginScan     *AgentPluginScan     `json:"agent_plugin_scan,omitempty"`
 	AgentSkillUsageScan *AgentSkillUsageScan `json:"agent_skill_usage_scan,omitempty"`

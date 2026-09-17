@@ -263,14 +263,19 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	// internal 60s budget and per-root caps. Project roots surfaced by the
 	// node/python scanners feed per-project discovery on top of the detector's
 	// own ~/.claude.json registry.
-	// The same phase inventories agent plugins, standalone Claude commands and
-	// Claude's recorded skill usage; plugin-owned MCP configs leave the ordinary
-	// list. Community output never carries MCP content, nested or not.
-	log.StepStart("Collecting AI agent skills and plugins")
+	// Standalone commands and recorded usage belong to the skills phase.
+	log.StepStart("Collecting AI agent skills")
 	start = time.Now()
 	skillsDetector := detector.NewSkillsDetector(exec).WithSkipper(tccSkipper).WithAgentVersions(detector.AgentVersions(cliTools))
-	skillsResult := skillsDetector.DetectAll(ctx, detector.CollectProjectRoots(nodeProjects, pythonProjects), searchDirs)
+	skillsResult := skillsDetector.DetectSkills(ctx, detector.CollectProjectRoots(nodeProjects, pythonProjects), searchDirs)
 	agentSkills, agentSkillScan := skillsResult.Skills, skillsResult.Info
+	log.StepDone(time.Since(start))
+
+	log.StepStart("Collecting AI agent plugins")
+	start = time.Now()
+	if err := skillsDetector.DetectPlugins(ctx, &skillsResult); err != nil {
+		log.Warn("agent plugin scan failed: %v", err)
+	}
 	mcpConfigs = skillsResult.ReconcilePluginMCPCommunity(mcpConfigs)
 	detector.StripNestedMCPContent(skillsResult.Plugins)
 	log.StepDone(time.Since(start))

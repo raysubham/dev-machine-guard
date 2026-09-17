@@ -1026,22 +1026,30 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	// feed per-project discovery on top of the detector's own ~/.claude.json
 	// registry. A non-nil scan info always ships (the backend "scan ran"
 	// sentinel), even when zero skills are found.
-	// The same phase inventories agent plugins, standalone Claude commands and
-	// Claude's recorded skill usage; plugin-owned MCP configs then leave the
-	// ordinary MCP list so they are reported once, under their plugin.
+	// Standalone commands and recorded usage belong to the skills phase.
 	phaseCtx, phaseCancel = startPhase(ctx, tracker, "agent_skills_scan")
-	log.Progress("Collecting AI agent skills and plugins...")
+	log.Progress("Collecting AI agent skills...")
 	// userExec (not exec): match every other user-facing detector so home
 	// resolves to the logged-in user, not the SYSTEM/root profile, under an
 	// unattended enterprise deploy. The wrapper currently passes all read ops
 	// straight through, so this is convention + future-proofing, not a live fix.
 	skillsDetector := detector.NewSkillsDetector(userExec).WithSkipper(tccSkipper).WithAgentVersions(detector.AgentVersions(cliTools))
-	skillsResult := skillsDetector.DetectAll(phaseCtx, collectProjectRoots(nodeProjects, pythonProjects), searchDirs)
+	skillsResult := skillsDetector.DetectSkills(phaseCtx, collectProjectRoots(nodeProjects, pythonProjects), searchDirs)
 	agentSkills, agentSkillScan := skillsResult.Skills, skillsResult.Info
-	mcpConfigs = skillsResult.ReconcilePluginMCP(mcpConfigs)
-	log.Progress("  Found %d agent skills across %d roots, %d plugins", len(agentSkills), len(agentSkillScan.RootsScanned), skillsResult.Plugins.PluginCount())
+	log.Progress("  Found %d agent skills across %d roots", len(agentSkills), len(agentSkillScan.RootsScanned))
 	fmt.Fprintln(os.Stderr)
 	endPhase(phaseCtx, phaseCancel, tracker, log, "agent_skills_scan")
+	postPhase()
+
+	phaseCtx, phaseCancel = startPhase(ctx, tracker, "agent_plugins_scan")
+	log.Progress("Collecting AI agent plugins...")
+	if err := skillsDetector.DetectPlugins(phaseCtx, &skillsResult); err != nil {
+		log.Warn("agent plugin scan failed: %v", err)
+	}
+	mcpConfigs = skillsResult.ReconcilePluginMCP(mcpConfigs)
+	log.Progress("  Found %d agent plugins", skillsResult.Plugins.PluginCount())
+	fmt.Fprintln(os.Stderr)
+	endPhase(phaseCtx, phaseCancel, tracker, log, "agent_plugins_scan")
 	postPhase()
 
 	// Credential-location inventory — where this machine's developer tools keep
