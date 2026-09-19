@@ -174,7 +174,15 @@
                   "allowed_tools": [
                     "Read",
                     "Grep"
-                  ]
+                  ],
+                  "usage": {
+                    "availability": "available",
+                    "raw_key": "team-tools:review",
+                    "recorded_uses": 12,
+                    "last_recorded_use_at_ms": 1789599000123,
+                    "source_id": "usage_48d5dc7c5b25ec3eb224159273e368bb9f8ba28f2978cc40ebc9705c358a98df",
+                    "observed_at_ms": 1789600000000
+                  }
                 }
               },
               {
@@ -200,7 +208,11 @@
                   "license": "MIT",
                   "allowed_tools": [
                     "Bash"
-                  ]
+                  ],
+                  "usage": {
+                    "availability": "unavailable",
+                    "observed_at_ms": 1789600000000
+                  }
                 }
               },
               {
@@ -402,7 +414,11 @@
                   "has_frontmatter": true,
                   "callable_names": [
                     "tools:review"
-                  ]
+                  ],
+                  "usage": {
+                    "availability": "unavailable",
+                    "observed_at_ms": 1789600000000
+                  }
                 }
               },
               {
@@ -524,7 +540,11 @@
                   "total_size_bytes": 512,
                   "has_frontmatter": true,
                   "project_path": "/Users/example-user/src/example-repo",
-                  "has_plugin_manifest": true
+                  "has_plugin_manifest": true,
+                  "usage": {
+                    "availability": "unavailable",
+                    "observed_at_ms": 1789600000000
+                  }
                 }
               }
             ],
@@ -572,7 +592,11 @@
                   "skill_md_hash": "51ad0d5651f3c53c11eef5546a2d906f80a34fb3f86b9c8836a53372b39b08fc",
                   "file_count": 1,
                   "total_size_bytes": 512,
-                  "has_frontmatter": true
+                  "has_frontmatter": true,
+                  "usage": {
+                    "availability": "unavailable",
+                    "observed_at_ms": 1789600000000
+                  }
                 }
               }
             ],
@@ -1047,54 +1071,6 @@
       }
     ]
   },
-  "agent_skill_usage_scan": {
-    "schema_version": 1,
-    "collected_at_ms": 1789600000000,
-    "sources": [
-      {
-        "source_id": "usage_48d5dc7c5b25ec3eb224159273e368bb9f8ba28f2978cc40ebc9705c358a98df",
-        "agent": "claude-code",
-        "source_path": "/Users/example-user/.claude.json",
-        "status": "complete",
-        "agent_version": "2.1.273",
-        "counters": [
-          {
-            "raw_key": "team-tools:review",
-            "recorded_uses": 12,
-            "last_recorded_use_at_ms": 1789599000123
-          },
-          {
-            "raw_key": "deploy",
-            "recorded_uses": 0
-          },
-          {
-            "raw_key": "orphaned-skill",
-            "recorded_uses": 4,
-            "last_recorded_use_at_ms": 1789000000000
-          },
-          {
-            "raw_key": "review",
-            "recorded_uses": 9007199254740991,
-            "last_recorded_use_at_ms": 9007199254740991
-          }
-        ],
-        "errors": []
-      },
-      {
-        "source_id": "usage_38460be7fbb2a10e73a7a0a0e177e0924688fd55abbf7e36fde87be52e447361",
-        "agent": "claude-code",
-        "source_path": "/custom/claude-config/.claude.json",
-        "status": "partial",
-        "counters": [],
-        "errors": [
-          {
-            "code": "parse_failed",
-            "source_path": "/custom/claude-config/.claude.json"
-          }
-        ]
-      }
-    ]
-  },
   "agent_skills": [
     {
       "skill_slug": "pdf-tools",
@@ -1109,7 +1085,11 @@
       "skill_md_hash": "125c5ba501a38fb6c374685c136d3747cf27e084e6c4b683cc344394203e0efa",
       "file_count": 1,
       "total_size_bytes": 512,
-      "has_frontmatter": true
+      "has_frontmatter": true,
+      "usage": {
+        "availability": "unavailable",
+        "observed_at_ms": 1789600000000
+      }
     },
     {
       "skill_slug": "review",
@@ -1126,7 +1106,15 @@
       "total_size_bytes": 512,
       "has_frontmatter": true,
       "project_path": "/Users/example-user/src/example-repo",
-      "definition_kind": "skill"
+      "definition_kind": "skill",
+      "usage": {
+        "availability": "available",
+        "raw_key": "review",
+        "recorded_uses": 9007199254740991,
+        "last_recorded_use_at_ms": 9007199254740991,
+        "source_id": "usage_48d5dc7c5b25ec3eb224159273e368bb9f8ba28f2978cc40ebc9705c358a98df",
+        "observed_at_ms": 1789600000000
+      }
     },
     {
       "skill_slug": "deploy",
@@ -1141,7 +1129,14 @@
       "callable_names": [
         "/deploy"
       ],
-      "has_frontmatter": true
+      "has_frontmatter": true,
+      "usage": {
+        "availability": "available",
+        "raw_key": "deploy",
+        "recorded_uses": 0,
+        "source_id": "usage_48d5dc7c5b25ec3eb224159273e368bb9f8ba28f2978cc40ebc9705c358a98df",
+        "observed_at_ms": 1789600000000
+      }
     },
     {
       "skill_slug": "component",
@@ -1158,7 +1153,11 @@
       ],
       "has_frontmatter": false,
       "frontmatter_error": "missing_name",
-      "has_shell_injection": true
+      "has_shell_injection": true,
+      "usage": {
+        "availability": "unavailable",
+        "observed_at_ms": 1789600000000
+      }
     }
   ],
   "agent_skill_scan": {

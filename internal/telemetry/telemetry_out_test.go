@@ -109,7 +109,7 @@ func TestWriteTelemetryFileAgentPlugins(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(got.AgentPluginScan, payload.AgentPluginScan) || !reflect.DeepEqual(got.AgentSkillUsageScan, payload.AgentSkillUsageScan) || !reflect.DeepEqual(got.AgentSkills, payload.AgentSkills) || !reflect.DeepEqual(got.AgentSkillScan, payload.AgentSkillScan) {
+	if !reflect.DeepEqual(got.AgentPluginScan, payload.AgentPluginScan) || !reflect.DeepEqual(got.AgentSkills, payload.AgentSkills) || !reflect.DeepEqual(got.AgentSkillScan, payload.AgentSkillScan) {
 		t.Fatal("telemetry output lost agent plugin or skill usage fields")
 	}
 	if !reflect.DeepEqual(got.WSLGuest, payload.WSLGuest) || !reflect.DeepEqual(got.NodeProjectsUnchanged, payload.NodeProjectsUnchanged) || got.PayloadSchemaVersion != CurrentPayloadSchemaVersion {

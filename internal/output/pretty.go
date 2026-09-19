@@ -762,32 +762,17 @@ func printAgentPlugins(w io.Writer, c *colors, result *model.ScanResult) {
 		}
 	}
 	fmt.Fprintln(w)
-	usage := result.AgentSkillUsageScan
-	printSectionHeader(w, c, "RECORDED SKILL USE", usageCounterCount(usage))
-	if usage == nil {
-		fmt.Fprintln(w, "    Not scanned")
-	} else {
-		if len(usage.Sources) == 0 {
-			fmt.Fprintln(w, "    No recorded-use sources detected")
+	for _, skill := range result.AgentSkills {
+		if skill.Usage == nil {
+			continue
 		}
-		for _, source := range usage.Sources {
-			fmt.Fprintf(w, "    %s — %s (%s)\n", source.Agent, source.SourcePath, source.Status)
-			for _, counter := range source.Counters {
-				fmt.Fprintf(w, "      %s: %d recorded uses\n", counter.RawKey, counter.RecordedUses)
-			}
+		if skill.Usage.RecordedUses != nil {
+			fmt.Fprintf(w, "    %s: %d recorded uses\n", skill.SkillName, *skill.Usage.RecordedUses)
+		} else {
+			fmt.Fprintf(w, "    %s: usage %s\n", skill.SkillName, skill.Usage.Availability)
 		}
 	}
 	fmt.Fprintln(w)
-}
-
-func usageCounterCount(scan *model.AgentSkillUsageScan) int {
-	count := 0
-	if scan != nil {
-		for _, source := range scan.Sources {
-			count += len(source.Counters)
-		}
-	}
-	return count
 }
 
 // communityInventory combines display rows without duplicating the wire inventory.
@@ -827,7 +812,7 @@ func communityInventory(result *model.ScanResult) *model.ScanResult {
 					skill = component.Skill
 				} else if command := component.Command; command != nil {
 					skill = &model.AgentSkill{SkillName: command.Name, Agent: context.Agent, Source: "plugin", Scope: plugin.Scope, ProjectPath: plugin.ProjectPath,
-						DefinitionKind: model.AgentDefinitionCommand, DefinitionPath: command.DefinitionPath}
+						DefinitionKind: model.AgentDefinitionCommand, DefinitionPath: command.DefinitionPath, Usage: command.Usage}
 				}
 				if skill != nil {
 					key := skillPath(*skill)

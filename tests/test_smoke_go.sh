@@ -153,11 +153,12 @@ else
     fail "browser_extension_scan is either absent or carries its coverage list"
 fi
 
-# New envelopes may be absent; reported scopes must carry explicit coverage.
+# Plugin scopes carry explicit coverage; usage stays on skill definitions.
 if echo "$JSON_OUTPUT" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
-for key, rows in [('agent_plugin_scan', 'contexts'), ('agent_skill_usage_scan', 'sources')]:
+assert 'agent_skill_usage_scan' not in d
+for key, rows in [('agent_plugin_scan', 'contexts')]:
     s = d.get(key)
     if s is None:
         continue
@@ -173,10 +174,8 @@ for key, rows in [('agent_plugin_scan', 'contexts'), ('agent_skill_usage_scan', 
             for plugin in row['plugins']:
                 assert plugin['component_status']
                 assert isinstance(plugin['components'], list) and isinstance(plugin['enablement'], list)
-        else:
-            assert row['status'] and isinstance(row['counters'], list)
 " 2>/dev/null; then
-    pass "agent plugin and skill usage envelopes have explicit coverage and arrays"
+    pass "agent plugin scope has explicit coverage and arrays"
 else
     fail "agent plugin and skill usage envelopes have explicit coverage and arrays"
 fi

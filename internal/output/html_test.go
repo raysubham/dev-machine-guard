@@ -12,12 +12,13 @@ import (
 
 func TestPluginOutputStatesAndEscaping(t *testing.T) {
 	disabled := false
+	zero := int64(0)
 	result := &model.ScanResult{
 		AgentPluginScan: &model.AgentPluginScan{Contexts: []model.AgentPluginContext{{
 			Agent: model.AgentClaudeCode, MarketplaceStatus: "complete", InstallationStatus: "partial",
 			Plugins: []model.PluginObservation{{Name: "<script>example</script>", ConfiguredEnabled: &disabled, ComponentStatus: "partial", Components: []model.PluginComponent{{Kind: "mcp", Name: "declared-server", Status: "complete"}}}},
 		}}},
-		AgentSkillUsageScan: &model.AgentSkillUsageScan{Sources: []model.SkillUsageSource{{Agent: model.AgentClaudeCode, Status: "complete", Counters: []model.SkillUsageCounter{{RawKey: "example:check", RecordedUses: 0}}}}},
+		AgentSkills: []model.AgentSkill{{SkillName: "example:check", Usage: &model.SkillUsage{Availability: "available", RecordedUses: &zero}}},
 	}
 	var pretty bytes.Buffer
 	if err := Pretty(&pretty, result, "never"); err != nil {

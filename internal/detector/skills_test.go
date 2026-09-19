@@ -1108,6 +1108,7 @@ func TestDetect_SkillsShSymlinkLayout(t *testing.T) {
 	real := testHome + "/.agents/skills/foo"
 	fs.addSkill(real, "SKILL.md", validFrontmatter("foo", "d"), map[string]string{"tool.py": "x=1\n"})
 	fs.addSymlink(testHome+"/.claude/skills/foo", real)
+	fs.addFile(testHome+"/.claude.json", `{"skillUsage":{"foo":{"usageCount":7,"lastUsedAt":1000}}}`)
 	fs.addFile(testHome+"/.agents/.skill-lock.json",
 		`{"skills":{"foo":{"source":"acme/foo","sourceType":"github","sourceUrl":"https://github.com/acme/foo","ref":"main","skillFolderHash":"tree123"}}}`)
 	fs.commit()
@@ -1126,6 +1127,9 @@ func TestDetect_SkillsShSymlinkLayout(t *testing.T) {
 	}
 	if !equalStrings(agents.SymlinkSources, []string{"claude_user"}) {
 		t.Errorf("symlink_sources = %v, want [claude_user]", agents.SymlinkSources)
+	}
+	if agents.Usage == nil || agents.Usage.RecordedUses == nil || *agents.Usage.RecordedUses != 7 {
+		t.Fatalf("shared Claude skill lost usage: %+v", agents.Usage)
 	}
 	if agents.SkillMDHash == "" {
 		t.Error("expected non-empty skill_md_hash")

@@ -347,9 +347,10 @@ type PluginComponent struct {
 // an actual hash. It is never represented as a SKILL.md, and its path is never
 // reported in a skill's skill_md_path.
 type AgentCommandDefinition struct {
-	Name           string `json:"name"`
-	DefinitionPath string `json:"definition_path"`
-	DefinitionHash string `json:"definition_hash"` // hex(sha256(raw file bytes))
+	Usage          *SkillUsage `json:"usage,omitempty"`
+	Name           string      `json:"name"`
+	DefinitionPath string      `json:"definition_path"`
+	DefinitionHash string      `json:"definition_hash"` // hex(sha256(raw file bytes))
 
 	Description  string   `json:"description,omitempty"`
 	Version      string   `json:"version,omitempty"`
@@ -363,36 +364,13 @@ type AgentCommandDefinition struct {
 	HasShellInjection      bool `json:"has_shell_injection"`
 }
 
-// AgentSkillUsageScan is the raw recorded-use observation. It is independent of
-// plugin inventory: a counter is reported whether or not anything that could have
-// produced it is still installed.
-type AgentSkillUsageScan struct {
-	SchemaVersion int                `json:"schema_version"`
-	CollectedAtMs int64              `json:"collected_at_ms"`
-	Sources       []SkillUsageSource `json:"sources"`
-}
-
-// SkillUsageSource is one native state file. Collection supports Claude only;
-// unsupported agents do not produce zero-use observations.
-type SkillUsageSource struct {
-	SourceID     string              `json:"source_id"`
-	Agent        string              `json:"agent"`
-	SourcePath   string              `json:"source_path"`
-	Status       string              `json:"status"`
-	AgentVersion string              `json:"agent_version,omitempty"`
-	Counters     []SkillUsageCounter `json:"counters"`
-	Errors       []AgentScanError    `json:"errors"`
-}
-
-// SkillUsageCounter is one native key's cumulative snapshot, sent exactly as
-// read. The key is preserved verbatim whether the writer qualified it or not,
-// and it is never resolved to a current owner here: the same name can have
-// belonged to a plugin that is long gone.
-type SkillUsageCounter struct {
-	RawKey string `json:"raw_key"`
-	// Cumulative, not a delta and not an installation count. An explicit zero is
-	// a real observation and survives serialization.
-	RecordedUses int64 `json:"recorded_uses"`
-	// Unix ms. Absent means the native entry had none, not "never used".
+// SkillUsage is a native cumulative counter associated with a detected skill.
+// A nil count means unavailable or ambiguous, not zero uses.
+type SkillUsage struct {
+	Availability        string `json:"availability"`
+	RecordedUses        *int64 `json:"recorded_uses,omitempty"`
 	LastRecordedUseAtMs *int64 `json:"last_recorded_use_at_ms,omitempty"`
+	RawKey              string `json:"raw_key,omitempty"`
+	SourceID            string `json:"source_id,omitempty"`
+	ObservedAtMs        int64  `json:"observed_at_ms,omitempty"`
 }

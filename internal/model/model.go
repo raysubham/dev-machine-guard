@@ -49,9 +49,8 @@ type ScanResult struct {
 	// skipped scan from erasing a device's extensions.
 	BrowserExtensionScan *BrowserExtensionScanInfo `json:"browser_extension_scan,omitempty"`
 
-	// Nil plugin or usage coverage means unreported, not an empty inventory.
-	AgentPluginScan     *AgentPluginScan     `json:"agent_plugin_scan,omitempty"`
-	AgentSkillUsageScan *AgentSkillUsageScan `json:"agent_skill_usage_scan,omitempty"`
+	// Nil plugin coverage means unreported, not an empty inventory.
+	AgentPluginScan *AgentPluginScan `json:"agent_plugin_scan,omitempty"`
 
 	Summary Summary `json:"summary"`
 }
@@ -775,6 +774,7 @@ type FileAttrs struct {
 // listed in SymlinkSources). Never carries file content — identity, provenance,
 // hashes, and census counts only.
 type AgentSkill struct {
+	Usage *SkillUsage `json:"usage,omitempty"`
 	// Identity
 	SkillSlug    string   `json:"skill_slug"`              // directory basename
 	SkillName    string   `json:"skill_name"`              // frontmatter name, else slug

@@ -629,8 +629,8 @@ func TestClaudeUsageFailurePreservesProjectDiscovery(t *testing.T) {
 	if len(result.Skills) != 1 || result.Skills[0].ProjectPath != project || result.Info.Truncated {
 		t.Fatalf("invalid usage changed project skills: %+v", result)
 	}
-	if result.Usage == nil || len(result.Usage.Sources) != 1 || result.Usage.Sources[0].Status != model.AgentScanStatusError {
-		t.Fatalf("usage failure not reported: %+v", result.Usage)
+	if result.usage == nil || len(result.usage.Sources) != 1 || result.usage.Sources[0].Status != model.AgentScanStatusError {
+		t.Fatalf("usage failure not reported: %+v", result.usage)
 	}
 	mcp := NewMCPDetector(m)
 	enterprise := mcp.DetectEnterprise(context.Background(), nil)
@@ -704,24 +704,24 @@ func TestPluginCollectorReadOnlyAndSharedDefinition(t *testing.T) {
 	if result.Plugins != nil || spy.reads[filepath.Join(home, "plugins/installed_plugins.json")] != 0 {
 		t.Fatal("skills phase read plugin installation metadata")
 	}
-	if len(result.Skills) != 2 || result.Usage == nil || result.Info.CommandsStatus != model.AgentScanStatusComplete {
+	if len(result.Skills) != 2 || result.usage == nil || result.Info.CommandsStatus != model.AgentScanStatusComplete {
 		t.Fatalf("skills phase did not finish commands and usage: %+v", result)
 	}
-	info, usage := *result.Info, result.Usage
+	info, usage := *result.Info, result.usage
 	skillsCancel()
 	if err := detector.DetectPlugins(context.Background(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Info.DurationMs != info.DurationMs || result.Info.Truncated != info.Truncated || result.Usage != usage {
+	if result.Info.DurationMs != info.DurationMs || result.Info.Truncated != info.Truncated || result.usage != usage {
 		t.Fatal("plugin phase changed completed skills or usage observations")
 	}
-	if result.Plugins.PluginCount() != 1 || len(result.Skills) != 2 || result.Usage == nil {
+	if result.Plugins.PluginCount() != 1 || len(result.Skills) != 2 || result.usage == nil {
 		t.Fatalf("lost independent exposure: %+v", result)
 	}
 	if spy.reads[filepath.Join(skill, "SKILL.md")] != 1 || spy.reads[filepath.Join(testHome, ".claude.json")] != 1 {
 		t.Fatalf("repeated definition/state reads: %v", spy.reads)
 	}
-	if result.Plugins.CollectedAtMs != result.Usage.CollectedAtMs {
+	if result.Plugins.CollectedAtMs != result.usage.CollectedAtMs {
 		t.Fatal("envelopes have different observation times")
 	}
 }
@@ -739,7 +739,7 @@ func TestPluginPhaseFailurePreservesSkills(t *testing.T) {
 			spy := &pluginReadOnlyExecutor{Executor: m, t: t, reads: map[string]int{}}
 			d := NewSkillsDetector(spy)
 			result := d.DetectSkills(context.Background(), nil, nil)
-			before, err := json.Marshal([]any{result.Skills, result.Info, result.Usage})
+			before, err := json.Marshal([]any{result.Skills, result.Info, result.usage})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -765,7 +765,7 @@ func TestPluginPhaseFailurePreservesSkills(t *testing.T) {
 					}
 				}
 			}
-			after, err := json.Marshal([]any{result.Skills, result.Info, result.Usage})
+			after, err := json.Marshal([]any{result.Skills, result.Info, result.usage})
 			if err != nil || string(after) != string(before) {
 				t.Fatalf("plugin failure changed skills or usage: err=%v", err)
 			}
@@ -1189,7 +1189,7 @@ func TestPluginOversizeStateMustDowngradeSkillsAndCommands(t *testing.T) {
 	fs.addFile(filepath.Join(project, ".claude/commands/other.md"), "Check this.")
 	fs.commit()
 	got := NewSkillsDetector(m).DetectAll(context.Background(), nil, nil)
-	if got.Usage == nil || got.Usage.Sources[0].Status != model.AgentScanStatusError {
+	if got.usage == nil || got.usage.Sources[0].Status != model.AgentScanStatusError {
 		t.Fatal("setup: expected capped state read")
 	}
 	if !got.Info.Truncated || got.Info.CommandsStatus == model.AgentScanStatusComplete {
@@ -1221,8 +1221,8 @@ func TestClaudeStateIndependentCoverage(t *testing.T) {
 			if !tc.partialProjects && (got.Info.ProjectsScanned != 1 || len(got.Skills) != 2) {
 				t.Fatalf("project definitions lost: %+v", got)
 			}
-			if got.Usage == nil || (got.Usage.Sources[0].Status == model.AgentScanStatusError) != tc.badUsage {
-				t.Fatalf("usage coverage: %+v", got.Usage)
+			if got.usage == nil || (got.usage.Sources[0].Status == model.AgentScanStatusError) != tc.badUsage {
+				t.Fatalf("usage coverage: %+v", got.usage)
 			}
 		})
 	}
@@ -1269,5 +1269,83 @@ func TestPluginSharedPayloadSnapshot(t *testing.T) {
 				t.Fatalf("shared payload incomplete: %+v", plugin)
 			}
 		}
+	}
+}
+
+func TestPluginSkillUsageAssociation(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		qualified bool
+		duplicate bool
+		command   bool
+		want      string
+		count     int64
+	}{
+		{"qualified", true, false, false, "available", 3},
+		{"bare", false, false, false, "available", 8},
+		{"duplicate namespace", true, true, false, "ambiguous", 0},
+		{"command", true, false, true, "available", 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			component := model.PluginComponent{Kind: "skill", Name: "review", RelativePath: "skills/review/SKILL.md", CallableNames: []string{"widgets:review"}, Skill: &model.AgentSkill{SkillName: "review"}}
+			if tc.command {
+				component.Kind = "command"
+				component.Skill = nil
+				component.Command = &model.AgentCommandDefinition{Name: "review"}
+			}
+			plugin := model.PluginObservation{Name: "widgets", NativeID: "widgets", MarketplaceID: "market-one", Components: []model.PluginComponent{component}}
+			counters := []skillUsageCounter{{RawKey: "review", RecordedUses: 8}}
+			if tc.qualified {
+				counters = append(counters, skillUsageCounter{RawKey: "widgets:review", RecordedUses: 3})
+			}
+			result := SkillsResult{Plugins: &model.AgentPluginScan{Contexts: []model.AgentPluginContext{{Agent: model.AgentClaudeCode, Plugins: []model.PluginObservation{plugin}}}}, usage: &skillUsageObservations{CollectedAtMs: 100, Sources: []skillUsageSource{{SourceID: "source", Counters: counters}}}}
+			if tc.duplicate {
+				other := plugin
+				other.MarketplaceID = "market-two"
+				other.Components = []model.PluginComponent{{Kind: "skill", Name: "review", RelativePath: component.RelativePath, CallableNames: component.CallableNames, Skill: &model.AgentSkill{SkillName: "review"}}}
+				result.Plugins.Contexts[0].Plugins = append(result.Plugins.Contexts[0].Plugins, other)
+			}
+			associateSkillUsage(&result)
+			usage := component.Skill
+			var snapshot *model.SkillUsage
+			if usage != nil {
+				snapshot = usage.Usage
+			} else {
+				snapshot = component.Command.Usage
+			}
+			if snapshot == nil || snapshot.Availability != tc.want {
+				t.Fatalf("usage=%+v, want %s", snapshot, tc.want)
+			}
+			if tc.want == "available" && (snapshot.RecordedUses == nil || *snapshot.RecordedUses != tc.count) {
+				t.Fatalf("wrong selected counter: %+v", snapshot)
+			}
+			if tc.want == "ambiguous" && snapshot.RecordedUses != nil {
+				t.Fatal("ambiguous name received a counter")
+			}
+		})
+	}
+}
+
+func TestPluginSkillUsageStandaloneZeroAndCollision(t *testing.T) {
+	result := SkillsResult{Skills: []model.AgentSkill{{Agent: model.AgentClaudeCode, SkillName: "review", SkillMDPath: "/home/test/.claude/skills/review/SKILL.md"}, {Agent: model.AgentCodex, SkillName: "review", SkillMDPath: "/home/test/.agents/skills/review/SKILL.md"}},
+		usage: &skillUsageObservations{CollectedAtMs: 100, Sources: []skillUsageSource{{SourceID: "source", Counters: []skillUsageCounter{{RawKey: "review", RecordedUses: 0}}}}}}
+	associateSkillUsage(&result)
+	if u := result.Skills[0].Usage; u == nil || u.RecordedUses == nil || *u.RecordedUses != 0 {
+		t.Fatalf("explicit zero lost: %+v", u)
+	}
+	if result.Skills[1].Usage != nil {
+		t.Fatal("Codex inherited Claude usage")
+	}
+	result.Skills = append(result.Skills, model.AgentSkill{Agent: model.AgentClaudeCode, SkillName: "review", DefinitionKind: "command", DefinitionPath: "/home/test/.claude/commands/review.md"})
+	associateSkillUsage(&result)
+	for _, i := range []int{0, 2} {
+		if u := result.Skills[i].Usage; u == nil || u.Availability != "ambiguous" || u.RecordedUses != nil {
+			t.Fatalf("collision attributed: %+v", u)
+		}
+	}
+	result.usage.Sources = nil
+	associateSkillUsage(&result)
+	if result.Skills[0].Usage.Availability != "unavailable" {
+		t.Fatal("failed source inferred a count")
 	}
 }

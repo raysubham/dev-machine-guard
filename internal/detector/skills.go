@@ -79,7 +79,7 @@ var hashExcludedNames = map[string]bool{
 type SkillsDetector struct {
 	exec          executor.Executor
 	skipper       *tcc.Skipper
-	now           func() time.Time  // observation time for the plugin and usage envelopes
+	now           func() time.Time  // observation time for plugins and skill usage
 	agentVersions map[string]string // model.Agent* name → already-collected version
 }
 
@@ -249,12 +249,13 @@ func (d *SkillsDetector) DetectSkills(ctx context.Context, extraProjectRoots []s
 	if projectInfo.Truncated || len(projectInfo.Errors) > 0 {
 		degrade(&info.CommandsStatus, model.AgentScanStatusPartial)
 	}
-	result.Usage = ps.collectClaudeUsage(state)
+	result.usage = ps.collectClaudeUsage(state)
 
 	// Collapse symlink shadows, sort, and apply the aggregate cap — shared with
 	// the panic-recovery path so both return identically bounded, ordered records.
 	// Standalone commands are bounded separately and never evict an ordinary skill.
 	result.Skills = append(d.finalizeSkills(discovered, info), commands...)
+	associateSkillUsage(&result)
 
 	// A deadline or parent cancellation short-circuits the walk, yielding a
 	// partial inventory. Mark it truncated so the backend does not treat this scan
@@ -271,6 +272,144 @@ func (d *SkillsDetector) DetectSkills(ctx context.Context, extraProjectRoots []s
 
 var strictUintRE = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
 
+type skillUsageObservations struct {
+	CollectedAtMs int64
+	Sources       []skillUsageSource
+}
+
+type skillUsageSource struct {
+	SourceID     string
+	Agent        string
+	SourcePath   string
+	Status       string
+	AgentVersion string
+	Counters     []skillUsageCounter
+	Errors       []model.AgentScanError
+}
+
+type skillUsageCounter struct {
+	RawKey              string
+	RecordedUses        int64
+	LastRecordedUseAtMs *int64
+}
+
+// associateSkillUsage matches native names only when they identify one definition.
+// Multiple installation scopes of the same plugin definition share a snapshot.
+func associateSkillUsage(result *SkillsResult) {
+	if result.usage == nil {
+		return
+	}
+	type candidate struct {
+		identity string
+		names    []string
+		plugin   bool
+		usage    **model.SkillUsage
+	}
+	var candidates []candidate
+	for i := range result.Skills {
+		s := &result.Skills[i]
+		claude := s.Agent == model.AgentClaudeCode || strings.HasPrefix(s.Source, "claude_")
+		for _, source := range s.SymlinkSources {
+			claude = claude || strings.HasPrefix(source, "claude_")
+		}
+		if !claude {
+			continue
+		}
+		names := s.CallableNames
+		if len(names) == 0 {
+			names = []string{s.SkillName}
+		}
+		definition := s.SkillMDPath
+		if s.DefinitionPath != "" {
+			definition = s.DefinitionPath
+		}
+		candidates = append(candidates, candidate{identity: definition, names: names, usage: &s.Usage})
+	}
+	if result.Plugins != nil {
+		for _, context := range result.Plugins.Contexts {
+			if context.Agent != model.AgentClaudeCode {
+				continue
+			}
+			for _, plugin := range context.Plugins {
+				for _, component := range plugin.Components {
+					var usage **model.SkillUsage
+					if component.Skill != nil {
+						usage = &component.Skill.Usage
+					}
+					if component.Command != nil {
+						usage = &component.Command.Usage
+					}
+					if usage == nil {
+						continue
+					}
+					origin := plugin.MarketplaceID
+					if origin == "" {
+						origin = plugin.InstallPath
+					}
+					identity := inventoryHash(origin, plugin.NativeID, component.Kind, component.RelativePath, component.Name)
+					names := component.CallableNames
+					if len(names) == 0 {
+						names = []string{plugin.Name + ":" + component.Name}
+					}
+					candidates = append(candidates, candidate{identity: identity, names: names, plugin: true, usage: usage})
+				}
+			}
+		}
+	}
+	available := map[string]*model.SkillUsage{}
+	for _, source := range result.usage.Sources {
+		for _, counter := range source.Counters {
+			if prev := available[counter.RawKey]; prev != nil && prev.SourceID <= source.SourceID {
+				continue
+			}
+			count := counter.RecordedUses
+			available[counter.RawKey] = &model.SkillUsage{Availability: "available", RecordedUses: &count,
+				LastRecordedUseAtMs: counter.LastRecordedUseAtMs, RawKey: counter.RawKey, SourceID: source.SourceID, ObservedAtMs: result.usage.CollectedAtMs}
+		}
+	}
+	owners := map[string]map[string]bool{}
+	matched := make([][]string, len(candidates))
+	for i, candidate := range candidates {
+		for _, name := range candidate.names {
+			name = strings.TrimPrefix(name, "/")
+			if available[name] != nil {
+				matched[i] = append(matched[i], name)
+			}
+		}
+		if len(matched[i]) == 0 && candidate.plugin {
+			for _, name := range candidate.names {
+				name = name[strings.LastIndex(name, ":")+1:]
+				if available[name] != nil {
+					matched[i] = append(matched[i], name)
+				}
+			}
+		}
+		for _, name := range matched[i] {
+			if owners[name] == nil {
+				owners[name] = map[string]bool{}
+			}
+			owners[name][candidate.identity] = true
+		}
+	}
+	for i, candidate := range candidates {
+		selected := &model.SkillUsage{Availability: "unavailable", ObservedAtMs: result.usage.CollectedAtMs}
+		for _, name := range matched[i] {
+			if len(owners[name]) != 1 {
+				if selected.RecordedUses == nil {
+					selected.Availability = "ambiguous"
+				}
+				continue
+			}
+			counter := available[name]
+			if selected.RecordedUses == nil || *counter.RecordedUses > *selected.RecordedUses ||
+				(*counter.RecordedUses == *selected.RecordedUses && counter.RawKey < selected.RawKey) {
+				selected = counter
+			}
+		}
+		*candidate.usage = selected
+	}
+}
+
 // strictUint parses a JSON number that is a plain non-negative integer no
 // larger than max. Fractions, exponents, strings and negatives are rejected.
 func strictUint(raw json.RawMessage, max int64) (int64, bool) {
@@ -284,14 +423,14 @@ func strictUint(raw json.RawMessage, max int64) (int64, bool) {
 	return n, true
 }
 
-// usageSource projects one state file's skillUsage map into a wire source. Each
+// usageSource projects one state file's skillUsage map into validated observations. Each
 // entry is validated on its own; a rejected entry makes the source partial
 // without touching the valid keys beside it.
-func (s *pluginScan) usageSource(st claudeState, status string) model.SkillUsageSource {
-	src := model.SkillUsageSource{
+func (s *pluginScan) usageSource(st claudeState, status string) skillUsageSource {
+	src := skillUsageSource{
 		SourceID: s.usageSourceID(model.AgentClaudeCode, st.path), Agent: model.AgentClaudeCode, SourcePath: st.path,
 		Status: status, AgentVersion: s.d.agentVersions[model.AgentClaudeCode],
-		Counters: []model.SkillUsageCounter{}, Errors: []model.AgentScanError{},
+		Counters: []skillUsageCounter{}, Errors: []model.AgentScanError{},
 	}
 	code := st.code
 	if code == "" {
@@ -333,16 +472,16 @@ func (s *pluginScan) usageSource(st claudeState, status string) model.SkillUsage
 			scanError(&src.Errors, model.AgentScanError{Code: model.AgentScanErrParseFailed, SourcePath: st.path})
 			continue
 		}
-		src.Counters = append(src.Counters, model.SkillUsageCounter{RawKey: key, RecordedUses: count, LastRecordedUseAtMs: last})
+		src.Counters = append(src.Counters, skillUsageCounter{RawKey: key, RecordedUses: count, LastRecordedUseAtMs: last})
 	}
 	return src
 }
 
-// collectClaudeUsage builds the usage envelope from the home state file and,
+// collectClaudeUsage collects usage observations from the home state file and,
 // when a custom configuration root is visible, that root's state file. The
 // custom layout is not a verified client fixture, so its coverage stays partial.
-func (s *pluginScan) collectClaudeUsage(homeState claudeState) *model.AgentSkillUsageScan {
-	var sources []model.SkillUsageSource
+func (s *pluginScan) collectClaudeUsage(homeState claudeState) *skillUsageObservations {
+	var sources []skillUsageSource
 	if !homeState.absent {
 		sources = append(sources, s.usageSource(homeState, model.AgentScanStatusComplete))
 	}
@@ -369,7 +508,7 @@ func (s *pluginScan) collectClaudeUsage(homeState claudeState) *model.AgentSkill
 		remaining -= len(source.Counters)
 		errors = capErrors(&source.Errors, errors)
 	}
-	scan := &model.AgentSkillUsageScan{SchemaVersion: agentPluginsSchemaVersion, CollectedAtMs: s.now.UnixMilli(), Sources: sources}
+	scan := &skillUsageObservations{CollectedAtMs: s.now.UnixMilli(), Sources: sources}
 	if encodedSize(scan) > maxEnvelopeBytes {
 		for i := len(scan.Sources) - 1; i >= 0 && encodedSize(scan) > maxEnvelopeBytes; i-- {
 			source := &scan.Sources[i]

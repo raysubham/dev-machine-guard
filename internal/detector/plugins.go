@@ -131,7 +131,7 @@ type SkillsResult struct {
 	Skills         []model.AgentSkill
 	Info           *model.AgentSkillScanInfo
 	Plugins        *model.AgentPluginScan
-	Usage          *model.AgentSkillUsageScan
+	usage          *skillUsageObservations
 	evidence       *pluginEvidence
 	pendingPlugins *pluginScan
 }
@@ -169,6 +169,7 @@ func (d *SkillsDetector) DetectPlugins(ctx context.Context, result *SkillsResult
 		}
 	}
 	result.Plugins = s.finalizePluginScan(contexts)
+	associateSkillUsage(result)
 	result.evidence = s.evidence
 	return nil
 }

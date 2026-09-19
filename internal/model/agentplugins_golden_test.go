@@ -16,10 +16,9 @@ const agentPluginsGoldenPath = "testdata/agent_plugins_v1_golden.json"
 
 // agentPluginsGolden contains the plugin, usage and skill sections of telemetry.
 type agentPluginsGolden struct {
-	AgentPluginScan     *AgentPluginScan     `json:"agent_plugin_scan"`
-	AgentSkillUsageScan *AgentSkillUsageScan `json:"agent_skill_usage_scan"`
-	AgentSkills         []AgentSkill         `json:"agent_skills"`
-	AgentSkillScan      *AgentSkillScanInfo  `json:"agent_skill_scan"`
+	AgentPluginScan *AgentPluginScan    `json:"agent_plugin_scan"`
+	AgentSkills     []AgentSkill        `json:"agent_skills"`
+	AgentSkillScan  *AgentSkillScanInfo `json:"agent_skill_scan"`
 }
 
 func loadAgentPluginsGolden(t *testing.T) ([]byte, agentPluginsGolden) {
@@ -54,9 +53,9 @@ func TestAgentPluginsGolden_RoundTripsWithNoDroppedField(t *testing.T) {
 // Every wire vocabulary value must be represented in the shared fixture.
 func TestAgentPluginsGolden_CoversTheWholeVocabulary(t *testing.T) {
 	_, doc := loadAgentPluginsGolden(t)
-	scan, usage := doc.AgentPluginScan, doc.AgentSkillUsageScan
-	if scan == nil || usage == nil || doc.AgentSkillScan == nil {
-		t.Fatal("golden payload must carry both envelopes and the skill scan info")
+	scan := doc.AgentPluginScan
+	if scan == nil || doc.AgentSkillScan == nil {
+		t.Fatal("fixture must carry the plugin scan and skill scan info")
 	}
 
 	seen := map[string]map[string]bool{}
@@ -104,13 +103,6 @@ func TestAgentPluginsGolden_CoversTheWholeVocabulary(t *testing.T) {
 			}
 		}
 	}
-	for _, s := range usage.Sources {
-		mark("agent", s.Agent)
-		mark("status", s.Status)
-		for _, e := range s.Errors {
-			mark("error", e.Code)
-		}
-	}
 	for _, s := range doc.AgentSkills {
 		mark("definition", s.DefinitionKind)
 	}
@@ -143,9 +135,6 @@ func TestAgentPluginsGolden_CoversTheWholeVocabulary(t *testing.T) {
 		if got := len(seen[tt.what]); got != len(tt.want) {
 			t.Errorf("golden payload carries %d %s values, want exactly %d: %v", got, tt.what, len(tt.want), seen[tt.what])
 		}
-	}
-	if scan.SchemaVersion != 1 || usage.SchemaVersion != 1 {
-		t.Errorf("schema_version = %d/%d, want 1", scan.SchemaVersion, usage.SchemaVersion)
 	}
 }
 
@@ -229,14 +218,9 @@ func TestAgentPluginsGolden_Invariants(t *testing.T) {
 			t.Errorf("%s: marketplaces/plugins/errors must be [] not omitted", c.ContextID)
 		}
 	}
-	for _, s := range doc.AgentSkillUsageScan.Sources {
-		if s.Counters == nil || s.Errors == nil {
-			t.Errorf("%s: counters/errors must be [] not omitted", s.SourceID)
-		}
-	}
 	// The required arrays render as [] in the bytes; an optional one is never
 	// rendered empty.
-	if !bytes.Contains(raw, []byte(`"marketplaces": []`)) || !bytes.Contains(raw, []byte(`"counters": []`)) {
+	if !bytes.Contains(raw, []byte(`"marketplaces": []`)) {
 		t.Error("an empty required array must be serialized as []")
 	}
 	for _, key := range []string{`"sparse_paths": []`, `"auto_update_preferences": []`, `"allowed_tools": []`, `"symlink_sources": []`} {
@@ -287,7 +271,7 @@ func TestAgentPluginsGolden_Invariants(t *testing.T) {
 	}
 
 	// Millisecond fields carry values that cannot be Unix seconds.
-	if doc.AgentPluginScan.CollectedAtMs < 1e12 || doc.AgentSkillUsageScan.CollectedAtMs < 1e12 {
+	if doc.AgentPluginScan.CollectedAtMs < 1e12 {
 		t.Error("collected_at_ms must be Unix milliseconds")
 	}
 }
@@ -352,11 +336,6 @@ func TestAgentPluginsGolden_IdentityVectors(t *testing.T) {
 					t.Errorf("component_id %s != %s (%s)", comp.ComponentID, want, comp.Name)
 				}
 			}
-		}
-	}
-	for _, s := range doc.AgentSkillUsageScan.Sources {
-		if want := "usage_" + h(s.Agent, s.SourcePath); s.SourceID != want {
-			t.Errorf("source_id %s != %s", s.SourceID, want)
 		}
 	}
 	// Two records must never share an instance id.

@@ -113,7 +113,6 @@ type Payload struct {
 	AgentSkills             []model.AgentSkill              `json:"agent_skills,omitempty"`
 	AgentSkillScan          *model.AgentSkillScanInfo       `json:"agent_skill_scan,omitempty"`
 	AgentPluginScan         *model.AgentPluginScan          `json:"agent_plugin_scan,omitempty"`
-	AgentSkillUsageScan     *model.AgentSkillUsageScan      `json:"agent_skill_usage_scan,omitempty"`
 	CredentialScan          *model.CredentialScanInfo       `json:"credential_scan,omitempty"`
 	// Nil means the phase did not run, and that is the only signal a reader has
 	// for it: a section carrying zero findings is the positive claim that this
@@ -1240,7 +1239,6 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		AgentSkills:             agentSkills,
 		AgentSkillScan:          agentSkillScan,
 		AgentPluginScan:         skillsResult.Plugins,
-		AgentSkillUsageScan:     skillsResult.Usage,
 		CredentialScan:          credentialScan,
 		BrowserExtensionScan:    browserExtensionScan,
 

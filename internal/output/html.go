@@ -11,25 +11,24 @@ import (
 )
 
 type htmlData struct {
-	ScanTime            string
-	Version             string
-	Device              model.Device
-	AITools             []model.AITool
-	IDEInstallations    []model.IDE
-	IDEExtensions       []model.Extension
-	MCPConfigs          []model.MCPConfig
-	NodePkgManagers     []model.PkgManager
-	NodeProjects        []model.ProjectInfo
-	BrewPkgManager      *model.PkgManager
-	BrewFormulae        []model.BrewPackage
-	BrewCasks           []model.BrewPackage
-	PythonPkgManagers   []model.PkgManager
-	PythonPackages      []model.PythonPackage
-	PythonProjects      []model.ProjectInfo
-	AgentSkills         []model.AgentSkill
-	AgentSkillScan      *model.AgentSkillScanInfo
-	AgentPluginScan     *model.AgentPluginScan
-	AgentSkillUsageScan *model.AgentSkillUsageScan
+	ScanTime          string
+	Version           string
+	Device            model.Device
+	AITools           []model.AITool
+	IDEInstallations  []model.IDE
+	IDEExtensions     []model.Extension
+	MCPConfigs        []model.MCPConfig
+	NodePkgManagers   []model.PkgManager
+	NodeProjects      []model.ProjectInfo
+	BrewPkgManager    *model.PkgManager
+	BrewFormulae      []model.BrewPackage
+	BrewCasks         []model.BrewPackage
+	PythonPkgManagers []model.PkgManager
+	PythonPackages    []model.PythonPackage
+	PythonProjects    []model.ProjectInfo
+	AgentSkills       []model.AgentSkill
+	AgentSkillScan    *model.AgentSkillScanInfo
+	AgentPluginScan   *model.AgentPluginScan
 	// Nil means the phase did not run, which the template shows differently from a
 	// scan that ran and found nothing.
 	BrowserExtensionScan *model.BrowserExtensionScanInfo
@@ -61,25 +60,24 @@ func HTML(outputFile string, result *model.ScanResult) error {
 	scanTime := time.Unix(result.ScanTimestamp, 0).Format("2006-01-02 15:04:05")
 
 	data := htmlData{
-		ScanTime:            scanTime,
-		Version:             buildinfo.Version,
-		Device:              result.Device,
-		AITools:             result.AIAgentsAndTools,
-		IDEInstallations:    result.IDEInstallations,
-		IDEExtensions:       result.IDEExtensions,
-		MCPConfigs:          result.MCPConfigs,
-		NodePkgManagers:     result.NodePkgManagers,
-		NodeProjects:        result.NodeProjects,
-		BrewPkgManager:      result.BrewPkgManager,
-		BrewFormulae:        result.BrewFormulae,
-		BrewCasks:           result.BrewCasks,
-		PythonPkgManagers:   result.PythonPkgManagers,
-		PythonPackages:      result.PythonPackages,
-		PythonProjects:      result.PythonProjects,
-		AgentSkills:         result.AgentSkills,
-		AgentSkillScan:      result.AgentSkillScan,
-		AgentPluginScan:     result.AgentPluginScan,
-		AgentSkillUsageScan: result.AgentSkillUsageScan,
+		ScanTime:          scanTime,
+		Version:           buildinfo.Version,
+		Device:            result.Device,
+		AITools:           result.AIAgentsAndTools,
+		IDEInstallations:  result.IDEInstallations,
+		IDEExtensions:     result.IDEExtensions,
+		MCPConfigs:        result.MCPConfigs,
+		NodePkgManagers:   result.NodePkgManagers,
+		NodeProjects:      result.NodeProjects,
+		BrewPkgManager:    result.BrewPkgManager,
+		BrewFormulae:      result.BrewFormulae,
+		BrewCasks:         result.BrewCasks,
+		PythonPkgManagers: result.PythonPkgManagers,
+		PythonPackages:    result.PythonPackages,
+		PythonProjects:    result.PythonProjects,
+		AgentSkills:       result.AgentSkills,
+		AgentSkillScan:    result.AgentSkillScan,
+		AgentPluginScan:   result.AgentPluginScan,
 
 		BrowserExtensionScan: result.BrowserExtensionScan,
 		Summary:              result.Summary,
@@ -305,11 +303,8 @@ const htmlTemplate = `<!DOCTYPE html>
 </div>
 <div class="section">
  <h2>Recorded Skill Use</h2>
- {{if .AgentSkillUsageScan}}{{range .AgentSkillUsageScan.Sources}}
- <p>{{.Agent}} — {{.SourcePath}} ({{.Status}})</p>
- <table><tr><th>Native key</th><th>Cumulative recorded uses</th><th>Last recorded use (Unix ms)</th></tr>
- {{range .Counters}}<tr><td>{{.RawKey}}</td><td>{{.RecordedUses}}</td><td>{{if .LastRecordedUseAtMs}}{{.LastRecordedUseAtMs}}{{else}}unknown{{end}}</td></tr>{{else}}<tr><td colspan="3">{{if eq .Status "complete"}}No recorded uses{{else}}Inventory incomplete{{end}}</td></tr>{{end}}</table>
- {{else}}<p>No recorded-use sources detected</p>{{end}}{{else}}<p>Not scanned</p>{{end}}
+ <table><tr><th>Skill</th><th>Cumulative recorded uses</th><th>Last recorded use (Unix ms)</th></tr>
+ {{range .AgentSkills}}{{if .Usage}}<tr><td>{{.SkillName}}</td><td>{{if .Usage.RecordedUses}}{{.Usage.RecordedUses}}{{else}}{{.Usage.Availability}}{{end}}</td><td>{{if .Usage.LastRecordedUseAtMs}}{{.Usage.LastRecordedUseAtMs}}{{else}}unknown{{end}}</td></tr>{{end}}{{end}}</table>
 </div>
 
 <div class="section">

@@ -54,7 +54,7 @@ func TestScanResult_BrowserExtensionScan_OmittedWhenNil(t *testing.T) {
 	}
 }
 
-// Unreported plugin and usage coverage must not serialize as an empty scan.
+// An unreported plugin scan is omitted; usage has no top-level section.
 func TestScanResult_AgentPlugins_OmittedWhenNil(t *testing.T) {
 	b, err := json.Marshal(&ScanResult{})
 	if err != nil {
