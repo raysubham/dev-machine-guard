@@ -276,7 +276,7 @@ func (a *codexAdapter) readMarketplaces() {
 		}
 		switch cfg.SourceType {
 		case "local":
-			loc.Kind, loc.Location = model.PluginSourceLocal, cleanPath(cfg.Source)
+			loc.Kind, loc.Location = model.PluginSourceLocal, cleanPluginPath(cfg.Source)
 			if isAbsPath(cfg.Source) && !a.s.d.skipper.WithinProtected(cfg.Source) {
 				m.root = filepath.Clean(cfg.Source)
 			} else {
@@ -314,7 +314,7 @@ func (a *codexAdapter) discoverCatalogs() {
 			continue
 		}
 		m.obs.MarketplaceID = marketplaceID(a.c.ContextID, m.obs.Name)
-		m.obs.Source = &model.SourceLocator{Kind: model.PluginSourceLocal, NativeKind: "local", Location: cleanPath(root)}
+		m.obs.Source = &model.SourceLocator{Kind: model.PluginSourceLocal, NativeKind: "local", Location: cleanPluginPath(root)}
 		a.markets[m.obs.Name] = m
 	}
 }

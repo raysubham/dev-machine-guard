@@ -353,7 +353,7 @@ func (a *claudeAdapter) readMarketplaces() {
 		m.obs.Source = claudeCatalogSource(km.Source)
 		m.obs.LastRefreshedAtMs = parseNativeTimeMs(km.LastUpdated)
 		if km.InstallLocation != "" {
-			m.obs.CatalogPath = cleanPath(km.InstallLocation)
+			m.obs.CatalogPath = cleanPluginPath(km.InstallLocation)
 			a.loadCatalog(m, km.InstallLocation)
 		}
 	}
@@ -564,7 +564,7 @@ func claudeCatalogSource(src claudeSourceSpec) *model.SourceLocator {
 	case "settings":
 		loc.Kind = model.PluginSourceSettings
 	case "file", "directory":
-		loc.Kind, loc.Location = model.PluginSourceLocal, cleanPath(src.Path)
+		loc.Kind, loc.Location = model.PluginSourceLocal, cleanPluginPath(src.Path)
 	case "":
 		return nil
 	default:
@@ -667,10 +667,10 @@ func (a *claudeAdapter) registryPlugin(nativeID string, rec claudeRegistryRecord
 	p.InstalledAtMs = parseNativeTimeMs(rec.InstalledAt)
 	p.LastUpdatedAtMs = parseNativeTimeMs(rec.LastUpdated)
 	if p.Scope == model.PluginScopeProject || p.Scope == model.PluginScopeLocal {
-		p.ProjectPath = cleanPath(rec.ProjectPath)
+		p.ProjectPath = cleanPluginPath(rec.ProjectPath)
 	}
 	if rec.InstallPath != "" {
-		p.InstallPath = cleanPath(rec.InstallPath)
+		p.InstallPath = cleanPluginPath(rec.InstallPath)
 	}
 
 	var entry *claudeCatalogEntry

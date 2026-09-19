@@ -192,21 +192,30 @@ func (s *pluginScan) hashPath(p string) string {
 		return ""
 	}
 	if s.goos == model.PlatformWindows {
-		p = strings.TrimPrefix(strings.TrimPrefix(p, `\\?\`), `\??\`)
-		if strings.HasPrefix(strings.ToUpper(p), `UNC\`) {
-			p = `\\` + p[4:]
-		}
 		p = strings.ToLower(strings.ReplaceAll(p, `\`, "/"))
+		for _, prefix := range []string{"//?/", "/??/", "//./"} {
+			if strings.HasPrefix(p, prefix) {
+				p = p[len(prefix):]
+				break
+			}
+		}
+		if strings.HasPrefix(p, "unc/") {
+			p = "//" + p[4:]
+		}
 	}
 	unc := strings.HasPrefix(p, "//")
 	p = path.Clean(p)
 	if unc {
 		p = "/" + p
 	}
-	if len(p) > 1 {
-		p = strings.TrimSuffix(p, "/")
-	}
 	return p
+}
+
+func cleanPluginPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	return filepath.Clean(p)
 }
 
 func (s *pluginScan) contextID(agent, configRoot, pluginRoot string) string {
@@ -1122,7 +1131,7 @@ func (s *pluginScan) addPlugin(c *model.AgentPluginContext, p *model.PluginObser
 func (s *pluginScan) newContext(agent, configRoot, pluginRoot string) *model.AgentPluginContext {
 	return &model.AgentPluginContext{
 		ContextID: s.contextID(agent, configRoot, pluginRoot), Agent: agent, AgentVersion: s.d.agentVersions[agent],
-		ConfigRoot: cleanPath(configRoot), PluginRoot: cleanPath(pluginRoot),
+		ConfigRoot: cleanPluginPath(configRoot), PluginRoot: cleanPluginPath(pluginRoot),
 		MarketplaceStatus: model.AgentScanStatusComplete, InstallationStatus: model.AgentScanStatusComplete,
 		Marketplaces: []model.MarketplaceObservation{}, Plugins: []model.PluginObservation{}, Errors: []model.AgentScanError{},
 	}

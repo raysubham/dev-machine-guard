@@ -291,12 +291,43 @@ func TestPluginMCPFormatsAndRedaction(t *testing.T) {
 func TestPluginWindowsPathIdentity(t *testing.T) {
 	s := pluginScan{goos: model.PlatformWindows}
 	for _, tc := range [][2]string{
-		{`C:\Users\Test\.codex`, `\\?\C:\users\test\.codex\`},
-		{`\\server\share\plugins`, `\\?\UNC\SERVER\SHARE\plugins`},
+		{``, ``},
+		{`/`, `/`},
+		{`C:\`, `c:`},
+		{`C:\Users\TEST\.claude\`, `c:/users/test/.claude`},
+		{`\\?\C:\Users\test\.claude`, `c:/users/test/.claude`},
+		{`\\.\C:\Users\test\.claude`, `c:/users/test/.claude`},
+		{`\??\C:\Users\test\.claude`, `c:/users/test/.claude`},
+		{`\\SERVER\Share\plugins`, `//server/share/plugins`},
+		{`\\?\UNC\SERVER\Share\plugins`, `//server/share/plugins`},
+		{`//?/unc/SERVER/Share/plugins`, `//server/share/plugins`},
 	} {
-		if s.hashPath(tc[0]) != s.hashPath(tc[1]) {
-			t.Errorf("different identities for %q and %q", tc[0], tc[1])
+		if got := s.hashPath(tc[0]); got != tc[1] {
+			t.Errorf("hashPath(%q) = %q, want %q", tc[0], got, tc[1])
 		}
+	}
+}
+
+func TestPluginWindowsContextRoundTrip(t *testing.T) {
+	s := pluginScan{goos: model.PlatformWindows, d: &SkillsDetector{}}
+	for _, root := range []string{`C:\Users\Test\.claude`, `\\?\C:\Users\Test\.claude`, `\\server\share\.claude`, `\\?\UNC\server\share\.claude`} {
+		t.Run(root, func(t *testing.T) {
+			context := s.newContext("claude-code", root, root+`\plugins`)
+			data, err := json.Marshal(context)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded model.AgentPluginContext
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded.ConfigRoot != root {
+				t.Errorf("ConfigRoot = %q, want %q", decoded.ConfigRoot, root)
+			}
+			if got := s.contextID(decoded.Agent, decoded.ConfigRoot, decoded.PluginRoot); decoded.ContextID != got {
+				t.Errorf("ContextID = %q, want %q from serialized coordinates", decoded.ContextID, got)
+			}
+		})
 	}
 }
 
