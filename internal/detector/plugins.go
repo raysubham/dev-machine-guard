@@ -111,7 +111,7 @@ func AgentVersions(tools []model.AITool) map[string]string {
 
 // StripNestedMCPContent blanks the sanitized MCP bodies inside plugin
 // components for the community output, which never carries config content.
-func StripNestedMCPContent(scan *model.AgentPluginScan) {
+func StripNestedMCPContent(scan *model.AgentPlugins) {
 	if scan == nil {
 		return
 	}
@@ -130,7 +130,7 @@ func StripNestedMCPContent(scan *model.AgentPluginScan) {
 type SkillsResult struct {
 	Skills         []model.AgentSkill
 	Info           *model.AgentSkillScanInfo
-	Plugins        *model.AgentPluginScan
+	Plugins        *model.AgentPlugins
 	usage          *skillUsageObservations
 	evidence       *pluginEvidence
 	pendingPlugins *pluginScan
@@ -1152,7 +1152,7 @@ func (s *pluginScan) unresolvedContext(agent, configRoot, pluginRoot string) *mo
 
 // finalizePluginScan sorts every list, applies the report-wide caps and the
 // envelope byte budget, and returns nil when nothing survives.
-func (s *pluginScan) finalizePluginScan(contexts []*model.AgentPluginContext) *model.AgentPluginScan {
+func (s *pluginScan) finalizePluginScan(contexts []*model.AgentPluginContext) *model.AgentPlugins {
 	if len(contexts) == 0 {
 		return nil
 	}
@@ -1169,7 +1169,7 @@ func (s *pluginScan) finalizePluginScan(contexts []*model.AgentPluginContext) *m
 	if len(contexts) > maxPluginContexts {
 		contexts = contexts[:maxPluginContexts] // omitted contexts are unreported, never "removed"
 	}
-	scan := &model.AgentPluginScan{SchemaVersion: agentPluginsSchemaVersion, CollectedAtMs: s.now.UnixMilli()}
+	scan := &model.AgentPlugins{SchemaVersion: agentPluginsSchemaVersion, CollectedAtMs: s.now.UnixMilli()}
 	markets, plugins, errs := 0, 0, 0
 	for _, c := range contexts {
 		if !isAbsPath(c.ConfigRoot) || !isAbsPath(c.PluginRoot) || len(c.ConfigRoot) > maxPathBytes || len(c.PluginRoot) > maxPathBytes {

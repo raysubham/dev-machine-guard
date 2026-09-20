@@ -143,10 +143,10 @@ const (
 	AgentDefinitionCommand = "command"
 )
 
-// AgentPluginScan is one device's plugin observation. Absent means unreported —
-// never "this machine has no plugins" — so a reader that receives no envelope
+// AgentPlugins is one device's plugin observation. Absent means unreported,
+// never "this machine has no plugins", so a reader that receives no envelope
 // keeps what it already stored.
-type AgentPluginScan struct {
+type AgentPlugins struct {
 	SchemaVersion int                  `json:"schema_version"`
 	CollectedAtMs int64                `json:"collected_at_ms"` // unix ms, one instant per scan
 	Contexts      []AgentPluginContext `json:"contexts"`
@@ -154,7 +154,7 @@ type AgentPluginScan struct {
 
 // PluginCount is the number of plugin observations across every context —
 // installations, never catalog entries or stale cache versions. Nil-safe.
-func (s *AgentPluginScan) PluginCount() int {
+func (s *AgentPlugins) PluginCount() int {
 	if s == nil {
 		return 0
 	}

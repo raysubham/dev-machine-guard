@@ -720,7 +720,7 @@ func pluginState(value *bool) string {
 
 //nolint:errcheck // terminal output
 func printAgentPlugins(w io.Writer, c *colors, result *model.ScanResult) {
-	scan := result.AgentPluginScan
+	scan := result.AgentPlugins
 	printSectionHeader(w, c, "AGENT PLUGINS", scan.PluginCount())
 	if scan == nil {
 		fmt.Fprintln(w, "    Not scanned")
@@ -778,7 +778,7 @@ func printAgentPlugins(w io.Writer, c *colors, result *model.ScanResult) {
 // communityInventory combines display rows without duplicating the wire inventory.
 // MCP counts remain configuration-file counts, not server or component counts.
 func communityInventory(result *model.ScanResult) *model.ScanResult {
-	if result.AgentPluginScan == nil {
+	if result.AgentPlugins == nil {
 		return result
 	}
 	view := *result
@@ -804,7 +804,7 @@ func communityInventory(result *model.ScanResult) *model.ScanResult {
 			mcpPaths[mcp.ConfigPath] = true
 		}
 	}
-	for _, context := range result.AgentPluginScan.Contexts {
+	for _, context := range result.AgentPlugins.Contexts {
 		for _, plugin := range context.Plugins {
 			for _, component := range plugin.Components {
 				var skill *model.AgentSkill

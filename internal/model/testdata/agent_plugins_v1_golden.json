@@ -1,5 +1,5 @@
 {
-  "agent_plugin_scan": {
+  "agent_plugins": {
     "schema_version": 1,
     "collected_at_ms": 1789600000000,
     "contexts": [

@@ -1298,7 +1298,7 @@ func TestPluginSkillUsageAssociation(t *testing.T) {
 			if tc.qualified {
 				counters = append(counters, skillUsageCounter{RawKey: "widgets:review", RecordedUses: 3})
 			}
-			result := SkillsResult{Plugins: &model.AgentPluginScan{Contexts: []model.AgentPluginContext{{Agent: model.AgentClaudeCode, Plugins: []model.PluginObservation{plugin}}}}, usage: &skillUsageObservations{CollectedAtMs: 100, Sources: []skillUsageSource{{SourceID: "source", Counters: counters}}}}
+			result := SkillsResult{Plugins: &model.AgentPlugins{Contexts: []model.AgentPluginContext{{Agent: model.AgentClaudeCode, Plugins: []model.PluginObservation{plugin}}}}, usage: &skillUsageObservations{CollectedAtMs: 100, Sources: []skillUsageSource{{SourceID: "source", Counters: counters}}}}
 			if tc.duplicate {
 				other := plugin
 				other.MarketplaceID = "market-two"

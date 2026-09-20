@@ -112,7 +112,7 @@ type Payload struct {
 	YarnAudit               *model.YarnAudit                `json:"yarn_audit,omitempty"`
 	AgentSkills             []model.AgentSkill              `json:"agent_skills,omitempty"`
 	AgentSkillScan          *model.AgentSkillScanInfo       `json:"agent_skill_scan,omitempty"`
-	AgentPluginScan         *model.AgentPluginScan          `json:"agent_plugin_scan,omitempty"`
+	AgentPlugins            *model.AgentPlugins             `json:"agent_plugins,omitempty"`
 	CredentialScan          *model.CredentialScanInfo       `json:"credential_scan,omitempty"`
 	// Nil means the phase did not run, and that is the only signal a reader has
 	// for it: a section carrying zero findings is the positive claim that this
@@ -1031,9 +1031,9 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	postPhase()
 
 	phaseCtx, phaseCancel = startPhase(ctx, tracker, "agent_plugins_scan")
-	log.Progress("Collecting AI agent plugins...")
+	log.Progress("Collecting agent plugins...")
 	if err := skillsDetector.DetectPlugins(phaseCtx, &skillsResult); err != nil {
-		log.Warn("agent plugin scan failed: %v", err)
+		log.Warn("agent plugins scan failed: %v", err)
 	}
 	mcpConfigs = skillsResult.ReconcilePluginMCP(mcpConfigs)
 	log.Progress("  Found %d agent plugins", skillsResult.Plugins.PluginCount())
@@ -1238,7 +1238,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		YarnAudit:               &yarnAudit,
 		AgentSkills:             agentSkills,
 		AgentSkillScan:          agentSkillScan,
-		AgentPluginScan:         skillsResult.Plugins,
+		AgentPlugins:            skillsResult.Plugins,
 		CredentialScan:          credentialScan,
 		BrowserExtensionScan:    browserExtensionScan,
 

@@ -18,7 +18,7 @@ func TestCommunityInventoryDeduplicatesWithoutChangingWireRows(t *testing.T) {
 		{Kind: model.PluginComponentCommand, Command: &model.AgentCommandDefinition{Name: "run", DefinitionPath: "/plugins/test/commands/run.md"}},
 	}
 	result := &model.ScanResult{AgentSkills: []model.AgentSkill{skill}, MCPConfigs: []model.MCPConfig{mcp}, Summary: model.Summary{AgentSkillsCount: 1, MCPConfigsCount: 1},
-		AgentPluginScan: &model.AgentPluginScan{Contexts: []model.AgentPluginContext{{Agent: model.AgentClaudeCode, Plugins: []model.PluginObservation{{Components: components}, {Components: components}}}}}}
+		AgentPlugins: &model.AgentPlugins{Contexts: []model.AgentPluginContext{{Agent: model.AgentClaudeCode, Plugins: []model.PluginObservation{{Components: components}, {Components: components}}}}}}
 	view := communityInventory(result)
 	if len(view.AgentSkills) != 2 || len(view.MCPConfigs) != 1 || view.Summary.AgentSkillsCount != 2 || view.Summary.MCPConfigsCount != 1 {
 		t.Fatalf("duplicate display rows or changed count semantics: %+v", view)

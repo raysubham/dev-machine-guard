@@ -60,7 +60,7 @@ func TestScanResult_AgentPlugins_OmittedWhenNil(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	for _, key := range []string{`"agent_plugin_scan"`, `"agent_skill_usage_scan"`} {
+	for _, key := range []string{`"agent_plugins"`, `"agent_skill_usage_scan"`} {
 		if s := string(b); strings.Contains(s, key) {
 			t.Errorf("zero ScanResult should omit %s, got: %s", key, s)
 		}

@@ -16,9 +16,9 @@ const agentPluginsGoldenPath = "testdata/agent_plugins_v1_golden.json"
 
 // agentPluginsGolden contains the plugin, usage and skill sections of telemetry.
 type agentPluginsGolden struct {
-	AgentPluginScan *AgentPluginScan    `json:"agent_plugin_scan"`
-	AgentSkills     []AgentSkill        `json:"agent_skills"`
-	AgentSkillScan  *AgentSkillScanInfo `json:"agent_skill_scan"`
+	AgentPlugins   *AgentPlugins       `json:"agent_plugins"`
+	AgentSkills    []AgentSkill        `json:"agent_skills"`
+	AgentSkillScan *AgentSkillScanInfo `json:"agent_skill_scan"`
 }
 
 func loadAgentPluginsGolden(t *testing.T) ([]byte, agentPluginsGolden) {
@@ -53,7 +53,7 @@ func TestAgentPluginsGolden_RoundTripsWithNoDroppedField(t *testing.T) {
 // Every wire vocabulary value must be represented in the shared fixture.
 func TestAgentPluginsGolden_CoversTheWholeVocabulary(t *testing.T) {
 	_, doc := loadAgentPluginsGolden(t)
-	scan := doc.AgentPluginScan
+	scan := doc.AgentPlugins
 	if scan == nil || doc.AgentSkillScan == nil {
 		t.Fatal("fixture must carry the plugin scan and skill scan info")
 	}
@@ -159,7 +159,7 @@ func TestAgentPluginsGolden_Invariants(t *testing.T) {
 			tris[key].f = true
 		}
 	}
-	for _, c := range doc.AgentPluginScan.Contexts {
+	for _, c := range doc.AgentPlugins.Contexts {
 		for _, m := range c.Marketplaces {
 			note("auto_update_enabled", m.AutoUpdateEnabled)
 		}
@@ -184,7 +184,7 @@ func TestAgentPluginsGolden_Invariants(t *testing.T) {
 	}
 
 	// A component has exactly the payload its kind names, and never another.
-	for _, c := range doc.AgentPluginScan.Contexts {
+	for _, c := range doc.AgentPlugins.Contexts {
 		for _, p := range c.Plugins {
 			for _, comp := range p.Components {
 				n := 0
@@ -256,9 +256,9 @@ func TestAgentPluginsGolden_Invariants(t *testing.T) {
 	// The account plugin: installed unknown and effective_enabled absent, with a
 	// configured false still recorded.
 	var account *PluginObservation
-	for i := range doc.AgentPluginScan.Contexts {
-		for j := range doc.AgentPluginScan.Contexts[i].Plugins {
-			if p := &doc.AgentPluginScan.Contexts[i].Plugins[j]; p.InstallationKind == PluginInstallAccount {
+	for i := range doc.AgentPlugins.Contexts {
+		for j := range doc.AgentPlugins.Contexts[i].Plugins {
+			if p := &doc.AgentPlugins.Contexts[i].Plugins[j]; p.InstallationKind == PluginInstallAccount {
 				account = p
 			}
 		}
@@ -271,7 +271,7 @@ func TestAgentPluginsGolden_Invariants(t *testing.T) {
 	}
 
 	// Millisecond fields carry values that cannot be Unix seconds.
-	if doc.AgentPluginScan.CollectedAtMs < 1e12 {
+	if doc.AgentPlugins.CollectedAtMs < 1e12 {
 		t.Error("collected_at_ms must be Unix milliseconds")
 	}
 }
@@ -301,7 +301,7 @@ func TestAgentPluginsGolden_IdentityVectors(t *testing.T) {
 		sum := sha256.Sum256(b)
 		return hex.EncodeToString(sum[:])
 	}
-	for _, c := range doc.AgentPluginScan.Contexts {
+	for _, c := range doc.AgentPlugins.Contexts {
 		if want := "ctx_" + h(c.Agent, c.ConfigRoot, c.PluginRoot); c.ContextID != want {
 			t.Errorf("context_id %s != %s", c.ContextID, want)
 		}
@@ -340,7 +340,7 @@ func TestAgentPluginsGolden_IdentityVectors(t *testing.T) {
 	}
 	// Two records must never share an instance id.
 	ids := map[string]bool{}
-	for _, c := range doc.AgentPluginScan.Contexts {
+	for _, c := range doc.AgentPlugins.Contexts {
 		for _, p := range c.Plugins {
 			if ids[p.InstanceID] {
 				t.Errorf("duplicate instance_id %s", p.InstanceID)

@@ -50,7 +50,7 @@ type ScanResult struct {
 	BrowserExtensionScan *BrowserExtensionScanInfo `json:"browser_extension_scan,omitempty"`
 
 	// Nil plugin coverage means unreported, not an empty inventory.
-	AgentPluginScan *AgentPluginScan `json:"agent_plugin_scan,omitempty"`
+	AgentPlugins *AgentPlugins `json:"agent_plugins,omitempty"`
 
 	Summary Summary `json:"summary"`
 }

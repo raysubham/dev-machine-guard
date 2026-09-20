@@ -266,10 +266,10 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	agentSkills, agentSkillScan := skillsResult.Skills, skillsResult.Info
 	log.StepDone(time.Since(start))
 
-	log.StepStart("Collecting AI agent plugins")
+	log.StepStart("Collecting agent plugins")
 	start = time.Now()
 	if err := skillsDetector.DetectPlugins(ctx, &skillsResult); err != nil {
-		log.Warn("agent plugin scan failed: %v", err)
+		log.Warn("agent plugins scan failed: %v", err)
 	}
 	mcpConfigs = skillsResult.ReconcilePluginMCPCommunity(mcpConfigs)
 	detector.StripNestedMCPContent(skillsResult.Plugins)
@@ -426,7 +426,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 		YarnAudit:         yarnAudit,
 		AgentSkills:       agentSkills,
 		AgentSkillScan:    agentSkillScan,
-		AgentPluginScan:   skillsResult.Plugins,
+		AgentPlugins:      skillsResult.Plugins,
 		CredentialScan:    credentialScan,
 
 		BrowserExtensionScan: browserExtensionScan,

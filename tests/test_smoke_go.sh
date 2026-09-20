@@ -158,7 +158,7 @@ if echo "$JSON_OUTPUT" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 assert 'agent_skill_usage_scan' not in d
-for key, rows in [('agent_plugin_scan', 'contexts')]:
+for key, rows in [('agent_plugins', 'contexts')]:
     s = d.get(key)
     if s is None:
         continue
@@ -175,9 +175,9 @@ for key, rows in [('agent_plugin_scan', 'contexts')]:
                 assert plugin['component_status']
                 assert isinstance(plugin['components'], list) and isinstance(plugin['enablement'], list)
 " 2>/dev/null; then
-    pass "agent plugin scope has explicit coverage and arrays"
+    pass "agent plugins section has explicit coverage and arrays"
 else
-    fail "agent plugin and skill usage envelopes have explicit coverage and arrays"
+    fail "agent plugins section has explicit coverage and arrays"
 fi
 
 # device object fields

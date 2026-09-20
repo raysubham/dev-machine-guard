@@ -14,7 +14,7 @@ func TestPluginOutputStatesAndEscaping(t *testing.T) {
 	disabled := false
 	zero := int64(0)
 	result := &model.ScanResult{
-		AgentPluginScan: &model.AgentPluginScan{Contexts: []model.AgentPluginContext{{
+		AgentPlugins: &model.AgentPlugins{Contexts: []model.AgentPluginContext{{
 			Agent: model.AgentClaudeCode, MarketplaceStatus: "complete", InstallationStatus: "partial",
 			Plugins: []model.PluginObservation{{Name: "<script>example</script>", ConfiguredEnabled: &disabled, ComponentStatus: "partial", Components: []model.PluginComponent{{Kind: "mcp", Name: "declared-server", Status: "complete"}}}},
 		}}},
@@ -51,7 +51,7 @@ func TestPluginOutputStatesAndEscaping(t *testing.T) {
 func TestPluginOnlyCommunityComponents(t *testing.T) {
 	result := &model.ScanResult{
 		AgentSkillScan: &model.AgentSkillScanInfo{},
-		AgentPluginScan: &model.AgentPluginScan{Contexts: []model.AgentPluginContext{{
+		AgentPlugins: &model.AgentPlugins{Contexts: []model.AgentPluginContext{{
 			Agent: model.AgentClaudeCode,
 			Plugins: []model.PluginObservation{{Name: "test-plugin", Components: []model.PluginComponent{
 				{Kind: model.PluginComponentSkill, Name: "test-skill", Skill: &model.AgentSkill{SkillName: "test-skill", Agent: model.AgentClaudeCode}},

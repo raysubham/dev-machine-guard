@@ -28,7 +28,7 @@ type htmlData struct {
 	PythonProjects    []model.ProjectInfo
 	AgentSkills       []model.AgentSkill
 	AgentSkillScan    *model.AgentSkillScanInfo
-	AgentPluginScan   *model.AgentPluginScan
+	AgentPlugins      *model.AgentPlugins
 	// Nil means the phase did not run, which the template shows differently from a
 	// scan that ran and found nothing.
 	BrowserExtensionScan *model.BrowserExtensionScanInfo
@@ -77,7 +77,7 @@ func HTML(outputFile string, result *model.ScanResult) error {
 		PythonProjects:    result.PythonProjects,
 		AgentSkills:       result.AgentSkills,
 		AgentSkillScan:    result.AgentSkillScan,
-		AgentPluginScan:   result.AgentPluginScan,
+		AgentPlugins:      result.AgentPlugins,
 
 		BrowserExtensionScan: result.BrowserExtensionScan,
 		Summary:              result.Summary,
@@ -285,8 +285,8 @@ const htmlTemplate = `<!DOCTYPE html>
 
 <div class="section">
  <h2>Agent Plugins</h2>
- {{if .AgentPluginScan}}
- {{range .AgentPluginScan.Contexts}}
+ {{if .AgentPlugins}}
+ {{range .AgentPlugins.Contexts}}
  <p>{{.Agent}} — marketplaces: {{.MarketplaceStatus}}; installations: {{.InstallationStatus}}</p>
  {{if .Marketplaces}}<table>
  <tr><th>Marketplace</th><th>Source</th><th>Registered</th><th>Auto-update</th></tr>
