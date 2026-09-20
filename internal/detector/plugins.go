@@ -1295,13 +1295,19 @@ func encodedSize(v any) int {
 // MCP reconciliation
 // ---------------------------------------------------------------------------
 
-// ownsMCPPath reports whether the plugin scan already accounts for an MCP
-// config path: it became a plugin component, or it lies in a covered plugin
-// subtree (catalog clone, stale cache version, staging, data) that must not
-// resurface as an ordinary server.
-func (r SkillsResult) ownsMCPPath(p string) bool {
+// replacesMCPConfig suppresses walker findings accounted for by plugin evidence.
+// Explicit user and project configurations remain independent suppliers.
+func (r SkillsResult) replacesMCPConfig(source, p string) bool {
 	if r.evidence == nil {
 		return false
+	}
+	if source == "project_mcp" {
+		return false
+	}
+	for _, spec := range mcpConfigDefinitions {
+		if source == spec.SourceName {
+			return false
+		}
 	}
 	c := filepath.Clean(p)
 	if r.evidence.owned[c] {
@@ -1315,16 +1321,15 @@ func (r SkillsResult) ownsMCPPath(p string) bool {
 	return false
 }
 
-// ReconcilePluginMCP removes from the ordinary enterprise MCP list every config
-// the plugin scan owns. Configs in contexts the scan did not cover keep their
-// walker classification.
+// ReconcilePluginMCP replaces plugin-classified walker findings without removing
+// independently configured suppliers. Uncovered paths keep their classification.
 func (r SkillsResult) ReconcilePluginMCP(configs []model.MCPConfigEnterprise) []model.MCPConfigEnterprise {
 	if r.evidence == nil {
 		return configs
 	}
 	out := make([]model.MCPConfigEnterprise, 0, len(configs))
 	for _, c := range configs {
-		if !r.ownsMCPPath(c.ConfigPath) {
+		if !r.replacesMCPConfig(c.ConfigSource, c.ConfigPath) {
 			out = append(out, c)
 		}
 	}
@@ -1338,7 +1343,7 @@ func (r SkillsResult) ReconcilePluginMCPCommunity(configs []model.MCPConfig) []m
 	}
 	out := make([]model.MCPConfig, 0, len(configs))
 	for _, c := range configs {
-		if !r.ownsMCPPath(c.ConfigPath) {
+		if !r.replacesMCPConfig(c.ConfigSource, c.ConfigPath) {
 			out = append(out, c)
 		}
 	}

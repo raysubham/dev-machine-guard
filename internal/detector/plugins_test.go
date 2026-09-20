@@ -207,6 +207,91 @@ func TestClaudeLocalSourceComponents(t *testing.T) {
 	}
 }
 
+func TestClaudeLocalSourcePreservesProjectMCP(t *testing.T) {
+	m, fs := newPluginMock()
+	home := filepath.Join(testHome, ".claude")
+	catalog := filepath.Join(testHome, "local-marketplace")
+	source := filepath.Join(catalog, "plugin-project")
+	cache := filepath.Join(home, "plugins/cache/company/test-plugin/1.0.0")
+	registry, _ := json.Marshal(map[string]any{"version": 2, "plugins": map[string]any{"test-plugin@company": []map[string]string{{"scope": "user", "installPath": cache}}}})
+	known, _ := json.Marshal(map[string]any{"company": map[string]any{"source": map[string]string{"source": "directory", "path": catalog}, "installLocation": catalog}})
+	fs.addFile(filepath.Join(home, "plugins/installed_plugins.json"), string(registry))
+	fs.addFile(filepath.Join(home, "plugins/known_marketplaces.json"), string(known))
+	fs.addFile(filepath.Join(catalog, claudeCatalogRel), `{"name":"company","plugins":[{"name":"test-plugin","source":"./plugin-project"}]}`)
+	for _, root := range []string{source, cache} {
+		fs.addFile(filepath.Join(root, claudeManifestRel), `{"name":"test-plugin"}`)
+	}
+	config := filepath.Join(source, ".mcp.json")
+	fs.addFile(config, `{"mcpServers":{"shared":{"command":"node","args":["server.js"]}}}`)
+	state, _ := json.Marshal(map[string]any{"projects": map[string]any{source: map[string]any{}}})
+	fs.addFile(filepath.Join(testHome, ".claude.json"), string(state))
+	fs.commit()
+	mcp := NewMCPDetector(m)
+	enterprise := mcp.DetectEnterprise(context.Background(), nil)
+	community := mcp.Detect(context.Background(), "", nil, false)
+	if !slices.ContainsFunc(enterprise, func(c model.MCPConfigEnterprise) bool {
+		return c.ConfigPath == config && c.ConfigSource == "project_mcp"
+	}) {
+		t.Fatal("missing independently registered project MCP")
+	}
+	result := NewSkillsDetector(m).DetectAll(context.Background(), nil, nil)
+	if result.Plugins.PluginCount() != 1 {
+		t.Fatalf("plugins = %+v", result.Plugins)
+	}
+	p := result.Plugins.Contexts[0].Plugins[0]
+	if p.InstallPath != cache || p.SourcePath != source || !slices.ContainsFunc(p.Components, func(c model.PluginComponent) bool {
+		return c.MCPConfig != nil && c.MCPConfig.ConfigPath == config
+	}) {
+		t.Fatalf("missing local-source plugin MCP: %+v", p)
+	}
+	if got := result.ReconcilePluginMCP(enterprise); !reflect.DeepEqual(got, enterprise) {
+		t.Fatalf("independent enterprise MCP changed: got=%+v want=%+v", got, enterprise)
+	}
+	if got := result.ReconcilePluginMCPCommunity(community); !reflect.DeepEqual(got, community) {
+		t.Fatalf("independent community MCP changed: got=%+v want=%+v", got, community)
+	}
+}
+
+func TestPluginUsageIgnoresUnverifiedCustomState(t *testing.T) {
+	for _, tc := range []struct {
+		name, state string
+		partial     bool
+	}{
+		{name: "custom only"},
+		{name: "verified home", state: `{"skillUsage":{"review":{"usageCount":2}}}`},
+		{name: "partial verified home", state: `{"skillUsage":{"review":{"usageCount":2},"bad":{"usageCount":-1}}}`, partial: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, fs := newPluginMock()
+			custom := filepath.Join(testHome, "custom-claude")
+			m.SetEnv("CLAUDE_CONFIG_DIR", custom)
+			fs.addFile(filepath.Join(custom, ".claude.json"), `{"skillUsage":{"review":{"usageCount":99}}}`)
+			fs.addSkill(filepath.Join(custom, "skills/review"), "SKILL.md", validFrontmatter("review", "test"), nil)
+			if tc.state != "" {
+				fs.addFile(filepath.Join(testHome, ".claude.json"), tc.state)
+			}
+			fs.commit()
+			result := NewSkillsDetector(m).DetectSkills(context.Background(), nil, nil)
+			if len(result.Skills) != 1 {
+				t.Fatalf("skills = %+v", result.Skills)
+			}
+			usage := result.Skills[0].Usage
+			if tc.state == "" {
+				if usage != nil && (usage.Availability == "available" || usage.RecordedUses != nil) {
+					t.Fatalf("unverified state supplied usage: %+v", usage)
+				}
+				return
+			}
+			if usage == nil || usage.Availability != "available" || usage.RecordedUses == nil || *usage.RecordedUses != 2 {
+				t.Fatalf("verified counter not retained: %+v", usage)
+			}
+			if len(result.usage.Sources) != 1 || (result.usage.Sources[0].Status == model.AgentScanStatusPartial) != tc.partial {
+				t.Fatalf("incorrect usage sources: %+v", result.usage)
+			}
+		})
+	}
+}
+
 func TestClaudeStateGuardedRead(t *testing.T) {
 	home := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "state.json")
@@ -920,6 +1005,43 @@ func TestLocalPluginMCPExamplesStayOutOfStandaloneInventory(t *testing.T) {
 	}
 	if !reflect.DeepEqual((SkillsResult{}).ReconcilePluginMCP(enterprise), enterprise) || !reflect.DeepEqual((SkillsResult{}).ReconcilePluginMCPCommunity(community), community) {
 		t.Fatal("unreported plugins changed the MCP inventory")
+	}
+}
+
+func TestPluginMCPReconciliationPreservesConfiguredSources(t *testing.T) {
+	root := filepath.Join(testHome, "local-plugin")
+	config := filepath.Join(root, ".mcp.json")
+	evidence := newPluginEvidence()
+	evidence.owned[config] = true
+	evidence.suppress(root)
+	result := SkillsResult{evidence: evidence}
+	sources := []string{"project_mcp"}
+	for _, spec := range mcpConfigDefinitions {
+		sources = append(sources, spec.SourceName)
+	}
+	for _, source := range sources {
+		t.Run(source, func(t *testing.T) {
+			enterprise := []model.MCPConfigEnterprise{{ConfigSource: source, ConfigPath: config, ConfigContentBase64: "e30="}}
+			community := []model.MCPConfig{{ConfigSource: source, ConfigPath: config}}
+			if got := result.ReconcilePluginMCP(enterprise); !reflect.DeepEqual(got, enterprise) {
+				t.Fatalf("independent enterprise MCP changed: %+v", got)
+			}
+			if got := result.ReconcilePluginMCPCommunity(community); !reflect.DeepEqual(got, community) {
+				t.Fatalf("independent community MCP changed: %+v", got)
+			}
+		})
+	}
+	for _, source := range []string{"discovered_mcp", "claude_plugin", "codex_plugin"} {
+		t.Run(source, func(t *testing.T) {
+			enterprise := []model.MCPConfigEnterprise{{ConfigSource: source, ConfigPath: config}}
+			community := []model.MCPConfig{{ConfigSource: source, ConfigPath: config}}
+			if got := result.ReconcilePluginMCP(enterprise); len(got) != 0 {
+				t.Fatalf("plugin-owned walker finding retained: %+v", got)
+			}
+			if got := result.ReconcilePluginMCPCommunity(community); len(got) != 0 {
+				t.Fatalf("plugin-owned community walker finding retained: %+v", got)
+			}
+		})
 	}
 }
 

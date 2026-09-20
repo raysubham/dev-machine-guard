@@ -477,18 +477,12 @@ func (s *pluginScan) usageSource(st claudeState, status string) skillUsageSource
 	return src
 }
 
-// collectClaudeUsage collects usage observations from the home state file and,
-// when a custom configuration root is visible, that root's state file. The
-// custom layout is not a verified client fixture, so its coverage stays partial.
+// collectClaudeUsage reads the supported home state file. Custom configuration
+// roots do not establish a verified location for usage state.
 func (s *pluginScan) collectClaudeUsage(homeState claudeState) *skillUsageObservations {
 	var sources []skillUsageSource
 	if !homeState.absent {
 		sources = append(sources, s.usageSource(homeState, model.AgentScanStatusComplete))
-	}
-	if cfg := s.d.exec.Getenv("CLAUDE_CONFIG_DIR"); cfg != "" {
-		if st := readClaudeState(s.d.exec, s.d.skipper, filepath.Clean(cfg)); !st.absent && st.path != homeState.path {
-			sources = append(sources, s.usageSource(st, model.AgentScanStatusPartial))
-		}
 	}
 	if len(sources) == 0 {
 		return nil
