@@ -39,13 +39,20 @@ type deltaSnapshot struct {
 // A nil scan state means delta is disabled and the caller should use the
 // legacy payload shape.
 func buildDeltaSnapshot(
-	s *state.State, fullSync bool,
+	s *state.State, fullSync, npmEnabled, pythonEnabled bool,
 	npmResults []model.NodeScanResult, npmDiscovered []string,
 	pythonResults []model.ProjectInfo, pythonDiscovered []string,
 	npmGlobals []model.NodeScanResult, pythonGlobals []model.PythonScanResult,
 ) *deltaSnapshot {
 	if s == nil {
 		return nil
+	}
+	// Disabled scans provide no evidence of changes or removals.
+	if !npmEnabled {
+		npmResults, npmGlobals = nil, nil
+	}
+	if !pythonEnabled {
+		pythonResults, pythonGlobals = nil, nil
 	}
 	snap := &deltaSnapshot{fullSync: fullSync}
 
@@ -65,13 +72,16 @@ func buildDeltaSnapshot(
 	snap.pyGlobalsChanged, snap.pyGlobalsUnchanged = splitPythonGlobals(s.PythonGlobal, pythonGlobals, snap.pyGlobalRecords, pyGChanged, pyGUnchanged)
 
 	now := time.Now()
-	_, _, npmRemovedPaths := s.Reconcile(state.EcosystemNPM, npmDiscovered)
-	_, _, pyRemovedPaths := s.Reconcile(state.EcosystemPython, pythonDiscovered)
-	s.MarkRemovedPending(state.EcosystemNPM, npmRemovedPaths, now)
-	s.MarkRemovedPending(state.EcosystemPython, pyRemovedPaths, now)
-
-	snap.npmRemoved = removedRefsFor(s, state.EcosystemNPM, npmDiscovered)
-	snap.pyRemoved = removedRefsFor(s, state.EcosystemPython, pythonDiscovered)
+	if npmEnabled {
+		_, _, removed := s.Reconcile(state.EcosystemNPM, npmDiscovered)
+		s.MarkRemovedPending(state.EcosystemNPM, removed, now)
+		snap.npmRemoved = removedRefsFor(s, state.EcosystemNPM, npmDiscovered)
+	}
+	if pythonEnabled {
+		_, _, removed := s.Reconcile(state.EcosystemPython, pythonDiscovered)
+		s.MarkRemovedPending(state.EcosystemPython, removed, now)
+		snap.pyRemoved = removedRefsFor(s, state.EcosystemPython, pythonDiscovered)
+	}
 	return snap
 }
 
@@ -116,32 +126,49 @@ func pythonRecordsFromResults(results []model.ProjectInfo) []state.ScanRecord {
 		if r.Path == "" {
 			continue
 		}
-		exitCode := 0
+		// A nil list means failed or unscanned, not empty. ProjectInfo has
+		// no wire error field, so omit it rather than replacing prior inventory.
 		if r.Packages == nil {
-			exitCode = 1
+			continue
 		}
 		out = append(out, state.ScanRecordFromValue(
-			r.Path, r.PackageManager, "", r.Packages, exitCode,
+			r.Path, r.PackageManager, "", r.Packages, 0,
 		))
 	}
 	return out
 }
 
+// globalRecordsFromNode reduces the global results to one record per package
+// manager, which is how state keys them. The disk scan emits one result per
+// root, so a PM with several roots folds into one hash and counts as changed
+// if any root failed.
 func globalRecordsFromNode(results []model.NodeScanResult) []state.GlobalRecord {
 	out := make([]state.GlobalRecord, 0, len(results))
+	idx := make(map[string]int, len(results))
 	for _, r := range results {
 		if r.PackageManager == "" {
 			continue
 		}
 		var hash string
 		if isDiskScanResult(r) {
-			// Disk-parse globals: hash the parsed packages (see
-			// npmRecordsFromResults). ScanRecordFromValue gives the same
-			// canonical hash used everywhere else for structured values.
-			hash = state.ScanRecordFromValue("", r.PackageManager, "", r.Packages, r.ExitCode).Hash
+			// Root is hashed with the packages — ScanRecordFromValue keeps its
+			// path argument out of the digest — so a global moving between
+			// prefixes re-uploads instead of stranding a stale path.
+			hash = state.ScanRecordFromValue("", r.PackageManager, "", struct {
+				Root     string              `json:"root"`
+				Packages []model.NodePackage `json:"packages"`
+			}{r.ProjectPath, r.Packages}, r.ExitCode).Hash
 		} else {
 			hash, _ = state.CanonicalHashJSON(decodeBase64OrRaw(r.RawStdoutBase64))
 		}
+		if i, ok := idx[r.PackageManager]; ok {
+			out[i].Hash = state.CombineHashes(out[i].Hash, hash)
+			if r.ExitCode != 0 {
+				out[i].ExitCode = r.ExitCode
+			}
+			continue
+		}
+		idx[r.PackageManager] = len(out)
 		out = append(out, state.GlobalRecord{PM: r.PackageManager, Hash: hash, ExitCode: r.ExitCode})
 	}
 	return out
@@ -227,12 +254,19 @@ func splitNodeGlobals(
 
 	changed := make([]model.NodeScanResult, 0, len(changedPMs))
 	unchanged := make([]model.UnchangedGlobalRef, 0, len(unchangedPMs))
+	emitted := make(map[string]struct{}, len(unchangedPMs))
 	for _, r := range results {
 		if _, ok := changedSet[r.PackageManager]; ok {
 			changed = append(changed, r)
 			continue
 		}
+		// One ref per PM — the backend keys the unchanged ref by PM, so
+		// several roots would repeat it.
 		if _, ok := unchangedSet[r.PackageManager]; ok {
+			if _, dup := emitted[r.PackageManager]; dup {
+				continue
+			}
+			emitted[r.PackageManager] = struct{}{}
 			unchanged = append(unchanged, model.UnchangedGlobalRef{
 				PackageManager:          r.PackageManager,
 				ScanOutputHash:          hashByPM[r.PackageManager],

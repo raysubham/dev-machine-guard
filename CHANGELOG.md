@@ -26,9 +26,16 @@ See [VERSIONING.md](VERSIONING.md) for why the version starts at 1.8.1.
 
 ### Fixed
 
+- Suppress Windows scheduler-registration probe console flashes during heartbeat, telemetry initialization, and scheduler diagnostics; bound each probe to three seconds.
+- Reduce malicious-file scan CPU and allocations by checking mandatory conditions before optional evidence and constructing paths only for directories and candidate files. Retain filename indexes with wildcard rules, prune disjoint literal prefixes, reuse bounded file reads and metadata, and retire truncated rules. Detection coverage, rule ordering, and reported evidence are preserved.
+
 - **The scan no longer opens LM Studio's window on Linux.** `lm-studio` names the desktop application's launcher, not a CLI (LM Studio's CLI is a separate binary, `lms`), and a packaged Electron app does not implement `--version`, so the flag was ignored and the app booted. An Ubuntu 22.04 customer running the agent from a systemd timer had LM Studio appear on their desktop mid-scan, with the probe of `/usr/bin/lm-studio` sitting on the full 10s exec deadline before being killed. Framework specs now carry a per-tool `GUIApp` flag that suppresses the `--version` fallback, so a GUI entry point is reported as installed with whatever on-disk metadata yields and `unknown` otherwise. The flag is opt-in per entry: ollama, LocalAI and Text Generation WebUI are real CLIs and are still exec'd exactly as before.
 - **IDE version probes on Linux are static-first and shim-only.** `<installDir>/<LinuxBinary>` was an exec candidate ahead of `product-info.json` and `.eclipseproduct` — and for every VS Code fork that path is the Electron GUI binary, not the CLI (`/opt/Cursor/cursor` launches Cursor; the CLI is `bin/cursor`), so an install whose `package.json` had moved would launch the app. It is no longer a candidate. Separately, an IDE found only as a name on `$PATH` went straight to `<binary> --version`; it now resolves the symlink and walks up to the install root's `package.json`/`product-info.json` first, which also yields a better version than the shim prints.
 - **README download instructions.** Release assets carry the version in their filename, so the documented `releases/latest/download/…` URLs resolved to nothing; the snippets now look up the latest tag first, and macOS is one universal binary rather than two per-arch downloads.
+
+### Changed
+
+- **The scan-state delta upload protocol is now on by default.** `use_legacy_package_scan` defaults to `false`, so a run uploads full npm and Python package bodies only for projects whose inventory hash changed, ships refs for the unchanged and removed ones, and re-asserts the whole picture on a full sync — weekly, or after an agent-version change. Requires a backend that understands `payload_schema_version` 1. Measured on Ubuntu 24.04 at 2000 npm plus 600 Python packages: the npm and Python inventory drops out of a settled payload entirely, taking the whole payload down 27.5% (22.7% gzipped). Scan time is unchanged — the scan still walks everything, so the saving is upload bytes, not runtime, and `system_package_scans` caps it. Set `use_legacy_package_scan=true` in config.json to hold a fleet on full-snapshot uploads; `STEPSEC_DISABLE_SCAN_STATE=1` forces legacy for one run.
 
 ## [1.16.0] - 2026-08-20
 

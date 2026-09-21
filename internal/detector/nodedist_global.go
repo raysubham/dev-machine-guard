@@ -26,10 +26,22 @@ type nodeGlobalRoot struct {
 // every installed version's global dir is included.
 func NodeGlobalRoots(exec executor.Executor) []nodeGlobalRoot {
 	var roots []nodeGlobalRoot
+	// The candidate lists overlap: npm_config_prefix=/usr/local resolves to the
+	// same directory as the built-in /usr/local entry, and PREFIX can repeat
+	// either. Callers emit one scan result per root, so a duplicate would scan
+	// and upload the same directory twice.
+	seen := make(map[string]struct{})
 	add := func(pm, dir string) {
-		if dir != "" && exec.DirExists(dir) {
-			roots = append(roots, nodeGlobalRoot{pm: pm, dir: dir})
+		if dir == "" || !exec.DirExists(dir) {
+			return
 		}
+		dir = filepath.Clean(dir)
+		key := pm + "\x00" + dir
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		roots = append(roots, nodeGlobalRoot{pm: pm, dir: dir})
 	}
 	addGlob := func(pm, pattern string) {
 		if matches, err := exec.Glob(pattern); err == nil {
@@ -121,12 +133,15 @@ func pnpmGlobalHomes(exec executor.Executor, home string) []string {
 }
 
 // nodeHomeDir returns the user's home directory via the platform-appropriate
-// environment variable. Uses the env rather than user.Current so that, under a
-// root daemon delegating to a logged-in user, callers that pre-set HOME resolve
-// the user's tree.
+// source: macOS resolves the console user; Windows keeps USERPROFILE;
+// other platforms keep HOME.
 func nodeHomeDir(exec executor.Executor) string {
-	if exec.GOOS() == model.PlatformWindows {
+	switch exec.GOOS() {
+	case model.PlatformWindows:
 		return exec.Getenv("USERPROFILE")
+	case model.PlatformDarwin:
+		return executor.ResolveHome(exec)
+	default:
+		return exec.Getenv("HOME")
 	}
-	return exec.Getenv("HOME")
 }

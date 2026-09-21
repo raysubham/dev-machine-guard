@@ -2,10 +2,14 @@ package detector
 
 import (
 	"context"
+	"os"
+	"os/user"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/progress"
 )
 
@@ -38,6 +42,77 @@ func TestNodeGlobalRoots_PrefixOverride(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected npm global root %q from prefix override", nm)
+	}
+}
+
+type nodeConsoleExecutor struct {
+	*executor.Mock
+	consoleHome string
+}
+
+func (e nodeConsoleExecutor) LoggedInUser() (*user.User, error) {
+	return &user.User{HomeDir: e.consoleHome}, nil
+}
+
+func TestNodeHomeDir_Linux(t *testing.T) {
+	for _, tc := range []struct {
+		name, home, accountHome, want string
+		root                          bool
+	}{
+		{"user home", "/home/testuser", "/home/testuser", "/home/testuser", false},
+		{"user override", "/custom/home", "/home/testuser", "/custom/home", false},
+		{"root override", "/home/testuser", "/root", "/home/testuser", true},
+		{"root home", "/root", "/root", "/root", true},
+		{"user unset home", "", "/home/testuser", "", false},
+		{"root unset home", "", "/root", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := executor.NewMock()
+			mock.SetGOOS(model.PlatformLinux)
+			mock.SetIsRoot(tc.root)
+			mock.SetEnv("HOME", tc.home)
+			mock.SetHomeDir(tc.accountHome)
+			if got := nodeHomeDir(mock); got != tc.want {
+				t.Fatalf("nodeHomeDir() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNodeGlobalRoots_MacOSUsesLoggedInUserHome(t *testing.T) {
+	serviceHome := "/root"
+	userHome := "/home/testuser"
+	npmRoot := filepath.Join(userHome, ".npm-global", "lib", "node_modules")
+	pnpmRoot := filepath.Join(userHome, "Library", "pnpm", "global", "5", "node_modules")
+	yarnRoot := filepath.Join(userHome, ".config", "yarn", "global", "node_modules")
+	serviceNPMRoot := filepath.Join(serviceHome, ".npm-global", "lib", "node_modules")
+	servicePNPMRoot := filepath.Join(serviceHome, "Library", "pnpm", "global", "5", "node_modules")
+	serviceYarnRoot := filepath.Join(serviceHome, ".config", "yarn", "global", "node_modules")
+	want := []nodeGlobalRoot{
+		{pm: "npm", dir: npmRoot},
+		{pm: "pnpm", dir: pnpmRoot},
+		{pm: "yarn", dir: yarnRoot},
+	}
+	mock := executor.NewMock()
+	mock.SetGOOS(model.PlatformDarwin)
+	mock.SetIsRoot(true)
+	mock.SetEnv("HOME", serviceHome)
+	mock.SetHomeDir(serviceHome)
+	for _, dir := range []string{
+		npmRoot,
+		pnpmRoot,
+		yarnRoot,
+		serviceNPMRoot,
+		servicePNPMRoot,
+		serviceYarnRoot,
+	} {
+		mock.SetDir(dir)
+	}
+	mock.SetGlob(filepath.Join(userHome, "Library", "pnpm", "global", "*", "node_modules"), []string{pnpmRoot})
+	mock.SetGlob(filepath.Join(serviceHome, "Library", "pnpm", "global", "*", "node_modules"), []string{servicePNPMRoot})
+
+	if got := NodeGlobalRoots(nodeConsoleExecutor{Mock: mock, consoleHome: userHome}); !slices.Equal(got, want) {
+		t.Fatalf("NodeGlobalRoots() = %+v, want %+v", got, want)
 	}
 }
 
@@ -77,5 +152,107 @@ func TestNodeScanner_DiskMode_Project(t *testing.T) {
 	assertPkgs(t, r.Packages, "lodash@4.17.21+direct", "dep@1.0.0")
 	if len(discovered) != 1 {
 		t.Errorf("want 1 discovered project, got %d", len(discovered))
+	}
+}
+
+// Every global result names the root it was read from — the backend reads
+// ProjectPath into the row's project_paths — and two prefixes stay two
+// results. Prefixes come from npm_config_prefix / PREFIX so the fixture does
+// not depend on the host's nvm or homebrew layout.
+func TestNodeScanner_DiskMode_GlobalsCarryRoot(t *testing.T) {
+	pfxA, pfxB := t.TempDir(), t.TempDir()
+	rootA := filepath.Join(pfxA, "lib", "node_modules")
+	rootB := filepath.Join(pfxB, "lib", "node_modules")
+	mustWrite(t, filepath.Join(rootA, "chalk", "package.json"), `{"name":"chalk","version":"5.6.1"}`)
+	mustWrite(t, filepath.Join(rootB, "chalk", "package.json"), `{"name":"chalk","version":"5.6.1"}`)
+	mustWrite(t, filepath.Join(rootB, "typescript", "package.json"), `{"name":"typescript","version":"5.4.0"}`)
+	t.Setenv("npm_config_prefix", pfxA)
+	t.Setenv("PREFIX", pfxB)
+
+	exec := executor.NewReal()
+	scanner := NewNodeScanner(exec, progress.NewNoop(), "").
+		WithDiskScan(NewNodeDistDetector(exec))
+
+	byRoot := make(map[string][]string)
+	for _, r := range scanner.ScanGlobalPackages(context.Background()) {
+		if r.PackageManager != "npm" {
+			continue
+		}
+		if r.ProjectPath == "" {
+			t.Fatalf("global npm result has no ProjectPath: %+v", r)
+		}
+		if r.WorkingDirectory != r.ProjectPath {
+			t.Errorf("WorkingDirectory = %q, want it to match ProjectPath %q", r.WorkingDirectory, r.ProjectPath)
+		}
+		for _, p := range r.Packages {
+			byRoot[filepath.Clean(r.ProjectPath)] = append(byRoot[filepath.Clean(r.ProjectPath)], p.Name)
+		}
+	}
+
+	if got := byRoot[filepath.Clean(rootA)]; len(got) != 1 || got[0] != "chalk" {
+		t.Errorf("prefix A packages = %v, want [chalk]; all roots seen: %v", got, keysOf(byRoot))
+	}
+	if got := byRoot[filepath.Clean(rootB)]; len(got) != 2 {
+		t.Errorf("prefix B packages = %v, want chalk and typescript; all roots seen: %v", got, keysOf(byRoot))
+	}
+}
+
+func keysOf(m map[string][]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// The candidate lists overlap, so the same directory can be added twice (here
+// via both prefix env vars). One result per root means a duplicate would scan
+// and upload the same directory twice and fold its hash twice.
+func TestNodeGlobalRoots_DedupesRepeatedRoots(t *testing.T) {
+	prefix := t.TempDir()
+	nm := filepath.Join(prefix, "lib", "node_modules")
+	mustWrite(t, filepath.Join(nm, "typescript", "package.json"), `{"name":"typescript","version":"5.4.0"}`)
+	t.Setenv("npm_config_prefix", prefix)
+	t.Setenv("PREFIX", prefix)
+
+	var hits int
+	for _, r := range NodeGlobalRoots(executor.NewReal()) {
+		if r.pm == "npm" && filepath.Clean(r.dir) == filepath.Clean(nm) {
+			hits++
+		}
+	}
+	if hits != 1 {
+		t.Errorf("root %q reported %d times, want exactly 1", nm, hits)
+	}
+}
+
+// A root whose packages have all been uninstalled must still be reported.
+// Dropping it would leave the PM out of the delta records once its last root
+// empties, so nothing marks the PM changed and the old packages linger.
+func TestNodeScanner_DiskMode_EmptyGlobalRootStillReported(t *testing.T) {
+	prefix := t.TempDir()
+	nm := filepath.Join(prefix, "lib", "node_modules")
+	if err := os.MkdirAll(nm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("npm_config_prefix", prefix)
+
+	exec := executor.NewReal()
+	scanner := NewNodeScanner(exec, progress.NewNoop(), "").
+		WithDiskScan(NewNodeDistDetector(exec))
+
+	var found *model.NodeScanResult
+	for _, r := range scanner.ScanGlobalPackages(context.Background()) {
+		if filepath.Clean(r.ProjectPath) == filepath.Clean(nm) {
+			found = &r
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("emptied global root %q was dropped from the scan results", nm)
+	}
+	if found.PackagesCount != 0 || len(found.Packages) != 0 {
+		t.Errorf("want an empty package set, got count=%d %v", found.PackagesCount, found.Packages)
 	}
 }
