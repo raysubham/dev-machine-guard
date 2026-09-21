@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/safepath"
+	"github.com/step-security/dev-machine-guard/internal/tcc"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -179,6 +180,118 @@ func TestPluginUsageSharesPhysicalDefinition(t *testing.T) {
 	associateSkillUsage(&result)
 	if skill.Usage.Availability != "ambiguous" {
 		t.Fatalf("unrelated same-name skill inherited usage: %+v", skill.Usage)
+	}
+}
+
+func TestClaudeDeclaredRootSkillCallable(t *testing.T) {
+	for _, declaration := range []string{`"."`, `[".", "./skills"]`} {
+		t.Run(declaration, func(t *testing.T) {
+			m, fs := newPluginMock()
+			root := filepath.Join(testHome, ".claude/skills/widgets")
+			fs.addFile(filepath.Join(root, claudeManifestRel), `{"name":"widgets","skills":`+declaration+`}`)
+			fs.addFile(filepath.Join(root, "SKILL.md"), validFrontmatter("widgets", "Review changes"))
+			fs.addFile(filepath.Join(root, "skills/nested/SKILL.md"), validFrontmatter("nested", "Review details"))
+			fs.commit()
+			d := NewSkillsDetector(m)
+			definitions := 0
+			s := &pluginScan{d: d, ctx: context.Background(), home: testHome, definitions: &definitions, memo: map[string]*skillScan{}, evidence: newPluginEvidence()}
+			a := &claudeAdapter{s: s, gd: s.guarded(root)}
+			p := newPlugin("widgets@skills-dir", "widgets", model.PluginInstallDirectory, model.PluginScopeUser)
+			p.InstallPath = root
+			a.components(p, nil, nil)
+			if len(p.Components) != 2 {
+				t.Fatalf("components = %d, want 2", len(p.Components))
+			}
+			for _, c := range p.Components {
+				want := "widgets:nested"
+				if c.RelativePath == "SKILL.md" {
+					want = "widgets"
+				}
+				if !reflect.DeepEqual(c.CallableNames, []string{want}) || !reflect.DeepEqual(c.Skill.CallableNames, []string{want}) {
+					t.Errorf("%s callable = %v, want %s", c.RelativePath, c.CallableNames, want)
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeCommandLinkedChildren(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native command-link installation is unsupported on Windows")
+	}
+	for _, tc := range []struct {
+		name                                   string
+		outside, malformed, missing, protected bool
+	}{
+		{name: "native child links"},
+		{name: "outside scan roots", outside: true},
+		{name: "malformed marker", malformed: true},
+		{name: "missing marker", missing: true},
+		{name: "protected payload", protected: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.protected && runtime.GOOS != "darwin" {
+				t.Skip("macOS TCC protection")
+			}
+			home, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			root, payload := filepath.Join(home, "installed"), filepath.Join(home, "source")
+			if tc.protected {
+				payload = filepath.Join(home, "Documents/source")
+			}
+			if tc.outside {
+				payload, err = filepath.EvalSymlinks(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, dir := range []string{root, filepath.Join(payload, ".claude-plugin"), filepath.Join(payload, "skills/check")} {
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for file, body := range map[string]string{
+				filepath.Join(payload, claudeManifestRel):       `{"name":"widgets"}`,
+				filepath.Join(payload, "skills/check/SKILL.md"): validFrontmatter("check", "Review changes"),
+			} {
+				if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, name := range []string{".claude-plugin", "skills"} {
+				if err := os.Symlink(filepath.Join(payload, name), filepath.Join(root, name)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			marker, _ := json.Marshal(map[string]string{"target": payload})
+			if tc.malformed {
+				marker = []byte(`{"target":`)
+			}
+			if !tc.missing {
+				if err := os.WriteFile(filepath.Join(root, ".claude-plugin-link"), marker, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			d := NewSkillsDetector(executor.NewReal()).WithSkipper(tcc.New(home))
+			definitions := 0
+			s := &pluginScan{d: d, ctx: context.Background(), home: home, definitions: &definitions, memo: map[string]*skillScan{}, evidence: newPluginEvidence()}
+			a := &claudeAdapter{s: s, gd: s.guarded(root)}
+			p := newPlugin("widgets@company", "widgets", model.PluginInstallMarketplace, model.PluginScopeUser)
+			p.InstallPath = root
+			p.Source = &model.SourceLocator{Kind: model.PluginSourceCommand, CommandMode: model.PluginCommandModeLink}
+			a.components(p, nil, nil)
+			if tc.outside || tc.malformed || tc.missing || tc.protected {
+				if p.ComponentStatus == model.AgentScanStatusComplete || len(p.Components) != 0 {
+					t.Fatalf("unsafe payload read: %+v", p)
+				}
+				return
+			}
+			if p.InstallPath != root || p.ComponentStatus != model.AgentScanStatusComplete || len(p.Components) != 1 || p.Components[0].Skill == nil {
+				t.Fatalf("linked payload = %+v, want one complete skill", p)
+			}
+		})
 	}
 }
 

@@ -911,6 +911,31 @@ func (a *claudeAdapter) components(p *model.PluginObservation, entry *claudeCata
 	}
 	local := *a
 	a = &local
+	if p.Source != nil && p.Source.Kind == model.PluginSourceCommand && p.Source.CommandMode == model.PluginCommandModeLink {
+		markerPath := filepath.Join(root, ".claude-plugin-link")
+		data, absent, code := a.s.readMetadata(a.gd.componentReader(root), markerPath)
+		if !absent {
+			var marker struct {
+				Target string `json:"target"`
+			}
+			if code == "" && (json.Unmarshal(data, &marker) != nil || !filepath.IsAbs(marker.Target)) {
+				code = model.AgentScanErrParseFailed
+			}
+			if code == "" {
+				if state, _, err := a.s.stat(a.gd, marker.Target); state != fileDir {
+					code = readCode(err)
+				}
+			}
+			if code != "" {
+				p.ComponentStatus = model.AgentScanStatusError
+				scanError(&p.Errors, model.AgentScanError{Code: code, SourcePath: markerPath, InstanceID: p.InstanceID})
+				return
+			}
+			// Native link installs select a payload through this marker, not the cache directory.
+			root = marker.Target
+			p.SourcePath = root
+		}
+	}
 	a.gd = a.gd.componentReader(root)
 	a.s.evidence.suppress(root)
 	manifestPath := filepath.Join(root, filepath.FromSlash(claudeManifestRel))
@@ -1146,7 +1171,11 @@ func (a *claudeAdapter) skillsUnder(r *pluginRootScan, dir, namespace string) {
 			continue
 		}
 		name := path.Base(rel)
-		r.skillComponent(d, rel, name, namespace+":"+name)
+		callable := namespace + ":" + name
+		if rel == "." {
+			name, callable = r.p.Name, namespace
+		}
+		r.skillComponent(d, rel, name, callable)
 	}
 }
 
