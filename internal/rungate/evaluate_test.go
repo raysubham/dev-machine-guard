@@ -257,6 +257,8 @@ func TestEvaluatePackageDelta(t *testing.T) {
 	for _, force := range []bool{false, true} {
 		for _, enabled := range []bool{false, true} {
 			t.Run(fmt.Sprintf("force=%v/enabled=%v", force, enabled), func(t *testing.T) {
+				t.Setenv("STEPSEC_ENABLE_SCAN_STATE", "1")
+				t.Setenv("STEPSEC_DISABLE_SCAN_STATE", "1")
 				withTempState(t)
 				seedDeviceID(t)
 				gateServer(t, 0, fmt.Sprintf(`{"scan_directive":{"mode":"full"},"package_scan":{"delta_enabled":%v}}`, enabled))

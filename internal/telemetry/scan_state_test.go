@@ -443,20 +443,6 @@ func TestDelta_FailedVenvPreservesPriorInventoryAndRetries(t *testing.T) {
 	}
 }
 
-func TestPackageDeltaRequiresBackendAuthorization(t *testing.T) {
-	t.Setenv("STEPSEC_ENABLE_SCAN_STATE", "1")
-	for _, backend := range []bool{false, true} {
-		for _, local := range []bool{false, true} {
-			for _, disable := range []string{"", "1"} {
-				want := backend && !local && disable != "1"
-				if got := packageDeltaEnabled(backend, local, disable); got != want {
-					t.Fatalf("backend=%v local=%v disable=%q got=%v", backend, local, disable, got)
-				}
-			}
-		}
-	}
-}
-
 func TestLegacyTransitionDiscardsOldDeltaBaseline(t *testing.T) {
 	path := tempStateFile(t)
 	s := state.New(buildinfo.Version)

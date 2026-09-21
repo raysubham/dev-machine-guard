@@ -387,9 +387,3 @@ func hashesByPM(records []state.GlobalRecord) map[string]string {
 	}
 	return out
 }
-
-// packageDeltaEnabled keeps backend authorization authoritative. The old
-// STEPSEC_ENABLE_SCAN_STATE override intentionally cannot enable managed delta.
-func packageDeltaEnabled(backendEnabled, localLegacy bool, disableEnv string) bool {
-	return backendEnabled && !localLegacy && disableEnv != "1"
-}

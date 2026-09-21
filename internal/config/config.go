@@ -34,11 +34,6 @@ var (
 	HTMLOutputFile        string // "" means not set
 	LogLevel              string // "" means default (info); one of error/warn/info/debug
 	InstallDir            string // "" means default (~/.stepsecurity); non-empty makes the agent put all its files (logs, hook errors, future state) under this directory. Bootstrap config.json itself stays at the legacy location. Per-run opt-out is the CLI flag --install-dir=. Resolution: --install-dir flag > STEPSECURITY_HOME env > this field > default — see internal/paths.
-	// UseLegacyPackageScan defaults to legacy uploads. An explicit true in
-	// config.json also pins legacy when the backend opts this tenant into delta.
-	// An explicit false cannot enable delta without backend authorization.
-	UseLegacyPackageScan        = true
-	legacyPackageScanConfigured bool
 
 	// UseLegacyNodeScan, when true, reverts Node.js package discovery to the
 	// command-based path (`npm ls` / `yarn list` / `pnpm ls` / `bun pm ls`,
@@ -47,8 +42,7 @@ var (
 	// with no package-manager subprocess. Set use_legacy_node_scan=true in
 	// config.json (or --legacy-node-scan) to opt back into the command path.
 	//
-	// Independent of UseLegacyPackageScan above (which gates the delta-upload
-	// optimization, not the disk-vs-command source).
+	// Independent of the package upload protocol selected by backend run-config.
 	UseLegacyNodeScan = false
 
 	// UseLegacyPythonScan, when true, reverts Python package discovery to the
@@ -88,7 +82,6 @@ type ConfigFile struct {
 	LogLevel              string   `json:"log_level,omitempty"`
 	InstallDir            string   `json:"install_dir,omitempty"`
 	MaxExecutionDuration  string   `json:"max_execution_duration,omitempty"`
-	UseLegacyPackageScan  *bool    `json:"use_legacy_package_scan,omitempty"`
 	UseLegacyNodeScan     *bool    `json:"use_legacy_node_scan,omitempty"`
 	UseLegacyPythonScan   *bool    `json:"use_legacy_python_scan,omitempty"`
 }
@@ -244,10 +237,7 @@ func Load() {
 	if cfg.MaxExecutionDuration != "" && MaxExecutionDuration == "" {
 		MaxExecutionDuration = cfg.MaxExecutionDuration
 	}
-	if cfg.UseLegacyPackageScan != nil {
-		legacyPackageScanConfigured = true
-		UseLegacyPackageScan = *cfg.UseLegacyPackageScan
-	}
+
 	if cfg.UseLegacyNodeScan != nil {
 		UseLegacyNodeScan = *cfg.UseLegacyNodeScan
 	}
@@ -820,10 +810,4 @@ func PersistMaxExecutionDuration(value string) error {
 	}
 	existing.MaxExecutionDuration = value
 	return save(existing)
-}
-
-// LegacyPackageScanPinned reports an explicit local opt-out, rather than the
-// default value, so a tenant's backend opt-in can enable delta on fresh installs.
-func LegacyPackageScanPinned() bool {
-	return legacyPackageScanConfigured && UseLegacyPackageScan
 }

@@ -8,7 +8,7 @@ Legacy full package reporting is the default. The agent enables delta only when 
 
 A missing, null, malformed, or false setting, an older backend, or a failed check-in selects legacy. The setting is not remembered between invocations. Forced scans still honor it. This changes the upload protocol for npm and Python, not disk-versus-command inventory collection or suspicious-file rules.
 
-An explicit `use_legacy_package_scan: true` in local config or `STEPSEC_DISABLE_SCAN_STATE=1` can force legacy. `use_legacy_package_scan: false` and the old `STEPSEC_ENABLE_SCAN_STATE=1` do not bypass backend authorization, including telemetry-out runs.
+Run-config is the only source of truth. The retired `use_legacy_package_scan` config field and `STEPSEC_ENABLE_SCAN_STATE` / `STEPSEC_DISABLE_SCAN_STATE` environment variables are ignored, including telemetry-out runs. Existing config files containing the retired field remain readable.
 
 Before a legacy upload (or telemetry-out dump), the agent removes the old delta baseline. If removal fails, the upload is stopped rather than leaving a stale baseline that could later reference replaced inventory. A subsequent delta run starts fresh and sends full bodies for its scanned inventory; normal scan limits still apply. Failed or rejected delta uploads retain the existing retry behavior.
 

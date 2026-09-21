@@ -183,54 +183,6 @@ func TestConfigFile_InstallDir_JSONRoundTrip(t *testing.T) {
 	}
 }
 
-// The delta upload protocol ships on. This pins the default so flipping it
-// back becomes a deliberate, visible change rather than an accident.
-func TestUseLegacyPackageScan_DefaultsToLegacy(t *testing.T) {
-	if !UseLegacyPackageScan {
-		t.Error("UseLegacyPackageScan should default to true (legacy upload enabled)")
-	}
-}
-
-func TestConfigFile_UseLegacyPackageScan_JSONRoundTrip(t *testing.T) {
-	legacy := true
-	in := ConfigFile{UseLegacyPackageScan: &legacy}
-	data, err := json.Marshal(in)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(data, []byte(`"use_legacy_package_scan":true`)) {
-		t.Errorf("use_legacy_package_scan not serialized: %s", data)
-	}
-
-	var out ConfigFile
-	if err := json.Unmarshal(data, &out); err != nil {
-		t.Fatal(err)
-	}
-	if out.UseLegacyPackageScan == nil || !*out.UseLegacyPackageScan {
-		t.Errorf("UseLegacyPackageScan round-trip = %v, want true", out.UseLegacyPackageScan)
-	}
-
-	// An explicit false must survive the round trip to clear a local opt-out.
-	enabled := false
-	data, err = json.Marshal(ConfigFile{UseLegacyPackageScan: &enabled})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(data, []byte(`"use_legacy_package_scan":false`)) {
-		t.Errorf("explicit false should serialize, not be omitted: %s", data)
-	}
-
-	// Absent (nil) is omitted — the field falls back to the package default.
-	empty := ConfigFile{}
-	data, err = json.Marshal(empty)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Contains(data, []byte("use_legacy_package_scan")) {
-		t.Errorf("nil should be omitted: %s", data)
-	}
-}
-
 func TestLoad_IncludeNetworkVolumes_AppliedFromFile(t *testing.T) {
 	prev := IncludeNetworkVolumes
 	t.Cleanup(func() { IncludeNetworkVolumes = prev })
@@ -269,62 +221,22 @@ func TestLoad_IncludeNetworkVolumes_AppliedFromFile(t *testing.T) {
 	}
 }
 
-func TestLoad_UseLegacyPackageScan_AppliedFromFile(t *testing.T) {
-	// Save and restore package var.
-	prev, configured := UseLegacyPackageScan, legacyPackageScanConfigured
-	t.Cleanup(func() { UseLegacyPackageScan = prev; legacyPackageScanConfigured = configured })
-	UseLegacyPackageScan = false
-
-	dir := t.TempDir()
-	t.Setenv("HOME", dir)
-	t.Setenv("STEPSECURITY_HOME", dir)
-	cfgPath := filepath.Join(dir, ".stepsecurity", "config.json")
-	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	body := []byte(`{"use_legacy_package_scan":true}`)
-	if err := os.WriteFile(cfgPath, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	Load()
-
-	if !UseLegacyPackageScan || !LegacyPackageScanPinned() {
-		t.Errorf("Load did not propagate use_legacy_package_scan from config.json")
-	}
-}
-
-func TestLoad_UseLegacyPackageScan_FalseClearsLocalOptOut(t *testing.T) {
-	// An explicit false clears the local legacy pin; the backend still decides.
-	prev, configured := UseLegacyPackageScan, legacyPackageScanConfigured
-	t.Cleanup(func() { UseLegacyPackageScan = prev; legacyPackageScanConfigured = configured })
-	UseLegacyPackageScan = true
-
-	dir := t.TempDir()
-	t.Setenv("HOME", dir)
-	t.Setenv("STEPSECURITY_HOME", dir)
-	cfgPath := filepath.Join(dir, ".stepsecurity", "config.json")
-	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(cfgPath, []byte(`{"use_legacy_package_scan":false}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	Load()
-
-	if UseLegacyPackageScan || LegacyPackageScanPinned() {
-		t.Errorf("explicit use_legacy_package_scan=false did not clear the local legacy pin")
-	}
-}
-
-func TestLegacyPackageScanPinned(t *testing.T) {
-	oldConfigured, oldLegacy := legacyPackageScanConfigured, UseLegacyPackageScan
-	t.Cleanup(func() { legacyPackageScanConfigured = oldConfigured; UseLegacyPackageScan = oldLegacy })
-	for _, tc := range []struct{ configured, legacy, want bool }{{false, true, false}, {true, true, true}, {true, false, false}} {
-		legacyPackageScanConfigured, UseLegacyPackageScan = tc.configured, tc.legacy
-		if got := LegacyPackageScanPinned(); got != tc.want {
-			t.Fatalf("case=%+v got=%v", tc, got)
+// Old config files remain readable, but cannot select the package protocol.
+func TestConfigFileIgnoresRetiredPackageScanFlag(t *testing.T) {
+	for _, value := range []string{"true", "false"} {
+		var cfg ConfigFile
+		if err := json.Unmarshal([]byte(`{"use_legacy_package_scan":`+value+`,"customer_id":"tenant"}`), &cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.CustomerID != "tenant" {
+			t.Fatal("existing config did not load")
+		}
+		data, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(data, []byte("use_legacy_package_scan")) {
+			t.Fatal("retired flag was retained")
 		}
 	}
 }

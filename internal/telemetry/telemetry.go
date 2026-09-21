@@ -502,13 +502,11 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		endPhase(wslCtx, wslCancel, tracker, log, "wsl_scan")
 	}
 
-	// Delta requires this run's backend opt-in. Local configuration and the
-	// environment kill switch may disable it, but cannot bypass the backend.
+	// Delta requires this run's backend opt-in; there are no local overrides.
 	var scanState *state.State
 	var scanStatePath string
 	var scanStateFullSync bool
-	scanStateDisabled := !packageDeltaEnabled(cfg.DeltaScanEnabled, config.LegacyPackageScanPinned(), exec.Getenv("STEPSEC_DISABLE_SCAN_STATE"))
-	if !scanStateDisabled {
+	if cfg.DeltaScanEnabled {
 		scanStatePath = paths.ScanStateFile()
 		if scanStatePath != "" {
 			loaded, loadErr := state.Load(scanStatePath, buildinfo.Version)
