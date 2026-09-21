@@ -300,10 +300,11 @@ func associateSkillUsage(result *SkillsResult) {
 		return
 	}
 	type candidate struct {
-		identity string
-		names    []string
-		plugin   bool
-		usage    **model.SkillUsage
+		identity   string
+		definition string
+		names      []string
+		plugin     bool
+		usage      **model.SkillUsage
 	}
 	var candidates []candidate
 	for i := range result.Skills {
@@ -323,7 +324,10 @@ func associateSkillUsage(result *SkillsResult) {
 		if s.DefinitionPath != "" {
 			definition = s.DefinitionPath
 		}
-		candidates = append(candidates, candidate{identity: definition, names: names, usage: &s.Usage})
+		if s.DefinitionKind != model.AgentDefinitionCommand && s.SkillDirPath != "" {
+			definition = filepath.Join(s.SkillDirPath, "SKILL.md")
+		}
+		candidates = append(candidates, candidate{identity: definition, definition: definition, names: names, usage: &s.Usage})
 	}
 	if result.Plugins != nil {
 		for _, context := range result.Plugins.Contexts {
@@ -351,8 +355,29 @@ func associateSkillUsage(result *SkillsResult) {
 					if len(names) == 0 {
 						names = []string{plugin.Name + ":" + component.Name}
 					}
-					candidates = append(candidates, candidate{identity: identity, names: names, plugin: true, usage: usage})
+					definition := component.ResolvedDefinitionPath
+					if definition == "" {
+						definition = component.DefinitionPath
+					}
+					candidates = append(candidates, candidate{identity: identity, definition: definition, names: names, plugin: true, usage: usage})
 				}
+			}
+		}
+	}
+	physicalOwners := map[string]map[string]bool{}
+	for _, candidate := range candidates {
+		if candidate.plugin && candidate.definition != "" {
+			if physicalOwners[candidate.definition] == nil {
+				physicalOwners[candidate.definition] = map[string]bool{}
+			}
+			physicalOwners[candidate.definition][candidate.identity] = true
+		}
+	}
+	for i := range candidates {
+		candidate := &candidates[i]
+		if !candidate.plugin && len(physicalOwners[candidate.definition]) == 1 {
+			for identity := range physicalOwners[candidate.definition] {
+				candidate.identity = identity
 			}
 		}
 	}

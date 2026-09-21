@@ -338,9 +338,10 @@ type PluginComponent struct {
 	// How the agent invokes this declaration. Empty for kinds that are not invoked.
 	CallableNames []string `json:"callable_names"`
 
-	Skill     *AgentSkill             `json:"skill,omitempty"`
-	Command   *AgentCommandDefinition `json:"command,omitempty"`
-	MCPConfig *MCPConfigEnterprise    `json:"mcp_config,omitempty"`
+	Skill         *AgentSkill             `json:"skill,omitempty"`
+	Command       *AgentCommandDefinition `json:"command,omitempty"`
+	MCPConfig     *MCPConfigEnterprise    `json:"mcp_config,omitempty"`
+	MCPEnablement []EnablementObservation `json:"mcp_enablement,omitempty"`
 }
 
 // AgentCommandDefinition is a legacy command Markdown file — an actual file with

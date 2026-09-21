@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -58,6 +59,126 @@ func TestPluginDeclaredPaths(t *testing.T) {
 				t.Fatalf("insideRoot(%q) valid = %v, want %v", tc.path, ok, tc.valid)
 			}
 		})
+	}
+}
+
+func TestPluginExtendedDrivePath(t *testing.T) {
+	if got := cleanPluginPath(`\\?\C:\Users\test\catalog\marketplace.json`); got != filepath.Clean(`C:\Users\test\catalog\marketplace.json`) {
+		t.Fatalf("extended drive path: %q", got)
+	}
+	for _, value := range []string{`\\.\PhysicalDrive0`, `\\?\GLOBALROOT\Device\HarddiskVolume1`} {
+		if cleanPluginPath(value) != filepath.Clean(value) {
+			t.Fatalf("device path was reinterpreted: %q", value)
+		}
+	}
+}
+
+func TestPluginMacSystemAliasAbsent(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS system alias")
+	}
+	d := NewSkillsDetector(executor.NewReal())
+	s := &pluginScan{d: d, home: t.TempDir(), goos: model.PlatformDarwin}
+	root := "/etc/agent-plugin-regression-not-installed"
+	if state, _, err := s.stat(s.guarded(root), filepath.Join(root, "config.toml")); state != fileAbsent {
+		t.Fatalf("absent system config: state=%v err=%v", state, err)
+	}
+}
+
+func TestClaudeRegistryProjectSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name, project, local string
+		want                 *bool
+	}{
+		{"project disabled", `{"enabledPlugins":{"widgets@company":false}}`, "", boolPtr(false)},
+		{"local override", `{"enabledPlugins":{"widgets@company":false}}`, `{"enabledPlugins":{"widgets@company":true}}`, boolPtr(true)},
+		{"unreadable project", `{`, "", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, fs := newPluginMock()
+			cfg, project := filepath.Join(testHome, ".claude"), filepath.Join(testHome, "project-only")
+			fs.addFile(filepath.Join(cfg, "settings.json"), `{"enabledPlugins":{"widgets@company":true}}`)
+			fs.addFile(filepath.Join(project, ".claude/settings.json"), tc.project)
+			if tc.local != "" {
+				fs.addFile(filepath.Join(project, ".claude/settings.local.json"), tc.local)
+			}
+			fs.commit()
+			s := &pluginScan{d: NewSkillsDetector(m), home: testHome, goos: model.PlatformLinux}
+			a := &claudeAdapter{s: s, gd: s.guarded(cfg), configRoot: cfg, c: s.newContext(model.AgentClaudeCode, cfg, filepath.Join(cfg, "plugins"))}
+			a.layers = a.readSettingsLayers(map[string][]claudeRegistryRecord{"widgets@company": {{Scope: model.PluginScopeProject, ProjectPath: project}}})
+			p := newPlugin("widgets@company", "widgets", model.PluginInstallMarketplace, model.PluginScopeProject)
+			p.ProjectPath = project
+			a.enablement(p)
+			if !reflect.DeepEqual(p.EffectiveEnabled, tc.want) {
+				t.Fatalf("effective=%v, want %v", p.EffectiveEnabled, tc.want)
+			}
+			user := newPlugin("widgets@company", "widgets", model.PluginInstallMarketplace, model.PluginScopeUser)
+			a.enablement(user)
+			if user.EffectiveEnabled == nil || !*user.EffectiveEnabled {
+				t.Fatal("project override changed user installation")
+			}
+		})
+	}
+}
+
+func TestPluginLinkedPayloadAndContainedSkill(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native command-link installation is unsupported on Windows")
+	}
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(home, "source")
+	for _, dir := range []string{filepath.Join(payload, "skills/compress"), filepath.Join(payload, "canonical")} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	definition := filepath.Join(payload, "canonical/SKILL.md")
+	if err := os.WriteFile(definition, []byte(validFrontmatter("compress", "Summarize context")), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../canonical/SKILL.md", filepath.Join(payload, "skills/compress/SKILL.md")); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(home, "installed")
+	if err := os.Symlink(payload, root); err != nil {
+		t.Fatal(err)
+	}
+	d := NewSkillsDetector(executor.NewReal())
+	definitions := 0
+	s := &pluginScan{d: d, ctx: context.Background(), home: home, memo: map[string]*skillScan{}, definitions: &definitions, evidence: newPluginEvidence()}
+	p := newPlugin("widgets@company", "widgets", model.PluginInstallMarketplace, model.PluginScopeUser)
+	p.InstanceID = "instance"
+	r := &pluginRootScan{s: s, gd: s.guarded(root), p: p, root: root, attr: nestedAttr{agent: model.AgentClaudeCode}}
+	dirs := r.skillDirs(filepath.Join(root, "skills"), true)
+	if len(dirs) != 1 {
+		t.Fatalf("linked skill directories: %v", dirs)
+	}
+	r.skillComponent(dirs[0], "skills/compress", "compress", "widgets:compress")
+	if len(p.Components) != 1 || p.Components[0].Skill == nil || p.Components[0].ResolvedDefinitionPath != definition {
+		t.Fatalf("linked definition: %+v", p.Components)
+	}
+	if p.ComponentStatus != model.AgentScanStatusComplete {
+		t.Fatalf("linked payload incomplete: %+v", p.Errors)
+	}
+}
+
+func TestPluginUsageSharesPhysicalDefinition(t *testing.T) {
+	definition := filepath.Join(testHome, ".claude/skills/widgets/SKILL.md")
+	skill := &model.AgentSkill{Agent: model.AgentClaudeCode, SkillName: "widgets", SkillMDPath: definition}
+	result := SkillsResult{Skills: []model.AgentSkill{*skill}, Plugins: &model.AgentPlugins{Contexts: []model.AgentPluginContext{{Agent: model.AgentClaudeCode, Plugins: []model.PluginObservation{{NativeID: "widgets@skills-dir", Name: "widgets", Components: []model.PluginComponent{{Kind: model.PluginComponentSkill, Name: "widgets", DefinitionPath: definition, ResolvedDefinitionPath: definition, CallableNames: []string{"widgets"}, Skill: skill}}}}}}}, usage: &skillUsageObservations{CollectedAtMs: 100, Sources: []skillUsageSource{{SourceID: "source", Counters: []skillUsageCounter{{RawKey: "widgets", RecordedUses: 7}}}}}}
+	associateSkillUsage(&result)
+	for _, usage := range []*model.SkillUsage{result.Skills[0].Usage, skill.Usage} {
+		if usage == nil || usage.Availability != "available" || usage.RecordedUses == nil || *usage.RecordedUses != 7 {
+			t.Fatalf("shared usage: %+v", usage)
+		}
+	}
+	result.Skills[0].DefinitionPath = filepath.Join(testHome, "other/SKILL.md")
+	associateSkillUsage(&result)
+	if skill.Usage.Availability != "ambiguous" {
+		t.Fatalf("unrelated same-name skill inherited usage: %+v", skill.Usage)
 	}
 }
 
@@ -406,8 +527,8 @@ func TestPluginWindowsContextRoundTrip(t *testing.T) {
 			if err := json.Unmarshal(data, &decoded); err != nil {
 				t.Fatal(err)
 			}
-			if decoded.ConfigRoot != root {
-				t.Errorf("ConfigRoot = %q, want %q", decoded.ConfigRoot, root)
+			if want := cleanPluginPath(root); decoded.ConfigRoot != want {
+				t.Errorf("ConfigRoot = %q, want %q", decoded.ConfigRoot, want)
 			}
 			if got := s.contextID(decoded.Agent, decoded.ConfigRoot, decoded.PluginRoot); decoded.ContextID != got {
 				t.Errorf("ContextID = %q, want %q from serialized coordinates", decoded.ContextID, got)
@@ -481,9 +602,10 @@ func TestCodexScopedPreferencesStaySeparate(t *testing.T) {
 	home := filepath.Join(testHome, ".codex")
 	project := filepath.Join(testHome, "test-repo")
 	m.SetEnv("CODEX_HOME", home)
-	fs.addFile(filepath.Join(home, "config.toml"), "[plugins.'test-plugin@company']\nenabled = false\n")
-	fs.addFile(filepath.Join(project, ".codex/config.toml"), "[plugins.'test-plugin@company']\nenabled = true\n")
+	fs.addFile(filepath.Join(home, "config.toml"), "[plugins.'test-plugin@company']\nenabled = false\n[plugins.'test-plugin@company'.mcp_servers.docs]\nenabled = true\n[plugins.'other@company'.mcp_servers.docs]\nenabled = false\n")
+	fs.addFile(filepath.Join(project, ".codex/config.toml"), "[plugins.'test-plugin@company']\nenabled = true\n[plugins.'test-plugin@company'.mcp_servers.docs]\nenabled = false\n")
 	fs.addFile(filepath.Join(home, "plugins/cache/company/test-plugin/local/.codex-plugin/plugin.json"), `{"name":"test-plugin"}`)
+	fs.addFile(filepath.Join(home, "plugins/cache/company/test-plugin/local/.mcp.json"), `{"mcpServers":{"docs":{"url":"https://docs.example.com/mcp"},"other":{"command":"example-server"}}}`)
 	fs.commit()
 	result := NewSkillsDetector(m).DetectAll(context.Background(), []string{project}, nil)
 	if result.Plugins.PluginCount() != 1 {
@@ -492,6 +614,30 @@ func TestCodexScopedPreferencesStaySeparate(t *testing.T) {
 	p := result.Plugins.Contexts[0].Plugins[0]
 	if len(p.Enablement) != 2 || p.ConfiguredEnabled == nil || *p.ConfiguredEnabled || p.EffectiveEnabled != nil {
 		t.Fatalf("conflated scoped preferences: %+v", p)
+	}
+	for _, c := range p.Components {
+		if c.Name == "docs" {
+			if len(c.MCPEnablement) != 2 || !c.MCPEnablement[0].Enabled || c.MCPEnablement[1].Enabled || c.MCPEnablement[1].ProjectPath != project {
+				t.Fatalf("server policy = %+v", c.MCPEnablement)
+			}
+		} else if len(c.MCPEnablement) != 0 {
+			t.Fatalf("policy leaked to %s", c.Name)
+		}
+	}
+	fs.addFile(filepath.Join(project, ".codex/config.toml"), "[")
+	fs.commit()
+	result = NewSkillsDetector(m).DetectAll(context.Background(), []string{project}, nil)
+	for _, c := range result.Plugins.Contexts[0].Plugins[0].Components {
+		if c.Status != model.AgentScanStatusPartial {
+			t.Fatalf("failed settings reported complete: %+v", c)
+		}
+	}
+	p.Components[0].Status = model.AgentScanStatusComplete
+	p.ComponentStatus = model.AgentScanStatusComplete
+	a := codexAdapter{s: &pluginScan{projectsIncomplete: true}}
+	a.mcpEnablement(&p)
+	if p.Components[0].Status != model.AgentScanStatusPartial {
+		t.Fatal("project limit lost policy retention")
 	}
 }
 
@@ -612,13 +758,70 @@ func TestClaudeComponentSelection(t *testing.T) {
 	}
 }
 
+func TestCodexPortableValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name, extra string
+		valid       bool
+	}{
+		{"plain", "", true}, {"unknown legacy field", `,"interface":42`, true},
+		{"ignored extensions", `,"extensions":[]`, true}, {"ignored namespace", `,"extensions":{"com.openai":false}`, true},
+		{"null version", `,"version":null`, false}, {"bad author", `,"author":"publisher"`, false},
+		{"unknown author field", `,"author":{"company":"example"}`, false}, {"null keyword", `,"keywords":[null]`, false},
+		{"descriptive version", `,"version":"preview"`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(`{"$schema":"`+codexPortableSchema+`","name":"developer-tools"`+tc.extra+`}`), &fields); err != nil {
+				t.Fatal(err)
+			}
+			_, valid := parsePortableManifest(fields)
+			if valid != tc.valid {
+				t.Fatalf("valid = %v, want %v", valid, tc.valid)
+			}
+		})
+	}
+	for _, name := range []string{"", "Bad", "bad--name", "bad..name", "-bad", "bad_"} {
+		raw, _ := json.Marshal(name)
+		if _, ok := parsePortableManifest(map[string]json.RawMessage{"name": raw}); ok {
+			t.Fatalf("accepted name %q", name)
+		}
+	}
+	m, _ := newPluginMock()
+	d := NewSkillsDetector(m)
+	r := &pluginRootScan{s: &pluginScan{goos: model.PlatformWindows}, gd: d, root: testHome}
+	for _, tc := range []struct{ name, raw, code string }{
+		{"stdio", `{"type":"stdio","command":"example-server","args":[],"env":{},"cwd":"${PLUGIN_DATA}"}`, ""},
+		{"http", `{"type":"streamable-http","url":"https://docs.example.com/mcp"}`, ""},
+		{"loopback", `{"type":"streamable-http","url":"http://127.0.0.1:8000/mcp"}`, ""},
+		{"sse", `{"type":"sse","url":"https://docs.example.com/mcp"}`, model.AgentScanErrUnsupportedSchema},
+		{"missing type", `{"command":"example-server"}`, model.AgentScanErrParseFailed},
+		{"cross variant", `{"type":"stdio","command":"server","url":"https://example.com"}`, model.AgentScanErrParseFailed},
+		{"null args", `{"type":"stdio","command":"server","args":null}`, model.AgentScanErrParseFailed},
+		{"null argument", `{"type":"stdio","command":"server","args":[null]}`, model.AgentScanErrParseFailed},
+		{"reserved env", `{"type":"stdio","command":"server","env":{"plugin_root":"anything"}}`, model.AgentScanErrParseFailed},
+		{"escape", `{"type":"stdio","command":"./../server"}`, model.AgentScanErrParseFailed},
+		{"absolute", `{"type":"stdio","command":"/usr/bin/server"}`, model.AgentScanErrParseFailed},
+		{"bad cwd", `{"type":"stdio","command":"server","cwd":"${PLUGIN_DATA}/../escape"}`, model.AgentScanErrParseFailed},
+		{"remote http", `{"type":"streamable-http","url":"http://docs.example.com/mcp"}`, model.AgentScanErrParseFailed},
+		{"userinfo", `{"type":"streamable-http","url":"https://user@docs.example.com/mcp"}`, model.AgentScanErrParseFailed},
+		{"duplicate headers", `{"type":"streamable-http","url":"https://docs.example.com/mcp","headers":{"Accept":"a","accept":"b"}}`, model.AgentScanErrParseFailed},
+		{"unknown field", `{"type":"stdio","command":"server","enabled":true}`, model.AgentScanErrParseFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := r.portableMCPError(json.RawMessage(tc.raw)); got != tc.code {
+				t.Fatalf("error = %q, want %q", got, tc.code)
+			}
+		})
+	}
+}
+
 func TestCodexPortableDescriptiveComponents(t *testing.T) {
 	m, fs := newPluginMock()
 	home := filepath.Join(testHome, ".codex")
 	m.SetEnv("CODEX_HOME", home)
 	fs.addFile(filepath.Join(home, "config.toml"), "[plugins.'test-plugin@company']\nenabled = false\n")
 	root := filepath.Join(home, "plugins/cache/company/test-plugin/local")
-	fs.addFile(filepath.Join(root, "plugin.json"), `{"$schema":"`+codexPortableSchema+`","name":"test-plugin","skills":"ignored","extensions":{"com.openai":{"apps":"./.app.json","hooks":"./hooks.json"}}}`)
+	fs.addFile(filepath.Join(root, "plugin.json"), `{"$schema":"`+codexPortableSchema+`","name":"test-plugin","interface":42,"skills":"ignored","extensions":{"com.openai":{"apps":"./.app.json","hooks":"./hooks.json"}}}`)
 	fs.addFile(filepath.Join(root, ".app.json"), `{"apps":{"test-app":{"id":"connector_example"}}}`)
 	fs.addFile(filepath.Join(root, "hooks.json"), `{"hooks":{}}`)
 	fs.addSkill(filepath.Join(root, "skills/fixed"), "SKILL.md", validFrontmatter("fixed", "test"), nil)
@@ -639,6 +842,26 @@ func TestCodexPortableDescriptiveComponents(t *testing.T) {
 	slices.Sort(names)
 	if !slices.Equal(names, []string{"fixed", "hooks", "test-app"}) {
 		t.Fatalf("components = %v", names)
+	}
+	for _, envelope := range []string{
+		`{"$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json","mcpServers":{"docs":{"type":"streamable-http","url":"https://docs.example.com/mcp"},"invalid":{"command":"server"}}}`,
+		`{"mcpServers":{"docs":{"command":"server"}}}`,
+	} {
+		fs.addFile(filepath.Join(root, "mcp.json"), envelope)
+		fs.commit()
+		result = NewSkillsDetector(m).DetectAll(context.Background(), nil, nil)
+		p = result.Plugins.Contexts[0].Plugins[0]
+		if p.ComponentStatus == model.AgentScanStatusComplete {
+			t.Fatal("invalid MCP marked complete")
+		}
+		foundSkill, foundHTTP := false, false
+		for _, c := range p.Components {
+			foundSkill = foundSkill || c.Name == "fixed" && c.Skill != nil
+			foundHTTP = foundHTTP || c.Name == "docs" && c.MCPConfig != nil
+		}
+		if !foundSkill || (strings.Contains(envelope, "$schema") && !foundHTTP) {
+			t.Fatalf("valid siblings lost: %+v", p.Components)
+		}
 	}
 }
 

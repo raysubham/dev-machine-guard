@@ -216,6 +216,9 @@ func cleanPluginPath(p string) string {
 	if p == "" {
 		return ""
 	}
+	if len(p) >= 7 && strings.HasPrefix(p, `\\?\`) && p[5] == ':' && p[6] == '\\' && ((p[4] >= 'A' && p[4] <= 'Z') || (p[4] >= 'a' && p[4] <= 'z')) {
+		p = p[4:]
+	}
 	return filepath.Clean(p)
 }
 
@@ -311,6 +314,13 @@ func readCode(err error) string {
 // inside TCC-protected trees. Metadata reads are capped at maxJSONConfigBytes.
 func (s *pluginScan) guarded(roots ...string) *SkillsDetector {
 	all := append([]string{s.home}, roots...)
+	if s.goos == model.PlatformDarwin {
+		for _, root := range roots {
+			if strings.HasPrefix(root, "/etc/") {
+				all = append(all, "/private"+root)
+			}
+		}
+	}
 	all = append(all, s.searchDirs...)
 	all = append(all, s.projects...)
 	gd := *s.d
@@ -326,7 +336,11 @@ func (s *pluginScan) guarded(roots ...string) *SkillsDetector {
 // componentReader confines redirected component paths to the selected payload.
 func (d *SkillsDetector) componentReader(root string) *SkillsDetector {
 	gd := *d
-	gd.exec = d.exec.GuardedFiles([]string{root}, func(p string) string {
+	roots := []string{root}
+	if resolved, err := d.exec.EvalSymlinks(root); err == nil && resolved != root {
+		roots = append(roots, resolved)
+	}
+	gd.exec = d.exec.GuardedFiles(roots, func(p string) string {
 		if d.skipper.WithinProtected(p) {
 			return "tcc_protected"
 		}
@@ -748,7 +762,7 @@ func (r *pluginRootScan) skillComponent(dir, rel, name, callable string) {
 		r.addComponent(c)
 		return
 	}
-	if _, ok := findSkillMD(entries); !ok {
+	if !pluginSkillMD(entries) {
 		r.componentError(&c, model.AgentScanErrReadFailed)
 		r.addComponent(c)
 		return
@@ -757,6 +771,9 @@ func (r *pluginRootScan) skillComponent(dir, rel, name, callable string) {
 	if resolved, err := r.gd.exec.EvalSymlinks(dir); err == nil && resolved != "" {
 		resolvedDir = resolved
 		c.ResolvedDefinitionPath = filepath.Join(resolved, "SKILL.md")
+	}
+	if resolved, err := r.gd.exec.EvalSymlinks(c.DefinitionPath); err == nil {
+		c.ResolvedDefinitionPath = resolved
 	}
 	if r.s.d.skipper.WithinProtected(resolvedDir) {
 		r.componentError(&c, model.AgentScanErrUnsafePath)
@@ -798,7 +815,9 @@ func (r *pluginRootScan) skillComponent(dir, rel, name, callable string) {
 	applySkillMeta(&rec, meta)
 	c.Name = rec.SkillName
 	if callable != "" {
-		c.CallableNames = []string{strings.TrimSuffix(callable, name) + rec.SkillName}
+		if rel != "." || strings.Contains(callable, ":") {
+			c.CallableNames = []string{strings.TrimSuffix(callable, name) + rec.SkillName}
+		}
 		rec.CallableNames = c.CallableNames
 	}
 	applySkillCensus(&rec, scan.census)
@@ -868,6 +887,15 @@ func (r *pluginRootScan) mcpFileComponents(file, rel string, required bool) {
 	if absent {
 		code = model.AgentScanErrReadFailed
 	}
+	if code == "" && r.p.ManifestFormat == model.PluginManifestPortable {
+		if entries, err := r.gd.exec.ReadDir(filepath.Dir(file)); err == nil {
+			for _, entry := range entries {
+				if entry.Name() == filepath.Base(file) && entry.Type()&os.ModeSymlink != 0 {
+					code = model.AgentScanErrUnsupportedSchema
+				}
+			}
+		}
+	}
 	r.s.evidence.owned[filepath.Clean(file)] = true
 	if code != "" {
 		c := model.PluginComponent{Kind: model.PluginComponentMCP, Name: path.Base(rel), RelativePath: rel, DefinitionPath: file}
@@ -879,6 +907,12 @@ func (r *pluginRootScan) mcpFileComponents(file, rel string, required bool) {
 	if err := json.Unmarshal(data, &doc); err != nil || doc == nil {
 		c := model.PluginComponent{Kind: model.PluginComponentMCP, Name: path.Base(rel), RelativePath: rel, DefinitionPath: file}
 		r.componentError(&c, model.AgentScanErrParseFailed)
+		r.addComponent(c)
+		return
+	}
+	if r.p.ManifestFormat == model.PluginManifestPortable && (len(doc) != 2 || jsonString(doc["$schema"]) != "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json" || doc["mcpServers"] == nil) {
+		c := model.PluginComponent{Kind: model.PluginComponentMCP, Name: path.Base(rel), RelativePath: rel, DefinitionPath: file}
+		r.componentError(&c, model.AgentScanErrUnsupportedSchema)
 		r.addComponent(c)
 		return
 	}
@@ -911,6 +945,18 @@ func (r *pluginRootScan) mcpServerComponents(servers json.RawMessage, rel, point
 			return
 		}
 		r.s.mcpServers++
+		serverPointer := pointer
+		if pointer != "" {
+			serverPointer += "/" + strings.NewReplacer("~", "~0", "/", "~1").Replace(name)
+		}
+		if r.p.ManifestFormat == model.PluginManifestPortable {
+			if code := r.portableMCPError(declarations[name]); code != "" {
+				c := model.PluginComponent{Kind: model.PluginComponentMCP, Name: name, RelativePath: rel, DeclarationPointer: serverPointer, DefinitionPath: configPath}
+				r.componentError(&c, code)
+				r.addComponent(c)
+				continue
+			}
+		}
 		one, err := json.Marshal(map[string]json.RawMessage{name: declarations[name]})
 		filtered := filterServerFields(one)
 		if err != nil || filtered == nil || strings.TrimSpace(string(declarations[name])) == "null" {
@@ -922,10 +968,6 @@ func (r *pluginRootScan) mcpServerComponents(servers json.RawMessage, rel, point
 		body, err := json.Marshal(map[string]any{"mcpServers": filtered})
 		if err != nil {
 			continue
-		}
-		serverPointer := pointer
-		if pointer != "" {
-			serverPointer = pointer + "/" + strings.NewReplacer("~", "~0", "/", "~1").Replace(name)
 		}
 		c := model.PluginComponent{
 			Kind: model.PluginComponentMCP, Name: name, RelativePath: rel, DeclarationPointer: serverPointer, DefinitionPath: configPath, ResolvedDefinitionPath: resolvedPath,
@@ -961,7 +1003,7 @@ func (r *pluginRootScan) skillDirs(dir string, recursive bool) []string {
 			return
 		}
 		if depth > 0 {
-			if _, ok := findSkillMD(entries); ok {
+			if pluginSkillMD(entries) {
 				out = append(out, cur)
 				return
 			}
@@ -979,6 +1021,16 @@ func (r *pluginRootScan) skillDirs(dir string, recursive bool) []string {
 	}
 	walk(dir, 0)
 	return out
+}
+
+// Linked definitions are validated by the payload-confined reader before use.
+func pluginSkillMD(entries []os.DirEntry) bool {
+	for _, entry := range entries {
+		if entry.Name() == "SKILL.md" && (entry.Type().IsRegular() || entry.Type()&os.ModeSymlink != 0) {
+			return true
+		}
+	}
+	return false
 }
 
 // markdownFiles lists *.md regular files under dir, bounded, never following

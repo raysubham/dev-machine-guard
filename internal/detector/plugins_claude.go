@@ -222,8 +222,8 @@ func (s *pluginScan) managedSettingsPath() string {
 
 func (a *claudeAdapter) run() {
 	a.markets = map[string]*claudeMarket{}
-	a.layers = a.readSettingsLayers()
 	registry := a.readRegistry()
+	a.layers = a.readSettingsLayers(registry)
 	a.readMarketplaces()
 	a.readSeedMarketplaces()
 	a.registryPlugins(registry)
@@ -236,12 +236,27 @@ func (a *claudeAdapter) run() {
 // Settings layers
 // ---------------------------------------------------------------------------
 
-func (a *claudeAdapter) readSettingsLayers() []claudeSettingsLayer {
+func (a *claudeAdapter) readSettingsLayers(registry map[string][]claudeRegistryRecord) []claudeSettingsLayer {
 	layers := []claudeSettingsLayer{
 		a.readSettings(a.s.managedSettingsPath(), model.PluginScopeSystem, ""),
 		a.readSettings(filepath.Join(a.configRoot, "settings.json"), model.PluginScopeUser, ""),
 	}
-	for _, proj := range a.s.projects {
+	projects := map[string]bool{}
+	for _, project := range a.s.projects {
+		projects[project] = true
+	}
+	for _, records := range registry {
+		for _, record := range records {
+			if record.ProjectPath != "" && (record.Scope == model.PluginScopeProject || record.Scope == model.PluginScopeLocal) {
+				projects[cleanPluginPath(record.ProjectPath)] = true
+			}
+		}
+	}
+	for i, proj := range sortedMapKeys(projects) {
+		if i >= maxProjects {
+			degrade(&a.c.MarketplaceStatus, model.AgentScanStatusPartial)
+			break
+		}
 		layers = append(layers,
 			a.readSettings(filepath.Join(proj, ".claude", "settings.json"), model.PluginScopeProject, proj),
 			a.readSettings(filepath.Join(proj, ".claude", "settings.local.json"), model.PluginScopeLocal, proj))
@@ -354,7 +369,7 @@ func (a *claudeAdapter) readMarketplaces() {
 		m.obs.LastRefreshedAtMs = parseNativeTimeMs(km.LastUpdated)
 		if km.InstallLocation != "" {
 			m.obs.CatalogPath = cleanPluginPath(km.InstallLocation)
-			a.loadCatalog(m, km.InstallLocation)
+			a.loadCatalog(m, m.obs.CatalogPath)
 		}
 	}
 	// Settings-declared catalogs: an explicit auto-update preference for a
@@ -830,6 +845,7 @@ func (a *claudeAdapter) enablement(p *model.PluginObservation) {
 	order := []string{model.PluginScopeUser, model.PluginScopeProject, model.PluginScopeLocal, model.PluginScopeSystem}
 	projectScoped := p.Scope == model.PluginScopeProject || p.Scope == model.PluginScopeLocal
 	allReadable := true
+	projectRead := !projectScoped
 	var effective *bool
 	for _, scope := range order {
 		for _, layer := range a.layers {
@@ -838,6 +854,9 @@ func (a *claudeAdapter) enablement(p *model.PluginObservation) {
 			}
 			if layer.projectPath != "" && (!projectScoped || layer.projectPath != p.ProjectPath) {
 				continue
+			}
+			if projectScoped && layer.projectPath == p.ProjectPath && layer.scope == model.PluginScopeProject {
+				projectRead = true
 			}
 			if !layer.ok {
 				allReadable = false
@@ -853,7 +872,7 @@ func (a *claudeAdapter) enablement(p *model.PluginObservation) {
 			}
 		}
 	}
-	if allReadable && p.InstallationKind != model.PluginInstallSynced {
+	if allReadable && projectRead && p.InstallationKind != model.PluginInstallSynced {
 		p.EffectiveEnabled = effective
 	}
 }
@@ -996,8 +1015,8 @@ func (a *claudeAdapter) components(p *model.PluginObservation, entry *claudeCata
 	if !sharedRoot || !selectedSkills {
 		a.skillsUnder(r, filepath.Join(root, "skills"), namespace)
 		if entries, _ := a.s.listDir(a.gd, root); entries != nil {
-			if _, ok := findSkillMD(entries); ok {
-				r.skillComponent(root, ".", p.Name, namespace+":"+p.Name)
+			if pluginSkillMD(entries) {
+				r.skillComponent(root, ".", p.Name, namespace)
 			}
 		}
 	}
@@ -1117,7 +1136,7 @@ func (a *claudeAdapter) skillsUnder(r *pluginRootScan, dir, namespace string) {
 	}
 	dirs := []string{dir}
 	if entries, _ := a.s.listDir(r.gd, dir); entries != nil {
-		if _, ok := findSkillMD(entries); !ok {
+		if !pluginSkillMD(entries) {
 			dirs = r.skillDirs(dir, true)
 		}
 	}

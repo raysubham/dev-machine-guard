@@ -3,6 +3,8 @@ package detector
 import (
 	"encoding/json"
 	"maps"
+	"net"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -61,13 +63,17 @@ type codexMarketplaceCfg struct {
 type codexConfig struct {
 	Marketplaces map[string]codexMarketplaceCfg `toml:"marketplaces"`
 	Plugins      map[string]struct {
-		Enabled *bool `toml:"enabled"`
+		Enabled    *bool `toml:"enabled"`
+		MCPServers map[string]struct {
+			Enabled *bool `toml:"enabled"`
+		} `toml:"mcp_servers"`
 	} `toml:"plugins"`
 }
 
 type codexLayer struct {
 	path, scope, project string
 	config               codexConfig
+	failed               bool
 }
 
 type codexMarketplaceMarkerFile struct {
@@ -212,6 +218,8 @@ func (a *codexAdapter) readConfigs() {
 			degrade(&a.c.MarketplaceStatus, model.AgentScanStatusPartial)
 			degrade(&a.c.InstallationStatus, model.AgentScanStatusPartial)
 			scanError(&a.c.Errors, model.AgentScanError{Code: code, SourcePath: layer.path})
+			layer.failed = true
+			a.layers = append(a.layers, layer)
 			continue
 		}
 		if a.cfg.Marketplaces == nil {
@@ -278,7 +286,7 @@ func (a *codexAdapter) readMarketplaces() {
 		case "local":
 			loc.Kind, loc.Location = model.PluginSourceLocal, cleanPluginPath(cfg.Source)
 			if isAbsPath(cfg.Source) && !a.s.d.skipper.WithinProtected(cfg.Source) {
-				m.root = filepath.Clean(cfg.Source)
+				m.root = cleanPluginPath(cfg.Source)
 			} else {
 				scanError(&a.c.Errors, model.AgentScanError{Code: model.AgentScanErrUnsafePath, SourcePath: cfg.Source})
 				degrade(&a.c.MarketplaceStatus, model.AgentScanStatusPartial)
@@ -574,7 +582,33 @@ func (a *codexAdapter) plugin(nativeID string) {
 		p.SourcePath = ""
 	}
 	if a.s.addPlugin(a.c, p) {
-		a.components(&a.c.Plugins[len(a.c.Plugins)-1])
+		p := &a.c.Plugins[len(a.c.Plugins)-1]
+		a.components(p)
+		a.mcpEnablement(p)
+	}
+}
+
+func (a *codexAdapter) mcpEnablement(p *model.PluginObservation) {
+	for i := range p.Components {
+		c := &p.Components[i]
+		if c.Kind != model.PluginComponentMCP {
+			continue
+		}
+		if a.s.projectsIncomplete {
+			degrade(&c.Status, model.AgentScanStatusPartial)
+			degrade(&p.ComponentStatus, model.AgentScanStatusPartial)
+		}
+		for _, layer := range a.layers {
+			if layer.failed {
+				degrade(&c.Status, model.AgentScanStatusPartial)
+				degrade(&p.ComponentStatus, model.AgentScanStatusPartial)
+				continue
+			}
+			server := layer.config.Plugins[p.NativeID].MCPServers[c.Name]
+			if server.Enabled != nil {
+				c.MCPEnablement = append(c.MCPEnablement, model.EnablementObservation{Scope: layer.scope, SourcePath: layer.path, ProjectPath: layer.project, Enabled: *server.Enabled})
+			}
+		}
 	}
 }
 
@@ -904,14 +938,19 @@ func (a *codexAdapter) selectManifest(root string) (format, manifestPath string,
 		if code != "" {
 			return "", rootManifest, mf, code
 		}
-		var probe codexManifest
-		if json.Unmarshal(data, &probe) != nil {
+		var probe map[string]json.RawMessage
+		if json.Unmarshal(data, &probe) != nil || probe == nil {
 			return "", rootManifest, mf, model.AgentScanErrParseFailed
 		}
+		schema := jsonString(probe["$schema"])
 		switch {
-		case probe.Schema == codexPortableSchema:
-			return model.PluginManifestPortable, rootManifest, probe, ""
-		case strings.HasPrefix(probe.Schema, codexPortablePrefix):
+		case schema == codexPortableSchema:
+			mf, valid := parsePortableManifest(probe)
+			if !valid {
+				return "", rootManifest, mf, model.AgentScanErrParseFailed
+			}
+			return model.PluginManifestPortable, rootManifest, mf, ""
+		case strings.HasPrefix(schema, codexPortablePrefix):
 			return "", rootManifest, mf, model.AgentScanErrUnsupportedSchema
 		}
 	}
@@ -930,6 +969,203 @@ func (a *codexAdapter) selectManifest(root string) (format, manifestPath string,
 		return legacy.format, p, mf, ""
 	}
 	return "", "", mf, ""
+}
+
+func decodePortableValue(raw json.RawMessage, target any) bool {
+	if _, ok := target.(*[]string); ok {
+		var values []json.RawMessage
+		if json.Unmarshal(raw, &values) != nil {
+			return false
+		}
+		for _, value := range values {
+			var text string
+			if !decodePortableValue(value, &text) {
+				return false
+			}
+		}
+	}
+	return len(raw) > 0 && strings.TrimSpace(string(raw)) != "null" && json.Unmarshal(raw, target) == nil
+}
+
+func parsePortableManifest(fields map[string]json.RawMessage) (codexManifest, bool) {
+	var mf codexManifest
+	for key, dst := range map[string]*string{"$schema": &mf.Schema, "name": &mf.Name, "version": &mf.Version, "description": &mf.Description, "homepage": &mf.Homepage} {
+		if raw, exists := fields[key]; exists && !decodePortableValue(raw, dst) {
+			return mf, false
+		}
+	}
+	name := mf.Name
+	if name == "" || len(name) > 64 || strings.Contains(name, "--") || strings.Contains(name, "..") || strings.ContainsAny(name[:1]+name[len(name)-1:], ".-") {
+		return mf, false
+	}
+	for _, ch := range name {
+		if !(ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '.' || ch == '-') {
+			return mf, false
+		}
+	}
+	for _, key := range []string{"repository", "license"} {
+		var value string
+		if raw, exists := fields[key]; exists && !decodePortableValue(raw, &value) {
+			return mf, false
+		}
+	}
+	if raw, exists := fields["keywords"]; exists {
+		var keywords []string
+		if !decodePortableValue(raw, &keywords) {
+			return mf, false
+		}
+	}
+	if raw, exists := fields["author"]; exists {
+		var author map[string]json.RawMessage
+		if !decodePortableValue(raw, &author) {
+			return mf, false
+		}
+		for key, value := range author {
+			var text string
+			if key != "name" && key != "email" && key != "url" || !decodePortableValue(value, &text) {
+				return mf, false
+			}
+		}
+		mf.Author = raw
+	}
+	var extensions map[string]json.RawMessage
+	if decodePortableValue(fields["extensions"], &extensions) {
+		var overlay map[string]json.RawMessage
+		if decodePortableValue(extensions["com.openai"], &overlay) {
+			mf.Extensions.OpenAI = extensions["com.openai"]
+		}
+	}
+	return mf, true
+}
+
+// portableMCPError validates only the portable format, not legacy MCP JSON.
+func (r *pluginRootScan) portableMCPError(raw json.RawMessage) string {
+	bad := model.AgentScanErrParseFailed
+	var fields map[string]json.RawMessage
+	if !decodePortableValue(raw, &fields) {
+		return bad
+	}
+	typ := jsonString(fields["type"])
+	if typ != "stdio" && typ != "streamable-http" && typ != "sse" {
+		return bad
+	}
+	for key, raw := range fields {
+		switch key {
+		case "type", "command", "cwd", "url":
+			var value string
+			if !decodePortableValue(raw, &value) {
+				return bad
+			}
+			if typ == "stdio" && key == "url" || typ != "stdio" && (key == "command" || key == "cwd") {
+				return bad
+			}
+		case "args":
+			var values []string
+			if typ != "stdio" || !decodePortableValue(raw, &values) {
+				return bad
+			}
+		case "env", "headers":
+			var values map[string]json.RawMessage
+			if typ == "stdio" && key == "headers" || typ != "stdio" && key == "env" || !decodePortableValue(raw, &values) {
+				return bad
+			}
+			seen := map[string]bool{}
+			for name, raw := range values {
+				var value string
+				if !decodePortableValue(raw, &value) {
+					return bad
+				}
+				if key == "env" {
+					if r.s.goos == model.PlatformWindows {
+						name = strings.ToUpper(name)
+					}
+					if name == "PLUGIN_ROOT" || name == "PLUGIN_DATA" {
+						return bad
+					}
+				} else {
+					lower := strings.ToLower(name)
+					if name == "" || seen[lower] {
+						return bad
+					}
+					seen[lower] = true
+					for _, ch := range name {
+						if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || strings.ContainsRune("!#$%&'*+-.^_`|~", ch)) {
+							return bad
+						}
+					}
+					for _, ch := range value {
+						if ch < 32 && ch != '\t' || ch == 127 {
+							return bad
+						}
+					}
+				}
+			}
+		default:
+			return bad
+		}
+	}
+	if typ == "stdio" {
+		command := jsonString(fields["command"])
+		if command == "" {
+			return bad
+		}
+		if strings.HasPrefix(command, "./") {
+			if !r.portablePath(command[2:], true) {
+				return bad
+			}
+		} else if strings.ContainsAny(command, "/\\:") || strings.Contains(command, "${") || command == "." || command == ".." {
+			return bad
+		}
+		if raw, exists := fields["cwd"]; exists {
+			cwd := jsonString(raw)
+			switch {
+			case cwd == "${PLUGIN_ROOT}", cwd == "${PLUGIN_DATA}":
+			case strings.HasPrefix(cwd, "./"):
+				if !r.portablePath(cwd[2:], true) {
+					return bad
+				}
+			case strings.HasPrefix(cwd, "${PLUGIN_ROOT}/"):
+				if !r.portablePath(strings.TrimPrefix(cwd, "${PLUGIN_ROOT}/"), true) {
+					return bad
+				}
+			case strings.HasPrefix(cwd, "${PLUGIN_DATA}/"):
+				if !r.portablePath(strings.TrimPrefix(cwd, "${PLUGIN_DATA}/"), false) {
+					return bad
+				}
+			default:
+				return bad
+			}
+		}
+		return ""
+	}
+	u, err := url.Parse(jsonString(fields["url"]))
+	if err != nil || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.Scheme != "https" && u.Scheme != "http" {
+		return bad
+	}
+	if u.Scheme == "http" && u.Hostname() != "localhost" && !net.ParseIP(u.Hostname()).IsLoopback() {
+		return bad
+	}
+	if typ == "sse" {
+		return model.AgentScanErrUnsupportedSchema
+	}
+	return ""
+}
+
+func (r *pluginRootScan) portablePath(suffix string, checkLink bool) bool {
+	if suffix == "" || strings.ContainsAny(suffix, "\\\x00") {
+		return false
+	}
+	clean := path.Clean(suffix)
+	if path.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
+		return false
+	}
+	if checkLink {
+		_, err := r.gd.exec.EvalSymlinks(filepath.Join(r.root, filepath.FromSlash(clean)))
+		if err != nil && !os.IsNotExist(err) {
+			return false
+		}
+	}
+	return true
 }
 
 // legacySkillPaths accepts the legacy skills field forms: a path, a list of
@@ -965,7 +1201,7 @@ func (a *codexAdapter) skillsUnder(r *pluginRootScan, dir string, recursive bool
 	dirs := r.skillDirs(dir, recursive)
 	if recursive {
 		if entries, _ := a.s.listDir(r.gd, dir); entries != nil {
-			if _, ok := findSkillMD(entries); ok {
+			if pluginSkillMD(entries) {
 				dirs = []string{dir}
 			}
 		}

@@ -13,6 +13,29 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/executor"
 )
 
+func TestCodexMCPContent(t *testing.T) {
+	d := &MCPDetector{}
+	content := []byte("model = 'example'\n[mcp_servers.docs]\nurl = 'https://docs.example.com/mcp'\nenabled = false\nhttp_headers = { Authorization = 'private-value' }\n[mcp_servers.local]\ncommand = 'example-server'\nargs = ['--workspace', '/work']\nenv = { API_KEY = 'private-value' }\n[plugins.'tools@catalog'.mcp_servers.other]\nenabled = true\n")
+	filtered, ok := d.filterMCPContent("codex", "/home/test/.codex/config.toml", content)
+	if !ok || strings.Contains(string(filtered), "private-value") || strings.Contains(string(filtered), "plugins") || strings.Contains(string(filtered), "model") {
+		t.Fatalf("unexpected filtered content: %s", filtered)
+	}
+	if !strings.Contains(string(filtered), "mcp_servers.docs") || !strings.Contains(string(filtered), "mcp_servers.local") {
+		t.Fatalf("missing server: %s", filtered)
+	}
+	for _, malformed := range []string{"[", "[mcp_servers]\ndocs = 42", "model='example'"} {
+		if _, ok := d.filterMCPContent("codex", "/home/test/.codex/config.toml", []byte(malformed)); ok {
+			t.Fatalf("accepted invalid or unrelated config: %s", malformed)
+		}
+	}
+	m := executor.NewMock()
+	m.SetEnv("CODEX_HOME", filepath.Join(testHome, "custom-codex"))
+	d.exec = m
+	if got := d.resolveConfigPath(mcpConfigSpec{SourceName: "codex"}, testHome); got != filepath.Join(testHome, "custom-codex/config.toml") {
+		t.Fatalf("custom root = %s", got)
+	}
+}
+
 func TestDiscoverClaudeProjectsPreservesProjectKeys(t *testing.T) {
 	for _, tc := range []struct {
 		name, contents string
@@ -824,9 +847,9 @@ func TestFilterMCPContent_NonOpenCodeUnchanged(t *testing.T) {
 			true, `{"servers":{"fs":{"command":"npx"}}}`,
 		},
 		{
-			"codex toml still emits nothing", "codex", "/Users/testuser/.codex/config.toml",
+			"codex toml", "codex", "/Users/testuser/.codex/config.toml",
 			"[mcp_servers.fs]\ncommand = \"npx\"\n",
-			false, "",
+			true, "[mcp_servers]\n[mcp_servers.fs]\ncommand = 'npx'\n",
 		},
 	}
 
