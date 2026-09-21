@@ -185,9 +185,9 @@ func TestConfigFile_InstallDir_JSONRoundTrip(t *testing.T) {
 
 // The delta upload protocol ships on. This pins the default so flipping it
 // back becomes a deliberate, visible change rather than an accident.
-func TestUseLegacyPackageScan_DefaultsToDeltaEnabled(t *testing.T) {
-	if UseLegacyPackageScan {
-		t.Error("UseLegacyPackageScan should default to false (delta upload enabled)")
+func TestUseLegacyPackageScan_DefaultsToLegacy(t *testing.T) {
+	if !UseLegacyPackageScan {
+		t.Error("UseLegacyPackageScan should default to true (legacy upload enabled)")
 	}
 }
 
@@ -210,8 +210,7 @@ func TestConfigFile_UseLegacyPackageScan_JSONRoundTrip(t *testing.T) {
 		t.Errorf("UseLegacyPackageScan round-trip = %v, want true", out.UseLegacyPackageScan)
 	}
 
-	// An explicit false must survive the round trip — it's how a config opts
-	// the delta protocol on for a fleet.
+	// An explicit false must survive the round trip to clear a local opt-out.
 	enabled := false
 	data, err = json.Marshal(ConfigFile{UseLegacyPackageScan: &enabled})
 	if err != nil {
@@ -272,8 +271,8 @@ func TestLoad_IncludeNetworkVolumes_AppliedFromFile(t *testing.T) {
 
 func TestLoad_UseLegacyPackageScan_AppliedFromFile(t *testing.T) {
 	// Save and restore package var.
-	prev := UseLegacyPackageScan
-	t.Cleanup(func() { UseLegacyPackageScan = prev })
+	prev, configured := UseLegacyPackageScan, legacyPackageScanConfigured
+	t.Cleanup(func() { UseLegacyPackageScan = prev; legacyPackageScanConfigured = configured })
 	UseLegacyPackageScan = false
 
 	dir := t.TempDir()
@@ -290,16 +289,15 @@ func TestLoad_UseLegacyPackageScan_AppliedFromFile(t *testing.T) {
 
 	Load()
 
-	if !UseLegacyPackageScan {
+	if !UseLegacyPackageScan || !LegacyPackageScanPinned() {
 		t.Errorf("Load did not propagate use_legacy_package_scan from config.json")
 	}
 }
 
-func TestLoad_UseLegacyPackageScan_FalseReEnablesFromFile(t *testing.T) {
-	// An explicit false in config.json must hold the package var on the delta
-	// protocol even when something earlier pinned it to legacy.
-	prev := UseLegacyPackageScan
-	t.Cleanup(func() { UseLegacyPackageScan = prev })
+func TestLoad_UseLegacyPackageScan_FalseClearsLocalOptOut(t *testing.T) {
+	// An explicit false clears the local legacy pin; the backend still decides.
+	prev, configured := UseLegacyPackageScan, legacyPackageScanConfigured
+	t.Cleanup(func() { UseLegacyPackageScan = prev; legacyPackageScanConfigured = configured })
 	UseLegacyPackageScan = true
 
 	dir := t.TempDir()
@@ -315,7 +313,18 @@ func TestLoad_UseLegacyPackageScan_FalseReEnablesFromFile(t *testing.T) {
 
 	Load()
 
-	if UseLegacyPackageScan {
-		t.Errorf("explicit use_legacy_package_scan=false did not re-enable the delta protocol")
+	if UseLegacyPackageScan || LegacyPackageScanPinned() {
+		t.Errorf("explicit use_legacy_package_scan=false did not clear the local legacy pin")
+	}
+}
+
+func TestLegacyPackageScanPinned(t *testing.T) {
+	oldConfigured, oldLegacy := legacyPackageScanConfigured, UseLegacyPackageScan
+	t.Cleanup(func() { legacyPackageScanConfigured = oldConfigured; UseLegacyPackageScan = oldLegacy })
+	for _, tc := range []struct{ configured, legacy, want bool }{{false, true, false}, {true, true, true}, {true, false, false}} {
+		legacyPackageScanConfigured, UseLegacyPackageScan = tc.configured, tc.legacy
+		if got := LegacyPackageScanPinned(); got != tc.want {
+			t.Fatalf("case=%+v got=%v", tc, got)
+		}
 	}
 }

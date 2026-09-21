@@ -34,20 +34,11 @@ var (
 	HTMLOutputFile        string // "" means not set
 	LogLevel              string // "" means default (info); one of error/warn/info/debug
 	InstallDir            string // "" means default (~/.stepsecurity); non-empty makes the agent put all its files (logs, hook errors, future state) under this directory. Bootstrap config.json itself stays at the legacy location. Per-run opt-out is the CLI flag --install-dir=. Resolution: --install-dir flag > STEPSECURITY_HOME env > this field > default — see internal/paths.
-	// UseLegacyPackageScan, when true, disables the scan-state delta-upload
-	// optimization for npm and Python project scans — every run re-uploads
-	// the full snapshot as in pre-1.13 agents.
-	//
-	// Defaults to false: the delta protocol is ON. A run uploads full package
-	// bodies only for projects whose inventory hash changed, plus refs for the
-	// unchanged and removed ones, and re-asserts everything on a full sync
-	// (weekly, or after an agent-version change). Requires a backend that
-	// understands payload_schema_version 1.
-	//
-	// Set use_legacy_package_scan=true in config.json to pin a fleet back to
-	// full-snapshot uploads. STEPSEC_DISABLE_SCAN_STATE=1 forces legacy for a
-	// single run and always wins; STEPSEC_ENABLE_SCAN_STATE=1 forces delta on.
-	UseLegacyPackageScan = false
+	// UseLegacyPackageScan defaults to legacy uploads. An explicit true in
+	// config.json also pins legacy when the backend opts this tenant into delta.
+	// An explicit false cannot enable delta without backend authorization.
+	UseLegacyPackageScan        = true
+	legacyPackageScanConfigured bool
 
 	// UseLegacyNodeScan, when true, reverts Node.js package discovery to the
 	// command-based path (`npm ls` / `yarn list` / `pnpm ls` / `bun pm ls`,
@@ -254,6 +245,7 @@ func Load() {
 		MaxExecutionDuration = cfg.MaxExecutionDuration
 	}
 	if cfg.UseLegacyPackageScan != nil {
+		legacyPackageScanConfigured = true
 		UseLegacyPackageScan = *cfg.UseLegacyPackageScan
 	}
 	if cfg.UseLegacyNodeScan != nil {
@@ -828,4 +820,10 @@ func PersistMaxExecutionDuration(value string) error {
 	}
 	existing.MaxExecutionDuration = value
 	return save(existing)
+}
+
+// LegacyPackageScanPinned reports an explicit local opt-out, rather than the
+// default value, so a tenant's backend opt-in can enable delta on fresh installs.
+func LegacyPackageScanPinned() bool {
+	return legacyPackageScanConfigured && UseLegacyPackageScan
 }

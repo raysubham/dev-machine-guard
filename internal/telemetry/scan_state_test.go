@@ -442,3 +442,42 @@ func TestDelta_FailedVenvPreservesPriorInventoryAndRetries(t *testing.T) {
 		t.Fatal("successful retry did not upload changed inventory")
 	}
 }
+
+func TestPackageDeltaRequiresBackendAuthorization(t *testing.T) {
+	t.Setenv("STEPSEC_ENABLE_SCAN_STATE", "1")
+	for _, backend := range []bool{false, true} {
+		for _, local := range []bool{false, true} {
+			for _, disable := range []string{"", "1"} {
+				want := backend && !local && disable != "1"
+				if got := packageDeltaEnabled(backend, local, disable); got != want {
+					t.Fatalf("backend=%v local=%v disable=%q got=%v", backend, local, disable, got)
+				}
+			}
+		}
+	}
+}
+
+func TestLegacyTransitionDiscardsOldDeltaBaseline(t *testing.T) {
+	path := tempStateFile(t)
+	s := state.New(buildinfo.Version)
+	s.CommitAfterUpload(time.Now(), "old-upload", buildinfo.Version, []state.ScanRecord{{Path: "/project", Hash: "A"}}, nil, nil, nil, true)
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	// A legacy run can upload B, then the inventory can return to A. The old
+	// A hash must not let the next delta run reference the pre-legacy upload.
+	if err := state.Invalidate(path); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := state.Load(path, buildinfo.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.IsFullSyncDue(time.Now(), buildinfo.Version, state.DefaultFullSyncHorizon) {
+		t.Fatal("expected fresh full sync")
+	}
+	changed, unchanged := loaded.Partition(state.EcosystemNPM, []state.ScanRecord{{Path: "/project", Hash: "A"}}, false)
+	if len(changed) != 1 || len(unchanged) != 0 {
+		t.Fatal("reused stale inventory reference")
+	}
+}
