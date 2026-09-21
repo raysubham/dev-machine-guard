@@ -1301,18 +1301,24 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	// itself cannot wedge the agent indefinitely.
 	phaseCtx, phaseCancel = startPhase(runCtx, tracker, "telemetry_upload")
 	log.Progress("Requesting upload URL from backend...")
-	if err := uploadToS3(phaseCtx, log, payload, executionID, tracker, capture); err != nil {
+	ingest, uploadErr := uploadToS3(phaseCtx, log, payload, executionID, tracker, capture)
+	if uploadErr != nil {
 		endPhase(phaseCtx, phaseCancel, tracker, log, "telemetry_upload")
 		// Force-attach a final tail capturing the upload-failure output before
 		// returning. The deferred failure report carries no status_info (and so
 		// can't ship a tail itself); this progress upsert lands the tail on the
 		// row, which the subsequent "failed" transition preserves.
 		postPhaseFinal()
-		return fmt.Errorf("uploading telemetry: %w", err)
+		return fmt.Errorf("uploading telemetry: %w", uploadErr)
 	}
 	endPhase(phaseCtx, phaseCancel, tracker, log, "telemetry_upload")
 
-	if snap != nil {
+	if snap != nil && ingest == ingestRejected {
+		// Leaving scan-state uncommitted keeps our predecessor identity aligned
+		// with what the backend actually holds, so the next run re-sends the same
+		// refs rather than claiming an upload the backend discarded.
+		log.Warn("scan-state: backend rejected the payload — not advancing scan state")
+	} else if snap != nil {
 		if err := commitDeltaSnapshot(scanState, snap, scanStatePath, executionID, buildinfo.Version); err != nil {
 			log.Warn("scan-state: save failed (%v) — next run will full-sync", err)
 		} else {
@@ -1421,7 +1427,45 @@ func collectProjectRoots(nodeProjects []model.NodeScanResult, pythonProjects []m
 	return out
 }
 
-func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, executionID string, tracker *PhaseTracker, capture *LogCapture) error {
+// ingestStatus is what the backend's process-uploaded response claims about the
+// payload we just handed it. The endpoint only enqueues, so "queued" proves
+// nothing about persistence and must stay indistinguishable from no answer at
+// all — a backend that never adopts the richer values keeps today's behaviour.
+type ingestStatus int
+
+const (
+	// ingestUnknown = queued, absent, or unparseable. The payload may or may not
+	// have been persisted.
+	ingestUnknown ingestStatus = iota
+	// ingestProcessed = the backend persisted the payload.
+	ingestProcessed
+	// ingestRejected = the backend will not persist the payload, so the snapshot
+	// it describes was never stored.
+	ingestRejected
+)
+
+// maxNotifyResponseBytes caps the notify body we read. It is a status envelope,
+// not data.
+const maxNotifyResponseBytes = 4 << 10
+
+func parseIngestStatus(body []byte) ingestStatus {
+	var resp struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return ingestUnknown
+	}
+	switch resp.Status {
+	case "processed", "ingested":
+		return ingestProcessed
+	case "failed", "rejected":
+		return ingestRejected
+	default:
+		return ingestUnknown
+	}
+}
+
+func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, executionID string, tracker *PhaseTracker, capture *LogCapture) (ingestStatus, error) {
 	// updateDetail forwards sub-progress to the heartbeat goroutine via the
 	// tracker. Tolerates nil so the function stays callable from tests that
 	// don't supply a tracker.
@@ -1434,7 +1478,7 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 	updateDetail("compressing payload")
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshaling payload: %w", err)
+		return ingestUnknown, fmt.Errorf("marshaling payload: %w", err)
 	}
 
 	// Gzip-compress the payload before upload. The backend signals support by
@@ -1442,7 +1486,7 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 	// to the S3 key, which tells GetTelemetryFromS3 to decompress on read.
 	compressedPayload, err := gzipBytes(payloadJSON)
 	if err != nil {
-		return fmt.Errorf("compressing payload: %w", err)
+		return ingestUnknown, fmt.Errorf("compressing payload: %w", err)
 	}
 	updateDetail("requesting upload URL")
 
@@ -1457,7 +1501,7 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURLEndpoint, bytes.NewReader(reqBody))
 	if err != nil {
-		return fmt.Errorf("creating upload URL request: %w", err)
+		return ingestUnknown, fmt.Errorf("creating upload URL request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+config.APIKey)
@@ -1466,7 +1510,7 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("requesting upload URL: %w", err)
+		return ingestUnknown, fmt.Errorf("requesting upload URL: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -1475,13 +1519,13 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 		S3Key     string `json:"s3_key"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&urlResp); err != nil {
-		return fmt.Errorf("decoding upload URL response: %w", err)
+		return ingestUnknown, fmt.Errorf("decoding upload URL response: %w", err)
 	}
 
 	log.Debug("upload URL response: status=%d s3_key=%q url_len=%d", resp.StatusCode, urlResp.S3Key, len(urlResp.UploadURL))
 
 	if urlResp.UploadURL == "" {
-		return fmt.Errorf("empty upload URL in response")
+		return ingestUnknown, fmt.Errorf("empty upload URL in response")
 	}
 
 	// Upload payload to S3 with retry. Content-Type stays application/json to
@@ -1523,7 +1567,7 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 		uploadStart := time.Now()
 		putReq, reqErr := http.NewRequestWithContext(ctx, http.MethodPut, urlResp.UploadURL, bytes.NewReader(compressedPayload))
 		if reqErr != nil {
-			return fmt.Errorf("creating S3 PUT request: %w", reqErr)
+			return ingestUnknown, fmt.Errorf("creating S3 PUT request: %w", reqErr)
 		}
 		putReq.Header.Set("Content-Type", "application/json")
 
@@ -1592,12 +1636,12 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
-			return ctx.Err()
+			return ingestUnknown, ctx.Err()
 		}
 	}
 
 	if !uploaded {
-		return fmt.Errorf("telemetry upload failed after %d attempts: %s (payload: %d bytes) — the network may be intercepting outbound traffic to S3 (TLS-inspecting proxy, DLP appliance, or outbound firewall)",
+		return ingestUnknown, fmt.Errorf("telemetry upload failed after %d attempts: %s (payload: %d bytes) — the network may be intercepting outbound traffic to S3 (TLS-inspecting proxy, DLP appliance, or outbound firewall)",
 			maxRetries, lastFailure, len(compressedPayload))
 	}
 
@@ -1615,7 +1659,7 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 
 	notifyReq, err := http.NewRequestWithContext(ctx, http.MethodPost, notifyEndpoint, bytes.NewReader(notifyBody))
 	if err != nil {
-		return fmt.Errorf("creating notify request: %w", err)
+		return ingestUnknown, fmt.Errorf("creating notify request: %w", err)
 	}
 	notifyReq.Header.Set("Content-Type", "application/json")
 	notifyReq.Header.Set("Authorization", "Bearer "+config.APIKey)
@@ -1623,18 +1667,19 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 
 	notifyResp, err := client.Do(notifyReq)
 	if err != nil {
-		return fmt.Errorf("notifying backend: %w", err)
+		return ingestUnknown, fmt.Errorf("notifying backend: %w", err)
 	}
 	defer func() { _ = notifyResp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, notifyResp.Body)
-	log.Debug("notify backend: status=%d s3_key=%q", notifyResp.StatusCode, urlResp.S3Key)
+	notifyBodyBytes, _ := io.ReadAll(io.LimitReader(notifyResp.Body, maxNotifyResponseBytes))
+	log.Debug("notify backend: status=%d s3_key=%q body=%q", notifyResp.StatusCode, urlResp.S3Key, notifyBodyBytes)
 
 	if notifyResp.StatusCode != http.StatusOK && notifyResp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("backend notification failed with status %d", notifyResp.StatusCode)
+		return ingestUnknown, fmt.Errorf("backend notification failed with status %d", notifyResp.StatusCode)
 	}
+	status := parseIngestStatus(notifyBodyBytes)
 	log.Progress("Backend processing initiated (HTTP %d)", notifyResp.StatusCode)
 
-	return nil
+	return status, nil
 }
 
 // uploadCheckResult is the four-valued answer the agent gets back when it

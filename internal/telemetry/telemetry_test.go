@@ -99,7 +99,7 @@ func TestUploadToS3_SendsCompressedBodyAndIsCompressedFlag(t *testing.T) {
 	payload := &Payload{CustomerID: "test-customer", DeviceID: "dev-1"}
 
 	const testExecutionID = "11111111-2222-4333-8444-555555555555"
-	if err := uploadToS3(context.Background(), progress.NewLogger(progress.LevelInfo), payload, testExecutionID, nil, nil); err != nil {
+	if _, err := uploadToS3(context.Background(), progress.NewLogger(progress.LevelInfo), payload, testExecutionID, nil, nil); err != nil {
 		t.Fatalf("uploadToS3 failed: %v", err)
 	}
 
@@ -197,7 +197,7 @@ func TestUploadToS3_Synthetic200ConfirmedByBackend(t *testing.T) {
 	defer backendServer.Close()
 	withTestConfig(t, backendServer.URL)
 
-	err := uploadToS3(context.Background(), progress.NewLogger(progress.LevelInfo),
+	_, err := uploadToS3(context.Background(), progress.NewLogger(progress.LevelInfo),
 		&Payload{CustomerID: "test-customer", DeviceID: "dev-1"},
 		"11111111-2222-4333-8444-555555555555", nil, nil)
 	if err != nil {
@@ -256,7 +256,7 @@ func TestUploadToS3_Synthetic200MissingExhaustsRetries(t *testing.T) {
 	defer backendServer.Close()
 	withTestConfig(t, backendServer.URL)
 
-	err := uploadToS3(context.Background(), progress.NewLogger(progress.LevelInfo),
+	_, err := uploadToS3(context.Background(), progress.NewLogger(progress.LevelInfo),
 		&Payload{CustomerID: "test-customer", DeviceID: "dev-1"},
 		"11111111-2222-4333-8444-555555555555", nil, nil)
 	if err == nil {
@@ -312,7 +312,7 @@ func TestUploadToS3_Synthetic200UnsupportedBackendTrustsPUT(t *testing.T) {
 	defer backendServer.Close()
 	withTestConfig(t, backendServer.URL)
 
-	err := uploadToS3(context.Background(), progress.NewLogger(progress.LevelInfo),
+	_, err := uploadToS3(context.Background(), progress.NewLogger(progress.LevelInfo),
 		&Payload{CustomerID: "test-customer", DeviceID: "dev-1"},
 		"11111111-2222-4333-8444-555555555555", nil, nil)
 	if err != nil {
@@ -362,7 +362,7 @@ func TestUploadToS3_Synthetic200IndeterminateExhausts(t *testing.T) {
 	defer backendServer.Close()
 	withTestConfig(t, backendServer.URL)
 
-	err := uploadToS3(context.Background(), progress.NewLogger(progress.LevelInfo),
+	_, err := uploadToS3(context.Background(), progress.NewLogger(progress.LevelInfo),
 		&Payload{CustomerID: "test-customer", DeviceID: "dev-1"},
 		"11111111-2222-4333-8444-555555555555", nil, nil)
 	if err == nil {
@@ -431,7 +431,7 @@ func TestUploadToS3_Synthetic200ThenRealAWSHeaders(t *testing.T) {
 	defer backendServer.Close()
 	withTestConfig(t, backendServer.URL)
 
-	err := uploadToS3(context.Background(), progress.NewLogger(progress.LevelInfo),
+	_, err := uploadToS3(context.Background(), progress.NewLogger(progress.LevelInfo),
 		&Payload{CustomerID: "test-customer", DeviceID: "dev-1"},
 		"11111111-2222-4333-8444-555555555555", nil, nil)
 	if err != nil {
