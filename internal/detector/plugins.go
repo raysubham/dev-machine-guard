@@ -1384,7 +1384,7 @@ func (r SkillsResult) replacesMCPConfig(source, p string, represented map[string
 		}
 	}
 	c := filepath.Clean(p)
-	if r.evidence.owned[c] || source == "claude_plugin" || source == "codex_plugin" {
+	if r.evidence.owned[c] {
 		return represented[c]
 	}
 	for _, prefix := range r.evidence.suppressed {

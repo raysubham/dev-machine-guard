@@ -1386,6 +1386,19 @@ func TestPluginMCPReconciliationPreservesConfiguredSources(t *testing.T) {
 func TestPluginMCPReconciliationKeepsUnrepresentedServers(t *testing.T) {
 	root := filepath.Join(testHome, "plugins/cache/company/widgets/1.0.0")
 	config := filepath.Join(root, ".mcp.json")
+	t.Run("unregistered cache file", func(t *testing.T) {
+		evidence := newPluginEvidence()
+		evidence.suppress(filepath.Join(testHome, "plugins/cache"))
+		result := SkillsResult{evidence: evidence}
+		for _, source := range []string{"claude_plugin", "codex_plugin"} {
+			if got := result.ReconcilePluginMCP([]model.MCPConfigEnterprise{{ConfigSource: source, ConfigPath: config}}); len(got) != 0 {
+				t.Errorf("%s orphan cache server retained in enterprise inventory: %+v", source, got)
+			}
+			if got := result.ReconcilePluginMCPCommunity([]model.MCPConfig{{ConfigSource: source, ConfigPath: config}}); len(got) != 0 {
+				t.Errorf("%s orphan cache server retained in community inventory: %+v", source, got)
+			}
+		}
+	})
 	for _, tc := range []struct {
 		name, status                      string
 		reported, component, wantRetained bool
