@@ -479,9 +479,14 @@ func (a *claudeAdapter) readSeedMarketplaces() {
 	}
 }
 
-// autoUpdateScalar resolves the device-level preference: the managed layer,
-// then the user layer; project layers alone count only when they agree.
+// autoUpdateScalar reports a managed preference, or a value shared by all
+// observed scopes when no managed preference exists.
 func autoUpdateScalar(prefs []model.EnablementObservation) *bool {
+	for _, preference := range prefs {
+		if preference.Scope == model.PluginScopeSystem {
+			return boolPtr(preference.Enabled)
+		}
+	}
 	var agreed *bool
 	for _, preference := range prefs {
 		if agreed != nil && *agreed != preference.Enabled {

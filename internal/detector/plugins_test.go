@@ -1350,7 +1350,9 @@ func TestPluginMCPReconciliationPreservesConfiguredSources(t *testing.T) {
 	evidence := newPluginEvidence()
 	evidence.owned[config] = true
 	evidence.suppress(root)
-	result := SkillsResult{evidence: evidence}
+	component := model.PluginComponent{Kind: model.PluginComponentMCP, Status: model.AgentScanStatusComplete, DefinitionPath: config, MCPConfig: &model.MCPConfigEnterprise{ConfigPath: config}}
+	plugin := model.PluginObservation{ComponentStatus: model.AgentScanStatusComplete, Components: []model.PluginComponent{component}}
+	result := SkillsResult{evidence: evidence, Plugins: &model.AgentPlugins{Contexts: []model.AgentPluginContext{{Plugins: []model.PluginObservation{plugin}}}}}
 	sources := []string{"project_mcp"}
 	for _, spec := range mcpConfigDefinitions {
 		sources = append(sources, spec.SourceName)
@@ -1376,6 +1378,61 @@ func TestPluginMCPReconciliationPreservesConfiguredSources(t *testing.T) {
 			}
 			if got := result.ReconcilePluginMCPCommunity(community); len(got) != 0 {
 				t.Fatalf("plugin-owned community walker finding retained: %+v", got)
+			}
+		})
+	}
+}
+
+func TestPluginMCPReconciliationKeepsUnrepresentedServers(t *testing.T) {
+	root := filepath.Join(testHome, "plugins/cache/company/widgets/1.0.0")
+	config := filepath.Join(root, ".mcp.json")
+	for _, tc := range []struct {
+		name, status                      string
+		reported, component, wantRetained bool
+	}{
+		{name: "envelope omitted", wantRetained: true},
+		{name: "component omitted", reported: true, status: model.AgentScanStatusPartial, wantRetained: true},
+		{name: "some servers omitted", reported: true, component: true, status: model.AgentScanStatusPartial, wantRetained: true},
+		{name: "all servers represented", reported: true, component: true, status: model.AgentScanStatusComplete},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			evidence := newPluginEvidence()
+			evidence.owned[config] = true
+			evidence.suppress(root)
+			result := SkillsResult{evidence: evidence}
+			if tc.reported {
+				plugin := model.PluginObservation{ComponentStatus: tc.status}
+				if tc.component {
+					component := model.PluginComponent{Kind: model.PluginComponentMCP, Status: model.AgentScanStatusComplete, DefinitionPath: config, MCPConfig: &model.MCPConfigEnterprise{ConfigPath: config}}
+					plugin.Components = []model.PluginComponent{component}
+				}
+				result.Plugins = &model.AgentPlugins{Contexts: []model.AgentPluginContext{{Plugins: []model.PluginObservation{plugin}}}}
+			}
+			for _, source := range []string{"claude_plugin", "discovered_mcp"} {
+				enterprise := result.ReconcilePluginMCP([]model.MCPConfigEnterprise{{ConfigSource: source, ConfigPath: config}})
+				community := result.ReconcilePluginMCPCommunity([]model.MCPConfig{{ConfigSource: source, ConfigPath: config}})
+				if (len(enterprise) == 1) != tc.wantRetained || (len(community) == 1) != tc.wantRetained {
+					t.Errorf("source %q: enterprise=%d community=%d, want retained=%t", source, len(enterprise), len(community), tc.wantRetained)
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeAutoUpdateScalar(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		prefs []model.EnablementObservation
+		want  *bool
+	}{
+		{name: "unset"},
+		{name: "managed overrides project", prefs: []model.EnablementObservation{{Scope: model.PluginScopeSystem, Enabled: true}, {Scope: model.PluginScopeProject, Enabled: false}}, want: boolPtr(true)},
+		{name: "user and project conflict", prefs: []model.EnablementObservation{{Scope: model.PluginScopeUser, Enabled: true}, {Scope: model.PluginScopeProject, Enabled: false}}},
+		{name: "project preferences agree", prefs: []model.EnablementObservation{{Scope: model.PluginScopeProject, Enabled: false}, {Scope: model.PluginScopeLocal, Enabled: false}}, want: boolPtr(false)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := autoUpdateScalar(tc.prefs); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("autoUpdateScalar() = %v, want %v", got, tc.want)
 			}
 		})
 	}

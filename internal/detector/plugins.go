@@ -1347,9 +1347,31 @@ func encodedSize(v any) int {
 // MCP reconciliation
 // ---------------------------------------------------------------------------
 
-// replacesMCPConfig suppresses walker findings accounted for by plugin evidence.
-// Explicit user and project configurations remain independent suppliers.
-func (r SkillsResult) replacesMCPConfig(source, p string) bool {
+// representedMCPFiles contains files whose complete server declarations remain
+// in the final plugin report.
+func (r SkillsResult) representedMCPFiles() map[string]bool {
+	files := map[string]bool{}
+	if r.Plugins == nil {
+		return files
+	}
+	for _, context := range r.Plugins.Contexts {
+		for _, plugin := range context.Plugins {
+			if plugin.ComponentStatus != model.AgentScanStatusComplete {
+				continue
+			}
+			for _, component := range plugin.Components {
+				if component.Kind == model.PluginComponentMCP && component.Status == model.AgentScanStatusComplete && component.MCPConfig != nil {
+					files[filepath.Clean(component.DefinitionPath)] = true
+				}
+			}
+		}
+	}
+	return files
+}
+
+// replacesMCPConfig suppresses walker findings represented by plugin components
+// and vendored examples under plugin trees. Explicit configurations remain independent.
+func (r SkillsResult) replacesMCPConfig(source, p string, represented map[string]bool) bool {
 	if r.evidence == nil {
 		return false
 	}
@@ -1362,8 +1384,8 @@ func (r SkillsResult) replacesMCPConfig(source, p string) bool {
 		}
 	}
 	c := filepath.Clean(p)
-	if r.evidence.owned[c] {
-		return true
+	if r.evidence.owned[c] || source == "claude_plugin" || source == "codex_plugin" {
+		return represented[c]
 	}
 	for _, prefix := range r.evidence.suppressed {
 		if c == prefix || strings.HasPrefix(c, prefix+string(filepath.Separator)) {
@@ -1379,9 +1401,10 @@ func (r SkillsResult) ReconcilePluginMCP(configs []model.MCPConfigEnterprise) []
 	if r.evidence == nil {
 		return configs
 	}
+	represented := r.representedMCPFiles()
 	out := make([]model.MCPConfigEnterprise, 0, len(configs))
 	for _, c := range configs {
-		if !r.replacesMCPConfig(c.ConfigSource, c.ConfigPath) {
+		if !r.replacesMCPConfig(c.ConfigSource, c.ConfigPath, represented) {
 			out = append(out, c)
 		}
 	}
@@ -1393,9 +1416,10 @@ func (r SkillsResult) ReconcilePluginMCPCommunity(configs []model.MCPConfig) []m
 	if r.evidence == nil {
 		return configs
 	}
+	represented := r.representedMCPFiles()
 	out := make([]model.MCPConfig, 0, len(configs))
 	for _, c := range configs {
-		if !r.replacesMCPConfig(c.ConfigSource, c.ConfigPath) {
+		if !r.replacesMCPConfig(c.ConfigSource, c.ConfigPath, represented) {
 			out = append(out, c)
 		}
 	}
