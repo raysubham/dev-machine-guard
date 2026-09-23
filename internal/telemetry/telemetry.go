@@ -1465,6 +1465,72 @@ func parseIngestStatus(body []byte) ingestStatus {
 	}
 }
 
+type uploadURLResponse struct {
+	UploadURL string `json:"upload_url"`
+	S3Key     string `json:"s3_key"`
+}
+
+// uploadURLAttempts bounds retries of the upload-URL request. The endpoint
+// only presigns a key, so repeating it is safe; without a retry one dropped
+// connection discards the whole scan.
+const uploadURLAttempts = 3
+
+// requestUploadURL asks the backend for a presigned S3 URL, retrying transport
+// errors, 5xx and unreadable bodies. A 4xx is terminal.
+func requestUploadURL(ctx context.Context, log *progress.Logger, client *http.Client, endpoint string, reqBody []byte) (uploadURLResponse, error) {
+	var lastErr error
+	for attempt := 1; attempt <= uploadURLAttempts; attempt++ {
+		urlResp, retryable, err := requestUploadURLOnce(ctx, log, client, endpoint, reqBody)
+		if err == nil {
+			return urlResp, nil
+		}
+		lastErr = err
+		if !retryable || attempt == uploadURLAttempts {
+			break
+		}
+		backoff := time.Duration(attempt) * s3UploadBackoffUnit
+		log.Warn("upload URL attempt %d/%d failed (%v); retrying in %s...", attempt, uploadURLAttempts, err, backoff)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return uploadURLResponse{}, ctx.Err()
+		}
+	}
+	return uploadURLResponse{}, lastErr
+}
+
+func requestUploadURLOnce(ctx context.Context, log *progress.Logger, client *http.Client, endpoint string, reqBody []byte) (uploadURLResponse, bool, error) {
+	var urlResp uploadURLResponse
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return urlResp, false, fmt.Errorf("creating upload URL request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+config.APIKey)
+	req.Header.Set("X-Agent-Version", buildinfo.Version)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return urlResp, ctx.Err() == nil, fmt.Errorf("requesting upload URL: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 400 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxNotifyResponseBytes))
+		return urlResp, resp.StatusCode >= 500, fmt.Errorf("requesting upload URL: HTTP %d", resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&urlResp); err != nil {
+		return urlResp, true, fmt.Errorf("decoding upload URL response: %w", err)
+	}
+
+	log.Debug("upload URL response: status=%d s3_key=%q url_len=%d", resp.StatusCode, urlResp.S3Key, len(urlResp.UploadURL))
+
+	if urlResp.UploadURL == "" {
+		return urlResp, false, fmt.Errorf("empty upload URL in response")
+	}
+	return urlResp, true, nil
+}
+
 func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, executionID string, tracker *PhaseTracker, capture *LogCapture) (ingestStatus, error) {
 	// updateDetail forwards sub-progress to the heartbeat goroutine via the
 	// tracker. Tolerates nil so the function stays callable from tests that
@@ -1499,33 +1565,10 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 	uploadURLEndpoint := fmt.Sprintf("%s/v1/%s/developer-mdm-agent/telemetry/upload-url",
 		config.APIEndpoint, config.CustomerID)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURLEndpoint, bytes.NewReader(reqBody))
-	if err != nil {
-		return ingestUnknown, fmt.Errorf("creating upload URL request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+config.APIKey)
-	req.Header.Set("X-Agent-Version", buildinfo.Version)
-
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	urlResp, err := requestUploadURL(ctx, log, client, uploadURLEndpoint, reqBody)
 	if err != nil {
-		return ingestUnknown, fmt.Errorf("requesting upload URL: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var urlResp struct {
-		UploadURL string `json:"upload_url"`
-		S3Key     string `json:"s3_key"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&urlResp); err != nil {
-		return ingestUnknown, fmt.Errorf("decoding upload URL response: %w", err)
-	}
-
-	log.Debug("upload URL response: status=%d s3_key=%q url_len=%d", resp.StatusCode, urlResp.S3Key, len(urlResp.UploadURL))
-
-	if urlResp.UploadURL == "" {
-		return ingestUnknown, fmt.Errorf("empty upload URL in response")
+		return ingestUnknown, err
 	}
 
 	// Upload payload to S3 with retry. Content-Type stays application/json to

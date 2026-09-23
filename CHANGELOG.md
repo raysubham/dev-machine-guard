@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See [VERSIONING.md](VERSIONING.md) for why the version starts at 1.8.1.
 
+## [Unreleased]
+
+### Fixed
+
+- **The upload-URL request is retried.** It was a single attempt, so one dropped connection or TLS handshake timeout behind a flaky proxy discarded a finished scan, even though the S3 PUT after it already retried. It now makes up to three attempts with the same backoff, retrying transport errors, 5xx and unreadable bodies; a 4xx still fails at once.
+
 ## [1.17.0] - 2026-09-21
 
 ### Added

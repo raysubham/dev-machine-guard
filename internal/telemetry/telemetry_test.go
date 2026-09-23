@@ -512,3 +512,78 @@ func TestCollectCredentialsHonoursTenantSetting(t *testing.T) {
 		t.Fatalf("enabled: phases = %+v, want exactly credentials_scan", phases)
 	}
 }
+
+func TestRequestUploadURL_Retry(t *testing.T) {
+	ok := func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"upload_url": "https://s3/put", "s3_key": "k"})
+	}
+	status := func(code int) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) }
+	}
+	// dropConn closes the connection without a response, which the client
+	// sees as EOF — the failure seen behind flaky corporate proxies.
+	dropConn := func(w http.ResponseWriter, _ *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}
+	emptyURL := func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"upload_url": ""})
+	}
+
+	tests := []struct {
+		name      string
+		responses []http.HandlerFunc
+		wantErr   bool
+		wantCalls int32
+	}{
+		{"success first try", []http.HandlerFunc{ok}, false, 1},
+		{"dropped connection then success", []http.HandlerFunc{dropConn, ok}, false, 2},
+		{"5xx then success", []http.HandlerFunc{status(503), ok}, false, 2},
+		{"unreadable body then success", []http.HandlerFunc{status(200), ok}, false, 2},
+		{"5xx exhausts attempts", []http.HandlerFunc{status(502), status(502), status(502), ok}, true, 3},
+		{"4xx is terminal", []http.HandlerFunc{status(401), ok}, true, 1},
+		{"empty upload url is terminal", []http.HandlerFunc{emptyURL, ok}, true, 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			withFastBackoff(t)
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				n := calls.Add(1)
+				tc.responses[n-1](w, r)
+			}))
+			defer srv.Close()
+
+			got, err := requestUploadURL(context.Background(), progress.NewNoop(), srv.Client(), srv.URL, []byte(`{}`))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if !tc.wantErr && got.UploadURL != "https://s3/put" {
+				t.Errorf("UploadURL = %q, want %q", got.UploadURL, "https://s3/put")
+			}
+			if n := calls.Load(); n != tc.wantCalls {
+				t.Errorf("calls = %d, want %d", n, tc.wantCalls)
+			}
+		})
+	}
+}
+
+func TestRequestUploadURL_StopsOnCanceledContext(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := requestUploadURL(ctx, progress.NewNoop(), srv.Client(), srv.URL, []byte(`{}`)); err == nil {
+		t.Fatal("expected an error on a canceled context")
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("calls = %d, want 0", n)
+	}
+}
