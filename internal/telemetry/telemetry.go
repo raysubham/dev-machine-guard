@@ -1068,7 +1068,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	phaseCtx, phaseCancel = startPhase(ctx, tracker, "browser_extensions_scan")
 	log.Progress("Inventorying browser extensions...")
 	browserTarget, _ := exec.LoggedInUser()
-	browserExtensionScan := browserext.New(userExec).WithSkipper(tccSkipper).Detect(phaseCtx, browserTarget)
+	browserExtensionScan := browserext.New(userExec).WithOSVersion(dev.OSVersion).WithSkipper(tccSkipper).Detect(phaseCtx, browserTarget)
 	if browserExtensionScan == nil {
 		log.Progress("  Skipped: no interactive user to describe")
 	} else {
