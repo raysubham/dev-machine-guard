@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 )
 
 // Stable cause codes for network failures, carried in run-status error
@@ -34,6 +35,8 @@ const (
 // any non-200, so 1xx-3xx must not be reported as a client error.
 func httpStatusCode(status int) string {
 	switch {
+	case status == http.StatusProxyAuthRequired:
+		return codeProxy
 	case status >= 500:
 		return codeHTTP5xx
 	case status >= 400:
@@ -51,7 +54,6 @@ func netErrorCode(err error) string {
 		verifyErr *tls.CertificateVerificationError
 		authErr   x509.UnknownAuthorityError
 		hostErr   x509.HostnameError
-		alertErr  tls.AlertError
 		recordErr tls.RecordHeaderError
 		netErr    net.Error
 	)
@@ -62,7 +64,8 @@ func netErrorCode(err error) string {
 		return codeDNS
 	case errors.As(err, &verifyErr), errors.As(err, &authErr), errors.As(err, &hostErr):
 		return codeCert
-	case errors.As(err, &alertErr), errors.As(err, &recordErr):
+	// crypto/tls reports an alert from the server as OpError{Op: "remote error"}.
+	case errors.As(err, &recordErr), errors.As(err, &opErr) && opErr.Op == "remote error":
 		return codeTLS
 	// Includes "TLS handshake timeout", which net/http reports as a timeout.
 	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
@@ -73,4 +76,20 @@ func netErrorCode(err error) string {
 		return codeConnDropped
 	}
 	return codeNetOther
+}
+
+// proxyForRequest is the proxy the default transport would use; a var so tests
+// can stub it, since http.ProxyFromEnvironment caches the environment.
+var proxyForRequest = http.ProxyFromEnvironment
+
+// requestErrorCode is netErrorCode plus the case the error alone can't show: a
+// proxy refusing CONNECT (403, 407) surfaces as a bare status-text error.
+func requestErrorCode(req *http.Request, err error) string {
+	code := netErrorCode(err)
+	if code == codeNetOther && req.URL.Scheme == "https" {
+		if proxyURL, _ := proxyForRequest(req); proxyURL != nil {
+			return codeProxy
+		}
+	}
+	return code
 }

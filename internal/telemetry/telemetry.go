@@ -1512,7 +1512,7 @@ func requestUploadURLOnce(ctx context.Context, log *progress.Logger, client *htt
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return urlResp, ctx.Err() == nil, fmt.Errorf("requesting upload URL [%s]: %w", netErrorCode(err), err)
+		return urlResp, ctx.Err() == nil, fmt.Errorf("requesting upload URL [%s]: %w", requestErrorCode(req, err), err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -1619,7 +1619,7 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 		elapsed := time.Since(uploadStart)
 		if putErr != nil {
 			log.Debug("s3 PUT attempt %d/%d: error=%v elapsed=%s", attempt, maxRetries, putErr, elapsed)
-			lastFailure = fmt.Sprintf("S3 PUT error [%s]: %v", netErrorCode(putErr), putErr)
+			lastFailure = fmt.Sprintf("S3 PUT error [%s]: %v", requestErrorCode(putReq, putErr), putErr)
 		} else {
 			log.Debug("s3 PUT attempt %d/%d: status=%d elapsed=%s payload_bytes=%d", attempt, maxRetries, putResp.StatusCode, elapsed, len(payloadJSON))
 		}
