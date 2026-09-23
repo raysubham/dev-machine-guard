@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See [VERSIONING.md](VERSIONING.md) for why the version starts at 1.8.1.
 
+## [Unreleased]
+
+### Fixed
+
+- **The upload-URL request is retried.** It was a single attempt, so one dropped connection or TLS handshake timeout behind a flaky proxy discarded a finished scan, even though the S3 PUT after it already retried. It now makes up to three attempts with the same backoff, retrying transport errors, 5xx and unreadable bodies; a 4xx still fails at once.
+- **Upload failures carry a cause code.** Upload-URL and S3 PUT errors in run-status now include a stable code — `[net_dns]`, `[net_proxy]`, `[net_connect]`, `[net_timeout]`, `[net_tls]`, `[net_cert]`, `[net_conn_dropped]`, `[http_4xx]`, `[http_5xx]`, `[http_other]`, `[bad_response]` or `[net_other]` — the same set the loader scripts report, so failures group by cause instead of by raw Go error text.
+
 ## [1.17.0] - 2026-09-21
 
 ### Added
