@@ -502,24 +502,11 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		endPhase(wslCtx, wslCancel, tracker, log, "wsl_scan")
 	}
 
-	// Per-device scan state for the delta-upload protocol. Enabled by default
-	// (config.UseLegacyPackageScan defaults false). Resolution, in order:
-	//   - STEPSEC_DISABLE_SCAN_STATE=1         (env kill switch, always wins)
-	//   - STEPSEC_ENABLE_SCAN_STATE=1          (env test opt-in)
-	//   - config.UseLegacyPackageScan          (persistent, set in config.json)
-	//   - paths.Home() unresolvable            (no place to write the file)
-	// A disabled gate leaves scanState nil and the run behaves as pre-1.13.
+	// Delta requires this run's backend opt-in; there are no local overrides.
 	var scanState *state.State
 	var scanStatePath string
 	var scanStateFullSync bool
-	scanStateDisabled := config.UseLegacyPackageScan
-	if os.Getenv("STEPSEC_ENABLE_SCAN_STATE") == "1" {
-		scanStateDisabled = false
-	}
-	if os.Getenv("STEPSEC_DISABLE_SCAN_STATE") == "1" {
-		scanStateDisabled = true
-	}
-	if !scanStateDisabled {
+	if cfg.DeltaScanEnabled {
 		scanStatePath = paths.ScanStateFile()
 		if scanStatePath != "" {
 			loaded, loadErr := state.Load(scanStatePath, buildinfo.Version)
@@ -531,8 +518,8 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 			log.Debug("scan-state: loaded from %s (npm=%d python=%d full_sync=%v)",
 				scanStatePath, len(scanState.NPMProjects), len(scanState.PythonProjects), scanStateFullSync)
 		}
-	} else if config.UseLegacyPackageScan {
-		log.Debug("scan-state: disabled by config.use_legacy_package_scan; falling back to full-snapshot uploads")
+	} else {
+		log.Debug("scan-state: using legacy full-snapshot uploads")
 	}
 
 	// Report "started" now that we have a device_id. Fire-and-forget.
@@ -1259,6 +1246,16 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 			SystemPackagesCount:   totalSystemPackagesCount(systemPackageScans),
 			AgentSkillsCount:      len(agentSkills),
 		},
+	}
+
+	// A legacy upload may replace the backend inventory that old delta refs
+	// point at. Invalidate that baseline BEFORE uploading, including failed or
+	// ambiguous uploads; the next delta run must establish a fresh baseline.
+	// If invalidation fails, do not upload a snapshot that could leave stale refs.
+	if snap == nil {
+		if err := state.Invalidate(paths.ScanStateFile()); err != nil {
+			return fmt.Errorf("invalidating delta state before legacy upload: %w", err)
+		}
 	}
 
 	// Dev-only offline harness: dump the assembled Payload to a local
