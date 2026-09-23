@@ -12,7 +12,11 @@ import (
 
 func TestNetErrorCode(t *testing.T) {
 	// Real failures from http.Client, so the classification tracks what
-	// net/http actually returns rather than hand-built error values.
+	// net/http actually returns rather than hand-built error values. The
+	// clients bypass proxy env vars: a proxy would answer for host.invalid and
+	// turn the DNS row into a proxy or HTTP result.
+	direct := &http.Client{Transport: &http.Transport{}}
+	directTimeout := &http.Client{Transport: &http.Transport{}, Timeout: 50 * time.Millisecond}
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(200 * time.Millisecond)
 	}))
@@ -39,11 +43,11 @@ func TestNetErrorCode(t *testing.T) {
 		url    string
 		want   string
 	}{
-		{"dns", http.DefaultClient, "http://host.invalid", codeDNS},
-		{"refused", http.DefaultClient, refusedURL, codeConnect},
-		{"client timeout", &http.Client{Timeout: 50 * time.Millisecond}, slow.URL, codeTimeout},
-		{"dropped connection", http.DefaultClient, drop.URL, codeConnDropped},
-		{"untrusted certificate", http.DefaultClient, selfSigned.URL, codeCert},
+		{"dns", direct, "http://host.invalid", codeDNS},
+		{"refused", direct, refusedURL, codeConnect},
+		{"client timeout", directTimeout, slow.URL, codeTimeout},
+		{"dropped connection", direct, drop.URL, codeConnDropped},
+		{"untrusted certificate", direct, selfSigned.URL, codeCert},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -63,5 +67,25 @@ func TestNetErrorCode(t *testing.T) {
 	}
 	if got := netErrorCode(errors.New("boom")); got != codeNetOther {
 		t.Errorf("netErrorCode(unknown) = %q, want %q", got, codeNetOther)
+	}
+}
+
+func TestHTTPStatusCode(t *testing.T) {
+	tests := []struct {
+		status int
+		want   string
+	}{
+		{204, codeHTTPOther},
+		{301, codeHTTPOther},
+		{399, codeHTTPOther},
+		{400, codeHTTP4xx},
+		{499, codeHTTP4xx},
+		{500, codeHTTP5xx},
+		{503, codeHTTP5xx},
+	}
+	for _, tc := range tests {
+		if got := httpStatusCode(tc.status); got != tc.want {
+			t.Errorf("httpStatusCode(%d) = %q, want %q", tc.status, got, tc.want)
+		}
 	}
 }

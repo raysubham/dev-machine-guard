@@ -12,8 +12,9 @@ import (
 // Stable cause codes for network failures, carried in run-status error
 // messages as "[code]". The agent-api loader scripts (bash and PowerShell)
 // emit the same set, so failures group by cause across the loader and the
-// agent. codeBadResponse is agent-only: the loaders report malformed API
-// responses under their own error types.
+// agent. codeBadResponse and codeHTTPOther are agent-only: the loaders report
+// malformed API responses under their own error types, and curl -f only fails
+// on 4xx/5xx.
 const (
 	codeDNS         = "net_dns"
 	codeProxy       = "net_proxy"
@@ -24,15 +25,22 @@ const (
 	codeConnDropped = "net_conn_dropped"
 	codeHTTP4xx     = "http_4xx"
 	codeHTTP5xx     = "http_5xx"
+	codeHTTPOther   = "http_other"
 	codeBadResponse = "bad_response"
 	codeNetOther    = "net_other"
 )
 
+// httpStatusCode classifies an unexpected HTTP status. The S3 PUT path passes
+// any non-200, so 1xx-3xx must not be reported as a client error.
 func httpStatusCode(status int) string {
-	if status >= 500 {
+	switch {
+	case status >= 500:
 		return codeHTTP5xx
+	case status >= 400:
+		return codeHTTP4xx
+	default:
+		return codeHTTPOther
 	}
-	return codeHTTP4xx
 }
 
 // netErrorCode classifies an error returned by http.Client.Do.
