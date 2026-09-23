@@ -1479,7 +1479,8 @@ const uploadURLAttempts = 3
 // errors, 5xx and unreadable bodies. A 4xx is terminal.
 func requestUploadURL(ctx context.Context, log *progress.Logger, client *http.Client, endpoint string, reqBody []byte) (uploadURLResponse, error) {
 	var lastErr error
-	for attempt := 1; attempt <= uploadURLAttempts; attempt++ {
+	attempt := 1
+	for ; attempt <= uploadURLAttempts; attempt++ {
 		urlResp, retryable, err := requestUploadURLOnce(ctx, log, client, endpoint, reqBody)
 		if err == nil {
 			return urlResp, nil
@@ -1496,7 +1497,7 @@ func requestUploadURL(ctx context.Context, log *progress.Logger, client *http.Cl
 			return uploadURLResponse{}, ctx.Err()
 		}
 	}
-	return uploadURLResponse{}, lastErr
+	return uploadURLResponse{}, fmt.Errorf("%w (attempt %d/%d)", lastErr, attempt, uploadURLAttempts)
 }
 
 func requestUploadURLOnce(ctx context.Context, log *progress.Logger, client *http.Client, endpoint string, reqBody []byte) (uploadURLResponse, bool, error) {
@@ -1511,22 +1512,22 @@ func requestUploadURLOnce(ctx context.Context, log *progress.Logger, client *htt
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return urlResp, ctx.Err() == nil, fmt.Errorf("requesting upload URL: %w", err)
+		return urlResp, ctx.Err() == nil, fmt.Errorf("requesting upload URL [%s]: %w", netErrorCode(err), err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 400 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxNotifyResponseBytes))
-		return urlResp, resp.StatusCode >= 500, fmt.Errorf("requesting upload URL: HTTP %d", resp.StatusCode)
+		return urlResp, resp.StatusCode >= 500, fmt.Errorf("requesting upload URL [%s]: HTTP %d", httpStatusCode(resp.StatusCode), resp.StatusCode)
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&urlResp); err != nil {
-		return urlResp, true, fmt.Errorf("decoding upload URL response: %w", err)
+		return urlResp, true, fmt.Errorf("decoding upload URL response [%s]: %w", codeBadResponse, err)
 	}
 
 	log.Debug("upload URL response: status=%d s3_key=%q url_len=%d", resp.StatusCode, urlResp.S3Key, len(urlResp.UploadURL))
 
 	if urlResp.UploadURL == "" {
-		return urlResp, false, fmt.Errorf("empty upload URL in response")
+		return urlResp, false, fmt.Errorf("empty upload URL in response [%s]", codeBadResponse)
 	}
 	return urlResp, true, nil
 }
@@ -1618,7 +1619,7 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 		elapsed := time.Since(uploadStart)
 		if putErr != nil {
 			log.Debug("s3 PUT attempt %d/%d: error=%v elapsed=%s", attempt, maxRetries, putErr, elapsed)
-			lastFailure = fmt.Sprintf("S3 PUT error: %v", putErr)
+			lastFailure = fmt.Sprintf("S3 PUT error [%s]: %v", netErrorCode(putErr), putErr)
 		} else {
 			log.Debug("s3 PUT attempt %d/%d: status=%d elapsed=%s payload_bytes=%d", attempt, maxRetries, putResp.StatusCode, elapsed, len(payloadJSON))
 		}
@@ -1667,7 +1668,7 @@ func uploadToS3(ctx context.Context, log *progress.Logger, payload *Payload, exe
 		} else if putResp != nil {
 			_, _ = io.Copy(io.Discard, putResp.Body)
 			_ = putResp.Body.Close()
-			lastFailure = fmt.Sprintf("S3 PUT returned status %d", putResp.StatusCode)
+			lastFailure = fmt.Sprintf("S3 PUT returned status %d [%s]", putResp.StatusCode, httpStatusCode(putResp.StatusCode))
 		}
 
 		if attempt == maxRetries {

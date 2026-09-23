@@ -535,16 +535,17 @@ func TestRequestUploadURL_Retry(t *testing.T) {
 	tests := []struct {
 		name      string
 		responses []http.HandlerFunc
-		wantErr   bool
+		wantCode  string // "" = success
 		wantCalls int32
 	}{
-		{"success first try", []http.HandlerFunc{ok}, false, 1},
-		{"dropped connection then success", []http.HandlerFunc{dropConn, ok}, false, 2},
-		{"5xx then success", []http.HandlerFunc{status(503), ok}, false, 2},
-		{"unreadable body then success", []http.HandlerFunc{status(200), ok}, false, 2},
-		{"5xx exhausts attempts", []http.HandlerFunc{status(502), status(502), status(502), ok}, true, 3},
-		{"4xx is terminal", []http.HandlerFunc{status(401), ok}, true, 1},
-		{"empty upload url is terminal", []http.HandlerFunc{emptyURL, ok}, true, 1},
+		{"success first try", []http.HandlerFunc{ok}, "", 1},
+		{"dropped connection then success", []http.HandlerFunc{dropConn, ok}, "", 2},
+		{"5xx then success", []http.HandlerFunc{status(503), ok}, "", 2},
+		{"unreadable body then success", []http.HandlerFunc{status(200), ok}, "", 2},
+		{"dropped connection exhausts attempts", []http.HandlerFunc{dropConn, dropConn, dropConn, ok}, codeConnDropped, 3},
+		{"5xx exhausts attempts", []http.HandlerFunc{status(502), status(502), status(502), ok}, codeHTTP5xx, 3},
+		{"4xx is terminal", []http.HandlerFunc{status(401), ok}, codeHTTP4xx, 1},
+		{"empty upload url is terminal", []http.HandlerFunc{emptyURL, ok}, codeBadResponse, 1},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -557,10 +558,14 @@ func TestRequestUploadURL_Retry(t *testing.T) {
 			defer srv.Close()
 
 			got, err := requestUploadURL(context.Background(), progress.NewNoop(), srv.Client(), srv.URL, []byte(`{}`))
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			if tc.wantCode == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "["+tc.wantCode+"]") {
+				t.Fatalf("err = %v, want code [%s]", err, tc.wantCode)
 			}
-			if !tc.wantErr && got.UploadURL != "https://s3/put" {
+			if tc.wantCode == "" && got.UploadURL != "https://s3/put" {
 				t.Errorf("UploadURL = %q, want %q", got.UploadURL, "https://s3/put")
 			}
 			if n := calls.Load(); n != tc.wantCalls {
