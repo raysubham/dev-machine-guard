@@ -294,7 +294,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	log.StepStart("Inventorying browser extensions")
 	start = time.Now()
 	browserTarget, _ := exec.LoggedInUser()
-	browserExtensionScan := browserext.New(exec).WithSkipper(tccSkipper).Detect(ctx, browserTarget)
+	browserExtensionScan := browserext.New(exec).WithOSVersion(dev.OSVersion).WithSkipper(tccSkipper).Detect(ctx, browserTarget)
 	log.StepDone(time.Since(start))
 
 	// npm config audit — surface-only inventory of every .npmrc on the host

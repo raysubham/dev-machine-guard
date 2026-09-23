@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See [VERSIONING.md](VERSIONING.md) for why the version starts at 1.8.1.
 
+## [Unreleased]
+
+### Fixed
+
+- **The upload-URL request is retried.** It was a single attempt, so one dropped connection or TLS handshake timeout behind a flaky proxy discarded a finished scan, even though the S3 PUT after it already retried. It now makes up to three attempts with the same backoff, retrying transport errors, 5xx and unreadable bodies; a 4xx still fails at once.
+- **Upload failures carry a cause code.** Upload-URL and S3 PUT errors in run-status now include a stable code — `[net_dns]`, `[net_proxy]`, `[net_connect]`, `[net_timeout]`, `[net_tls]`, `[net_cert]`, `[net_conn_dropped]`, `[http_4xx]`, `[http_5xx]`, `[http_other]`, `[bad_response]` or `[net_other]` — the same set the loader scripts report, so failures group by cause instead of by raw Go error text.
+
 ## [1.17.0] - 2026-09-21
 
 ### Added
@@ -33,6 +40,7 @@ See [VERSIONING.md](VERSIONING.md) for why the version starts at 1.8.1.
 
 ### Fixed
 
+- Skip protected browser profile reads on macOS 27 when protected-directory scanning is disabled, while preserving browser extension inventory on macOS 26.
 - Suppress Windows scheduler-registration probe console flashes during heartbeat, telemetry initialization, and scheduler diagnostics; bound each probe to three seconds.
 - **Plugin-catalog templates are no longer counted as MCP servers.** The MCP walk matches on basename anywhere under `$HOME`, and an agent plugin marketplace is a clone of a catalog repo where every entry ships a template `.mcp.json` — on one machine that turned 7 real configs into 53, and in enterprise mode 36 of them carried an `mcpServers` block, so the backend recorded stripe, slack, gmail and notion as servers on a device that had installed none of them. A hit inside a plugin package (marked by a `.claude-plugin`/`.codex-plugin` manifest) is now classified rather than guessed at: the package's own `.mcp.json` is kept when the package is installed, while catalog entries and MCP-shaped files vendored elsewhere in a payload are dropped. Configs outside a plugin package are untouched. Fixes #201.
 - **Globally installed packages report the directory they live in.** The disk-based global scan built its result without a project path, and that field is the only place the backend learns where a global package lives, so since 1.13.0 every globally installed package reached the dashboard with a blank "Project Paths" column — a customer triaging the compromised `chalk`/`ansi-*` versions had no directory to go clean up. The scan now emits one result per global root, reporting the `node_modules` directory it actually read (exact even for pnpm's content-addressed store), so a package installed under two prefixes lists both. Roots are deduplicated on package manager and directory, and a root that has emptied is still emitted, so its packages are retracted instead of standing forever.
