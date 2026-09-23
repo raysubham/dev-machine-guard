@@ -168,10 +168,17 @@ func (d *Detector) consentGuard(platform, home string) safepath.Guard {
 		return nil
 	}
 	var exempt []string
-	majorText, _, _ := strings.Cut(d.osVersion, ".")
-	major, err := strconv.Atoi(majorText)
+	parts := strings.Split(d.osVersion, ".")
+	validVersion := len(parts) <= 3
+	for _, part := range parts {
+		if _, err := strconv.ParseUint(part, 10, 32); err != nil {
+			validVersion = false
+			break
+		}
+	}
+	major, _ := strconv.ParseUint(parts[0], 10, 32)
 	// macOS 27 protects these browser roots. Unknown versions fail closed.
-	if platform != model.PlatformDarwin || (err == nil && major > 0 && major < 27) {
+	if platform != model.PlatformDarwin || (validVersion && major > 0 && major < 27) {
 		for _, spec := range catalog {
 			exempt = append(exempt, spec.roots(platform, home)...)
 		}

@@ -27,6 +27,12 @@ func TestDetect_OSVersionConsent(t *testing.T) {
 		{"28-default", "28.0", nil, false},
 		{"unknown-default", "", nil, false},
 		{"malformed-default", "not-a-version", nil, false},
+		{"malformed-minor", "26.invalid", nil, false},
+		{"malformed-patch", "26.5.invalid", nil, false},
+		{"empty-component", "26..1", nil, false},
+		{"trailing-dot", "26.", nil, false},
+		{"signed-major", "+26.5.1", nil, false},
+		{"extra-component", "26.5.1.2", nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := tempHome(t)
