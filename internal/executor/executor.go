@@ -247,6 +247,8 @@ func (r *Real) ReadDirLimit(path string, max int) ([]os.DirEntry, bool, error) {
 	if max < 0 {
 		return nil, false, fmt.Errorf("read dir %s: negative limit", path)
 	}
+	// #nosec G304 -- Real is the unguarded executor, same as ReadDir; callers
+	// that need containment go through GuardedFiles, which overrides this.
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, false, err
