@@ -665,6 +665,20 @@ func TestGoScanner_Fixture(t *testing.T) {
 	})
 }
 
+func TestGoScanner_CompleteJSON(t *testing.T) {
+	home := goTestHome(t)
+	goWrite(t, filepath.Join(home, "app", "go.mod"), "module example.com/app\n", 0o644)
+	inv, _ := goTestScanner(t, nil).Scan(context.Background(), goTestTarget(home), []string{home}, nil)
+	goStatusOf(t, inv.Status, model.GoStatusComplete, "inventory status")
+	raw, err := json.Marshal(inv.Reasons)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "[]" {
+		t.Fatalf("complete inventory reasons = %s, want [] for API validation", raw)
+	}
+}
+
 func TestGoScanner_Declines(t *testing.T) {
 	home := goTestHome(t)
 	tests := []struct {

@@ -1129,7 +1129,7 @@ func (g *goScan) finish() *model.GoInventory {
 			parent.DiscoveredSources = append(parent.DiscoveredSources, s.SourceID)
 		}
 	}
-	reasons := slices.Clone(g.reasons)
+	reasons := append([]string{}, g.reasons...)
 	for _, s := range g.sources {
 		slices.Sort(s.Reasons)
 		slices.Sort(s.DiscoveredSources)
