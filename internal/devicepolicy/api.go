@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -283,6 +284,12 @@ func validateCategoryPolicy(category string, policy json.RawMessage) error {
 			u, err := url.Parse(raw)
 			if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" || u.User != nil || strings.Contains(raw, "#") {
 				return errors.New("devicepolicy: malformed policy: invalid gallery URL")
+			}
+			if port := u.Port(); port != "" {
+				n, err := strconv.Atoi(port)
+				if err != nil || n < 1 || n > 65535 {
+					return errors.New("devicepolicy: malformed policy: invalid gallery URL")
+				}
 			}
 		default:
 			return errors.New("devicepolicy: malformed policy: unsupported IDE setting")
