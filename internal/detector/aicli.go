@@ -140,10 +140,10 @@ var cliToolDefinitions = []cliToolSpec{
 			// extension shim never resolve into a Caskroom.
 			if exec.GOOS() == model.PlatformDarwin {
 				if resolved, err := exec.EvalSymlinks(binary); err == nil && resolved != "" {
-					root, pkg := brewRoot(resolved)
-					if root == "Caskroom" && pkg == "copilot-cli" && pathBase(resolved) == "copilot" &&
+					if pathBase(resolved) == "copilot" &&
 						pathBase(pathDir(pathDir(resolved))) == "copilot-cli" &&
-						versionmeta.FromBinary(ctx, exec, binary) != "" {
+						pathBase(pathDir(pathDir(pathDir(resolved)))) == "Caskroom" &&
+						versionmeta.IsVersionLike(pathBase(pathDir(resolved))) {
 						return true
 					}
 				}
@@ -1068,12 +1068,12 @@ func npmIdentity(exec executor.Executor, found, resolved string, names ...string
 // through packageRoot — and packageRoot returns "" for exactly the layouts the
 // ladders need (a standalone tarball, a snap payload).
 //
-// maxBytes caps the read, 0 for uncapped. Callers that reach a package root the
-// way versionmeta does pass 0 deliberately: that read already happens uncapped
+// maxBytes rejects oversized metadata, 0 for uncapped. Callers that reach a
+// package root the way versionmeta does pass 0 deliberately: that read already happens uncapped
 // in versionmeta for every existing spec, so capping only this copy would move
 // no attacker and would let the two disagree about the same file. Only the
 // reads with no versionmeta counterpart (siblingManifest, piBrewManifest)
-// pass a cap.
+// pass a cap. piBrewManifest also supplies a bounded file reader.
 func readNPMManifest(exec executor.Executor, pkgRoot string, maxBytes int64) (name, version string) {
 	path := joinPath(pkgRoot, "package.json")
 	if maxBytes > 0 {
@@ -1445,7 +1445,8 @@ func piBrewManifest(exec executor.Executor, keg string) (version string, ok bool
 	if !regularFileWithin(exec, joinPath(pkgRoot, "package.json"), siblingManifestMaxBytes) {
 		return "", false
 	}
-	name, version := readNPMManifest(exec, pkgRoot, siblingManifestMaxBytes)
+	reader := exec.GuardedFiles([]string{keg}, nil, siblingManifestMaxBytes)
+	name, version := readNPMManifest(reader, pkgRoot, siblingManifestMaxBytes)
 	return version, name == piPackageName
 }
 

@@ -510,6 +510,53 @@ func addPiBrew(m *executor.Mock, link, keg string) {
 	m.SetSymlink(link, joinPath(keg, "bin", "pi"))
 }
 
+type piBrewReadRecorder struct {
+	executor.Executor
+	t *testing.T
+}
+
+func (e *piBrewReadRecorder) Stat(path string) (os.FileInfo, error) {
+	// Model a size check before the manifest grows.
+	return sizedInfo{n: filepath.Base(path), sz: 0}, nil
+}
+
+func (e *piBrewReadRecorder) ReadFile(path string) ([]byte, error) {
+	e.t.Fatalf("unbounded ReadFile(%q)", path)
+	return nil, nil
+}
+
+func TestPiBrewManifest_BoundedRead(t *testing.T) {
+	keg, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkgRoot := filepath.Join(keg, "libexec", "lib", "node_modules", piPackageName)
+	if err := os.MkdirAll(pkgRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(pkgRoot, "package.json")
+	exec := &piBrewReadRecorder{Executor: executor.NewReal(), t: t}
+	for _, tc := range []struct {
+		name, content string
+		wantOK        bool
+	}{
+		{"normal manifest", string(aicliManifest(piPackageName, "0.87.1")), true},
+		{"grew beyond size check", `{"name":"` + piPackageName + `","version":"0.87.1","pad":"` +
+			strings.Repeat("x", int(siblingManifestMaxBytes)) + `"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec.t = t
+			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			version, ok := piBrewManifest(exec, keg)
+			if ok != tc.wantOK || (ok && version != "0.87.1") {
+				t.Fatalf("piBrewManifest = %q, %v; want acceptance %v", version, ok, tc.wantOK)
+			}
+		})
+	}
+}
+
 func TestAICLIAgents_Pi(t *testing.T) {
 	const piPkg = piPackageName
 	runAICLICases(t, []aicliCase{

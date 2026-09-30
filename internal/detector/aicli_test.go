@@ -142,6 +142,7 @@ func TestAICLIDetector_CopilotNoStaticBypass(t *testing.T) {
 	}{
 		{"AWS Cellar/copilot-cli formula", model.PlatformDarwin, "/opt/homebrew/Cellar/copilot-cli/1.0.0/bin/copilot"},
 		{"cask path at the wrong depth", model.PlatformDarwin, "/opt/homebrew/Caskroom/copilot-cli/1.0.88/bin/copilot"},
+		{"nested repeated cask token", model.PlatformDarwin, "/opt/homebrew/Caskroom/copilot-cli/1.0.88/sub/copilot-cli/2.0/copilot"},
 		{"another cask", model.PlatformDarwin, "/opt/homebrew/Caskroom/other/1.0.88/copilot"},
 		{"cask without a version segment", model.PlatformDarwin, "/opt/homebrew/Caskroom/copilot-cli/latest/copilot"},
 		{"cask layout off macOS", model.PlatformLinux, "/home/linuxbrew/.linuxbrew/Caskroom/copilot-cli/1.0.88/copilot"},
