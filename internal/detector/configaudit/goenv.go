@@ -374,7 +374,7 @@ func (d *GoEnvDetector) readSource(src *goEnvSource, scope GoEnvScope, path stri
 	if exact {
 		files = d.exec.GuardedFiles([]string{path}, goExactFileGuard(path, scope.Volume), maxGoEnvBytes)
 	} else {
-		if !withinGoRoots(path, scope.Roots) {
+		if !GoWithinRoots(d.exec.GOOS(), path, scope.Roots) {
 			fail(model.GoConfigUnsupported, model.GoReasonOutsideApprovedRoots)
 			return
 		}
@@ -474,10 +474,23 @@ func isLexicalAncestor(dir, path string) bool {
 	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
-func withinGoRoots(path string, roots []string) bool {
-	path = filepath.Clean(path)
+// GoPathKey is p as the target's filesystem compares names: Windows and macOS
+// fold case by default, Linux does not. Module paths never go through it.
+// ponytail: conflates names on a case-sensitive APFS volume; probe the volume if that matters.
+func GoPathKey(goos, p string) string {
+	p = filepath.Clean(p)
+	if goos == model.PlatformWindows || goos == model.PlatformDarwin {
+		return strings.ToLower(p)
+	}
+	return p
+}
+
+// GoWithinRoots reports whether path is one of roots or below one, compared
+// as goos's filesystem compares names.
+func GoWithinRoots(goos, path string, roots []string) bool {
+	path = GoPathKey(goos, path)
 	for _, root := range roots {
-		if root = filepath.Clean(root); path == root || isLexicalAncestor(root, path) {
+		if root = GoPathKey(goos, root); path == root || isLexicalAncestor(root, path) {
 			return true
 		}
 	}

@@ -58,6 +58,7 @@ func NewGoScanner(exec executor.Executor, log *progress.Logger) *GoScanner {
 type goScan struct {
 	ctx      context.Context
 	exec     executor.Executor
+	goos     string
 	identity string
 	home     string
 	roots    []string // approved scope: home plus every absolute search root
@@ -68,10 +69,11 @@ type goScan struct {
 	reasons  []string // global, not tied to a source
 	sources  []*model.GoSource
 	byID     map[string]*model.GoSource
+	budget   int // record rows left; see charge
 
 	projects   []*goProjectState
-	manifests  map[string]*goProjectState // default go.mod path -> project
-	vendorDirs map[string]bool            // a go.work beside a go.mod owns the shared vendor dir
+	manifests  map[string]*goProjectState // default go.mod path key -> project
+	vendorDirs map[string]bool            // vendor dir key; a go.work beside a go.mod owns the shared vendor dir
 	workspaces []model.GoWorkspace
 	vendored   []model.GoVendoredModule
 	cached     []model.GoCachedModule
@@ -83,6 +85,7 @@ type goScan struct {
 type goProjectState struct {
 	project model.GoProject
 	sums    []goSumSource
+	charged int // rows already spent on the project
 }
 
 // Scan returns both Go sections, always non-nil. An unresolvable or service
@@ -102,8 +105,8 @@ func (s *GoScanner) Scan(ctx context.Context, target *user.User, searchDirs []st
 	home := filepath.Clean(target.HomeDir)
 	guard, volume := s.protection(home, includeNetworkVolumes)
 	g := &goScan{
-		ctx: ctx, exec: s.exec, identity: target.Username, home: home, guard: guard, volume: volume,
-		roots: []string{home}, byID: map[string]*model.GoSource{}, manifests: map[string]*goProjectState{},
+		ctx: ctx, exec: s.exec, goos: s.exec.GOOS(), identity: target.Username, home: home, guard: guard, volume: volume,
+		roots: []string{home}, byID: map[string]*model.GoSource{}, budget: maxGoRecords, manifests: map[string]*goProjectState{},
 		vendorDirs: map[string]bool{},
 	}
 	// Configured roots are normalized before any containment check; only Go's
@@ -171,10 +174,14 @@ func isGoServiceIdentity(platform string, u *user.User) bool {
 }
 
 // addSource registers a source once; the same kind and path is one source.
+// It returns nil once the record budget is spent.
 func (g *goScan) addSource(kind, path, parent string) *model.GoSource {
 	id := configaudit.GoSourceID(g.identity, kind, path)
 	if src := g.byID[id]; src != nil {
 		return src
+	}
+	if !g.charge(g.byID[parent], 1) {
+		return nil
 	}
 	src := &model.GoSource{
 		SourceID: id, Kind: kind, Path: path,
@@ -185,6 +192,27 @@ func (g *goScan) addSource(kind, path, parent string) *model.GoSource {
 	g.byID[src.SourceID] = src
 	return src
 }
+
+// charge spends n rows on a record owned by src. The first record that does
+// not fit spends the rest, so nothing after it is collected, and marks src and
+// every enclosing source partial; a miss with no owner is a global reason.
+func (g *goScan) charge(src *model.GoSource, n int) bool {
+	if n <= g.budget {
+		g.budget -= n
+		return true
+	}
+	g.budget = 0
+	if src == nil {
+		g.globalReason(model.GoReasonRecordLimit)
+	}
+	for ; src != nil; src = g.byID[src.ParentSourceID] {
+		goDegrade(src, model.GoStatusPartial, model.GoReasonRecordLimit)
+	}
+	return false
+}
+
+// key is path as the target's filesystem compares names.
+func (g *goScan) key(path string) string { return configaudit.GoPathKey(g.goos, path) }
 
 func (g *goScan) globalReason(reason string) {
 	if !slices.Contains(g.reasons, reason) {
@@ -262,6 +290,9 @@ func goRefusalStatus(err error) string {
 // checksum coverage, never the owning source.
 func (g *goScan) checksumFile(files executor.Executor, readPath, path, parentID, kind string, limit int64, parse func([]byte) (goSumIndex, []string)) goSumSource {
 	src := g.addSource(model.GoSourceChecksumFile, path, parentID)
+	if src == nil {
+		return goSumSource{kind: kind, path: path, index: goSumIndex{}, failure: model.GoChecksumPartial}
+	}
 	out := goSumSource{kind: kind, id: src.SourceID, path: path, index: goSumIndex{}}
 	data, ok := goRead(src, files, readPath, limit, true)
 	switch {
@@ -309,10 +340,10 @@ func (g *goScan) scanProjects(searchDirs []string) {
 			g.globalReason(model.GoReasonPathUnresolved) // no working directory to resolve against
 			continue
 		}
-		if seen[dir] {
+		if seen[g.key(dir)] {
 			continue
 		}
-		seen[dir] = true
+		seen[g.key(dir)] = true
 		c := candidate{path: dir, status: model.GoStatusComplete, presence: model.GoPresencePresent}
 		if reason := g.guard(dir); reason != "" {
 			c.status, c.presence, c.reason = model.GoStatusSkipped, model.GoPresenceUnknown, reason
@@ -337,7 +368,8 @@ func (g *goScan) scanProjects(searchDirs []string) {
 			if i == j || c.phys == "" || o.phys == "" {
 				continue
 			}
-			if (o.phys == c.phys && j < i) || (o.phys != c.phys && goPathWithin(c.phys, o.phys)) {
+			cp, op := g.key(c.phys), g.key(o.phys)
+			if (op == cp && j < i) || (op != cp && goPathWithin(cp, op)) {
 				folded = true
 				break
 			}
@@ -346,6 +378,9 @@ func (g *goScan) scanProjects(searchDirs []string) {
 			continue
 		}
 		src := g.addSource(model.GoSourceProjectSearchRoot, c.path, "")
+		if src == nil {
+			break
+		}
 		src.Status, src.Presence = c.status, c.presence
 		if c.reason != "" {
 			src.Reasons = append(src.Reasons, c.reason)
@@ -367,9 +402,15 @@ func (g *goScan) scanProjects(searchDirs []string) {
 		g.readWorkspace(d)
 	}
 	g.readAlternateManifest(walk)
+	// Workspace paths and checksums are charged once attached.
+	kept := g.projects[:0]
 	for _, p := range g.projects {
 		goEnrichProject(&p.project, p.sums...)
+		if g.charge(g.byID[p.project.SourceID], goProjectRows(p.project)-p.charged) {
+			kept = append(kept, p)
+		}
 	}
+	g.projects = kept
 	for _, p := range g.projects {
 		if p.project.ManifestPath == filepath.Join(p.project.Path, "go.mod") {
 			g.readVendor(p.project.Path, p.project.SourceID, &p.project, p.sums[:1])
@@ -386,10 +427,10 @@ type goDiscovered struct{ path, rootID string }
 func (g *goScan) walkRoot(r goRoot) (mods, works []goDiscovered) {
 	skipDirs := map[string]bool{}
 	if c, ok := g.snap.ModCacheRoot(g.home); ok {
-		skipDirs[c] = true
+		skipDirs[g.key(c)] = true
 	}
 	if c, ok := g.snap.DefaultModCacheRoot(g.home); ok {
-		skipDirs[c] = true
+		skipDirs[g.key(c)] = true
 	}
 	type dir struct {
 		path  string
@@ -427,7 +468,7 @@ func (g *goScan) walkRoot(r goRoot) (mods, works []goDiscovered) {
 				continue
 			}
 			switch {
-			case goSkippedDirNames[e.Name()], e.Name() == "vendor" && manifestHere, skipDirs[p]:
+			case goSkippedDirNames[e.Name()], e.Name() == "vendor" && manifestHere, skipDirs[g.key(p)]:
 				continue
 			case g.guard(p) != "":
 				// Protected directories are deliberate scope; an excluded mount
@@ -460,7 +501,7 @@ func goPathWithin(path, dir string) bool {
 
 func (g *goScan) readManifest(d goDiscovered) {
 	src := g.addSource(model.GoSourceProjectManifest, d.path, d.rootID)
-	if g.expired(src, model.GoStatusSkipped) {
+	if src == nil || g.expired(src, model.GoStatusSkipped) {
 		return
 	}
 	data, ok := goRead(src, g.projFS, d.path, maxGoManifestBytes, false)
@@ -473,15 +514,18 @@ func (g *goScan) readManifest(d goDiscovered) {
 		return
 	}
 	p.SourceID, p.Path, p.ManifestPath = src.SourceID, filepath.Dir(d.path), d.path
-	state := &goProjectState{project: p}
+	state := &goProjectState{project: p, charged: goProjectRows(p)}
+	if !g.charge(src, state.charged) {
+		return
+	}
 	state.sums = []goSumSource{g.goSum(filepath.Join(p.Path, "go.sum"), src.SourceID, model.GoChecksumSourceProjectGoSum)}
 	g.projects = append(g.projects, state)
-	g.manifests[d.path] = state
+	g.manifests[g.key(d.path)] = state
 }
 
 func (g *goScan) readWorkspace(d goDiscovered) {
 	src := g.addSource(model.GoSourceWorkspace, d.path, d.rootID)
-	if g.expired(src, model.GoStatusSkipped) {
+	if src == nil || g.expired(src, model.GoStatusSkipped) {
 		return
 	}
 	data, ok := goRead(src, g.projFS, d.path, maxGoManifestBytes, false)
@@ -508,11 +552,11 @@ func (g *goScan) readWorkspace(d goDiscovered) {
 			p = filepath.Join(dir, p)
 		}
 		m.ResolvedPath = filepath.Clean(p)
-		state := g.manifests[filepath.Join(m.ResolvedPath, "go.mod")]
+		state := g.manifests[g.key(filepath.Join(m.ResolvedPath, "go.mod"))]
 		switch {
 		case g.guard(m.ResolvedPath) != "":
 			m.Reason = model.GoReasonSkippedProtected
-		case !slices.ContainsFunc(g.roots, func(r string) bool { return r == m.ResolvedPath || goPathWithin(m.ResolvedPath, r) }):
+		case !configaudit.GoWithinRoots(g.goos, m.ResolvedPath, g.roots):
 			m.Reason = model.GoReasonOutsideApprovedRoots
 		case state == nil:
 			m.Reason = model.GoReasonMemberNotDiscovered
@@ -526,8 +570,13 @@ func (g *goScan) readWorkspace(d goDiscovered) {
 			memberReqs = append(memberReqs, state.project.Requirements...)
 		}
 	}
+	rows := 1 + len(w.Members)
 	for i := range w.Replacements {
 		goEnrichReplacement(&w.Replacements[i], memberReqs, sums...)
+		rows += 1 + len(w.Replacements[i].RecordedChecksums)
+	}
+	if !g.charge(src, rows) {
+		return
 	}
 	g.workspaces = append(g.workspaces, w)
 	g.readVendor(dir, src.SourceID, nil, sums)
@@ -549,29 +598,29 @@ func (g *goScan) readAlternateManifest(walk []goRoot) {
 		return
 	}
 	name = filepath.Clean(name)
-	if g.manifests[name] != nil {
+	if g.manifests[g.key(name)] != nil {
 		return // the default go.mod, already read
 	}
-	if g.guard(name) != "" || !slices.ContainsFunc(g.roots, func(r string) bool { return goPathWithin(name, r) }) {
+	if g.guard(name) != "" || !configaudit.GoWithinRoots(g.goos, name, g.roots) {
 		g.globalReason(model.GoReasonAlternateManifestUnresolved)
 		return
 	}
 	// Owned by the nearest enclosing project, else the search root holding it.
 	parent, projectDir := "", filepath.Dir(name)
 	for _, r := range walk {
-		if goPathWithin(name, r.path) {
+		if goPathWithin(g.key(name), g.key(r.path)) {
 			parent = r.src.SourceID
 		}
 	}
 	best := ""
 	for _, p := range g.projects {
-		if dir := p.project.Path; goPathWithin(name, dir) && len(dir) > len(best) &&
+		if dir := p.project.Path; goPathWithin(g.key(name), g.key(dir)) && len(dir) > len(best) &&
 			p.project.ManifestPath == filepath.Join(dir, "go.mod") {
 			best, parent, projectDir = dir, p.project.SourceID, dir
 		}
 	}
 	src := g.addSource(model.GoSourceAlternateManifest, name, parent)
-	if g.expired(src, model.GoStatusSkipped) {
+	if src == nil || g.expired(src, model.GoStatusSkipped) {
 		return
 	}
 	data, ok := goRead(src, g.projFS, name, maxGoManifestBytes, true)
@@ -584,7 +633,10 @@ func (g *goScan) readAlternateManifest(walk []goRoot) {
 		return
 	}
 	p.SourceID, p.Path, p.ManifestPath = src.SourceID, projectDir, name
-	state := &goProjectState{project: p}
+	state := &goProjectState{project: p, charged: goProjectRows(p)}
+	if !g.charge(src, state.charged) {
+		return
+	}
 	// Go rejects a -modfile without the .mod extension, so no .sum is implied.
 	if base, ok := strings.CutSuffix(name, ".mod"); ok {
 		state.sums = []goSumSource{g.goSum(base+".sum", src.SourceID, model.GoChecksumSourceProjectGoSum)}
@@ -630,15 +682,15 @@ func goEnrichReplacement(r *model.GoReplacement, reqs []model.GoRequirement, sum
 func (g *goScan) readVendor(dir, parentID string, owner *model.GoProject, sums []goSumSource) {
 	vendorDir := filepath.Join(dir, "vendor")
 	listPath := filepath.Join(vendorDir, "modules.txt")
-	if g.vendorDirs[vendorDir] {
+	if g.vendorDirs[g.key(vendorDir)] {
 		return
 	}
 	if _, err := g.projFS.Stat(listPath); errors.Is(err, fs.ErrNotExist) {
 		return
 	}
-	g.vendorDirs[vendorDir] = true
+	g.vendorDirs[g.key(vendorDir)] = true
 	src := g.addSource(model.GoSourceVendorRoot, vendorDir, parentID)
-	if g.expired(src, model.GoStatusSkipped) {
+	if src == nil || g.expired(src, model.GoStatusSkipped) {
 		return
 	}
 	vendorFS := g.exec.GuardedFiles(g.roots, g.guard, maxGoVendorBytes)
@@ -692,6 +744,9 @@ func (g *goScan) readVendor(dir, parentID string, owner *model.GoProject, sums [
 		} else {
 			goChecksums(&v.GoChecksumEvidence, m.mod, sums...)
 		}
+		if !g.charge(src, 1+len(v.PackagePaths)+len(v.RecordedChecksums)+goReplacementRows(v.Replacement)) {
+			return
+		}
 		g.vendored = append(g.vendored, v)
 	}
 }
@@ -729,6 +784,9 @@ func (g *goScan) scanBin() {
 		return
 	}
 	src := g.addSource(model.GoSourceBinRoot, root, "")
+	if src == nil {
+		return
+	}
 	if g.expired(src, model.GoStatusSkipped) {
 		src.Presence = model.GoPresenceUnknown
 		return
@@ -761,6 +819,9 @@ func (g *goScan) scanBin() {
 			continue // dangling link
 		} else if err != nil {
 			b := g.addSource(model.GoSourceBinary, path, src.SourceID)
+			if b == nil {
+				return
+			}
 			b.Presence = model.GoPresenceUnknown
 			goDegrade(b, goRefusalStatus(err), configaudit.GoReadReason(err))
 			continue
@@ -769,6 +830,9 @@ func (g *goScan) scanBin() {
 			continue
 		}
 		b := g.addSource(model.GoSourceBinary, path, src.SourceID)
+		if b == nil {
+			return
+		}
 		data, ok := goRead(b, binFS, readPath, maxGoBinaryBytes, false)
 		if !ok {
 			continue
@@ -779,7 +843,11 @@ func (g *goScan) scanBin() {
 		case bi == nil:
 			goDegrade(b, model.GoStatusPartial, model.GoReasonBuildInfoUnusable)
 		default:
-			g.tools = append(g.tools, goToolFromBuildInfo(bi, path, b.SourceID))
+			t := goToolFromBuildInfo(bi, path, b.SourceID)
+			if !g.charge(b, goToolRows(t)) {
+				return
+			}
+			g.tools = append(g.tools, t)
 		}
 	}
 }
@@ -810,6 +878,9 @@ func (g *goScan) scanCache() {
 		return
 	}
 	src := g.addSource(model.GoSourceCacheRoot, root, "")
+	if src == nil {
+		return
+	}
 	if g.expired(src, model.GoStatusSkipped) {
 		src.Presence = model.GoPresenceUnknown
 		return
@@ -865,7 +936,11 @@ func (g *goScan) scanCache() {
 		if !listed {
 			known = downloadComplete
 		}
-		g.cached = append(g.cached, c.record(e, root, known))
+		rec := c.record(e, root, known)
+		if !g.charge(src, 1+len(rec.Artifacts)+len(rec.RecordedChecksums)) {
+			break
+		}
+		g.cached = append(g.cached, rec)
 	}
 }
 
@@ -1058,8 +1133,9 @@ func (c *goCacheWalk) zipStatus(e *goCacheEntry, readPath string, toolchain bool
 	}
 }
 
-// finish links discovered sources, applies the record budget, rolls up
-// status and sorts everything so an unchanged machine yields identical bytes.
+// finish links discovered sources, rolls up status and sorts everything so an
+// unchanged machine yields identical bytes. The record budget was spent during
+// collection, in sorted walk order, so the same records survive every run.
 func (g *goScan) finish() *model.GoInventory {
 	inv := newGoInventory()
 	for _, p := range g.projects {
@@ -1089,40 +1165,6 @@ func (g *goScan) finish() *model.GoInventory {
 		return strings.Compare(a.ModulePath+"\x00"+a.ObservedVersion, b.ModulePath+"\x00"+b.ObservedVersion)
 	})
 	slices.SortFunc(inv.InstalledTools, func(a, b model.GoInstalledTool) int { return strings.Compare(a.BinaryPath, b.BinaryPath) })
-
-	// Record budget, in sorted order so the same records survive every run.
-	// Dropped rows always mark their owning source incomplete.
-	budget := maxGoRecords
-	inv.Projects = goWithinBudget(g, &budget, inv.Projects, func(p model.GoProject) (string, int) {
-		n := 1 + len(p.Exclusions) + len(p.Tools) + len(p.WorkspacePaths)
-		for _, r := range p.Requirements {
-			n += 1 + len(r.RecordedChecksums)
-		}
-		for _, r := range p.Replacements {
-			n += 1 + len(r.RecordedChecksums)
-		}
-		return p.SourceID, n
-	})
-	inv.Workspaces = goWithinBudget(g, &budget, inv.Workspaces, func(w model.GoWorkspace) (string, int) {
-		n := 1 + len(w.Members)
-		for _, r := range w.Replacements {
-			n += 1 + len(r.RecordedChecksums)
-		}
-		return w.SourceID, n
-	})
-	inv.InstalledTools = goWithinBudget(g, &budget, inv.InstalledTools, func(t model.GoInstalledTool) (string, int) {
-		n := 1 + len(t.RecordedChecksums) + goReplacementRows(t.Replacement)
-		for _, d := range t.Dependencies {
-			n += 1 + len(d.RecordedChecksums) + goReplacementRows(d.Replacement)
-		}
-		return t.SourceID, n
-	})
-	inv.VendoredModules = goWithinBudget(g, &budget, inv.VendoredModules, func(v model.GoVendoredModule) (string, int) {
-		return v.SourceID, 1 + len(v.PackagePaths) + len(v.RecordedChecksums) + goReplacementRows(v.Replacement)
-	})
-	inv.CachedModules = goWithinBudget(g, &budget, inv.CachedModules, func(c model.GoCachedModule) (string, int) {
-		return c.SourceID, 1 + len(c.Artifacts) + len(c.RecordedChecksums)
-	})
 
 	for _, s := range g.sources {
 		if parent := g.byID[s.ParentSourceID]; parent != nil {
@@ -1157,21 +1199,23 @@ func goReplacementRows(r *model.GoReplacement) int {
 	return 1 + len(r.RecordedChecksums)
 }
 
-// goWithinBudget keeps records while they fit; the first that does not
-// exhausts the budget for everything after it.
-func goWithinBudget[T any](g *goScan, budget *int, records []T, rows func(T) (string, int)) []T {
-	kept := records[:0]
-	for _, r := range records {
-		id, n := rows(r)
-		if n > *budget {
-			*budget = 0
-			if src := g.byID[id]; src != nil {
-				goDegrade(src, model.GoStatusPartial, model.GoReasonRecordLimit)
-			}
-			continue
-		}
-		*budget -= n
-		kept = append(kept, r)
+// goProjectRows is a project's record rows: itself, its exclusions, tools
+// and workspace paths, and each requirement and replacement with checksums.
+func goProjectRows(p model.GoProject) int {
+	n := 1 + len(p.Exclusions) + len(p.Tools) + len(p.WorkspacePaths)
+	for _, r := range p.Requirements {
+		n += 1 + len(r.RecordedChecksums)
 	}
-	return kept
+	for _, r := range p.Replacements {
+		n += 1 + len(r.RecordedChecksums)
+	}
+	return n
+}
+
+func goToolRows(t model.GoInstalledTool) int {
+	n := 1 + len(t.RecordedChecksums) + goReplacementRows(t.Replacement)
+	for _, d := range t.Dependencies {
+		n += 1 + len(d.RecordedChecksums) + goReplacementRows(d.Replacement)
+	}
+	return n
 }

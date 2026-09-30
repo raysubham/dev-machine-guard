@@ -800,6 +800,24 @@ func TestGoScanner_Limits(t *testing.T) {
 			t.Errorf("record-capped: projects=%d source=%+v status=%s", len(inv.Projects), src, inv.Status)
 		}
 	})
+	t.Run("records during collection", func(t *testing.T) {
+		home := goTestHome(t)
+		code := filepath.Join(home, "code")
+		for _, d := range []string{"a", "b", "c", "d", "e", "f"} {
+			goWrite(t, filepath.Join(code, d, "go.mod"), "module example.com/"+d+"\n", 0o644)
+			goWrite(t, filepath.Join(code, d, "go.sum"), "", 0o644)
+		}
+		goLimit(t, &maxGoRecords, 2)
+		inv, _ := goTestScanner(t, nil).Scan(context.Background(), goTestTarget(home), []string{code}, nil)
+		// Sources are records too: the budget stops collection, not just output.
+		if len(inv.Sources) > 2 {
+			t.Errorf("sources = %d, want at most 2", len(inv.Sources))
+		}
+		root := goMustSource(t, inv, model.GoSourceProjectSearchRoot, code)
+		if root.Status != model.GoStatusPartial || !slices.Contains(root.Reasons, model.GoReasonRecordLimit) || inv.Status != model.GoStatusPartial {
+			t.Errorf("truncated root = %+v, inventory status = %s", root, inv.Status)
+		}
+	})
 	t.Run("output", func(t *testing.T) {
 		home := goTestHome(t)
 		goLimit(t, &maxGoOutputBytes, 10)
@@ -1230,4 +1248,50 @@ func TestGoScanner_QuotedModfile(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGoScanner_PathCase: Windows and macOS compare path names without case,
+// so differently cased spellings of one directory are one path there.
+func TestGoScanner_PathCase(t *testing.T) {
+	folds := runtime.GOOS == model.PlatformDarwin || runtime.GOOS == model.PlatformWindows
+	t.Run("workspace member", func(t *testing.T) {
+		home := goTestHome(t)
+		ws := filepath.Join(home, "code", "ws")
+		goWrite(t, filepath.Join(ws, "go.work"), "go 1.24\n\nuse ./APP\n", 0o644)
+		goWrite(t, filepath.Join(ws, "app", "go.mod"), "module example.com/App\n", 0o644)
+		inv, _ := goTestScanner(t, nil).Scan(context.Background(), goTestTarget(home), []string{filepath.Join(home, "code")}, nil)
+		app := goFindProject(inv, filepath.Join(ws, "app", "go.mod"))
+		if len(inv.Workspaces) != 1 || len(inv.Workspaces[0].Members) != 1 || app == nil {
+			t.Fatalf("workspaces = %+v, app = %v", inv.Workspaces, app)
+		}
+		if app.ModulePath != "example.com/App" {
+			t.Errorf("module path = %q, want case preserved", app.ModulePath)
+		}
+		m, want := inv.Workspaces[0].Members[0], model.GoReasonMemberNotDiscovered
+		if folds {
+			want = ""
+			if m.ProjectSourceID != app.SourceID {
+				t.Errorf("member ./APP linked to %q, want %q", m.ProjectSourceID, app.SourceID)
+			}
+		}
+		goStatusOf(t, m.Reason, want, "member ./APP reason")
+	})
+	t.Run("search roots", func(t *testing.T) {
+		home := goTestHome(t)
+		goMkdir(t, filepath.Join(home, "code"))
+		inv, _ := goTestScanner(t, nil).Scan(context.Background(), goTestTarget(home),
+			[]string{filepath.Join(home, "code"), filepath.Join(home, "CODE")}, nil)
+		roots, want := 0, 2
+		if folds {
+			want = 1
+		}
+		for _, s := range inv.Sources {
+			if s.Kind == model.GoSourceProjectSearchRoot {
+				roots++
+			}
+		}
+		if roots != want {
+			t.Errorf("search roots = %d, want %d", roots, want)
+		}
+	})
 }

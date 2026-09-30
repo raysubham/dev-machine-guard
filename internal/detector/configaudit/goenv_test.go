@@ -428,3 +428,24 @@ func TestGoProtection(t *testing.T) {
 		}
 	}
 }
+
+func TestGoWithinRoots(t *testing.T) {
+	tests := []struct {
+		name, goos, path string
+		want             bool
+	}{
+		{"linux exact case", model.PlatformLinux, "/home/dev/code/app", true},
+		{"linux differing case", model.PlatformLinux, "/home/dev/CODE/app", false},
+		{"darwin differing case", model.PlatformDarwin, "/home/dev/CODE/app", true},
+		{"windows differing case", model.PlatformWindows, "/HOME/dev/code", true},
+		{"sibling prefix", model.PlatformDarwin, "/home/dev/codex", false},
+		{"parent", model.PlatformDarwin, "/home/dev", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := GoWithinRoots(tc.goos, tc.path, []string{"/home/dev/code"}); got != tc.want {
+				t.Errorf("GoWithinRoots(%q, %q) = %v, want %v", tc.goos, tc.path, got, tc.want)
+			}
+		})
+	}
+}

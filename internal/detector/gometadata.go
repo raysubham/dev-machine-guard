@@ -8,6 +8,7 @@ import (
 	"debug/buildinfo"
 	"encoding/base64"
 	"errors"
+	"path"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -258,7 +259,8 @@ func goUnescapeModule(escPath, escVer string) (module.Version, error) {
 }
 
 // zipArchiveStatus inspects module ZIP metadata without decompressing: every
-// entry must sit under "path@version/", checked for at most maxGoZipEntries.
+// entry must sit under "path@version/" with a clean, valid file path below it,
+// as x/mod/zip's checkZip requires, checked for at most maxGoZipEntries.
 func zipArchiveStatus(data []byte, mod module.Version) string {
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -269,7 +271,15 @@ func zipArchiveStatus(data []byte, mod module.Version) string {
 		if i >= maxGoZipEntries {
 			return model.GoArtifactPartial
 		}
-		if !strings.HasPrefix(f.Name, prefix) {
+		name, ok := strings.CutPrefix(f.Name, prefix)
+		if !ok {
+			return model.GoArtifactUnreadable
+		}
+		if name == "" {
+			continue
+		}
+		name = strings.TrimSuffix(name, "/") // directory entry
+		if path.Clean(name) != name || module.CheckFilePath(name) != nil {
 			return model.GoArtifactUnreadable
 		}
 	}
