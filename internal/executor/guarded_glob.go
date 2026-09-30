@@ -74,3 +74,21 @@ func (g *guardedFiles) WalkDir(root string, fn fs.WalkDirFunc) error {
 		return fn(filepath.Join(root, filepath.FromSlash(name)), entry, err)
 	})
 }
+
+// Preserve dot-dot until the reader has checked preceding symlink targets.
+func guardedAbsolutePath(path string) (string, error) {
+	if path == "" {
+		return "", fs.ErrInvalid
+	}
+	if filepath.IsAbs(path) {
+		return path, nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	if filepath.VolumeName(path) != "" {
+		return filepath.Abs(path)
+	}
+	return cwd + string(filepath.Separator) + path, nil
+}

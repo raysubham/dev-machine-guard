@@ -123,6 +123,10 @@ func (g *guardedFiles) DirExists(path string) bool {
 }
 
 func (g *guardedFiles) Readlink(path string) (string, error) {
+	path, err := guardedAbsolutePath(path)
+	if err != nil {
+		return "", err
+	}
 	if _, err := g.resolver.Resolve(path); err != nil {
 		return "", err
 	}
@@ -130,18 +134,34 @@ func (g *guardedFiles) Readlink(path string) (string, error) {
 }
 
 func (g *guardedFiles) EvalSymlinks(path string) (string, error) {
+	path, err := guardedAbsolutePath(path)
+	if err != nil {
+		return "", err
+	}
 	return g.resolver.Resolve(path)
 }
 
 func (g *guardedFiles) Stat(path string) (os.FileInfo, error) {
+	path, err := guardedAbsolutePath(path)
+	if err != nil {
+		return nil, err
+	}
 	return g.resolver.Stat(path)
 }
 
 func (g *guardedFiles) ReadFile(path string) ([]byte, error) {
+	path, err := guardedAbsolutePath(path)
+	if err != nil {
+		return nil, err
+	}
 	return g.resolver.ReadFile(path, g.maxReadBytes)
 }
 
 func (g *guardedFiles) ReadDir(path string) ([]os.DirEntry, error) {
+	path, err := guardedAbsolutePath(path)
+	if err != nil {
+		return nil, err
+	}
 	return g.resolver.ReadDir(path)
 }
 
@@ -401,4 +421,10 @@ func (r *Real) Open(path string) (*os.File, error) {
 	// #nosec G304 -- OS boundary; protected scanners use guardedFiles.Open.
 	return os.Open(path)
 }
-func (g *guardedFiles) Open(path string) (*os.File, error) { return g.resolver.Open(path) }
+func (g *guardedFiles) Open(path string) (*os.File, error) {
+	path, err := guardedAbsolutePath(path)
+	if err != nil {
+		return nil, err
+	}
+	return g.resolver.Open(path)
+}

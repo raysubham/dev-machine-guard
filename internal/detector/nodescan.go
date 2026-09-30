@@ -434,14 +434,19 @@ type projectEntry struct {
 // the cap" when comparing against prior state.
 func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string, knownLastVerified map[string]time.Time) (results []model.NodeScanResult, discovered []string) {
 	var projects []projectEntry
+	var unobserved []string
 	for _, dir := range searchDirs {
 		s.log.Progress("  Searching in: %s", dir)
 		_ = s.exec.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
 			if err != nil {
+				if !os.IsNotExist(err) {
+					unobserved = append(unobserved, path)
+				}
 				return nil
 			}
 			if entry.IsDir() {
 				if s.skipper.ShouldSkip(path, dir) {
+					unobserved = append(unobserved, path)
 					return filepath.SkipDir
 				}
 				name := entry.Name()
@@ -474,6 +479,7 @@ func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string, kno
 		discovered = append(discovered, p.dir)
 	}
 
+	discovered = retainUnobservedProjects(discovered, knownLastVerified, unobserved)
 	projects = orderScanProjects(projects, knownLastVerified)
 
 	if len(projects) > maxNodeProjects {
@@ -789,16 +795,13 @@ func (s *NodeScanner) scanProjectFromDisk(projectDir, pm string) (model.NodeScan
 // separate so a package installed under two prefixes lists both; the delta
 // layer reconciles them back to one record per PM (globalRecordsFromNode).
 func (s *NodeScanner) scanGlobalPackagesFromDisk() []model.NodeScanResult {
-	before := tcc.Refusals(s.exec)
-	roots := NodeGlobalRoots(s.exec)
-	if tcc.Refusals(s.exec) != before {
-		return []model.NodeScanResult{{PackageManager: "npm", ExitCode: 1, Error: "global package roots include protected paths"}, {PackageManager: "pnpm", ExitCode: 1, Error: "global package roots include protected paths"}, {PackageManager: "yarn", ExitCode: 1, Error: "global package roots include protected paths"}, {PackageManager: "bun", ExitCode: 1, Error: "global package roots include protected paths"}}
+	roots, refused := nodeGlobalRoots(s.exec)
+	results := make([]model.NodeScanResult, 0, len(roots)+len(refused))
+	for _, pm := range []string{"npm", "pnpm", "yarn", "bun"} {
+		if refused[pm] {
+			results = append(results, model.NodeScanResult{PackageManager: pm, ExitCode: 1, Error: "global package roots include protected paths"})
+		}
 	}
-	if len(roots) == 0 {
-		s.log.Debug("node global disk scan: no global node_modules roots found")
-		return nil
-	}
-	results := make([]model.NodeScanResult, 0, len(roots))
 	for _, r := range roots {
 		s.emitProgress("global: " + r.pm)
 		pkgs := s.dist.ScanGlobalModules(r.dir)

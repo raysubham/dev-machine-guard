@@ -69,3 +69,45 @@ func TestGuardedFilesRootListingAndGlob(t *testing.T) {
 		t.Fatalf("root glob = %v, %v", matches, err)
 	}
 }
+
+func TestGuardedFilesRelativeWalkRead(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	if err := os.Mkdir("projects", 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("projects/package.json", []byte("ordinary"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.VolumeName(dir) + string(filepath.Separator)
+	guarded := NewReal().GuardedFiles([]string{root}, nil, 1024)
+	for _, search := range []string{".", "projects", filepath.Join(dir, "projects")} {
+		t.Run(search, func(t *testing.T) {
+			count := 0
+			err := guarded.WalkDir(search, func(path string, entry os.DirEntry, walkErr error) error {
+				if walkErr != nil {
+					return walkErr
+				}
+				if entry.Name() == "package.json" {
+					data, err := guarded.ReadFile(path)
+					if err != nil {
+						t.Errorf("ReadFile(%q): %v", path, err)
+					}
+					if string(data) == "ordinary" {
+						count++
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 {
+				t.Errorf("read %d manifests, want 1", count)
+			}
+		})
+	}
+}
