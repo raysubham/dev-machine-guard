@@ -3,13 +3,16 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +55,10 @@ type Executor interface {
 	ReadFile(path string) ([]byte, error)
 	// ReadDir lists directory entries.
 	ReadDir(path string) ([]os.DirEntry, error)
+	// ReadDirLimit lists at most max entries, reading no more than max+1 from
+	// the directory; more reports that entries were left unread. Entries are
+	// sorted by name.
+	ReadDirLimit(path string, max int) (entries []os.DirEntry, more bool, err error)
 	// Stat returns file info.
 	Stat(path string) (os.FileInfo, error)
 	// Hostname returns the system hostname.
@@ -165,6 +172,14 @@ func (g *guardedFiles) ReadDir(path string) ([]os.DirEntry, error) {
 	return g.resolver.ReadDir(path)
 }
 
+func (g *guardedFiles) ReadDirLimit(path string, max int) ([]os.DirEntry, bool, error) {
+	path, err := guardedAbsolutePath(path)
+	if err != nil {
+		return nil, false, err
+	}
+	return g.resolver.ReadDirLimit(path, max)
+}
+
 // StartDetached starts the process and lets it go. It deliberately does not
 // Wait: the child must outlive this process.
 //
@@ -272,6 +287,29 @@ func (r *Real) ReadFile(path string) ([]byte, error) {
 
 func (r *Real) ReadDir(path string) ([]os.DirEntry, error) {
 	return os.ReadDir(path)
+}
+
+func (r *Real) ReadDirLimit(path string, max int) ([]os.DirEntry, bool, error) {
+	if max < 0 {
+		return nil, false, fmt.Errorf("read dir %s: negative limit", path)
+	}
+	// #nosec G304 -- Real is the unguarded executor, same as ReadDir; callers
+	// that need containment go through GuardedFiles, which overrides this.
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = f.Close() }()
+	entries, err := f.ReadDir(max + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, false, err
+	}
+	more := len(entries) > max
+	if more {
+		entries = entries[:max]
+	}
+	slices.SortFunc(entries, func(a, b os.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+	return entries, more, nil
 }
 
 func (r *Real) Stat(path string) (os.FileInfo, error) {

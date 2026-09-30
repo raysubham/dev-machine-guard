@@ -86,6 +86,9 @@ func TestGuardedFilesRelativeWalkRead(t *testing.T) {
 	guarded := NewReal().GuardedFiles([]string{root}, nil, 1024)
 	for _, search := range []string{".", "projects", filepath.Join(dir, "projects")} {
 		t.Run(search, func(t *testing.T) {
+			if entries, more, err := guarded.ReadDirLimit(search, 10); err != nil || more || len(entries) != 1 {
+				t.Fatalf("ReadDirLimit(%q): count=%d more=%v err=%v", search, len(entries), more, err)
+			}
 			count := 0
 			err := guarded.WalkDir(search, func(path string, entry os.DirEntry, walkErr error) error {
 				if walkErr != nil {
