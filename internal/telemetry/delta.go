@@ -181,11 +181,9 @@ func globalRecordsFromPython(results []model.PythonScanResult) []state.GlobalRec
 			continue
 		}
 		hash, _ := state.CanonicalHashJSON(decodeBase64OrRaw(r.RawStdoutBase64))
-		exitCode := r.ExitCode
-		if r.Partial {
-			exitCode = 1
-		}
-		out = append(out, state.GlobalRecord{PM: r.PackageManager, Hash: hash, ExitCode: exitCode})
+		// Cache the body actually uploaded, including readable partial results.
+		// Global collection runs every scan, so recovery will produce a new hash.
+		out = append(out, state.GlobalRecord{PM: r.PackageManager, Hash: hash, ExitCode: r.ExitCode})
 	}
 	return out
 }
