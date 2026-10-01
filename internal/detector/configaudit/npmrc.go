@@ -17,7 +17,6 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/tcc"
-	"github.com/step-security/dev-machine-guard/internal/versionmeta"
 )
 
 // maxNPMRCFiles caps the number of .npmrc files we report. Even on big
@@ -87,8 +86,6 @@ func (d *NPMRCDetector) WithSkipper(s *tcc.Skipper) *NPMRCDetector {
 	if tcc.ProtectedReadsDisabled(d.exec, s) {
 		d.ownerLookup = guardedOwner(d.exec)
 		d.inGitRepo = guardedInGitRepo(d.exec)
-		// Git loads user-controlled config and includes in its own process.
-		d.gitTracked = nil
 	}
 	return d
 }
@@ -309,9 +306,6 @@ func (d *NPMRCDetector) collectFile(ctx context.Context, path, scope string) mod
 // captureEffective runs `npm config ls -l --json` and `npm config ls -l` for
 // source attribution. Returns nil when npm is unavailable.
 func (d *NPMRCDetector) captureEffective(ctx context.Context) *model.NPMRCEffective {
-	if tcc.ProtectedReadsDisabled(d.exec, d.skipper) {
-		return &model.NPMRCEffective{Error: protectedCommandReason}
-	}
 	if _, err := d.exec.LookPath("npm"); err != nil {
 		return nil
 	}
@@ -382,14 +376,6 @@ func parseSourceAttribution(text string) map[string]string {
 
 // npmVersion returns the npm CLI's version string, "unknown" on failure.
 func (d *NPMRCDetector) npmVersion(ctx context.Context) string {
-	if tcc.ProtectedReadsDisabled(d.exec, d.skipper) {
-		if path, err := d.exec.LookPath("npm"); err == nil {
-			if v := versionmeta.FromBinary(ctx, d.exec, path); v != "" {
-				return v
-			}
-		}
-		return "unknown"
-	}
 	stdout, _, exit, _ := d.exec.RunWithTimeout(ctx, 5*time.Second, "npm", "--version")
 	if exit != 0 {
 		return "unknown"
@@ -405,9 +391,6 @@ func (d *NPMRCDetector) npmVersion(ctx context.Context) string {
 // empty if the call failed or the value is "undefined" (npm's literal output
 // for an unset key).
 func (d *NPMRCDetector) npmConfigGet(ctx context.Context, key string) string {
-	if tcc.ProtectedReadsDisabled(d.exec, d.skipper) {
-		return ""
-	}
 	stdout, _, exit, _ := d.exec.RunWithTimeout(ctx, 5*time.Second, "npm", "config", "get", key)
 	if exit != 0 {
 		return ""

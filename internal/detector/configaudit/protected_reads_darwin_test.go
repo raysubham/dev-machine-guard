@@ -52,20 +52,6 @@ func TestProtectedConfigReads(t *testing.T) {
 	}
 }
 
-func TestProtectedConfigCommandsAreSkipped(t *testing.T) {
-	e, s := executor.NewMock(), tcc.New("/Users/test-user")
-	ctx := context.Background()
-	if got := NewNPMRCDetector(e).WithSkipper(s).captureEffective(ctx); got == nil || got.Error != protectedCommandReason {
-		t.Fatalf("npm effective=%+v", got)
-	}
-	if got := NewPnpmDetector(e).WithSkipper(s).captureEffective(ctx); got == nil || got.Error != protectedCommandReason {
-		t.Fatalf("pnpm effective=%+v", got)
-	}
-	if _, err := NewPipConfigDetector(e).WithSkipper(s).captureEffective(ctx); err == nil || err.Error() != protectedCommandReason {
-		t.Fatalf("pip err=%v", err)
-	}
-}
-
 func TestProtectedConfigOrdinarySymlinkMetadata(t *testing.T) {
 	home := t.TempDir()
 	target, link := filepath.Join(home, "config"), filepath.Join(home, ".npmrc")

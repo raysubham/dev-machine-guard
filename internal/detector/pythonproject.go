@@ -108,6 +108,9 @@ func (d *PythonProjectDetector) ListProjects(searchDirs []string, knownLastVerif
 
 	if len(candidates) > maxPythonProjects {
 		d.log.Warn("Python project scan truncated at %d venvs (total discovered: %d) — lowest-priority venvs were skipped", maxPythonProjects, len(candidates))
+		for _, c := range candidates[maxPythonProjects:] {
+			d.unobserved = append(d.unobserved, c.path)
+		}
 		candidates = candidates[:maxPythonProjects]
 	}
 
@@ -128,6 +131,9 @@ func (d *PythonProjectDetector) ListProjects(searchDirs []string, knownLastVerif
 			// No pip means this path cannot inspect the inventory. Keep nil
 			// so delta retries instead of caching an unverified empty result.
 			d.log.Debug("python venv has no pip — skipping package list: %s (%s)", c.path, c.pm)
+		}
+		if pkgs == nil {
+			d.unobserved = append(d.unobserved, c.path)
 		}
 		projects = append(projects, model.ProjectInfo{
 			Path:           c.path,
@@ -313,3 +319,6 @@ func (d *PythonProjectDetector) detectPM(projectDir string) string {
 	}
 	return "pip"
 }
+
+// UnobservedProjects includes subtrees this run could not inspect.
+func (d *PythonProjectDetector) UnobservedProjects() []string { return d.unobserved }

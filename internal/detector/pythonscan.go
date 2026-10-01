@@ -102,7 +102,8 @@ func (s *PythonScanner) ScanGlobalPackages(ctx context.Context) []model.PythonSc
 func (s *PythonScanner) ScanGlobalPackagesFromDisk(skipper *tcc.Skipper) []model.PythonScanResult {
 	guarded := tcc.GuardedFiles(s.exec, skipper, maxMetadataFileSize, "Python")
 	roots := GlobalPythonRoots(guarded, s.log)
-	if tcc.Refusals(guarded) > 0 {
+	partial := tcc.Refusals(guarded) > 0
+	if len(roots) == 0 && partial {
 		return []model.PythonScanResult{{PackageManager: "pip", ExitCode: 1, Error: "global package roots include protected paths"}}
 	}
 	if len(roots) == 0 {
@@ -115,7 +116,8 @@ func (s *PythonScanner) ScanGlobalPackagesFromDisk(skipper *tcc.Skipper) []model
 
 	start := time.Now()
 	dist := NewPythonDistDetector(s.exec).WithLogger(s.log).WithSkipper(skipper)
-	pkgs := dist.ScanRoots(roots)
+	pkgs := dist.scanRoots(roots)
+	partial = partial || dist.Incomplete()
 	duration := time.Since(start).Milliseconds()
 	if pkgs == nil {
 		return []model.PythonScanResult{{
@@ -139,6 +141,7 @@ func (s *PythonScanner) ScanGlobalPackagesFromDisk(skipper *tcc.Skipper) []model
 		PackageManager:  "pip",
 		RawStdoutBase64: base64.StdEncoding.EncodeToString(raw),
 		ExitCode:        0,
+		Partial:         partial,
 		ScanDurationMs:  duration,
 	}}
 }

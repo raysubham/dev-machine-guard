@@ -34,6 +34,7 @@ func getMaxProjectScanBytes() int64 {
 
 // NodeScanner performs enterprise-mode node scanning (raw output, base64 encoded).
 type NodeScanner struct {
+	unobserved   []string
 	exec         executor.Executor
 	log          *progress.Logger
 	loggedInUser string // when non-empty and running as root, commands run as this user
@@ -434,19 +435,19 @@ type projectEntry struct {
 // the cap" when comparing against prior state.
 func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string, knownLastVerified map[string]time.Time) (results []model.NodeScanResult, discovered []string) {
 	var projects []projectEntry
-	var unobserved []string
+	s.unobserved = nil
 	for _, dir := range searchDirs {
 		s.log.Progress("  Searching in: %s", dir)
 		_ = s.exec.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
 			if err != nil {
 				if !os.IsNotExist(err) {
-					unobserved = append(unobserved, path)
+					s.unobserved = append(s.unobserved, path)
 				}
 				return nil
 			}
 			if entry.IsDir() {
 				if s.skipper.ShouldSkip(path, dir) {
-					unobserved = append(unobserved, path)
+					s.unobserved = append(s.unobserved, path)
 					return filepath.SkipDir
 				}
 				name := entry.Name()
@@ -479,11 +480,14 @@ func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string, kno
 		discovered = append(discovered, p.dir)
 	}
 
-	discovered = retainUnobservedProjects(discovered, knownLastVerified, unobserved)
+	discovered = retainUnobservedProjects(discovered, knownLastVerified, s.unobserved)
 	projects = orderScanProjects(projects, knownLastVerified)
 
 	if len(projects) > maxNodeProjects {
 		s.log.Warn("Node project scan truncated at %d projects (total discovered: %d) — lowest-priority projects were skipped", maxNodeProjects, len(projects))
+		for _, p := range projects[maxNodeProjects:] {
+			s.unobserved = append(s.unobserved, p.dir)
+		}
 		projects = projects[:maxNodeProjects]
 	}
 
@@ -504,6 +508,9 @@ func (s *NodeScanner) ScanProjects(ctx context.Context, searchDirs []string, kno
 		}
 		totalSize += resultSize
 		capped = append(capped, r)
+	}
+	for _, r := range results[len(capped):] {
+		s.unobserved = append(s.unobserved, r.ProjectPath)
 	}
 
 	return capped, discovered
@@ -857,3 +864,6 @@ func isInsideNodeModules(projectDir string) bool {
 	normalized := strings.ReplaceAll(projectDir, "\\", "/")
 	return strings.Contains(normalized, "/node_modules/")
 }
+
+// UnobservedProjects includes subtrees this run could not inspect.
+func (s *NodeScanner) UnobservedProjects() []string { return s.unobserved }

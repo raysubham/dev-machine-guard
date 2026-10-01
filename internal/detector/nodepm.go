@@ -61,7 +61,7 @@ func (d *NodePMDetector) DetectManagers(ctx context.Context) []model.PkgManager 
 			// the version without launching anything.
 			version = versionmeta.FromBinary(ctx, d.exec, path)
 		}
-		if path != "" && version == "" && !tcc.HasGuard(d.exec) {
+		if path != "" && version == "" {
 			if safe, reason := execguard.SafeToExec(ctx, d.exec, path); !safe {
 				d.log.Warn("skipping %s version probe: %s", path, reason)
 			} else {

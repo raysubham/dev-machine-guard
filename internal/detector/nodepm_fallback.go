@@ -11,7 +11,6 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/progress"
-	"github.com/step-security/dev-machine-guard/internal/tcc"
 	"github.com/step-security/dev-machine-guard/internal/versionmeta"
 )
 
@@ -99,8 +98,8 @@ func pmBinaryCandidateDirs(exec executor.Executor) []string {
 // binary, not strict semver ordering).
 func nvmNodeBinDirs(exec executor.Executor, home string) []string {
 	pattern := filepath.Join(home, ".nvm", "versions", "node", "*", "bin")
-	matches, err := exec.Glob(pattern)
-	if err != nil || len(matches) == 0 {
+	matches, _ := exec.Glob(pattern)
+	if len(matches) == 0 {
 		return nil
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(matches)))
@@ -171,9 +170,6 @@ func runPMVersion(ctx context.Context, exec executor.Executor, log *progress.Log
 	// bridge at all, so it also sidesteps the sh -c wrapper below.
 	if v := versionmeta.FromBinary(ctx, exec, binPath); v != "" {
 		return v
-	}
-	if tcc.HasGuard(exec) {
-		return ""
 	}
 	if safe, reason := execguard.SafeToExec(ctx, exec, binPath); !safe {
 		log.Warn("skipping %s version probe: %s", binPath, reason)

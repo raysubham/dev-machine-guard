@@ -75,8 +75,6 @@ func (d *BunDetector) WithSkipper(s *tcc.Skipper) *BunDetector {
 	if tcc.ProtectedReadsDisabled(d.exec, s) {
 		d.ownerLookup = guardedOwner(d.exec)
 		d.inGitRepo = guardedInGitRepo(d.exec)
-		// Git loads user-controlled config and includes in its own process.
-		d.gitTracked = nil
 	}
 	return d
 }
@@ -291,9 +289,6 @@ func (d *BunDetector) bunVersion(ctx context.Context) string {
 			return "unknown"
 		}
 		target = path
-	}
-	if tcc.ProtectedReadsDisabled(d.exec, d.skipper) {
-		return "unknown"
 	}
 	d.log.Progress("exec fallback: running %s --version (no metadata version source)", target)
 	stdout, _, exit, _ := d.exec.RunWithTimeout(ctx, 5*time.Second, target, "--version")

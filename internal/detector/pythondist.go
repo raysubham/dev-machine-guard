@@ -38,6 +38,7 @@ const maxMetadataFileSize = 32 << 20 // 32 MiB
 // PythonDistDetector discovers installed Python packages from install
 // metadata on disk, with no package-manager subprocess.
 type PythonDistDetector struct {
+	readFailed  bool
 	exec        executor.Executor
 	log         *progress.Logger
 	skipper     *tcc.Skipper
@@ -89,9 +90,8 @@ func venvSitePackages(exec executor.Executor, venvPath string) []string {
 		filepath.Join(venvPath, "lib", "python*", "site-packages"),
 		filepath.Join(venvPath, "Lib", "site-packages"),
 	} {
-		if matches, err := exec.Glob(pattern); err == nil {
-			roots = append(roots, matches...)
-		}
+		matches, _ := exec.Glob(pattern)
+		roots = append(roots, matches...)
 	}
 	if len(roots) == 0 {
 		return []string{venvPath}
@@ -107,6 +107,15 @@ func venvSitePackages(exec executor.Executor, venvPath string) []string {
 // A successful empty walk returns a non-nil slice. A walk failure returns nil
 // so delta cannot replace previously uploaded inventory with a partial result.
 func (d *PythonDistDetector) ScanRoots(roots []string) []model.PackageDetail {
+	pkgs := d.scanRoots(roots)
+	if d.readFailed {
+		return nil
+	}
+	return pkgs
+}
+
+func (d *PythonDistDetector) scanRoots(roots []string) []model.PackageDetail {
+	d.readFailed = false
 	if len(roots) == 0 {
 		return nil
 	}
@@ -148,9 +157,7 @@ func (d *PythonDistDetector) ScanRoots(roots []string) []model.PackageDetail {
 		})
 	}
 
-	if walkFailed {
-		return nil
-	}
+	d.readFailed = walkFailed
 	sort.Slice(pkgs, func(i, j int) bool {
 		if pkgs[i].Name == pkgs[j].Name {
 			return pkgs[i].Version < pkgs[j].Version
@@ -163,12 +170,8 @@ func (d *PythonDistDetector) ScanRoots(roots []string) []model.PackageDetail {
 // ScanGlobalPackages walks the host's global / user site-packages roots and
 // returns the installed packages, replacing the `pip3 list` global scan.
 func (d *PythonDistDetector) ScanGlobalPackages() []model.PythonPackage {
-	before := tcc.Refusals(d.exec)
 	roots := GlobalPythonRoots(d.exec, d.log)
-	if tcc.Refusals(d.exec) != before {
-		return nil
-	}
-	details := d.ScanRoots(roots)
+	details := d.scanRoots(roots)
 	if details == nil {
 		return nil
 	}
@@ -304,9 +307,8 @@ func PythonGlobalRoots(exec executor.Executor) []string {
 	var candidates []string
 	add := func(paths ...string) { candidates = append(candidates, paths...) }
 	addGlob := func(pattern string) {
-		if matches, err := exec.Glob(pattern); err == nil {
-			add(matches...)
-		}
+		matches, _ := exec.Glob(pattern)
+		add(matches...)
 	}
 
 	// Anchor per-user paths on the console (GUI) user, not the process user:
@@ -355,3 +357,6 @@ func PythonGlobalRoots(exec executor.Executor) []string {
 	}
 	return roots
 }
+
+// Incomplete reports refused discovery or unreadable package metadata.
+func (d *PythonDistDetector) Incomplete() bool { return d.readFailed || tcc.Refusals(d.exec) > 0 }

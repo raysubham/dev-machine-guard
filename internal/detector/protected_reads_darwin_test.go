@@ -264,3 +264,28 @@ func TestProtectedPythonVenvDiscoveryIsNotEmptySuccess(t *testing.T) {
 		}
 	}
 }
+
+func TestMCPNestedReaderRefusalIsIncomplete(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(home, ".codex", "config.toml")
+	target := filepath.Join(home, "work", "config.toml")
+	for _, p := range []string{filepath.Dir(config), filepath.Dir(target)} {
+		if err := os.MkdirAll(p, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(target, []byte("[mcp_servers.widgets]\ncommand='example-tool'\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, config); err != nil {
+		t.Fatal(err)
+	}
+	e := protectedFixtureExecutor{Executor: executor.NewReal(), home: home}
+	d := NewMCPDetector(e).WithSkipper(tcc.New(home))
+	if got := d.DetectEnterprise(context.Background(), nil); len(got) != 0 || !d.Incomplete() {
+		t.Fatalf("nested-reader results=%v incomplete=%v", got, d.Incomplete())
+	}
+}

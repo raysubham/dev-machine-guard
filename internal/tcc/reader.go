@@ -47,8 +47,7 @@ func GuardedFiles(exec executor.Executor, s *Skipper, maxReadBytes int64, librar
 	return guarded
 }
 
-// ProtectedReadsDisabled also gates commands that load configuration themselves;
-// the executor's file guard cannot intercept a child process's filesystem reads.
+// ProtectedReadsDisabled selects guarded direct file reads.
 func ProtectedReadsDisabled(exec executor.Executor, s *Skipper) bool {
 	return exec.GOOS() == "darwin" && s != nil && (len(s.paths) != 0 || len(s.prefixes) != 0 || len(s.volumes) != 0)
 }
@@ -83,5 +82,5 @@ func Refusals(exec executor.Executor) uint64 {
 	return 0
 }
 
-// HasGuard also gates helper commands that would read outside this reader.
+// HasGuard identifies an executor with protected direct reads.
 func HasGuard(exec executor.Executor) bool { _, ok := exec.(*protectedFiles); return ok }

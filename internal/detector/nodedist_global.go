@@ -60,14 +60,12 @@ func nodeGlobalRoots(exec executor.Executor) ([]nodeGlobalRoot, map[string]bool)
 	}
 	addGlob := func(pm, pattern string) {
 		before := tcc.Refusals(exec)
-		matches, err := exec.Glob(pattern)
+		matches, _ := exec.Glob(pattern)
 		if tcc.Refusals(exec) != before {
 			refused[pm] = true
 		}
-		if err == nil {
-			for _, m := range matches {
-				add(pm, m)
-			}
+		for _, m := range matches {
+			add(pm, m)
 		}
 	}
 	home := nodeHomeDir(exec)

@@ -177,9 +177,6 @@ func (d *PipConfigDetector) detectPip(ctx context.Context) (string, []string, st
 			// invoking --version against them pops a GUI install prompt.
 			continue
 		}
-		if tcc.ProtectedReadsDisabled(d.exec, d.skipper) {
-			return path, cand.args, cand.display, "unknown", true
-		}
 		args := append([]string(nil), cand.args...)
 		args = append(args, "--version")
 		stdout, _, exit, err := d.exec.RunWithTimeout(ctx, 5*time.Second, cand.binary, args...)
@@ -470,7 +467,7 @@ func (d *PipConfigDetector) discoverFiles(ctx context.Context, pipAvailable bool
 	// Preferred: `pip config debug`. Falls back to manual path enumeration
 	// when pip isn't installed or the output is unparseable.
 	usedPipDebug := false
-	if pipAvailable && !tcc.ProtectedReadsDisabled(d.exec, d.skipper) {
+	if pipAvailable {
 		if discovered, ok := d.discoverViaPipDebug(ctx); ok {
 			usedPipDebug = true
 			for _, e := range discovered {
@@ -652,9 +649,6 @@ func (d *PipConfigDetector) populateFileMetadata(ctx context.Context, f *model.P
 var pipConfigListPrefix = regexp.MustCompile(`^([A-Za-z0-9_\-]+)\.([A-Za-z0-9_\-]+)='`)
 
 func (d *PipConfigDetector) captureEffective(ctx context.Context) (*model.PipEffective, error) {
-	if tcc.ProtectedReadsDisabled(d.exec, d.skipper) {
-		return nil, errors.New(protectedCommandReason)
-	}
 	stdout, exit, ok := d.runPip(ctx, 10*time.Second, "config", "list", "-v")
 	if !ok || exit != 0 {
 		return nil, fmt.Errorf("pip config list -v exited %d", exit)
@@ -784,8 +778,6 @@ func (d *PipConfigDetector) WithSkipper(s *tcc.Skipper) *PipConfigDetector {
 	if tcc.ProtectedReadsDisabled(d.exec, s) {
 		d.ownerLookup = guardedOwner(d.exec)
 		d.inGitRepo = guardedInGitRepo(d.exec)
-		// Git loads user-controlled config and includes in its own process.
-		d.gitTracked = nil
 	}
 	return d
 }

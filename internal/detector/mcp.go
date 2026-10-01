@@ -13,6 +13,7 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/aiagents/redact"
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
+	"github.com/step-security/dev-machine-guard/internal/safepath"
 	"github.com/step-security/dev-machine-guard/internal/tcc"
 )
 
@@ -52,8 +53,9 @@ var mcpConfigDefinitions = []mcpConfigSpec{
 
 // MCPDetector collects MCP configuration files.
 type MCPDetector struct {
-	exec    executor.Executor
-	skipper *tcc.Skipper
+	readRefused bool
+	exec        executor.Executor
+	skipper     *tcc.Skipper
 }
 
 func NewMCPDetector(exec executor.Executor) *MCPDetector {
@@ -102,6 +104,9 @@ func (d *MCPDetector) DetectEnterprise(_ context.Context, searchDirs []string) [
 			}, maxJSONConfigBytes)
 		}
 		content, err := reader.ReadFile(loc.ConfigPath)
+		if safepath.ReasonOf(err) != "" {
+			d.readRefused = true
+		}
 		if err != nil || len(content) == 0 {
 			continue
 		}
@@ -393,3 +398,6 @@ func stripJSONCComments(input []byte) []byte {
 	}
 	return out
 }
+
+// Incomplete reports a protected read refused during this scan.
+func (d *MCPDetector) Incomplete() bool { return d.readRefused || tcc.Refusals(d.exec) > 0 }

@@ -9,7 +9,6 @@ import (
 )
 
 const maxConfigFileSize = 32 << 20
-const protectedCommandReason = "not collected: protected-directory scanning is disabled"
 
 func auditLstat(exec executor.Executor, s *tcc.Skipper, path string) (os.FileInfo, error) {
 	if tcc.ProtectedReadsDisabled(exec, s) {

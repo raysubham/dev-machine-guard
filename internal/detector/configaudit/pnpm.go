@@ -16,7 +16,6 @@ import (
 	"github.com/step-security/dev-machine-guard/internal/executor"
 	"github.com/step-security/dev-machine-guard/internal/model"
 	"github.com/step-security/dev-machine-guard/internal/tcc"
-	"github.com/step-security/dev-machine-guard/internal/versionmeta"
 )
 
 // pnpmEnvVars: pnpm-specific names plus the npm_config_* lowercase variants
@@ -68,8 +67,6 @@ func (d *PnpmDetector) WithSkipper(s *tcc.Skipper) *PnpmDetector {
 	if tcc.ProtectedReadsDisabled(d.exec, s) {
 		d.ownerLookup = guardedOwner(d.exec)
 		d.inGitRepo = guardedInGitRepo(d.exec)
-		// Git loads user-controlled config and includes in its own process.
-		d.gitTracked = nil
 	}
 	return d
 }
@@ -237,9 +234,6 @@ func (d *PnpmDetector) collectFile(ctx context.Context, path, scope string) mode
 // captureEffective runs `pnpm config list --json`. SourceByKey stays empty —
 // pnpm doesn't emit per-key source attribution like `npm config ls -l` does.
 func (d *PnpmDetector) captureEffective(ctx context.Context) *model.PnpmEffective {
-	if tcc.ProtectedReadsDisabled(d.exec, d.skipper) {
-		return &model.PnpmEffective{Error: protectedCommandReason}
-	}
 	eff := &model.PnpmEffective{
 		SourceByKey: map[string]string{},
 		Config:      map[string]any{},
@@ -260,14 +254,6 @@ func (d *PnpmDetector) captureEffective(ctx context.Context) *model.PnpmEffectiv
 
 // pnpmVersion returns the pnpm CLI's version string, "unknown" on failure.
 func (d *PnpmDetector) pnpmVersion(ctx context.Context) string {
-	if tcc.ProtectedReadsDisabled(d.exec, d.skipper) {
-		if path, err := d.exec.LookPath("pnpm"); err == nil {
-			if v := versionmeta.FromBinary(ctx, d.exec, path); v != "" {
-				return v
-			}
-		}
-		return "unknown"
-	}
 	stdout, _, exit, _ := d.exec.RunWithTimeout(ctx, 5*time.Second, "pnpm", "--version")
 	if exit != 0 {
 		return "unknown"
@@ -282,9 +268,6 @@ func (d *PnpmDetector) pnpmVersion(ctx context.Context) string {
 // pnpmConfigGet runs `pnpm config get <key>` and returns the trimmed value,
 // or empty if the call failed or the value is pnpm's literal "undefined".
 func (d *PnpmDetector) pnpmConfigGet(ctx context.Context, key string) string {
-	if tcc.ProtectedReadsDisabled(d.exec, d.skipper) {
-		return ""
-	}
 	stdout, _, exit, _ := d.exec.RunWithTimeout(ctx, 5*time.Second, "pnpm", "config", "get", key)
 	if exit != 0 {
 		return ""

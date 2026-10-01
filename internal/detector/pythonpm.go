@@ -63,8 +63,6 @@ func (d *PythonPMDetector) DetectManagers(ctx context.Context) []model.PkgManage
 		// layouts carry the version in the install path.
 		if v := versionmeta.FromBinary(ctx, d.exec, path); v != "" {
 			version = v
-		} else if tcc.HasGuard(d.exec) {
-			// Preserve detection with an unknown version when executing could load protected config.
 		} else if safe, reason := execguard.SafeToExec(ctx, d.exec, path); !safe {
 			d.log.Warn("skipping %s version probe: %s", path, reason)
 		} else {
