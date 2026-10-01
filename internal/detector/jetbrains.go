@@ -255,6 +255,3 @@ func (d *JetBrainsPluginDetector) WithSkipper(s *tcc.Skipper) *JetBrainsPluginDe
 	d.exec = tcc.GuardedFiles(d.exec, s, maxLockfileSize, "Application Support/JetBrains", "Application Support/Google/AndroidStudio*")
 	return d
 }
-
-// Incomplete reports a protected read refused during this scan.
-func (d *JetBrainsPluginDetector) Incomplete() bool { return tcc.Refusals(d.exec) > 0 }

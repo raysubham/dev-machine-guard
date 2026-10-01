@@ -113,7 +113,6 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 	jbDetector := detector.NewJetBrainsPluginDetector(exec).WithSkipper(tccSkipper)
 	jbPlugins := jbDetector.Detect(ctx, ides)
 	extensions = append(extensions, jbPlugins...)
-	coverage := &model.InventoryCoverage{IDEExtensionsIncomplete: extDetector.Incomplete() || jbDetector.Incomplete(), MCPConfigsIncomplete: mcpDetector.Incomplete()}
 
 	// On Windows, filter out bundled/platform plugins (e.g., Eclipse's 500+ OSGi
 	// bundles) unless explicitly requested. macOS detection doesn't produce bundled
@@ -242,9 +241,7 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 		if config.UseLegacyPythonScan {
 			pythonPackages = pyDetector.ListPackages(ctx)
 		} else {
-			dist := detector.NewPythonDistDetector(exec).WithSkipper(tccSkipper).WithLogger(log)
-			pythonPackages = dist.ScanGlobalPackages()
-			coverage.PythonGlobalsIncomplete = dist.Incomplete()
+			pythonPackages = detector.NewPythonDistDetector(exec).WithSkipper(tccSkipper).WithLogger(log).ScanGlobalPackages()
 		}
 		log.StepDone(time.Since(start))
 
@@ -256,7 +253,6 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 				detector.NewPythonDistDetector(exec).WithSkipper(tccSkipper).WithLogger(log))
 		}
 		pythonProjects, _ = pyProjectDetector.ListProjects(searchDirs, nil)
-		coverage.PythonProjectsUnobserved = pyProjectDetector.UnobservedProjects()
 		log.StepDone(time.Since(start))
 	} else {
 		log.StepStart("Python package scanning")
@@ -408,7 +404,6 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) error {
 		Device:            dev,
 		AIAgentsAndTools:  aiTools,
 		IDEInstallations:  ides,
-		InventoryCoverage: coverage,
 		IDEExtensions:     extensions,
 		MCPConfigs:        mcpConfigsToCommunity(mcpConfigs),
 		NodePkgManagers:   pkgManagers,

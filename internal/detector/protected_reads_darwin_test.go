@@ -265,7 +265,7 @@ func TestProtectedPythonVenvDiscoveryIsNotEmptySuccess(t *testing.T) {
 	}
 }
 
-func TestMCPNestedReaderRefusalIsIncomplete(t *testing.T) {
+func TestMCPNestedReaderRefusalIsSkipped(t *testing.T) {
 	home, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -285,7 +285,7 @@ func TestMCPNestedReaderRefusalIsIncomplete(t *testing.T) {
 	}
 	e := protectedFixtureExecutor{Executor: executor.NewReal(), home: home}
 	d := NewMCPDetector(e).WithSkipper(tcc.New(home))
-	if got := d.DetectEnterprise(context.Background(), nil); len(got) != 0 || !d.Incomplete() {
-		t.Fatalf("nested-reader results=%v incomplete=%v", got, d.Incomplete())
+	if got := d.DetectEnterprise(context.Background(), nil); len(got) != 0 {
+		t.Fatalf("nested reader returned a refused configuration: %v", got)
 	}
 }

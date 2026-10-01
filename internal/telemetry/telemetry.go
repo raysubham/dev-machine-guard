@@ -51,7 +51,6 @@ const CurrentPayloadSchemaVersion = 1
 
 // Payload is the enterprise telemetry JSON structure.
 type Payload struct {
-	InventoryCoverage *model.InventoryCoverage `json:"inventory_coverage,omitempty"`
 	// PayloadSchemaVersion gates the delta-protocol sibling fields below
 	// (NodeProjectsUnchanged etc.). Zero/absent = legacy snapshot, every
 	// scanned project ships its full body in NodeProjects/PythonProjects.
@@ -635,7 +634,6 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	jbDetector := detector.NewJetBrainsPluginDetector(exec).WithSkipper(tccSkipper)
 	jbPlugins := jbDetector.Detect(phaseCtx, ides)
 	extensions = append(extensions, jbPlugins...)
-	coverage := &model.InventoryCoverage{IDEExtensionsIncomplete: extDetector.Incomplete() || jbDetector.Incomplete()}
 
 	// On Windows, filter out bundled/platform plugins (e.g., Eclipse's 500+ OSGi
 	// bundles) unless explicitly requested. macOS is unaffected.
@@ -697,7 +695,6 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 	log.Progress("Collecting MCP configuration files...")
 	mcpDetector := detector.NewMCPDetector(exec).WithSkipper(tccSkipper)
 	mcpConfigs := mcpDetector.DetectEnterprise(phaseCtx, searchDirs)
-	coverage.MCPConfigsIncomplete = mcpDetector.Incomplete()
 	for _, c := range mcpConfigs {
 		log.Progress("  Found: %s config (%s)", c.ConfigSource, c.Vendor)
 	}
@@ -847,7 +844,6 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 			}
 		}
 		pythonProjects, pythonDiscovered = pyProjectDetector.ListProjects(searchDirs, knownPython)
-		coverage.PythonProjectsUnobserved = pyProjectDetector.UnobservedProjects()
 		log.Progress("  Found %d Python projects", len(pythonProjects))
 		fmt.Fprintln(os.Stderr)
 		endPhase(phaseCtx, phaseCancel, tracker, log, "python_scan")
@@ -980,7 +976,6 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 			}
 		}
 		nodeProjects, nodeDiscovered = nodeScanner.ScanProjects(phaseCtx, searchDirs, knownNPM)
-		coverage.NodeProjectsUnobserved = nodeScanner.UnobservedProjects()
 		nodeScanMs = time.Since(scanStart).Milliseconds()
 		log.Progress("  Found %d Node.js projects", len(nodeProjects))
 		log.Progress("  Scan duration: %dms", nodeScanMs)
@@ -1217,7 +1212,6 @@ func Run(exec executor.Executor, log *progress.Logger, cfg *cli.Config) (err err
 		InvocationMethod: invocationMethod,
 		StatusInfo:       &finalStatusInfo,
 
-		InventoryCoverage:    coverage,
 		IDEExtensions:        extensions,
 		IDEInstallations:     ides,
 		NodePkgManagers:      pkgManagers,

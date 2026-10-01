@@ -2,8 +2,6 @@ package model
 
 // ScanResult is the community-mode JSON output structure.
 type ScanResult struct {
-	InventoryCoverage *InventoryCoverage `json:"inventory_coverage,omitempty"`
-
 	AgentVersion      string          `json:"agent_version"`
 	AgentURL          string          `json:"agent_url"`
 	ScanTimestamp     int64           `json:"scan_timestamp"`
@@ -377,8 +375,8 @@ type BrewScanResult struct {
 
 // PythonScanResult holds raw Python scan output for enterprise telemetry.
 type PythonScanResult struct {
-	// Partial preserves readable packages while preventing removal of unseen packages.
-	Partial         bool   `json:"partial,omitempty"`
+	// Partial keeps an incomplete global scan eligible for a local retry.
+	Partial         bool   `json:"-"`
 	PackageManager  string `json:"package_manager"`
 	PMVersion       string `json:"package_manager_version"`
 	BinaryPath      string `json:"binary_path"` // Resolved path to the package manager binary
@@ -1187,14 +1185,4 @@ type GoConfigFinding struct {
 	SourceID string `json:"source_id"`
 	Key      string `json:"key"`
 	Detail   string `json:"detail"`
-}
-
-// InventoryCoverage reports observations that cannot establish removals.
-// Absent coverage preserves the full-snapshot contract of older agents.
-type InventoryCoverage struct {
-	PythonGlobalsIncomplete  bool     `json:"python_globals_incomplete,omitempty"`
-	IDEExtensionsIncomplete  bool     `json:"ide_extensions_incomplete,omitempty"`
-	MCPConfigsIncomplete     bool     `json:"mcp_configs_incomplete,omitempty"`
-	NodeProjectsUnobserved   []string `json:"node_projects_unobserved,omitempty"`
-	PythonProjectsUnobserved []string `json:"python_projects_unobserved,omitempty"`
 }
