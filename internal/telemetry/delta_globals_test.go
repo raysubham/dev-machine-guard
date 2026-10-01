@@ -3,6 +3,7 @@ package telemetry
 import (
 	"encoding/base64"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -159,5 +160,46 @@ func TestPythonGlobals_PartialUploadRecovery(t *testing.T) {
 	full := buildDeltaSnapshot(saved, true, false, true, nil, nil, nil, nil, nil, complete)
 	if len(full.pyGlobalsChanged) != 1 || len(full.pyGlobalsUnchanged) != 0 {
 		t.Fatal("full sync must send the package body")
+	}
+}
+
+func TestNodeGlobals_FailedScanRecovery(t *testing.T) {
+	for _, mixed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "all-refused", true: "mixed-roots"}[mixed], func(t *testing.T) {
+			complete := []model.NodeScanResult{
+				npmGlobalRoot("/n/v20/lib/node_modules", model.NodePackage{Name: "widgets", Version: "1"}),
+				npmGlobalRoot("/n/v22/lib/node_modules", model.NodePackage{Name: "gizmo", Version: "1"}),
+			}
+			partial := []model.NodeScanResult{{PackageManager: "npm", ExitCode: 1, Error: "global package roots include protected paths"}}
+			if mixed {
+				partial = append(partial, complete[0])
+			}
+			saved := state.New("test")
+			now := time.Now()
+			saved.CommitAfterUpload(now, "exec-complete", "test", nil, nil, globalRecordsFromNode(complete), nil, true)
+			snapshot := buildDeltaSnapshot(saved, false, true, false, nil, nil, nil, nil, partial, nil)
+			if len(snapshot.npmGlobalsChanged) != len(partial) || len(snapshot.npmGlobalsUnchanged) != 0 {
+				t.Fatalf("failed global bodies not sent: %+v", snapshot)
+			}
+			statePath := filepath.Join(t.TempDir(), "scan-state.json")
+			if err := commitDeltaSnapshot(saved, snapshot, statePath, "exec-partial", "test"); err != nil {
+				t.Fatal(err)
+			}
+			restored, err := state.Load(statePath, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			recovered := buildDeltaSnapshot(restored, false, true, false, nil, nil, nil, nil, complete, nil)
+			if len(recovered.npmGlobalsChanged) != len(complete) || len(recovered.npmGlobalsUnchanged) != 0 {
+				t.Fatalf("recovery must upload each readable root after a failed global body, not reuse the old manager-wide reference: %+v", recovered)
+			}
+			if err := commitDeltaSnapshot(restored, recovered, statePath, "exec-recovered", "test"); err != nil {
+				t.Fatal(err)
+			}
+			unchanged := buildDeltaSnapshot(restored, false, true, false, nil, nil, nil, nil, complete, nil)
+			if len(unchanged.npmGlobalsChanged) != 0 || len(unchanged.npmGlobalsUnchanged) != 1 || unchanged.npmGlobalsUnchanged[0].LastUploadedExecutionID != "exec-recovered" {
+				t.Fatalf("complete recovered roots must become reusable: %+v", unchanged)
+			}
+		})
 	}
 }
