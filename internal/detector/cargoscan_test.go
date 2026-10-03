@@ -205,3 +205,128 @@ func TestCargoScan_UnreadableBinIsUnreadable(t *testing.T) {
 	}
 	t.Fatal("no installed_tool record")
 }
+
+func TestCargoScan_ConfigPatchWorkspace(t *testing.T) {
+	home := goTestHome(t)
+	code := filepath.Join(home, "code")
+	app := filepath.Join(code, "app")
+	ws := filepath.Join(home, "outside", "workspace")
+	goWrite(t, filepath.Join(app, "Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\nwidgets = \"1\"\n", 0o644)
+	goWrite(t, filepath.Join(app, ".cargo", "config.toml"), fmt.Sprintf("[patch.crates-io]\nwidgets = { path = %q }\n", filepath.ToSlash(filepath.Join(ws, "member"))), 0o644)
+	goWrite(t, filepath.Join(ws, "Cargo.toml"), `[workspace]
+members = ["member"]
+[workspace.package]
+version = "1.2.3"
+[workspace.dependencies]
+helper = { path = "helper", package = "actual-helper" }
+`, 0o644)
+	goWrite(t, filepath.Join(ws, "member", "Cargo.toml"), `[package]
+name = "widgets"
+version.workspace = true
+workspace = ".."
+[dependencies]
+helper.workspace = true
+`, 0o644)
+	goWrite(t, filepath.Join(ws, "helper", "Cargo.toml"), "[package]\nname = \"actual-helper\"\nversion = \"0.1.0\"\n", 0o644)
+	for _, dir := range []string{app, filepath.Join(ws, "member"), filepath.Join(ws, "helper")} {
+		goWrite(t, filepath.Join(dir, "src", "lib.rs"), "", 0o644)
+	}
+	inv, audit := cargoTestScan(t, home, code)
+	var widgets, helper, contextFound bool
+	for _, p := range inv.Projects {
+		if p.PackageName == "widgets" {
+			widgets = true
+			if p.PackageVersion != "1.2.3" || p.WorkspaceManifestPath != filepath.Join(ws, "Cargo.toml") {
+				t.Errorf("widgets version = %q, workspace = %q, want inherited version and workspace", p.PackageVersion, p.WorkspaceManifestPath)
+			}
+		}
+	}
+	for _, p := range inv.Packages {
+		if p.Evidence == model.CargoEvidenceDeclaredRequirement && p.PackageName == "actual-helper" {
+			helper = p.Origin.Kind == model.CargoOriginLocal && p.Origin.Path == filepath.Join(ws, "helper")
+		}
+		if p.PackageName == "helper" {
+			t.Errorf("dependency alias emitted as package name: %+v", p)
+		}
+	}
+	for _, c := range audit.Contexts {
+		if c.ProjectPath == filepath.Join(ws, "member") && c.WorkspacePath == ws {
+			contextFound = true
+		}
+	}
+	if !widgets || !helper || !contextFound {
+		t.Errorf("widgets=%v, inherited helper=%v, config context=%v, want all true", widgets, helper, contextFound)
+	}
+}
+
+func TestCargoScan_LocalLockOriginRequiresReference(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		present, transitive bool
+	}{
+		{name: "missing"},
+		{name: "direct", present: true},
+		{name: "transitive", present: true, transitive: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := goTestHome(t)
+			code := filepath.Join(home, "code")
+			referenced := filepath.Join(home, "outside", "shared")
+			goWrite(t, filepath.Join(code, "app", "Cargo.toml"), `[package]
+name = "app"
+version = "0.1.0"
+[dependencies]
+shared = {path = "../../outside/shared"}
+`, 0o644)
+			goWrite(t, filepath.Join(code, "app", "Cargo.lock"), `version = 4
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["shared"]
+[[package]]
+name = "shared"
+version = "1.2.3"
+`, 0o644)
+			manifest := "[package]\nname = \"shared\"\nversion = \"1.2.3\"\n"
+			goWrite(t, filepath.Join(code, "unrelated", "Cargo.toml"), manifest, 0o644)
+			if tc.present {
+				goWrite(t, filepath.Join(referenced, "Cargo.toml"), manifest, 0o644)
+			}
+			if tc.transitive {
+				goWrite(t, filepath.Join(code, "app", "Cargo.lock"), `version = 4
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["bridge"]
+[[package]]
+name = "bridge"
+version = "0.1.0"
+dependencies = ["shared"]
+[[package]]
+name = "shared"
+version = "1.2.3"
+`, 0o644)
+				goWrite(t, filepath.Join(code, "app", "Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\nbridge = {path = \"../../outside/bridge\"}\n", 0o644)
+				goWrite(t, filepath.Join(home, "outside", "bridge", "Cargo.toml"), "[package]\nname = \"bridge\"\nversion = \"0.1.0\"\n[dependencies]\nshared = {path = \"../shared\"}\n", 0o644)
+			}
+			inv, _ := cargoTestScan(t, home, code)
+			found := false
+			for _, p := range inv.Packages {
+				if p.Evidence != model.CargoEvidenceLockedPackage || p.PackageName != "shared" {
+					continue
+				}
+				found = true
+				kind, path := model.CargoOriginLocalUnknown, filepath.Join(code, "app", "Cargo.lock")
+				if tc.present {
+					kind, path = model.CargoOriginLocal, referenced
+				}
+				if p.Origin.Kind != kind || p.Origin.Path != path {
+					t.Errorf("locked shared origin = %s %s, want %s %s", p.Origin.Kind, p.Origin.Path, kind, path)
+				}
+			}
+			if !found {
+				t.Fatal("locked shared package missing")
+			}
+		})
+	}
+}

@@ -130,24 +130,30 @@ func (s *CargoScanner) Scan(ctx context.Context, target *user.User, searchDirs [
 	for _, r := range walk {
 		g.walkRoot(r)
 	}
-	g.readQueued()
-	g.associate()
-	for g.enqueueInherited() {
+	var audit model.CargoConfigAudit
+	for {
 		g.readQueued()
 		g.associate()
-	}
-
-	audit, snap := detector.Detect(ctx, configaudit.CargoConfigScope{
-		Username: g.identity, Home: home, Roots: g.roots, Protected: guard, Volume: volume,
-		ProcessVerified: g.verified, CargoHome: g.cargoHome, Contexts: g.contexts(), RegistryNames: g.registryNames(),
-	})
-	g.snap = snap
-	for _, p := range snap.LocalPaths() {
-		if s := g.enqueue(filepath.Join(p, "Cargo.toml"), ""); s != nil {
-			s.override = true
+		for g.enqueueInherited() {
+			g.readQueued()
+			g.associate()
 		}
+		audit, g.snap = detector.Detect(ctx, configaudit.CargoConfigScope{
+			Username: g.identity, Home: home, Roots: g.roots, Protected: guard, Volume: volume,
+			ProcessVerified: g.verified, CargoHome: g.cargoHome, Contexts: g.contexts(), RegistryNames: g.registryNames(),
+		})
+		before := len(g.states)
+		for _, p := range g.snap.LocalPaths() {
+			if s := g.enqueue(filepath.Join(p, "Cargo.toml"), ""); s != nil {
+				s.override = true
+			}
+		}
+		if len(g.states) == before {
+			break
+		}
+		// Config overrides need the same workspace and inherited-path handling
+		// as walked manifests. enqueue deduplicates and bounds the queue.
 	}
-	g.readQueued()
 
 	g.registerManifests()
 	g.emitProjects()
@@ -1004,6 +1010,7 @@ func (g *cargoScan) addPackage(src *model.CargoSource, p model.CargoPackage) boo
 type cargoLockGroup struct {
 	root    *cargoManifestState
 	members []*cargoManifestState
+	locals  []*cargoManifestState
 }
 
 // emitLockfiles reads the lockfile each context selects, once per path, and
@@ -1024,6 +1031,7 @@ func (g *cargoScan) emitLockfiles() {
 		projects[g.projects[i].ManifestSourceID] = &g.projects[i]
 	}
 	for _, grp := range groups {
+		grp.locals = g.lockLocalPackages(grp.members)
 		unresolved := map[string]bool{}
 		var paths []string
 		for _, m := range grp.members {
@@ -1113,10 +1121,38 @@ func (g *cargoScan) readLockfile(grp cargoLockGroup, path string, unresolved boo
 	}
 }
 
+// lockLocalPackages follows already-read path dependencies and overrides from
+// this lockfile's manifests. Unrelated checkouts cannot establish its origins.
+func (g *cargoScan) lockLocalPackages(members []*cargoManifestState) []*cargoManifestState {
+	queue := slices.Clone(members)
+	seen := map[*cargoManifestState]bool{}
+	for _, s := range queue {
+		seen[s] = true
+	}
+	var out []*cargoManifestState
+	for i := 0; i < len(queue); i++ {
+		s := queue[i]
+		for _, d := range slices.Concat(s.m.deps, s.m.overrides) {
+			dir := cargoPathDepDir(s, s.root, d)
+			if dir == "" {
+				continue
+			}
+			dep := g.byManifest[g.key(filepath.Join(dir, "Cargo.toml"))]
+			if dep == nil || dep.m == nil || seen[dep] {
+				continue
+			}
+			seen[dep] = true
+			queue = append(queue, dep)
+			out = append(out, dep)
+		}
+	}
+	return out
+}
+
 // localLockOrigin places a source-less lock entry. A workspace member or root
 // package is context, kept only when a declaration references it. Otherwise a
-// single manifest with that name and version is its local package; anything
-// else stays local_unknown, scoped to the lockfile.
+// single referenced path package with that name and version is its origin;
+// anything else stays local_unknown, scoped to the lockfile.
 func (g *cargoScan) localLockOrigin(grp cargoLockGroup, e cargoLockEntry, lockPath string) (model.CargoOrigin, bool) {
 	same := func(s *cargoManifestState) bool {
 		return s.m != nil && s.m.name == e.name && s.lockVersion() == e.version
@@ -1132,7 +1168,7 @@ func (g *cargoScan) localLockOrigin(grp cargoLockGroup, e cargoLockEntry, lockPa
 		return model.CargoOrigin{Kind: model.CargoOriginLocal, Path: member.dir, IsLocal: true}, referenced
 	}
 	var match *cargoManifestState
-	for _, s := range g.states {
+	for _, s := range grp.locals {
 		if same(s) {
 			if match != nil {
 				return model.CargoOrigin{Kind: model.CargoOriginLocalUnknown, Path: lockPath, IsLocal: true}, true
