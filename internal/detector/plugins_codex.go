@@ -1145,7 +1145,7 @@ func (r *pluginRootScan) portableMCPError(raw json.RawMessage) string {
 	if u.Scheme == "http" && u.Hostname() != "localhost" && !net.ParseIP(u.Hostname()).IsLoopback() {
 		return bad
 	}
-	if typ == "sse" {
+	if typ == "sse" && r.attr.agent != model.AgentCopilot {
 		return model.AgentScanErrUnsupportedSchema
 	}
 	return ""

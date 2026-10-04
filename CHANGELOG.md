@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See [VERSIONING.md](VERSIONING.md) for why the version starts at 1.8.1.
 
+## [Unreleased]
+
+### Added
+
+- Copilot CLI recorded plugins and live directory-marketplace selections, supplied skills, custom-agent declarations, and sanitized plugin/user/project MCP definitions. Collection is file-only; uncertain formats report incomplete coverage. No Copilot usage or credential collection is added.
+
 ## [1.17.0] - 2026-09-24
 
 ### Added

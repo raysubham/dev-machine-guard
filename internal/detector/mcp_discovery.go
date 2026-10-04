@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/step-security/dev-machine-guard/internal/executor"
+	"github.com/step-security/dev-machine-guard/internal/model"
 )
 
 // mcpConfigBasenames are the filenames recognized as MCP configs wherever they
@@ -101,6 +104,16 @@ func (d *MCPDetector) allConfigLocations(homeDir string, searchDirs []string) []
 	// (1) Known exact paths (includes ~/Library configs via targeted reads).
 	for _, spec := range mcpConfigDefinitions {
 		p := d.resolveConfigPath(spec, homeDir)
+		if spec.SourceName == model.AgentCopilot {
+			if executor.UserEnvironmentError(d.exec) != nil || d.skipper.WithinProtected(p) {
+				continue
+			}
+			reader := d.copilotMCPReader(filepath.Dir(p))
+			if info, err := reader.Stat(p); err == nil && info.Mode().IsRegular() {
+				add(spec.SourceName, p, spec.Vendor)
+			}
+			continue
+		}
 		if d.exec.FileExists(p) {
 			add(spec.SourceName, p, spec.Vendor)
 		}
@@ -113,7 +126,31 @@ func (d *MCPDetector) allConfigLocations(homeDir string, searchDirs []string) []
 	for _, s := range d.discoverWalkedMCPConfigs(searchDirs, homeDir) {
 		add(s.SourceName, s.ConfigPath, s.Vendor)
 	}
+
+	// Target already-known projects after existing discovery to retain attribution.
+	projects := append([]string{}, searchDirs...)
+	projects = append(projects, discoverClaudeProjects(d.exec)...)
+	for _, project := range projects {
+		for _, rel := range []string{".mcp.json", ".github/mcp.json"} {
+			file := filepath.Join(project, filepath.FromSlash(rel))
+			if d.skipper.WithinProtected(file) {
+				continue
+			}
+			if info, err := d.copilotMCPReader(project).Stat(file); err == nil && info.Mode().IsRegular() {
+				add("copilot_project", file, "GitHub")
+			}
+		}
+	}
 	return out
+}
+
+func (d *MCPDetector) copilotMCPReader(root string) executor.Executor {
+	return d.exec.GuardedFiles([]string{root}, func(file string) string {
+		if d.skipper.WithinProtected(file) {
+			return "tcc_protected"
+		}
+		return ""
+	}, maxJSONConfigBytes)
 }
 
 // discoverWalkedMCPConfigs walks the configured search dirs and the per-user

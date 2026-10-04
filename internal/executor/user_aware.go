@@ -34,6 +34,10 @@ func (e *UserAwareExecutor) GuardedFiles(roots []string, guard func(string) stri
 
 var userEnvironmentKeys = []string{
 	"APPDATA",
+	"COPILOT_HOME",
+	"COPILOT_CACHE_HOME",
+	"XDG_CACHE_HOME",
+	"LOCALAPPDATA",
 	"GOAUTH",
 	"GOENV",
 	"GOPROXY",

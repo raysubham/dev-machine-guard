@@ -23,7 +23,7 @@ import (
 )
 
 // Agent plugin inventory: shared identity, caps, guarded reads and component
-// construction for the Claude Code and Codex adapters. Everything here is a
+// construction for the Claude Code, Codex and Copilot adapters. Everything here is a
 // filesystem read; no agent is ever executed.
 
 const (
@@ -52,7 +52,7 @@ const (
 	maxRecordedUses        = 1<<53 - 1
 )
 
-// pluginScan is the per-run state shared by both adapters: one observation
+// pluginScan is the per-run state shared by the adapters: one observation
 // time, the SKILL.md parse memo shared with the ordinary skill walk, and the
 // envelope-wide budgets.
 type pluginScan struct {
@@ -98,10 +98,13 @@ type pluginRootScan struct {
 	attr nestedAttr
 }
 
-// AgentVersions selects Claude Code and Codex versions from the AI CLI inventory.
+// AgentVersions selects plugin agent versions from the AI CLI inventory.
 func AgentVersions(tools []model.AITool) map[string]string {
 	out := map[string]string{}
 	for _, t := range tools {
+		if t.Name == "github-copilot-cli" && t.Version != "" {
+			out[model.AgentCopilot] = t.Version
+		}
 		if (t.Name == model.AgentClaudeCode || t.Name == model.AgentCodex) && t.Version != "" {
 			out[t.Name] = t.Version
 		}
@@ -158,7 +161,7 @@ func (d *SkillsDetector) DetectPlugins(ctx context.Context, result *SkillsResult
 		s.now = d.now()
 	}
 	var contexts []*model.AgentPluginContext
-	for _, c := range []*model.AgentPluginContext{s.detectClaude(), s.detectCodex()} {
+	for _, c := range []*model.AgentPluginContext{s.detectClaude(), s.detectCodex(), s.detectCopilot()} {
 		if c != nil {
 			// Missing projects can hide project settings and catalogs.
 			if s.projectsIncomplete {
@@ -949,7 +952,7 @@ func (r *pluginRootScan) mcpServerComponents(servers json.RawMessage, rel, point
 		if pointer != "" {
 			serverPointer += "/" + strings.NewReplacer("~", "~0", "/", "~1").Replace(name)
 		}
-		if r.p.ManifestFormat == model.PluginManifestPortable {
+		if r.p.ManifestFormat == model.PluginManifestPortable && !(r.attr.agent == model.AgentCopilot && pointer == "/mcp-servers") {
 			if code := r.portableMCPError(declarations[name]); code != "" {
 				c := model.PluginComponent{Kind: model.PluginComponentMCP, Name: name, RelativePath: rel, DeclarationPointer: serverPointer, DefinitionPath: configPath}
 				r.componentError(&c, code)
@@ -1375,7 +1378,7 @@ func (r SkillsResult) replacesMCPConfig(source, p string, represented map[string
 	if r.evidence == nil {
 		return false
 	}
-	if source == "project_mcp" {
+	if source == "project_mcp" || source == "copilot_project" {
 		return false
 	}
 	for _, spec := range mcpConfigDefinitions {
