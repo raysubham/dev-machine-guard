@@ -111,7 +111,7 @@ func TestAgentPluginsGolden_CoversTheWholeVocabulary(t *testing.T) {
 		what string
 		want []string
 	}{
-		{"agent", []string{AgentClaudeCode, AgentCodex}},
+		{"agent", []string{AgentClaudeCode, AgentCodex, AgentCopilot}},
 		{"status", []string{AgentScanStatusComplete, AgentScanStatusPartial, AgentScanStatusError, AgentScanStatusUnsupported}},
 		{"error", []string{AgentScanErrReadFailed, AgentScanErrParseFailed, AgentScanErrUnsupportedSchema, AgentScanErrLimitExceeded,
 			AgentScanErrUnsafePath, AgentScanErrSourceChanged, AgentScanErrRootUnresolved}},
@@ -121,9 +121,9 @@ func TestAgentPluginsGolden_CoversTheWholeVocabulary(t *testing.T) {
 		{"install", []string{PluginInstallMarketplace, PluginInstallDirectory, PluginInstallSynced, PluginInstallAccount, PluginInstallUnknown}},
 		{"scope", []string{PluginScopeUser, PluginScopeProject, PluginScopeLocal, PluginScopeSystem, PluginScopeUnknown}},
 		{"evidence", []string{PluginEvidenceRegistry, PluginEvidenceLocalConfig, PluginEvidenceSkillDirectory, PluginEvidenceSyncedDirectory, PluginEvidenceRemoteMarker}},
-		{"manifest", []string{PluginManifestClaude, PluginManifestCodex, PluginManifestCursor, PluginManifestPortable, PluginManifestCatalog, PluginManifestNone, PluginManifestUnknown}},
+		{"manifest", []string{PluginManifestClaude, PluginManifestCodex, PluginManifestCopilot, PluginManifestCursor, PluginManifestPortable, PluginManifestCatalog, PluginManifestNone, PluginManifestUnknown}},
 		{"component", []string{PluginComponentSkill, PluginComponentCommand, PluginComponentMCP, PluginComponentAgent, PluginComponentHook, PluginComponentLSP, PluginComponentApp}},
-		{"nested source", []string{"claude_plugin", "codex_plugin"}},
+		{"nested source", []string{"claude_plugin", "codex_plugin", "copilot_plugin"}},
 		// An empty kind denotes SKILL.md and remains valid beside explicit kinds.
 		{"definition", []string{"", AgentDefinitionSkill, AgentDefinitionCommand}},
 	} {
@@ -348,4 +348,25 @@ func TestAgentPluginsGolden_IdentityVectors(t *testing.T) {
 			ids[p.InstanceID] = true
 		}
 	}
+}
+
+func TestAgentPluginsGolden_CopilotObservations(t *testing.T) {
+	_, doc := loadAgentPluginsGolden(t)
+	for _, c := range doc.AgentPlugins.Contexts {
+		if c.Agent != AgentCopilot {
+			continue
+		}
+		if len(c.Plugins) != 2 {
+			t.Fatalf("Copilot plugins: %d", len(c.Plugins))
+		}
+		for _, p := range c.Plugins {
+			for _, component := range p.Components {
+				if component.Skill != nil && (component.Skill.Agent != AgentCopilot || component.Skill.Source != "copilot_plugin" || component.Skill.Usage != nil) {
+					t.Fatal("Copilot skill attribution or usage changed")
+				}
+			}
+		}
+		return
+	}
+	t.Fatal("shared fixture is missing Copilot")
 }
