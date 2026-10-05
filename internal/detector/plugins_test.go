@@ -2384,6 +2384,267 @@ func TestCopilotNativeCachePaths(t *testing.T) {
 	}
 }
 
+func TestCopilotEditorReceipt(t *testing.T) {
+	m, fs := newPluginMock()
+	root := filepath.Join(testHome, ".vscode", "agent-plugins")
+	catalog := filepath.Join(root, "github.com", "test-org", "catalog")
+	payload := filepath.Join(catalog, "plugins", "review")
+	fs.addFile(filepath.Join(root, "installed.json"), fmt.Sprintf(`{"version":1,"installed":[{"pluginUri":%q,"marketplace":"test-org/catalog","name":"review"}]}`, "file://"+filepath.ToSlash(payload)))
+	fs.addFile(filepath.Join(catalog, ".github/plugin/marketplace.json"), `{"name":"engineering","owner":{"name":"Example Engineering"},"plugins":[{"name":"review","source":"./plugins/review"},{"name":"unselected","source":"./plugins/unselected"}]}`)
+	fs.addFile(filepath.Join(payload, ".plugin/plugin.json"), `{"name":"review"}`)
+	fs.addFile(filepath.Join(payload, "skills/check/SKILL.md"), validFrontmatter("check", "Review releases"))
+	fs.commit()
+	result := NewSkillsDetector(m).DetectAll(context.Background(), nil, nil)
+	c := copilotContext(t, result)
+	if len(c.Plugins) != 1 {
+		t.Fatalf("editor receipt not collected: %+v", c)
+	}
+	p := c.Plugins[0]
+	if p.InstallPath != payload || p.InstallationEvidence != model.PluginEvidenceRegistry || len(p.Components) != 1 || p.Source == nil || p.Source.Location != "https://github.com/test-org/catalog" || p.Source.Subdirectory != "plugins/review" || p.ConfiguredEnabled != nil {
+		t.Fatalf("editor evidence mismatch: %+v", p)
+	}
+}
+
+func TestCopilotEditorExternalGitReceipt(t *testing.T) {
+	for _, tc := range []struct {
+		name, source, relative string
+		mismatch, missing      bool
+	}{
+		{"github", `{"source":"github","repo":"test-org/review"}`, "github.com/test-org/review", false, false},
+		{"subdirectory", `{"source":"github","repo":"test-org/tools","path":"plugins/review","ref":"release/v2"}`, "github.com/test-org/tools/ref_release_v2/plugins/review", false, false},
+		{"git", `{"source":"url","url":"https://example.com/test-org/tools.git","sha":"abcd","path":"plugins/review"}`, "example.com/test-org/tools/sha_abcd/plugins/review", false, false},
+		{"mismatch", `{"source":"github","repo":"test-org/review"}`, "github.com/test-org/other", true, false},
+		{"missing catalog", `{"source":"github","repo":"test-org/review"}`, "github.com/test-org/review", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, fs := newPluginMock()
+			root := filepath.Join(testHome, ".vscode", "agent-plugins")
+			catalog := filepath.Join(root, "github.com", "test-org", "catalog")
+			payload := filepath.Join(root, filepath.FromSlash(tc.relative))
+			fs.addFile(filepath.Join(root, "installed.json"), fmt.Sprintf(`{"version":1,"installed":[{"pluginUri":%q,"marketplace":"test-org/catalog","name":"review"}]}`, "file://"+filepath.ToSlash(payload)))
+			if !tc.missing {
+				fs.addFile(filepath.Join(catalog, ".github/plugin/marketplace.json"), fmt.Sprintf(`{"plugins":[{"name":"review","source":%s}]}`, tc.source))
+			}
+			fs.addFile(filepath.Join(payload, ".plugin/plugin.json"), `{"name":"review"}`)
+			fs.addFile(filepath.Join(payload, "skills/check/SKILL.md"), validFrontmatter("check", "Review releases"))
+			fs.commit()
+			c := copilotContext(t, NewSkillsDetector(m).DetectAll(context.Background(), nil, nil))
+			if len(c.Plugins) != 1 || len(c.Plugins[0].Components) != 1 {
+				t.Fatalf("readable receipt evidence lost: %+v", c)
+			}
+			p := c.Plugins[0]
+			if tc.mismatch || tc.missing {
+				if p.Source != nil || c.MarketplaceStatus != model.AgentScanStatusPartial {
+					t.Fatalf("unverified provenance accepted: %+v", p)
+				}
+			} else if p.Source == nil || p.Source.Kind == model.PluginSourceUnknown || c.MarketplaceStatus != model.AgentScanStatusComplete {
+				t.Fatalf("external repository provenance missing: %+v", c)
+			}
+		})
+	}
+}
+
+func TestCopilotEditorReceiptCoverage(t *testing.T) {
+	for _, tc := range []struct {
+		name, receipt string
+		complete      bool
+	}{
+		{"empty", `{"version":1,"installed":[]}`, true},
+		{"malformed", `{`, false},
+		{"null", `null`, false},
+		{"unknown version", `{"version":2,"installed":[]}`, false},
+		{"remote URI", `{"version":1,"installed":[{"pluginUri":"vscode-remote://ssh-remote/host/plugin","marketplace":"test-org/catalog"}]}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, fs := newPluginMock()
+			root := filepath.Join(testHome, "editor-plugins")
+			m.SetEnv("VSCODE_AGENT_PLUGINS", root)
+			fs.addFile(filepath.Join(root, "installed.json"), tc.receipt)
+			fs.addFile(filepath.Join(root, "orphan/.plugin/plugin.json"), `{"name":"orphan"}`)
+			fs.commit()
+			c := copilotContext(t, NewSkillsDetector(m).DetectAll(context.Background(), nil, nil))
+			if len(c.Plugins) != 0 || (c.InstallationStatus == model.AgentScanStatusComplete) != tc.complete {
+				t.Fatalf("receipt coverage: %+v", c)
+			}
+		})
+	}
+}
+
+func TestCopilotEditorLocalRegistration(t *testing.T) {
+	m, fs := newPluginMock()
+	project := filepath.Join(testHome, "project")
+	payload := filepath.Join(testHome, "release-review")
+	fs.addFile(filepath.Join(project, ".git/HEAD"), "ref: refs/heads/main\n")
+	fs.addFile(filepath.Join(project, ".vscode/settings.json"), fmt.Sprintf(`{// native editor settings
+"chat.pluginLocations":{%q:false}}`, payload))
+	fs.addFile(filepath.Join(payload, ".plugin/plugin.json"), `{"name":"release-review","skills":"custom-skills"}`)
+	fs.addFile(filepath.Join(payload, "skills/default/SKILL.md"), validFrontmatter("default", "Default skill"))
+	fs.addFile(filepath.Join(payload, "custom-skills/custom/SKILL.md"), validFrontmatter("custom", "Custom skill"))
+	fs.addFile(filepath.Join(payload, "agents/reviewer.agent.md"), "Review releases.\n")
+	fs.commit()
+	result := NewSkillsDetector(m).DetectAll(context.Background(), []string{project}, nil)
+	c := copilotContext(t, result)
+	if len(c.Plugins) != 1 || c.Plugins[0].ConfiguredEnabled == nil || *c.Plugins[0].ConfiguredEnabled || c.Plugins[0].ProjectPath != project || c.Plugins[0].InstallationEvidence != model.PluginEvidenceLocalConfig || len(c.Plugins[0].Components) != 3 || c.Plugins[0].ComponentStatus != model.AgentScanStatusComplete {
+		t.Fatalf("editor registration, default/custom union and plain agent: %+v", c)
+	}
+}
+
+func TestCopilotEditorComponentPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name, manifest string
+		want           int
+	}{
+		{"exclusive", `{"name":"review","skills":{"paths":["custom"],"exclusive":true}}`, 1},
+		{"supplemental", `{"name":"review","skills":{"paths":["custom"]}}`, 2},
+		{"portable", `{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"review","extensions":{"com.github.copilot":{"skills":{"paths":["custom"]}}}}`, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, fs := newPluginMock()
+			project := filepath.Join(testHome, "project")
+			payload := filepath.Join(testHome, "review")
+			fs.addFile(filepath.Join(project, ".git/HEAD"), "ref: refs/heads/main\n")
+			fs.addFile(filepath.Join(project, ".vscode/settings.json"), fmt.Sprintf(`{"chat.pluginLocations":{%q:true}}`, payload))
+			fs.addFile(filepath.Join(payload, "plugin.json"), tc.manifest)
+			fs.addFile(filepath.Join(payload, "skills/default/SKILL.md"), validFrontmatter("default", "Default skill"))
+			custom := "custom"
+			if tc.name == "portable" {
+				custom = "com.github.copilot/custom"
+			}
+			fs.addFile(filepath.Join(payload, custom, "check/SKILL.md"), validFrontmatter("check", "Custom skill"))
+			fs.commit()
+			c := copilotContext(t, NewSkillsDetector(m).DetectAll(context.Background(), []string{project}, nil))
+			if len(c.Plugins) != 1 || len(c.Plugins[0].Components) != tc.want || c.Plugins[0].ComponentStatus != model.AgentScanStatusComplete {
+				t.Fatalf("editor path selection: %+v", c)
+			}
+		})
+	}
+}
+
+func TestCopilotEditorManifestAndMCPPrecedence(t *testing.T) {
+	m, fs := newPluginMock()
+	project, payload := filepath.Join(testHome, "project"), filepath.Join(testHome, "review")
+	fs.addFile(filepath.Join(project, ".git/HEAD"), "ref: refs/heads/main\n")
+	fs.addFile(filepath.Join(project, ".vscode/settings.json"), fmt.Sprintf(`{"chat.pluginLocations":{%q:true}}`, payload))
+	fs.addFile(filepath.Join(payload, "plugin.json"), `{"name":"wrong-root"}`)
+	fs.addFile(filepath.Join(payload, ".claude-plugin/plugin.json"), `{"name":"review","mcpServers":{"selected":{"command":"node","args":["server.js"]}}}`)
+	fs.addFile(filepath.Join(payload, ".mcp.json"), `{"servers":{"not-selected":{"command":"node","args":["other.js"]}}}`)
+	fs.commit()
+	c := copilotContext(t, NewSkillsDetector(m).DetectAll(context.Background(), []string{project}, nil))
+	if len(c.Plugins) != 1 || c.Plugins[0].ManifestFormat != model.PluginManifestClaude || c.Plugins[0].ManifestName != "review" || len(c.Plugins[0].Components) != 1 || c.Plugins[0].Components[0].Name != "selected" {
+		t.Fatalf("editor manifest and inline MCP precedence: %+v", c)
+	}
+}
+
+func TestCopilotEditorOptionalManifestAndConfigPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name, manifest, configRoot string
+		exclusive                  bool
+	}{
+		{"no manifest", "", "", false},
+		{"supplemental", `{"name":"review","hooks":{"paths":["custom/hooks.json"]},"mcpServers":{"paths":["custom/mcp.json"]}}`, "", false},
+		{"exclusive", `{"name":"review","hooks":{"paths":["custom/hooks.json"],"exclusive":true},"mcpServers":{"paths":["custom/mcp.json"],"exclusive":true}}`, "", true},
+		{"portable", `{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"review","extensions":{"com.github.copilot":{"hooks":{"paths":["custom/hooks.json"]},"mcpServers":{"paths":["custom/mcp.json"]}}}}`, "com.github.copilot", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, fs := newPluginMock()
+			project, payload := filepath.Join(testHome, "project"), filepath.Join(testHome, "review")
+			fs.addFile(filepath.Join(project, ".git/HEAD"), "ref: refs/heads/main\n")
+			fs.addFile(filepath.Join(project, ".vscode/settings.json"), fmt.Sprintf(`{"chat.pluginLocations":{%q:true}}`, payload))
+			if tc.manifest != "" {
+				fs.addFile(filepath.Join(payload, "plugin.json"), tc.manifest)
+			}
+			fs.addFile(filepath.Join(payload, "skills/check/SKILL.md"), validFrontmatter("check", "Review releases"))
+			hooks, mcp := "hooks.json", ".mcp.json"
+			if tc.configRoot != "" {
+				hooks, mcp = "com.github.copilot/hooks/hooks.json", "mcp.json"
+			}
+			fs.addFile(filepath.Join(payload, hooks), `{"hooks":{}}`)
+			fs.addFile(filepath.Join(payload, mcp), `{"mcpServers":{"default":{"type":"stdio","command":"node","args":["default.js"]}}}`)
+			if tc.name != "no manifest" {
+				fs.addFile(filepath.Join(payload, tc.configRoot, "custom/hooks.json"), `{"hooks":{}}`)
+				fs.addFile(filepath.Join(payload, tc.configRoot, "custom/mcp.json"), `{"mcpServers":{"custom":{"type":"stdio","command":"node","args":["custom.js"]}}}`)
+			}
+			fs.commit()
+			c := copilotContext(t, NewSkillsDetector(m).DetectAll(context.Background(), []string{project}, nil))
+			want := 5
+			if tc.name == "no manifest" || tc.exclusive {
+				want = 3
+			}
+			if len(c.Plugins) != 1 || len(c.Plugins[0].Components) != want || c.Plugins[0].ComponentStatus != model.AgentScanStatusComplete {
+				t.Fatalf("editor config selection: %+v", c)
+			}
+		})
+	}
+}
+
+func TestCopilotCommandRuleAndLSPDeclarations(t *testing.T) {
+	for _, portable := range []bool{false, true} {
+		t.Run(fmt.Sprint(portable), func(t *testing.T) {
+			m, fs := newPluginMock()
+			root := filepath.Join(testHome, ".copilot")
+			payload := filepath.Join(root, "installed-plugins/review")
+			fs.addFile(filepath.Join(root, "config.json"), fmt.Sprintf(`{"installedPlugins":[{"name":"review","marketplace":"","cache_path":%q}]}`, payload))
+			manifest, namespace, lsp := `{"name":"review","commands":"actions"}`, "", "lsp-config/servers.json"
+			if portable {
+				manifest = `{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"review","extensions":{"com.github.copilot":{"commands":{"paths":["actions"],"exclusive":true}}}}`
+				namespace, lsp = "com.github.copilot", "com.github.copilot/lsp.json"
+			}
+			fs.addFile(filepath.Join(payload, "plugin.json"), manifest)
+			fs.addFile(filepath.Join(payload, namespace, "actions/review.md"), validFrontmatter("review", "Review release changes"))
+			fs.addFile(filepath.Join(payload, namespace, "rules/safety.instructions.md"), "Review changes without running commands.\n")
+			fs.addFile(filepath.Join(payload, lsp), `{"lspServers":{"typescript":{"command":"language-server","fileExtensions":{".ts":"typescript"},"env":{"TOKEN":"not-uploaded"}}}}`)
+			fs.commit()
+			p := copilotContext(t, NewSkillsDetector(m).DetectAll(context.Background(), nil, nil)).Plugins[0]
+			if p.ComponentStatus != model.AgentScanStatusComplete || len(p.Components) != 3 {
+				t.Fatalf("component declarations incomplete: %+v", p)
+			}
+			seen := map[string]bool{}
+			for _, c := range p.Components {
+				seen[c.Kind] = true
+				if c.Kind == model.PluginComponentCommand && (c.Command == nil || c.Command.DefinitionHash == "" || c.CallableNames[0] != "review:review") {
+					t.Fatalf("command metadata missing: %+v", c)
+				}
+			}
+			for _, kind := range []string{model.PluginComponentCommand, model.PluginComponentRule, model.PluginComponentLSP} {
+				if !seen[kind] {
+					t.Fatalf("missing %s", kind)
+				}
+			}
+			data, _ := json.Marshal(p)
+			if strings.Contains(string(data), "not-uploaded") || strings.Contains(string(data), "language-server") {
+				t.Fatal("LSP contents leaked into declaration metadata")
+			}
+		})
+	}
+}
+
+func TestCopilotLSPFailureAndInlineDeclarations(t *testing.T) {
+	for _, tc := range []struct{ name, manifest, file, content, status string }{
+		{"inline", `{"name":"review","lspServers":{"typescript":{"command":"language-server"}}}`, "", "", model.AgentScanStatusComplete},
+		{"path", `{"name":"review","lspServers":"custom/lsp.json"}`, "custom/lsp.json", `{"lspServers":{"typescript":{"command":"language-server"}}}`, model.AgentScanStatusComplete},
+		{"missing", `{"name":"review","lspServers":"custom/lsp.json"}`, "", "", model.AgentScanStatusPartial},
+		{"malformed", `{"name":"review"}`, "lsp.json", `{`, model.AgentScanStatusPartial},
+		{"escape", `{"name":"review","lspServers":"../outside.json"}`, "", "", model.AgentScanStatusPartial},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, fs := newPluginMock()
+			root := filepath.Join(testHome, ".copilot")
+			payload := filepath.Join(root, "installed-plugins/review")
+			fs.addFile(filepath.Join(root, "config.json"), fmt.Sprintf(`{"installedPlugins":[{"name":"review","marketplace":"","cache_path":%q}]}`, payload))
+			fs.addFile(filepath.Join(payload, "plugin.json"), tc.manifest)
+			fs.addFile(filepath.Join(payload, "skills/check/SKILL.md"), validFrontmatter("check", "Check releases"))
+			if tc.file != "" {
+				fs.addFile(filepath.Join(payload, tc.file), tc.content)
+			}
+			fs.commit()
+			p := copilotContext(t, NewSkillsDetector(m).DetectAll(context.Background(), nil, nil)).Plugins[0]
+			if p.ComponentStatus != tc.status || len(p.Components) < 1 {
+				t.Fatalf("LSP coverage lost independent skill: %+v", p)
+			}
+		})
+	}
+}
+
 func TestCopilotAppMarketplaceCache(t *testing.T) {
 	if runtime.GOOS != model.PlatformDarwin {
 		t.Skip("native macOS app cache")

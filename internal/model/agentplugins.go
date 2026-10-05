@@ -137,6 +137,7 @@ const (
 	PluginComponentHook    = "hook"
 	PluginComponentLSP     = "lsp"
 	PluginComponentApp     = "app"
+	PluginComponentRule    = "rule"
 )
 
 // Definition kinds for AgentSkill.DefinitionKind. Empty also denotes SKILL.md.

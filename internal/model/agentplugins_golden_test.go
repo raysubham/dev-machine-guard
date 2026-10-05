@@ -122,7 +122,7 @@ func TestAgentPluginsGolden_CoversTheWholeVocabulary(t *testing.T) {
 		{"scope", []string{PluginScopeUser, PluginScopeProject, PluginScopeLocal, PluginScopeSystem, PluginScopeUnknown}},
 		{"evidence", []string{PluginEvidenceRegistry, PluginEvidenceLocalConfig, PluginEvidenceSkillDirectory, PluginEvidenceSyncedDirectory, PluginEvidenceRemoteMarker}},
 		{"manifest", []string{PluginManifestClaude, PluginManifestCodex, PluginManifestCopilot, PluginManifestCursor, PluginManifestPortable, PluginManifestCatalog, PluginManifestNone, PluginManifestUnknown}},
-		{"component", []string{PluginComponentSkill, PluginComponentCommand, PluginComponentMCP, PluginComponentAgent, PluginComponentHook, PluginComponentLSP, PluginComponentApp}},
+		{"component", []string{PluginComponentSkill, PluginComponentCommand, PluginComponentMCP, PluginComponentAgent, PluginComponentHook, PluginComponentLSP, PluginComponentApp, PluginComponentRule}},
 		{"nested source", []string{"claude_plugin", "codex_plugin", "copilot_plugin"}},
 		// An empty kind denotes SKILL.md and remains valid beside explicit kinds.
 		{"definition", []string{"", AgentDefinitionSkill, AgentDefinitionCommand}},

@@ -270,7 +270,7 @@ func TestUserAwareExecutor_LookPathHasDeadline(t *testing.T) {
 func TestUserAwareExecutor_CopilotRootsUseScannedUser(t *testing.T) {
 	service := NewMock()
 	service.SetGOOS("linux")
-	keys := []string{"COPILOT_HOME", "COPILOT_CACHE_HOME", "XDG_CACHE_HOME", "LOCALAPPDATA"}
+	keys := []string{"COPILOT_HOME", "COPILOT_CACHE_HOME", "XDG_CACHE_HOME", "LOCALAPPDATA", "VSCODE_AGENT_PLUGINS", "VSCODE_PORTABLE"}
 	for _, key := range keys {
 		service.SetEnv(key, "/daemon/"+key)
 	}

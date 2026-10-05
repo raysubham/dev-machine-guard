@@ -2,8 +2,10 @@ package detector
 
 import (
 	"encoding/json"
+	"net/url"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/tailscale/hujson"
@@ -31,6 +33,329 @@ type copilotAdapter struct {
 	markets      map[string]*model.MarketplaceObservation
 	cache        string
 	catalogRoots map[string]string
+	editor       bool
+}
+
+// Editor installations have their own receipts, separate from the CLI registry.
+func (s *pluginScan) detectCopilotEditors() []*model.AgentPluginContext {
+	if executor.UserEnvironmentError(s.d.exec) != nil {
+		root := filepath.Join(s.home, ".vscode", "agent-plugins")
+		return []*model.AgentPluginContext{s.unresolvedContext(model.AgentCopilot, root, root)}
+	}
+	restore := s.snapshotRetry()
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			restore()
+		}
+		s.reads = map[string]pluginMetadataStamp{}
+		s.sourceChanged = false
+		contexts := s.copilotEditorContexts()
+		if !s.snapshotChanged() {
+			return contexts
+		}
+		if attempt == 1 {
+			for _, c := range contexts {
+				degrade(&c.InstallationStatus, model.AgentScanStatusPartial)
+				degrade(&c.MarketplaceStatus, model.AgentScanStatusPartial)
+				scanError(&c.Errors, model.AgentScanError{Code: model.AgentScanErrSourceChanged, SourcePath: c.ConfigRoot})
+				for i := range c.Plugins {
+					degrade(&c.Plugins[i].ComponentStatus, model.AgentScanStatusPartial)
+				}
+			}
+			return contexts
+		}
+	}
+}
+
+func (s *pluginScan) copilotEditorContexts() []*model.AgentPluginContext {
+	roots := []string{filepath.Join(s.home, ".vscode", "agent-plugins"), filepath.Join(s.home, ".vscode-insiders", "agent-plugins")}
+	if root := s.d.exec.Getenv("VSCODE_AGENT_PLUGINS"); filepath.IsAbs(root) {
+		roots = append(roots, filepath.Clean(root))
+	} else if root := s.d.exec.Getenv("VSCODE_PORTABLE"); filepath.IsAbs(root) {
+		roots = append(roots, filepath.Join(root, "agent-plugins"))
+	}
+	var contexts []*model.AgentPluginContext
+	seen := map[string]bool{}
+	for _, root := range roots {
+		if seen[root] {
+			continue
+		}
+		seen[root] = true
+		a := &copilotAdapter{s: s, gd: s.guarded(root), root: root, c: s.newContext(model.AgentCopilot, root, root), markets: map[string]*model.MarketplaceObservation{}, editor: true}
+		file := filepath.Join(root, "installed.json")
+		doc, absent, code := a.object(file)
+		if absent {
+			continue
+		}
+		var version int
+		var records []json.RawMessage
+		if code == "" && (json.Unmarshal(doc["version"], &version) != nil || version != 1 || json.Unmarshal(doc["installed"], &records) != nil || records == nil) {
+			code = model.AgentScanErrUnsupportedSchema
+		}
+		if code != "" {
+			a.fail(code, file)
+		} else {
+			for i, raw := range records {
+				if i >= maxPluginObs || s.ctx.Err() != nil {
+					a.fail(model.AgentScanErrLimitExceeded, file)
+					break
+				}
+				a.editorReceipt(raw, file)
+			}
+		}
+		for _, name := range sortedMapKeys(a.markets) {
+			a.c.Marketplaces = append(a.c.Marketplaces, *a.markets[name])
+		}
+		s.evidence.suppress(root)
+		contexts = append(contexts, a.c)
+	}
+	for _, variant := range []string{"Code", "Code - Insiders"} {
+		dotRoot := filepath.Join(s.home, ".vscode")
+		if variant == "Code - Insiders" {
+			dotRoot = filepath.Join(s.home, ".vscode-insiders")
+		}
+		if state, _, _ := s.stat(s.guarded(dotRoot), dotRoot); state != fileDir {
+			continue
+		}
+		var userRoot string
+		switch s.goos {
+		case model.PlatformDarwin:
+			userRoot = filepath.Join(s.home, "Library", "Application Support", variant, "User")
+		case model.PlatformWindows:
+			if appData := s.d.exec.Getenv("APPDATA"); filepath.IsAbs(appData) {
+				userRoot = filepath.Join(appData, variant, "User")
+			}
+		default:
+			config := s.d.exec.Getenv("XDG_CONFIG_HOME")
+			if !filepath.IsAbs(config) {
+				config = filepath.Join(s.home, ".config")
+			}
+			userRoot = filepath.Join(config, variant, "User")
+		}
+		if userRoot == "" {
+			continue
+		}
+		if c := s.copilotEditorSettings(filepath.Join(userRoot, "settings.json"), model.PluginScopeUser, ""); c != nil {
+			contexts = append(contexts, c)
+		}
+		gd := s.guarded(userRoot)
+		profiles := filepath.Join(userRoot, "profiles")
+		if state, _, _ := s.stat(gd, profiles); state == fileDir {
+			entries, code := s.listDir(gd, profiles)
+			if code != "" {
+				contexts = append(contexts, s.unresolvedContext(model.AgentCopilot, profiles, profiles))
+			}
+			for i, entry := range entries {
+				if i >= maxPluginContexts || s.ctx.Err() != nil {
+					contexts = append(contexts, s.unresolvedContext(model.AgentCopilot, profiles, profiles))
+					break
+				}
+				if entry.IsDir() {
+					if c := s.copilotEditorSettings(filepath.Join(profiles, entry.Name(), "settings.json"), model.PluginScopeUser, ""); c != nil {
+						contexts = append(contexts, c)
+					}
+				}
+			}
+		}
+	}
+	for _, project := range s.projects {
+		if c := s.copilotEditorSettings(filepath.Join(project, ".vscode", "settings.json"), model.PluginScopeProject, project); c != nil {
+			contexts = append(contexts, c)
+		}
+	}
+	return contexts
+}
+
+func (s *pluginScan) copilotEditorSettings(file, scope, project string) *model.AgentPluginContext {
+	root := filepath.Dir(file)
+	a := &copilotAdapter{s: s, gd: s.guarded(root), root: root, c: s.newContext(model.AgentCopilot, root, root), editor: true}
+	doc, absent, code := a.object(file)
+	if absent {
+		return nil
+	}
+	if code != "" {
+		a.fail(code, file)
+		return a.c
+	}
+	raw, present := doc["chat.pluginLocations"]
+	if !present {
+		return nil
+	}
+	var locations map[string]bool
+	if json.Unmarshal(raw, &locations) != nil || locations == nil {
+		a.fail(model.AgentScanErrParseFailed, file)
+		return a.c
+	}
+	for i, location := range sortedMapKeys(locations) {
+		if i >= maxPluginObs || s.ctx.Err() != nil {
+			a.fail(model.AgentScanErrLimitExceeded, file)
+			break
+		}
+		payload := location
+		if strings.HasPrefix(payload, "~/") {
+			payload = filepath.Join(s.home, filepath.FromSlash(payload[2:]))
+		} else if !isAbsPath(payload) && project != "" {
+			payload = filepath.Join(project, filepath.FromSlash(payload))
+		}
+		if !isAbsPath(payload) {
+			a.fail(model.AgentScanErrRootUnresolved, file)
+			continue
+		}
+		payload = cleanPluginPath(payload)
+		p := newPlugin(filepath.Base(payload), filepath.Base(payload), model.PluginInstallDirectory, scope)
+		p.InstallPath, p.SourcePath, p.ProjectPath = payload, payload, project
+		p.Source = &model.SourceLocator{Kind: model.PluginSourceLocal, NativeKind: "local", Location: payload}
+		p.Installed, p.ConfiguredEnabled = boolPtr(true), boolPtr(locations[location])
+		p.InstallationEvidence = model.PluginEvidenceLocalConfig
+		p.Enablement = append(p.Enablement, model.EnablementObservation{Scope: scope, ProjectPath: project, SourcePath: file, Enabled: locations[location]})
+		a.finish(p)
+	}
+	return a.c
+}
+
+func (a *copilotAdapter) editorReceipt(raw json.RawMessage, file string) {
+	var row struct {
+		URI         string `json:"pluginUri"`
+		Marketplace string `json:"marketplace"`
+		Name        string `json:"name"`
+	}
+	if json.Unmarshal(raw, &row) != nil {
+		a.fail(model.AgentScanErrParseFailed, file)
+		return
+	}
+	u, err := url.Parse(row.URI)
+	if err != nil || u.Scheme != "file" || u.Host != "" && u.Host != "localhost" || u.RawQuery != "" || u.Fragment != "" {
+		a.fail(model.AgentScanErrUnsupportedSchema, file)
+		return
+	}
+	payload := filepath.FromSlash(u.Path)
+	if a.s.goos == model.PlatformWindows && len(payload) > 3 && payload[0] == filepath.Separator && payload[2] == ':' {
+		payload = payload[1:]
+	}
+	if !isAbsPath(payload) {
+		a.fail(model.AgentScanErrUnsafePath, file)
+		return
+	}
+	payload = cleanPluginPath(payload)
+	name := row.Name
+	if name == "" {
+		name = filepath.Base(payload)
+	}
+	p := newPlugin(name+"@"+row.Marketplace, name, model.PluginInstallMarketplace, model.PluginScopeUser)
+	p.InstallPath, p.Installed, p.InstallationEvidence = payload, boolPtr(true), model.PluginEvidenceRegistry
+	market := a.market(row.Marketplace)
+	market.Registered = true
+	p.MarketplaceID = market.MarketplaceID
+	ref, branch, _ := strings.Cut(row.Marketplace, "#")
+	encoded, _ := json.Marshal(ref)
+	market.Source = copilotSource(encoded)
+	if market.Source != nil {
+		market.Source.RequestedRef = branch
+	}
+	// Receipts can point to a payload repository separate from the catalog clone.
+	roots := []string{}
+	if root := copilotEditorGitRoot(a.root, market.Source, true); root != "" {
+		roots = append(roots, root)
+	}
+	for root, depth := payload, 0; depth < 8; root, depth = filepath.Dir(root), depth+1 {
+		if _, within := relSlash(a.root, root); !within {
+			break
+		}
+		if !slices.Contains(roots, root) {
+			roots = append(roots, root)
+		}
+		if root == a.root {
+			break
+		}
+	}
+	for _, root := range roots {
+		for _, rel := range copilotCatalogPaths {
+			doc, absent, code := a.object(filepath.Join(root, filepath.FromSlash(rel)))
+			if absent {
+				continue
+			}
+			if code != "" {
+				a.fail(code, filepath.Join(root, filepath.FromSlash(rel)))
+				continue
+			}
+			if name := jsonString(doc["name"]); name != "" {
+				market.Name = name
+			}
+			entry, found := a.catalogEntry(market, root, name)
+			if found {
+				selected, safe := insideRoot(root, jsonString(entry["source"]))
+				if declared := copilotSource(entry["source"]); len(entry["source"]) > 0 && entry["source"][0] == '{' && declared != nil && (declared.Kind == model.PluginSourceGit || declared.Kind == model.PluginSourceGitHub) {
+					selected = copilotEditorGitRoot(a.root, declared, false)
+					safe = selected != ""
+					if safe && a.s.hashPath(selected) == a.s.hashPath(payload) {
+						p.Source = declared
+					}
+				} else if safe && a.s.hashPath(selected) == a.s.hashPath(payload) && market.Source != nil {
+					source := *market.Source
+					if source.Kind == model.PluginSourceLocal {
+						source.Location, p.SourcePath = payload, payload
+					} else {
+						source.Subdirectory, _ = relSlash(root, payload)
+					}
+					p.Source = &source
+				}
+			}
+			break
+		}
+		if p.Source != nil {
+			break
+		}
+	}
+	if p.Source == nil {
+		copilotComponentError(p, model.AgentScanErrRootUnresolved, file)
+		degrade(&a.c.MarketplaceStatus, model.AgentScanStatusPartial)
+	}
+	a.finish(p)
+}
+
+// VS Code uses repository paths plus distinct catalog and payload revision suffixes.
+func copilotEditorGitRoot(store string, source *model.SourceLocator, catalog bool) string {
+	if source == nil || source.Kind != model.PluginSourceGit && source.Kind != model.PluginSourceGitHub {
+		return ""
+	}
+	u, err := url.Parse(source.Location)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return ""
+	}
+	sanitize := func(value string) string {
+		return strings.Map(func(r rune) rune {
+			if strings.ContainsRune(`\/:*?"<>|`, r) {
+				return '_'
+			}
+			return r
+		}, value)
+	}
+	parts := []string{sanitize(strings.ToLower(u.Host))}
+	repo := strings.Trim(strings.TrimSuffix(strings.TrimLeft(u.Path, "/"), ".git"), "/")
+	for _, part := range strings.Split(repo, "/") {
+		if part == "" || part == "." || part == ".." {
+			return ""
+		}
+		parts = append(parts, sanitize(part))
+	}
+	if catalog && source.RequestedRef != "" {
+		parts = append(parts, "ref_"+url.PathEscape(source.RequestedRef))
+	} else if !catalog && source.RequestedSHA != "" {
+		parts = append(parts, "sha_"+sanitize(source.RequestedSHA))
+	} else if !catalog && source.RequestedRef != "" {
+		parts = append(parts, "ref_"+sanitize(source.RequestedRef))
+	}
+	root, safe := insideRoot(store, filepath.Join(parts...))
+	if !safe {
+		return ""
+	}
+	if !catalog && source.Subdirectory != "" {
+		root, safe = insideRoot(root, source.Subdirectory)
+		if !safe {
+			return ""
+		}
+	}
+	return root
 }
 
 func copilotConfigRoot(exec executor.Executor, home string) string {
@@ -575,7 +900,7 @@ func (a *copilotAdapter) catalogEntry(m *model.MarketplaceObservation, root, nam
 			return nil, false
 		}
 		var owner map[string]json.RawMessage
-		if jsonString(doc["name"]) != m.Name || json.Unmarshal(doc["owner"], &owner) != nil || strings.TrimSpace(jsonString(owner["name"])) == "" {
+		if !a.editor && (jsonString(doc["name"]) != m.Name || json.Unmarshal(doc["owner"], &owner) != nil || strings.TrimSpace(jsonString(owner["name"])) == "") {
 			a.fail(model.AgentScanErrParseFailed, file)
 			return nil, false
 		}
@@ -671,7 +996,11 @@ func (a *copilotAdapter) components(p *model.PluginObservation) {
 		p.ManifestFormat = model.PluginManifestPortable
 		p.ManifestPath = filepath.Join(p.InstallPath, "plugin.json")
 	} else {
-		for _, rel := range copilotManifestPaths {
+		manifestPaths := copilotManifestPaths
+		if a.editor {
+			manifestPaths = []string{".plugin/plugin.json", ".claude-plugin/plugin.json", "plugin.json"}
+		}
+		for _, rel := range manifestPaths {
 			file := filepath.Join(p.InstallPath, filepath.FromSlash(rel))
 			var missing bool
 			if rel == "plugin.json" {
@@ -696,10 +1025,16 @@ func (a *copilotAdapter) components(p *model.PluginObservation) {
 	}
 	if doc == nil {
 		p.ManifestFormat = model.PluginManifestNone
-		copilotComponentError(p, model.AgentScanErrReadFailed, p.InstallPath)
-		return
+		if !a.editor {
+			copilotComponentError(p, model.AgentScanErrReadFailed, p.InstallPath)
+			return
+		}
+		doc = map[string]json.RawMessage{}
 	}
 	p.ManifestName = jsonString(doc["name"])
+	if a.editor && p.ManifestFormat == model.PluginManifestNone {
+		p.ManifestName = p.Name
+	}
 	if p.ManifestName == "" {
 		copilotComponentError(p, model.AgentScanErrParseFailed, p.ManifestPath)
 		return
@@ -713,7 +1048,33 @@ func (a *copilotAdapter) components(p *model.PluginObservation) {
 	skills, agents := []string{"skills"}, []string{"agents"}
 	if portable {
 		agents = []string{"com.github.copilot/agents"}
-	} else {
+	}
+	if a.editor {
+		configured := doc
+		namespace := ""
+		if portable {
+			namespace = "com.github.copilot"
+			var extensions map[string]json.RawMessage
+			if raw := doc["extensions"]; raw != nil {
+				if json.Unmarshal(raw, &extensions) != nil || extensions == nil {
+					copilotComponentError(p, model.AgentScanErrParseFailed, p.ManifestPath)
+				}
+			}
+			configured = nil
+			if raw := extensions[namespace]; raw != nil {
+				if json.Unmarshal(raw, &configured) != nil || configured == nil {
+					copilotComponentError(p, model.AgentScanErrParseFailed, p.ManifestPath)
+				}
+			}
+		}
+		for key, dst := range map[string]*[]string{"skills": &skills, "agents": &agents} {
+			paths, valid := copilotEditorPaths(configured[key], (*dst)[0], namespace)
+			if !valid {
+				copilotComponentError(p, model.AgentScanErrUnsupportedSchema, p.ManifestPath)
+			}
+			*dst = paths
+		}
+	} else if !portable {
 		for key, dst := range map[string]*[]string{"skills": &skills, "agents": &agents} {
 			if raw, ok := doc[key]; ok {
 				*dst = stringList(raw)
@@ -764,6 +1125,12 @@ func (a *copilotAdapter) components(p *model.PluginObservation) {
 			a.agent(r, file)
 		}
 	}
+	a.commandAndRuleComponents(r, doc, portable)
+	a.lspComponents(r, doc, portable)
+	if a.editor {
+		a.editorHookAndMCPComponents(r, doc, portable)
+		return
+	}
 	a.hooks(r, doc, portable)
 	if portable {
 		a.mcpFile(r, "mcp.json", strings.Replace(schema, "plugin.schema.json", "mcp.schema.json", 1))
@@ -790,6 +1157,248 @@ func (a *copilotAdapter) components(p *model.PluginObservation) {
 			a.mcpComponents(r, raw, rel, "/mcpServers", p.ManifestPath)
 		}
 	}
+}
+
+// Commands and rules carry file metadata, not their instruction bodies.
+func (a *copilotAdapter) commandAndRuleComponents(r *pluginRootScan, doc map[string]json.RawMessage, portable bool) {
+	r.gd = r.gd.componentReader(r.root)
+	namespace := ""
+	if portable {
+		namespace = "com.github.copilot"
+		var extensions map[string]json.RawMessage
+		_ = json.Unmarshal(doc["extensions"], &extensions)
+		doc = nil
+		_ = json.Unmarshal(extensions[namespace], &doc)
+	}
+	for _, kind := range []string{"commands", "rules"} {
+		fallback := path.Join(namespace, kind)
+		paths, valid := copilotEditorPaths(doc[kind], fallback, namespace)
+		if !valid {
+			copilotComponentError(r.p, model.AgentScanErrUnsupportedSchema, r.p.ManifestPath)
+		}
+		for _, declared := range paths {
+			file, safe := insideRoot(r.root, declared)
+			if !safe {
+				copilotComponentError(r.p, model.AgentScanErrUnsafePath, r.p.ManifestPath)
+				continue
+			}
+			state, _, err := a.s.stat(r.gd, file)
+			code := ""
+			if err != nil {
+				code = readCode(err)
+			}
+			if state == fileAbsent && declared == fallback {
+				continue
+			}
+			if code != "" || state == fileAbsent {
+				if code == "" {
+					code = model.AgentScanErrReadFailed
+				}
+				copilotComponentError(r.p, code, file)
+				continue
+			}
+			files := []string{file}
+			if state == fileDir {
+				entries, code := a.s.listDir(r.gd, file)
+				if code != "" {
+					copilotComponentError(r.p, code, file)
+				}
+				files = nil
+				for _, name := range sortedEntryNames(entries) {
+					entry := dirEntryByName(entries, name)
+					if entry.Type().IsRegular() {
+						files = append(files, filepath.Join(file, name))
+					}
+				}
+			}
+			for _, file := range files {
+				name := filepath.Base(file)
+				lower := strings.ToLower(name)
+				rel, _ := relSlash(r.root, file)
+				if kind == "commands" && strings.HasSuffix(lower, ".md") {
+					name = name[:len(name)-3]
+					r.commandComponent(file, rel, name, r.p.Name+":"+name)
+				} else if kind == "rules" && (strings.HasSuffix(lower, ".mdc") || strings.HasSuffix(lower, ".md")) {
+					if !r.takeDefinition() {
+						return
+					}
+					name = strings.TrimSuffix(strings.TrimSuffix(name, filepath.Ext(name)), ".instructions")
+					_, absent, code := a.s.readMetadata(r.gd, file)
+					if absent {
+						code = model.AgentScanErrReadFailed
+					}
+					if code != "" {
+						copilotComponentError(r.p, code, file)
+						continue
+					}
+					r.declared(model.PluginComponentRule, name, rel, "", file, model.AgentScanStatusComplete)
+				}
+			}
+		}
+	}
+}
+
+// LSP declarations use the same bounded metadata shape as Claude LSP components.
+func (a *copilotAdapter) lspComponents(r *pluginRootScan, doc map[string]json.RawMessage, portable bool) {
+	r.gd = r.gd.componentReader(r.root)
+	files := []string{"lsp.json", ".github/lsp.json", "lsp-config/servers.json"}
+	if portable {
+		files = []string{"com.github.copilot/lsp.json"}
+	}
+	add := func(object map[string]json.RawMessage, rel, pointer, file string) {
+		if raw := object["lspServers"]; raw != nil {
+			var nested map[string]json.RawMessage
+			if json.Unmarshal(raw, &nested) != nil || nested == nil {
+				copilotComponentError(r.p, model.AgentScanErrParseFailed, file)
+				return
+			}
+			object, pointer = nested, pointer+"/lspServers"
+		}
+		for _, name := range sortedMapKeys(object) {
+			var server map[string]json.RawMessage
+			if json.Unmarshal(object[name], &server) != nil || server == nil {
+				copilotComponentError(r.p, model.AgentScanErrParseFailed, file)
+				continue
+			}
+			r.declared(model.PluginComponentLSP, name, rel, pointer+"/"+strings.NewReplacer("~", "~0", "/", "~1").Replace(name), file, model.AgentScanStatusComplete)
+		}
+	}
+	if !portable && doc["lspServers"] != nil {
+		if file := jsonString(doc["lspServers"]); file != "" {
+			files = []string{file}
+		} else {
+			var object map[string]json.RawMessage
+			if json.Unmarshal(doc["lspServers"], &object) != nil || object == nil {
+				copilotComponentError(r.p, model.AgentScanErrParseFailed, r.p.ManifestPath)
+			} else {
+				rel, _ := relSlash(r.root, r.p.ManifestPath)
+				add(object, rel, "/lspServers", r.p.ManifestPath)
+			}
+			return
+		}
+	}
+	for _, declared := range files {
+		file, safe := insideRoot(r.root, declared)
+		if !safe {
+			copilotComponentError(r.p, model.AgentScanErrUnsafePath, r.p.ManifestPath)
+			continue
+		}
+		object, absent, code := a.s.readJSONObject(r.gd, file)
+		if absent && (portable || doc["lspServers"] == nil) {
+			continue
+		}
+		if absent {
+			code = model.AgentScanErrReadFailed
+		}
+		if code != "" {
+			copilotComponentError(r.p, code, file)
+			continue
+		}
+		rel, _ := relSlash(r.root, file)
+		add(object, rel, "", file)
+		return
+	}
+}
+
+func (a *copilotAdapter) editorHookAndMCPComponents(r *pluginRootScan, doc map[string]json.RawMessage, portable bool) {
+	namespace, hookDefault, mcpDefault := "", "hooks/hooks.json", ".mcp.json"
+	if r.p.ManifestPath == filepath.Join(r.root, "plugin.json") || r.p.ManifestFormat == model.PluginManifestNone {
+		hookDefault = "hooks.json"
+	}
+	if portable {
+		namespace, hookDefault, mcpDefault = "com.github.copilot", "com.github.copilot/hooks/hooks.json", "mcp.json"
+		var extensions map[string]json.RawMessage
+		_ = json.Unmarshal(doc["extensions"], &extensions)
+		doc = nil
+		_ = json.Unmarshal(extensions[namespace], &doc)
+	}
+	for _, kind := range []string{"hooks", "mcpServers"} {
+		raw := doc[kind]
+		var object map[string]json.RawMessage
+		_ = json.Unmarshal(raw, &object)
+		if object != nil && object["paths"] == nil {
+			rel, _ := relSlash(r.root, r.p.ManifestPath)
+			if kind == "hooks" {
+				r.declared(model.PluginComponentHook, "hooks", rel, "/hooks", r.p.ManifestPath, model.AgentScanStatusComplete)
+				continue
+			}
+			before := len(r.p.Components)
+			a.mcpComponents(r, raw, rel, "/mcpServers", r.p.ManifestPath)
+			if len(r.p.Components) > before {
+				continue
+			}
+			raw = nil
+		}
+		fallback := hookDefault
+		if kind == "mcpServers" {
+			fallback = mcpDefault
+		}
+		paths, valid := copilotEditorPaths(raw, fallback, namespace)
+		if !valid {
+			copilotComponentError(r.p, model.AgentScanErrUnsupportedSchema, r.p.ManifestPath)
+		}
+		for _, rel := range paths {
+			file, safe := insideRoot(r.root, rel)
+			if !safe {
+				copilotComponentError(r.p, model.AgentScanErrUnsafePath, r.p.ManifestPath)
+				continue
+			}
+			state, _, _ := a.s.stat(a.gd, file)
+			if state == fileAbsent && rel == fallback && len(raw) == 0 {
+				continue
+			}
+			if kind == "mcpServers" {
+				if !a.mcpFile(r, rel, "") {
+					if rel != fallback {
+						copilotComponentError(r.p, model.AgentScanErrReadFailed, file)
+					}
+				}
+			} else {
+				status := model.AgentScanStatusComplete
+				if state == fileAbsent && rel == fallback {
+					continue
+				}
+				if state != fileRegular {
+					status = model.AgentScanStatusError
+				}
+				r.declared(model.PluginComponentHook, "hooks", rel, "", file, status)
+			}
+		}
+	}
+}
+
+// Editor paths supplement defaults unless the manifest explicitly excludes them.
+func copilotEditorPaths(raw json.RawMessage, fallback, namespace string) ([]string, bool) {
+	paths := []string{fallback}
+	if len(raw) == 0 || string(raw) == "null" {
+		return paths, true
+	}
+	selected := stringList(raw)
+	if selected == nil {
+		var configured struct {
+			Paths     []string `json:"paths"`
+			Exclusive bool     `json:"exclusive"`
+		}
+		if json.Unmarshal(raw, &configured) != nil || configured.Paths == nil {
+			return paths, false
+		}
+		selected = configured.Paths
+		if configured.Exclusive {
+			paths = nil
+		}
+	}
+	for _, rel := range selected {
+		if namespace != "" {
+			rel = path.Join(namespace, rel)
+			if rel != namespace && !strings.HasPrefix(rel, namespace+"/") {
+				return paths, false
+			}
+		}
+		if !slices.Contains(paths, rel) {
+			paths = append(paths, rel)
+		}
+	}
+	return paths, true
 }
 
 func (a *copilotAdapter) hooks(r *pluginRootScan, doc map[string]json.RawMessage, portable bool) {
@@ -845,6 +1454,9 @@ func (a *copilotAdapter) mcpFile(r *pluginRootScan, rel, schema string) bool {
 		return true
 	}
 	raw, pointer := doc["mcpServers"], "/mcpServers"
+	if a.editor && raw == nil && doc["servers"] != nil {
+		raw, pointer = doc["servers"], "/servers"
+	}
 	if raw == nil {
 		raw, _ = json.Marshal(doc)
 		pointer = ""
@@ -873,12 +1485,12 @@ func (a *copilotAdapter) agent(r *pluginRootScan, file string) {
 	}
 	fm, _, ok := splitFrontmatter(string(data))
 	fields, err := parseYAMLMap(fm)
-	if !ok || err != nil {
+	if !ok && !a.editor || err != nil {
 		copilotComponentError(r.p, model.AgentScanErrParseFailed, file)
 		return
 	}
 	description, _ := fields["description"].(string)
-	if strings.TrimSpace(description) == "" {
+	if strings.TrimSpace(description) == "" && !a.editor {
 		copilotComponentError(r.p, model.AgentScanErrParseFailed, file)
 		return
 	}

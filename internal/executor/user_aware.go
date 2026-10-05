@@ -57,6 +57,8 @@ var userEnvironmentKeys = []string{
 	"UV_INDEX_URL",
 	"UV_NO_CONFIG",
 	"UV_NO_INDEX",
+	"VSCODE_AGENT_PLUGINS",
+	"VSCODE_PORTABLE",
 	"VIRTUAL_ENV",
 	"XDG_CONFIG_HOME",
 }

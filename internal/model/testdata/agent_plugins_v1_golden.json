@@ -1142,6 +1142,14 @@
                 "component_id": "comp_3140566e7551628232b566cd5abfb0e434f36bb24ab73e1e1aa84f4b0d9fa90a"
               },
               {
+                "kind": "rule",
+                "name": "safety",
+                "relative_path": "rules/safety.instructions.md",
+                "status": "complete",
+                "callable_names": [],
+                "component_id": "comp_4e19ec19e51e5ac6afa77b21fcffa3cc9b000f79fe7d12caee1e8db657b991ee"
+              },
+              {
                 "kind": "mcp",
                 "name": "example",
                 "relative_path": "agents/reviewer.agent.md",

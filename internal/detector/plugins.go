@@ -161,7 +161,9 @@ func (d *SkillsDetector) DetectPlugins(ctx context.Context, result *SkillsResult
 		s.now = d.now()
 	}
 	var contexts []*model.AgentPluginContext
-	for _, c := range []*model.AgentPluginContext{s.detectClaude(), s.detectCodex(), s.detectCopilot()} {
+	candidates := []*model.AgentPluginContext{s.detectClaude(), s.detectCodex(), s.detectCopilot()}
+	candidates = append(candidates, s.detectCopilotEditors()...)
+	for _, c := range candidates {
 		if c != nil {
 			// Missing projects can hide project settings and catalogs.
 			if s.projectsIncomplete {
