@@ -2383,3 +2383,81 @@ func TestCopilotNativeCachePaths(t *testing.T) {
 		}
 	}
 }
+
+func TestCopilotAppMarketplaceCache(t *testing.T) {
+	if runtime.GOOS != model.PlatformDarwin {
+		t.Skip("native macOS app cache")
+	}
+	for _, state := range []string{"complete", "malformed", "explicit override"} {
+		t.Run(state, func(t *testing.T) {
+			m, fs := newPluginMock()
+			root := filepath.Join(testHome, ".copilot")
+			payload := filepath.Join(root, "installed-plugins/engineering/review")
+			catalog := filepath.Join(root, "Library/Caches/copilot/marketplaces/test-org-catalog/marketplace.json")
+			fs.addFile(filepath.Join(root, "config.json"), fmt.Sprintf(`{"installedPlugins":[{"name":"review","marketplace":"engineering","cache_path":%q}]}`, payload))
+			fs.addFile(filepath.Join(root, "settings.json"), `{"extraKnownMarketplaces":{"engineering":{"source":{"source":"github","repo":"test-org/catalog"}}}}`)
+			fs.addFile(filepath.Join(payload, ".plugin/plugin.json"), `{"name":"review"}`)
+			fs.addFile(filepath.Join(payload, "skills/check/SKILL.md"), validFrontmatter("check", "Check releases"))
+			data := `{"name":"engineering","owner":{"name":"Engineering"},"plugins":[{"name":"review","source":{"source":"github","repo":"test-org/review"}}]}`
+			if state == "malformed" {
+				data = `{`
+			}
+			if state == "explicit override" {
+				m.SetEnv("COPILOT_CACHE_HOME", filepath.Join(testHome, "configured-cache"))
+			}
+			fs.addFile(catalog, data)
+			fs.commit()
+			c := copilotContext(t, NewSkillsDetector(m).WithSkipper(tcc.New(testHome)).DetectAll(context.Background(), nil, nil))
+			if len(c.Plugins) != 1 || len(c.Plugins[0].Components) != 1 {
+				t.Fatalf("readable installed evidence lost: %+v", c)
+			}
+			p := c.Plugins[0]
+			if state == "complete" {
+				if c.MarketplaceStatus != model.AgentScanStatusComplete || p.ComponentStatus != model.AgentScanStatusComplete || p.Source == nil || p.Source.Location != "https://github.com/test-org/review" || len(c.Errors) != 0 {
+					t.Fatalf("app cache provenance missing: %+v / %+v", c, p)
+				}
+			} else if p.ComponentStatus == model.AgentScanStatusComplete || p.Source != nil {
+				t.Fatalf("unverified catalog accepted: %+v", p)
+			}
+		})
+	}
+}
+
+func TestCopilotHookDeclarations(t *testing.T) {
+	for _, tc := range []struct{ name, manifest, file, wantStatus string }{
+		{"manifest path", `{"name":"review","hooks":"hooks/review.json"}`, "hooks/review.json", model.AgentScanStatusComplete},
+		{"default path", `{"name":"review"}`, "hooks/hooks.json", model.AgentScanStatusComplete},
+		{"inline", `{"name":"review","hooks":{"sessionStart":[]}}`, "", model.AgentScanStatusComplete},
+		{"missing", `{"name":"review","hooks":"hooks/missing.json"}`, "", model.AgentScanStatusError},
+		{"unsafe", `{"name":"review","hooks":"../outside.json"}`, "", ""},
+		{"portable", `{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"review"}`, "com.github.copilot/hooks/hooks.json", model.AgentScanStatusComplete},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, fs := newPluginMock()
+			root := filepath.Join(testHome, ".copilot")
+			payload := filepath.Join(root, "installed-plugins/_direct/review")
+			fs.addFile(filepath.Join(root, "config.json"), fmt.Sprintf(`{"installedPlugins":[{"name":"review","marketplace":"","cache_path":%q}]}`, payload))
+			fs.addFile(filepath.Join(payload, "plugin.json"), tc.manifest)
+			if tc.file != "" {
+				fs.addFile(filepath.Join(payload, tc.file), `{"hooks":{"sessionStart":[{"type":"command","bash":"HOOK_BODY_MUST_NOT_LEAVE_DEVICE"}]}}`)
+			}
+			fs.commit()
+			c := copilotContext(t, NewSkillsDetector(m).DetectAll(context.Background(), nil, nil))
+			if len(c.Plugins) != 1 {
+				t.Fatalf("installation lost: %+v", c)
+			}
+			p := c.Plugins[0]
+			if tc.wantStatus == "" {
+				if len(p.Components) != 0 || p.ComponentStatus == model.AgentScanStatusComplete {
+					t.Fatalf("escaping hook accepted: %+v", p)
+				}
+			} else if len(p.Components) != 1 || p.Components[0].Kind != model.PluginComponentHook || p.Components[0].Status != tc.wantStatus {
+				t.Fatalf("hook declaration missing: %+v", p)
+			}
+			data, _ := json.Marshal(c)
+			if strings.Contains(string(data), "HOOK_BODY_MUST_NOT_LEAVE_DEVICE") {
+				t.Fatal("hook body leaked into inventory")
+			}
+		})
+	}
+}

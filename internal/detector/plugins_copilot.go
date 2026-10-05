@@ -98,6 +98,9 @@ func (s *pluginScan) detectCopilot() *model.AgentPluginContext {
 	if cache != "" {
 		s.evidence.suppress(filepath.Join(cache, "marketplaces"))
 	}
+	if s.d.exec.GOOS() == model.PlatformDarwin {
+		s.evidence.suppress(filepath.Join(root, "Library", "Caches", "copilot", "marketplaces"))
+	}
 	if state == fileAbsent && len(a.c.Plugins) == 0 && len(a.c.Marketplaces) == 0 && len(a.c.Errors) == 0 {
 		return nil
 	}
@@ -211,7 +214,7 @@ func (a *copilotAdapter) settings(state map[string]json.RawMessage) {
 				}
 			}
 			m.Source = source
-			a.catalogRoots[name] = copilotCatalogRoot(entry["source"], a.cache)
+			a.catalogRoots[name] = a.catalogRoot(entry["source"])
 			if enabled := jsonBool(entry["autoUpdate"]); enabled != nil && len(m.AutoUpdatePreferences) < maxAutoUpdatePrefs {
 				m.AutoUpdatePreferences = append(m.AutoUpdatePreferences, model.EnablementObservation{Scope: layer.scope, ProjectPath: layer.project, SourcePath: layer.path, Enabled: *enabled})
 				if layer.scope == model.PluginScopeUser {
@@ -334,6 +337,25 @@ func copilotCatalogRoot(raw json.RawMessage, cache string) string {
 	return root
 }
 
+func (a *copilotAdapter) catalogRoot(raw json.RawMessage) string {
+	root := copilotCatalogRoot(raw, a.cache)
+	if root == "" || a.s.d.exec.GOOS() != model.PlatformDarwin || filepath.IsAbs(a.s.d.exec.Getenv("COPILOT_CACHE_HOME")) {
+		return root
+	}
+	if source := copilotSource(raw); source == nil || source.Kind == model.PluginSourceLocal {
+		return root
+	}
+	if state, _, _ := a.s.stat(a.gd, root); state == fileDir {
+		return root
+	}
+	// The native Mac app keeps its CLI marketplace cache inside the Copilot home.
+	appRoot := copilotCatalogRoot(raw, filepath.Join(a.root, "Library", "Caches", "copilot"))
+	if state, _, _ := a.s.stat(a.gd, appRoot); state == fileDir {
+		return appRoot
+	}
+	return root
+}
+
 func (a *copilotAdapter) registry(raw json.RawMessage, file string) {
 	var record map[string]json.RawMessage
 	if json.Unmarshal(raw, &record) != nil || record == nil {
@@ -371,7 +393,7 @@ func (a *copilotAdapter) registry(raw json.RawMessage, file string) {
 		if m.Source == nil && !m.Registered && a.c.MarketplaceStatus == model.AgentScanStatusComplete && (market == "copilot-plugins" || market == "awesome-copilot") {
 			raw, _ := json.Marshal("github/" + market)
 			m.Source = copilotSource(raw)
-			a.catalogRoots[market] = copilotCatalogRoot(raw, a.cache)
+			a.catalogRoots[market] = a.catalogRoot(raw)
 		}
 		p.MarketplaceID = m.MarketplaceID
 		root := a.catalogRoots[market]
@@ -742,6 +764,7 @@ func (a *copilotAdapter) components(p *model.PluginObservation) {
 			a.agent(r, file)
 		}
 	}
+	a.hooks(r, doc, portable)
 	if portable {
 		a.mcpFile(r, "mcp.json", strings.Replace(schema, "plugin.schema.json", "mcp.schema.json", 1))
 	} else {
@@ -766,6 +789,44 @@ func (a *copilotAdapter) components(p *model.PluginObservation) {
 			rel, _ := relSlash(p.InstallPath, p.ManifestPath)
 			a.mcpComponents(r, raw, rel, "/mcpServers", p.ManifestPath)
 		}
+	}
+}
+
+func (a *copilotAdapter) hooks(r *pluginRootScan, doc map[string]json.RawMessage, portable bool) {
+	files := []string{"hooks.json", "hooks/hooks.json"}
+	required := false
+	if portable {
+		files = []string{"com.github.copilot/hooks/hooks.json"}
+	} else if raw, ok := doc["hooks"]; ok {
+		if file := jsonString(raw); file != "" {
+			files, required = []string{file}, true
+		} else {
+			var hooks map[string]json.RawMessage
+			if json.Unmarshal(raw, &hooks) != nil || hooks == nil {
+				copilotComponentError(r.p, model.AgentScanErrParseFailed, r.p.ManifestPath)
+				return
+			}
+			rel, _ := relSlash(r.root, r.p.ManifestPath)
+			r.declared(model.PluginComponentHook, "hooks", rel, "/hooks", r.p.ManifestPath, model.AgentScanStatusComplete)
+			return
+		}
+	}
+	for _, rel := range files {
+		file, safe := insideRoot(r.root, rel)
+		if !safe {
+			copilotComponentError(r.p, model.AgentScanErrUnsafePath, r.p.ManifestPath)
+			continue
+		}
+		state, _, _ := a.s.stat(a.gd, file)
+		if state == fileAbsent && !required {
+			continue
+		}
+		status := model.AgentScanStatusComplete
+		if state != fileRegular {
+			status = model.AgentScanStatusError
+		}
+		rel, _ = relSlash(r.root, file)
+		r.declared(model.PluginComponentHook, "hooks", rel, "", file, status)
 	}
 }
 
