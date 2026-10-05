@@ -2267,6 +2267,21 @@ func TestCopilotProtectedPayloadAndMCP(t *testing.T) {
 			t.Fatal("protected standalone config read")
 		}
 	}
+	t.Run("editor local catalog", func(t *testing.T) {
+		m, fs := newPluginMock()
+		root := filepath.Join(testHome, ".vscode", "agent-plugins")
+		catalog := filepath.Join(testHome, "Downloads", "catalog")
+		payload := filepath.Join(root, "github.com", "test-org", "review")
+		fs.addFile(filepath.Join(root, "installed.json"), fmt.Sprintf(`{"version":1,"installed":[{"pluginUri":%q,"marketplace":%q,"name":"review"}]}`, "file://"+filepath.ToSlash(payload), "file://"+filepath.ToSlash(catalog)))
+		fs.addFile(filepath.Join(catalog, ".github/plugin/marketplace.json"), `{"plugins":[{"name":"review","source":{"source":"github","repo":"test-org/review"}}]}`)
+		fs.addFile(filepath.Join(payload, ".plugin/plugin.json"), `{"name":"review"}`)
+		fs.addFile(filepath.Join(payload, "skills/check/SKILL.md"), validFrontmatter("check", "Check releases"))
+		fs.commit()
+		c := copilotContext(t, NewSkillsDetector(m).WithSkipper(tcc.New(testHome)).DetectAll(context.Background(), nil, nil))
+		if len(c.Plugins) != 1 || len(c.Plugins[0].Components) != 1 || c.Plugins[0].Source != nil || c.MarketplaceStatus != model.AgentScanStatusPartial {
+			t.Fatalf("protected catalog supplied provenance or lost readable skill: %+v", c)
+		}
+	})
 }
 
 func TestCopilotPluginMCPSuppression(t *testing.T) {
@@ -2407,21 +2422,29 @@ func TestCopilotEditorReceipt(t *testing.T) {
 
 func TestCopilotEditorExternalGitReceipt(t *testing.T) {
 	for _, tc := range []struct {
-		name, source, relative string
-		mismatch, missing      bool
+		name, source, relative   string
+		mismatch, missing, local bool
 	}{
-		{"github", `{"source":"github","repo":"test-org/review"}`, "github.com/test-org/review", false, false},
-		{"subdirectory", `{"source":"github","repo":"test-org/tools","path":"plugins/review","ref":"release/v2"}`, "github.com/test-org/tools/ref_release_v2/plugins/review", false, false},
-		{"git", `{"source":"url","url":"https://example.com/test-org/tools.git","sha":"abcd","path":"plugins/review"}`, "example.com/test-org/tools/sha_abcd/plugins/review", false, false},
-		{"mismatch", `{"source":"github","repo":"test-org/review"}`, "github.com/test-org/other", true, false},
-		{"missing catalog", `{"source":"github","repo":"test-org/review"}`, "github.com/test-org/review", false, true},
+		{"github", `{"source":"github","repo":"test-org/review"}`, "github.com/test-org/review", false, false, false},
+		{"subdirectory", `{"source":"github","repo":"test-org/tools","path":"plugins/review","ref":"release/v2"}`, "github.com/test-org/tools/ref_release_v2/plugins/review", false, false, false},
+		{"git", `{"source":"url","url":"https://example.com/test-org/tools.git","sha":"abcd","path":"plugins/review"}`, "example.com/test-org/tools/sha_abcd/plugins/review", false, false, false},
+		{"mismatch", `{"source":"github","repo":"test-org/review"}`, "github.com/test-org/other", true, false, false},
+		{"missing catalog", `{"source":"github","repo":"test-org/review"}`, "github.com/test-org/review", false, true, false},
+		{"local catalog git-subdir", `{"source":"git-subdir","url":"https://example.com/test-org/tools.git","sha":"abcd","path":"plugins/review"}`, "example.com/test-org/tools/sha_abcd/plugins/review", false, false, true},
+		{"local catalog mismatch", `{"source":"github","repo":"test-org/review"}`, "github.com/test-org/other", true, false, true},
+		{"local catalog missing", `{"source":"github","repo":"test-org/review"}`, "github.com/test-org/review", false, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m, fs := newPluginMock()
 			root := filepath.Join(testHome, ".vscode", "agent-plugins")
 			catalog := filepath.Join(root, "github.com", "test-org", "catalog")
 			payload := filepath.Join(root, filepath.FromSlash(tc.relative))
-			fs.addFile(filepath.Join(root, "installed.json"), fmt.Sprintf(`{"version":1,"installed":[{"pluginUri":%q,"marketplace":"test-org/catalog","name":"review"}]}`, "file://"+filepath.ToSlash(payload)))
+			marketplace := "test-org/catalog"
+			if tc.local {
+				catalog = filepath.Join(testHome, "private-catalog")
+				marketplace = "file://" + filepath.ToSlash(catalog)
+			}
+			fs.addFile(filepath.Join(root, "installed.json"), fmt.Sprintf(`{"version":1,"installed":[{"pluginUri":%q,"marketplace":%q,"name":"review"}]}`, "file://"+filepath.ToSlash(payload), marketplace))
 			if !tc.missing {
 				fs.addFile(filepath.Join(catalog, ".github/plugin/marketplace.json"), fmt.Sprintf(`{"plugins":[{"name":"review","source":%s}]}`, tc.source))
 			}
@@ -2439,6 +2462,9 @@ func TestCopilotEditorExternalGitReceipt(t *testing.T) {
 				}
 			} else if p.Source == nil || p.Source.Kind == model.PluginSourceUnknown || c.MarketplaceStatus != model.AgentScanStatusComplete {
 				t.Fatalf("external repository provenance missing: %+v", c)
+			}
+			if tc.local && !tc.mismatch && !tc.missing && (p.Source.Location != "https://example.com/test-org/tools.git" || p.Source.Subdirectory != "plugins/review" || p.Source.RequestedSHA != "abcd") {
+				t.Fatalf("local catalog replaced payload provenance: %+v", p.Source)
 			}
 		})
 	}

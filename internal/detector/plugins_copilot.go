@@ -254,10 +254,23 @@ func (a *copilotAdapter) editorReceipt(raw json.RawMessage, file string) {
 	}
 	// Receipts can point to a payload repository separate from the catalog clone.
 	roots := []string{}
-	if root := copilotEditorGitRoot(a.root, market.Source, true); root != "" {
+	catalogURI, catalogErr := url.Parse(ref)
+	localCatalog := catalogErr == nil && catalogURI.Scheme == "file"
+	if localCatalog {
+		market.Source = nil
+		root := filepath.FromSlash(catalogURI.Path)
+		if a.s.goos == model.PlatformWindows && len(root) > 3 && root[0] == filepath.Separator && root[2] == ':' {
+			root = root[1:]
+		}
+		if (catalogURI.Host == "" || catalogURI.Host == "localhost") && catalogURI.RawQuery == "" && branch == "" && isAbsPath(root) {
+			root = cleanPluginPath(root)
+			market.Source = &model.SourceLocator{Kind: model.PluginSourceLocal, NativeKind: "local", Location: root}
+			roots = append(roots, root)
+		}
+	} else if root := copilotEditorGitRoot(a.root, market.Source, true); root != "" {
 		roots = append(roots, root)
 	}
-	for root, depth := payload, 0; depth < 8; root, depth = filepath.Dir(root), depth+1 {
+	for root, depth := payload, 0; !localCatalog && depth < 8; root, depth = filepath.Dir(root), depth+1 {
 		if _, within := relSlash(a.root, root); !within {
 			break
 		}
@@ -284,7 +297,11 @@ func (a *copilotAdapter) editorReceipt(raw json.RawMessage, file string) {
 			entry, found := a.catalogEntry(market, root, name)
 			if found {
 				selected, safe := insideRoot(root, jsonString(entry["source"]))
-				if declared := copilotSource(entry["source"]); len(entry["source"]) > 0 && entry["source"][0] == '{' && declared != nil && (declared.Kind == model.PluginSourceGit || declared.Kind == model.PluginSourceGitHub) {
+				declared := copilotSource(entry["source"])
+				if declared != nil && declared.NativeKind == "git-subdir" {
+					declared, _ = claudePayloadSource(entry["source"])
+				}
+				if len(entry["source"]) > 0 && entry["source"][0] == '{' && declared != nil && validSource(declared) && (declared.Kind == model.PluginSourceGit || declared.Kind == model.PluginSourceGitHub) {
 					selected = copilotEditorGitRoot(a.root, declared, false)
 					safe = selected != ""
 					if safe && a.s.hashPath(selected) == a.s.hashPath(payload) {
