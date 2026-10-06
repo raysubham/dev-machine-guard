@@ -2415,6 +2415,9 @@ func TestCopilotEditorReceipt(t *testing.T) {
 		t.Fatalf("editor receipt not collected: %+v", c)
 	}
 	p := c.Plugins[0]
+	if len(c.Marketplaces) != 1 || c.Marketplaces[0].Name != "test-org/catalog" || c.Marketplaces[0].MarketplaceID != marketplaceID(c.ContextID, c.Marketplaces[0].Name) || p.MarketplaceID != c.Marketplaces[0].MarketplaceID {
+		t.Fatalf("editor marketplace identity mismatch: %+v", c.Marketplaces)
+	}
 	if p.InstallPath != payload || p.InstallationEvidence != model.PluginEvidenceRegistry || len(p.Components) != 1 || p.Source == nil || p.Source.Location != "https://github.com/test-org/catalog" || p.Source.Subdirectory != "plugins/review" || p.ConfiguredEnabled != nil {
 		t.Fatalf("editor evidence mismatch: %+v", p)
 	}

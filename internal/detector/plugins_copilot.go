@@ -283,16 +283,13 @@ func (a *copilotAdapter) editorReceipt(raw json.RawMessage, file string) {
 	}
 	for _, root := range roots {
 		for _, rel := range copilotCatalogPaths {
-			doc, absent, code := a.object(filepath.Join(root, filepath.FromSlash(rel)))
+			_, absent, code := a.object(filepath.Join(root, filepath.FromSlash(rel)))
 			if absent {
 				continue
 			}
 			if code != "" {
 				a.fail(code, filepath.Join(root, filepath.FromSlash(rel)))
 				continue
-			}
-			if name := jsonString(doc["name"]); name != "" {
-				market.Name = name
 			}
 			entry, found := a.catalogEntry(market, root, name)
 			if found {
