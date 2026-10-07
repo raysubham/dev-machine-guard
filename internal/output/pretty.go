@@ -729,7 +729,7 @@ func printAgentPlugins(w io.Writer, c *colors, result *model.ScanResult) {
 			fmt.Fprintln(w, "    No agent contexts detected")
 		}
 		for _, context := range scan.Contexts {
-			fmt.Fprintf(w, "    %s — marketplaces: %s; installations: %s\n", context.Agent, context.MarketplaceStatus, context.InstallationStatus)
+			fmt.Fprintf(w, "    %s — marketplaces: %s; installations: %s\n", pluginAgentDisplayName(context.Agent), context.MarketplaceStatus, context.InstallationStatus)
 			if len(context.Plugins) == 0 && context.InstallationStatus == model.AgentScanStatusComplete {
 				fmt.Fprintln(w, "      None detected")
 			}
@@ -844,4 +844,11 @@ func communityInventory(result *model.ScanResult) *model.ScanResult {
 	view.Summary.AgentSkillsCount = len(view.AgentSkills)
 	view.Summary.MCPConfigsCount = len(view.MCPConfigs)
 	return &view
+}
+
+func pluginAgentDisplayName(agent string) string {
+	if agent == model.AgentCopilot {
+		return "GitHub Copilot"
+	}
+	return agent
 }

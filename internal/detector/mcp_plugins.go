@@ -19,6 +19,8 @@ type mcpPluginManifest struct {
 var mcpPluginManifests = []mcpPluginManifest{
 	{".claude-plugin", "claude_plugin", "Anthropic"},
 	{".codex-plugin", "codex_plugin", "OpenAI"},
+	{".plugin", "copilot_plugin", "GitHub"},
+	{".github/plugin", "copilot_plugin", "GitHub"},
 }
 
 // pluginMCPBasename is the only MCP surface a plugin package declares. Any
