@@ -2,7 +2,9 @@ package model
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"os"
 	"reflect"
 	"testing"
@@ -287,6 +289,101 @@ func TestGoGolden_CoversTheWholeVocabulary(t *testing.T) {
 	} {
 		if tt.got != tt.want {
 			t.Errorf("vocabulary value %q changed from %q", tt.got, tt.want)
+		}
+	}
+}
+
+func TestCargoGolden_Contract(t *testing.T) {
+	raw, err := os.ReadFile("testdata/cargo_inventory_v1_golden.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256(raw)); got != "4f0d4952b444464a74ecc08bc67252a598c38081526890ff66c8a719df9f46bf" {
+		t.Fatalf("Cargo golden SHA-256 = %s, shared fixture changed", got)
+	}
+	var g struct {
+		Inventory *CargoInventory   `json:"cargo_inventory"`
+		Audit     *CargoConfigAudit `json:"cargo_config_audit"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&g); err != nil {
+		t.Fatal(err)
+	}
+	if g.Inventory == nil || g.Audit == nil {
+		t.Fatal("golden payload is missing a Cargo section")
+	}
+	encoded, err := json.Marshal(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decodeGeneric(t, encoded), decodeGeneric(t, raw)) {
+		t.Fatal("round trip changed the Cargo payload")
+	}
+
+	ids := map[string]bool{}
+	for _, src := range g.Inventory.Sources {
+		if ids[src.SourceID] {
+			t.Errorf("duplicate inventory source %q", src.SourceID)
+		}
+		ids[src.SourceID] = true
+	}
+	ref := func(id string) {
+		if !ids[id] {
+			t.Errorf("unknown inventory source %q", id)
+		}
+	}
+	for _, src := range g.Inventory.Sources {
+		if src.ParentSourceID != "" {
+			ref(src.ParentSourceID)
+		}
+		for _, id := range src.DiscoveredSources {
+			ref(id)
+		}
+	}
+	for _, p := range g.Inventory.Projects {
+		ref(p.ManifestSourceID)
+	}
+	for _, w := range g.Inventory.Workspaces {
+		ref(w.ManifestSourceID)
+	}
+	for _, p := range g.Inventory.Packages {
+		ref(p.SourceID)
+		for _, c := range p.RecordedChecksums {
+			ref(c.SourceID)
+		}
+	}
+	files := map[string]bool{}
+	for _, f := range g.Audit.Files {
+		if files[f.SourceID] {
+			t.Errorf("duplicate config source %q", f.SourceID)
+		}
+		files[f.SourceID] = true
+	}
+	configRef := func(id string) {
+		if !files[id] {
+			t.Errorf("unknown config source %q", id)
+		}
+	}
+	for _, f := range g.Audit.Files {
+		if f.ShadowedBy != "" {
+			configRef(f.ShadowedBy)
+		}
+		if f.IncludeParentSourceID != "" {
+			configRef(f.IncludeParentSourceID)
+		}
+		for _, s := range f.Settings {
+			if s.SourceID != f.SourceID {
+				t.Errorf("setting %s source = %s, want %s", s.Key, s.SourceID, f.SourceID)
+			}
+		}
+	}
+	for _, f := range g.Audit.Findings {
+		configRef(f.SourceID)
+	}
+	for _, c := range g.Audit.Contexts {
+		for _, id := range c.ConfigSourceIDs {
+			configRef(id)
 		}
 	}
 }

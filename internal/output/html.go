@@ -84,14 +84,15 @@ func HTML(outputFile string, result *model.ScanResult) error {
 	}
 
 	funcMap := template.FuncMap{
-		"ideDisplayName":      ideDisplayName,
-		"typeLabel":           typeLabel,
-		"pluginState":         pluginState,
-		"platformDisplayName": model.PlatformDisplayName,
-		"add":                 func(a, b int) int { return a + b },
-		"formatBytes":         formatBytes,
-		"formatCPU":           formatCPU,
-		"formatWSL":           formatWSL,
+		"ideDisplayName":         ideDisplayName,
+		"typeLabel":              typeLabel,
+		"pluginState":            pluginState,
+		"pluginAgentDisplayName": pluginAgentDisplayName,
+		"platformDisplayName":    model.PlatformDisplayName,
+		"add":                    func(a, b int) int { return a + b },
+		"formatBytes":            formatBytes,
+		"formatCPU":              formatCPU,
+		"formatWSL":              formatWSL,
 	}
 
 	tmpl, err := template.New("report").Funcs(funcMap).Parse(htmlTemplate)
@@ -287,7 +288,7 @@ const htmlTemplate = `<!DOCTYPE html>
  <h2>Agent Plugins</h2>
  {{if .AgentPlugins}}
  {{range .AgentPlugins.Contexts}}
- <p>{{.Agent}} — marketplaces: {{.MarketplaceStatus}}; installations: {{.InstallationStatus}}</p>
+ <p>{{pluginAgentDisplayName .Agent}} — marketplaces: {{.MarketplaceStatus}}; installations: {{.InstallationStatus}}</p>
  {{if .Marketplaces}}<table>
  <tr><th>Marketplace</th><th>Source</th><th>Registered</th><th>Auto-update</th></tr>
  {{range .Marketplaces}}<tr><td>{{.Name}}</td><td>{{with .Source}}{{.Kind}} {{.Location}}{{else}}unknown{{end}}</td><td>{{.Registered}}</td><td>{{pluginState .AutoUpdateEnabled}}</td></tr>{{end}}

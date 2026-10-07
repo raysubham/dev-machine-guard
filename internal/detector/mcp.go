@@ -34,6 +34,7 @@ var mcpConfigDefinitions = []mcpConfigSpec{
 	{"zed", "~/.config/zed/settings.json", "", "", "Zed"},
 	{"open_interpreter", "~/.config/open-interpreter/config.yaml", "", "", "OpenSource"},
 	{"codex", "~/.codex/config.toml", "", "", "OpenAI"},
+	{"copilot", "~/.copilot/mcp-config.json", "", "", "GitHub"},
 	// VS Code and VS Code-based editors keep user-level MCP servers in
 	// <app-config>/User/mcp.json. These are targeted reads; on macOS the path
 	// is under ~/Library, which the discovery walk deliberately never enters.
@@ -92,8 +93,17 @@ func (d *MCPDetector) DetectEnterprise(_ context.Context, searchDirs []string) [
 
 	for _, loc := range d.allConfigLocations(homeDir, searchDirs) {
 		reader := d.exec
-		if loc.SourceName == "codex" {
-			reader = reader.GuardedFiles([]string{filepath.Dir(loc.ConfigPath)}, func(path string) string {
+		if loc.SourceName == "codex" || loc.SourceName == model.AgentCopilot || isCopilotProjectMCP(loc.ConfigPath) {
+			roots := []string{filepath.Dir(loc.ConfigPath)}
+			if isCopilotProjectMCP(loc.ConfigPath) {
+				project := filepath.Dir(loc.ConfigPath)
+				if filepath.Base(project) == ".github" {
+					project = filepath.Dir(project)
+				}
+				roots = append(roots, homeDir, project)
+				roots = append(roots, searchDirs...)
+			}
+			reader = reader.GuardedFiles(roots, func(path string) string {
 				if d.skipper.WithinProtected(path) {
 					return "tcc_protected"
 				}
@@ -152,6 +162,9 @@ func (d *MCPDetector) discoverProjectMCPConfigs() []mcpConfigSpec {
 
 // resolveConfigPath returns the appropriate config path for the current platform.
 func (d *MCPDetector) resolveConfigPath(spec mcpConfigSpec, homeDir string) string {
+	if spec.SourceName == model.AgentCopilot {
+		return filepath.Join(copilotConfigRoot(d.exec, homeDir), "mcp-config.json")
+	}
 	if spec.SourceName == "codex" {
 		if root := d.exec.Getenv("CODEX_HOME"); filepath.IsAbs(root) {
 			return filepath.Join(root, "config.toml")
@@ -192,6 +205,10 @@ func (d *MCPDetector) filterMCPContent(sourceName, configPath string, content []
 		return nil, false // Non-JSON formats cannot be safely filtered
 	}
 
+	if sourceName == model.AgentCopilot || sourceName == "copilot_project" {
+		return filterCopilotMCP(content, sourceName != model.AgentCopilot)
+	}
+
 	jsonInput := content
 
 	// Strip JSONC comments for Zed
@@ -204,7 +221,7 @@ func (d *MCPDetector) filterMCPContent(sourceName, configPath string, content []
 	// removes the comments but leaves the commas, which json.Unmarshal then
 	// rejects — dropping the content and losing the servers. hujson handles
 	// both, and is already this repo's front door for real-world JSONC.
-	if isOpenCodeConfigPath(configPath) {
+	if isOpenCodeConfigPath(configPath) || isCopilotProjectMCP(configPath) {
 		standard, err := hujson.Standardize(jsonInput)
 		if err != nil {
 			return nil, false
@@ -217,7 +234,23 @@ func (d *MCPDetector) filterMCPContent(sourceName, configPath string, content []
 		return nil, false // Can't parse; don't return raw content
 	}
 
+	if isCopilotProjectMCP(configPath) && raw["mcpServers"] == nil && raw["context_servers"] == nil && raw["servers"] == nil && raw["mcp"] == nil {
+		return filterCopilotMCP(jsonInput, true)
+	}
+
 	filtered := d.extractMCPServers(raw)
+	projectServers, _ := filtered["mcpServers"].(map[string]any)
+	if isCopilotProjectMCP(configPath) && raw["mcpServers"] != nil && projectServers == nil {
+		if data, ok := filterCopilotMCP(jsonInput, false); ok {
+			var recovered map[string]any
+			if json.Unmarshal(data, &recovered) == nil {
+				if filtered == nil {
+					filtered = make(map[string]any)
+				}
+				filtered["mcpServers"] = recovered["mcpServers"]
+			}
+		}
+	}
 	if filtered == nil {
 		return nil, false // No MCP servers found
 	}
@@ -391,4 +424,67 @@ func stripJSONCComments(input []byte) []byte {
 		i++
 	}
 	return out
+}
+
+// isCopilotProjectMCP limits bare-map parsing to documented project files.
+func isCopilotProjectMCP(file string) bool {
+	return filepath.Base(file) == ".mcp.json" || filepath.Base(file) == "mcp.json" && filepath.Base(filepath.Dir(file)) == ".github"
+}
+
+func filterCopilotMCP(content []byte, allowBare bool) ([]byte, bool) {
+	data, err := hujson.Standardize(content)
+	var doc map[string]json.RawMessage
+	if err != nil || json.Unmarshal(data, &doc) != nil || doc == nil {
+		return nil, false
+	}
+	var servers map[string]json.RawMessage
+	if raw, ok := doc["mcpServers"]; ok {
+		if json.Unmarshal(raw, &servers) != nil || servers == nil {
+			return nil, false
+		}
+	} else if allowBare {
+		servers = doc
+	} else {
+		return nil, false
+	}
+	filtered := map[string]any{}
+	for _, name := range sortedMapKeys(servers) {
+		if !validCopilotMCP(servers[name]) {
+			continue
+		}
+		one, _ := json.Marshal(map[string]json.RawMessage{name: servers[name]})
+		for key, value := range filterServerFields(one) {
+			filtered[key] = value
+		}
+	}
+	out, err := json.Marshal(map[string]any{"mcpServers": filtered})
+	return out, err == nil
+}
+
+func validCopilotMCP(raw json.RawMessage) bool {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || fields == nil {
+		return false
+	}
+	typ := ""
+	if raw, ok := fields["type"]; ok && !decodePortableValue(raw, &typ) {
+		return false
+	}
+	switch typ {
+	case "", "local", "stdio":
+		if command := jsonString(fields["command"]); command != "" {
+			if args, ok := fields["args"]; ok {
+				var values []string
+				if !decodePortableValue(args, &values) {
+					return false
+				}
+			}
+			return true
+		}
+		return typ == "" && jsonString(fields["url"]) != ""
+	case "http", "streamable-http", "sse":
+		return jsonString(fields["url"]) != ""
+	default:
+		return false
+	}
 }

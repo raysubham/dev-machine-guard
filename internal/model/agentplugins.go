@@ -21,6 +21,7 @@ package model
 const (
 	AgentClaudeCode = "claude-code"
 	AgentCodex      = "codex"
+	AgentCopilot    = "copilot"
 )
 
 // Coverage statuses. Each one answers whether an enumeration is the whole set for
@@ -117,6 +118,7 @@ const (
 const (
 	PluginManifestClaude   = "claude"
 	PluginManifestCodex    = "codex"
+	PluginManifestCopilot  = "copilot"
 	PluginManifestCursor   = "cursor"
 	PluginManifestPortable = "portable"
 	PluginManifestCatalog  = "catalog"
@@ -135,6 +137,7 @@ const (
 	PluginComponentHook    = "hook"
 	PluginComponentLSP     = "lsp"
 	PluginComponentApp     = "app"
+	PluginComponentRule    = "rule"
 )
 
 // Definition kinds for AgentSkill.DefinitionKind. Empty also denotes SKILL.md.
@@ -170,7 +173,7 @@ func (s *AgentPlugins) PluginCount() int {
 // not repeated for every discovered project.
 type AgentPluginContext struct {
 	ContextID  string `json:"context_id"`
-	Agent      string `json:"agent"`       // AgentClaudeCode | AgentCodex
+	Agent      string `json:"agent"`       // AgentClaudeCode | AgentCodex | AgentCopilot
 	ConfigRoot string `json:"config_root"` // observed, normalized; not an instruction to read it
 	PluginRoot string `json:"plugin_root"`
 	// Trusted existing inventory or passive metadata only. This collector never
