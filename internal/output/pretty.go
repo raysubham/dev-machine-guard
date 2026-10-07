@@ -848,7 +848,7 @@ func communityInventory(result *model.ScanResult) *model.ScanResult {
 
 func pluginAgentDisplayName(agent string) string {
 	if agent == model.AgentCopilot {
-		return "GitHub Copilot CLI"
+		return "GitHub Copilot"
 	}
 	return agent
 }

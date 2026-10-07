@@ -2399,6 +2399,59 @@ func TestCopilotNativeCachePaths(t *testing.T) {
 	}
 }
 
+func TestCopilotEditorVersions(t *testing.T) {
+	m, fs := newPluginMock()
+	m.SetGOOS(model.PlatformLinux)
+	cliRoot := filepath.Join(testHome, ".copilot")
+	project := filepath.Join(testHome, "project")
+	payload := filepath.Join(testHome, "review")
+	fs.addFile(filepath.Join(cliRoot, "config.json"), `{}`)
+	fs.addFile(filepath.Join(project, ".git/HEAD"), "ref: refs/heads/main\n")
+	fs.addFile(filepath.Join(payload, ".plugin/plugin.json"), `{"name":"review"}`)
+	root := filepath.Join(testHome, ".vscode", "agent-plugins")
+	fs.addFile(filepath.Join(root, "installed.json"), fmt.Sprintf(`{"version":1,"installed":[{"pluginUri":%q,"name":"review"}]}`, "file://"+filepath.ToSlash(payload)))
+	insiders := filepath.Join(testHome, ".vscode-insiders", "agent-plugins")
+	fs.addFile(filepath.Join(insiders, "installed.json"), `{`)
+	userRoot := filepath.Join(testHome, ".config", "Code", "User")
+	settingsRoots := []string{userRoot, filepath.Join(userRoot, "profiles", "review"), filepath.Join(project, ".vscode")}
+	for _, settingsRoot := range settingsRoots {
+		fs.addFile(filepath.Join(settingsRoot, "settings.json"), fmt.Sprintf(`{"chat.pluginLocations":{%q:true}}`, payload))
+	}
+	fs.commit()
+	versions := AgentVersions([]model.AITool{{Name: "github-copilot-cli", Version: "1.0.91"}})
+	result := NewSkillsDetector(m).WithAgentVersions(versions).DetectAll(context.Background(), []string{project}, nil)
+	want := map[string]string{cliRoot: "1.0.91", root: "", insiders: ""}
+	for _, settingsRoot := range settingsRoots {
+		want[settingsRoot] = ""
+	}
+	for _, c := range result.Plugins.Contexts {
+		if version, ok := want[c.ConfigRoot]; ok {
+			if c.AgentVersion != version {
+				t.Errorf("context %s version = %q, want %q", c.ConfigRoot, c.AgentVersion, version)
+			}
+			delete(want, c.ConfigRoot)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing version contexts: %v", want)
+	}
+}
+
+func TestCopilotEditorUnresolvedVersion(t *testing.T) {
+	m, _ := newPluginMock()
+	m.SetGOOS(model.PlatformLinux)
+	versions := AgentVersions([]model.AITool{{Name: "github-copilot-cli", Version: "1.0.91"}})
+	d := NewSkillsDetector(executor.NewUserAwareExecutor(m, "test-user")).WithAgentVersions(versions)
+	if executor.UserEnvironmentError(d.exec) == nil {
+		t.Fatal("expected unavailable user environment")
+	}
+	s := &pluginScan{d: d, home: testHome}
+	contexts := s.detectCopilotEditors()
+	if len(contexts) != 1 || contexts[0].AgentVersion != "" || contexts[0].InstallationStatus != model.AgentScanStatusError {
+		t.Fatalf("unresolved editor context: %+v", contexts)
+	}
+}
+
 func TestCopilotEditorReceipt(t *testing.T) {
 	m, fs := newPluginMock()
 	root := filepath.Join(testHome, ".vscode", "agent-plugins")

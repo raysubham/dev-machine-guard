@@ -40,7 +40,9 @@ type copilotAdapter struct {
 func (s *pluginScan) detectCopilotEditors() []*model.AgentPluginContext {
 	if executor.UserEnvironmentError(s.d.exec) != nil {
 		root := filepath.Join(s.home, ".vscode", "agent-plugins")
-		return []*model.AgentPluginContext{s.unresolvedContext(model.AgentCopilot, root, root)}
+		c := s.unresolvedContext(model.AgentCopilot, root, root)
+		c.AgentVersion = ""
+		return []*model.AgentPluginContext{c}
 	}
 	restore := s.snapshotRetry()
 	for attempt := 0; ; attempt++ {
@@ -50,6 +52,10 @@ func (s *pluginScan) detectCopilotEditors() []*model.AgentPluginContext {
 		s.reads = map[string]pluginMetadataStamp{}
 		s.sourceChanged = false
 		contexts := s.copilotEditorContexts()
+		// The recorded Copilot version belongs to the CLI, not the editor.
+		for _, c := range contexts {
+			c.AgentVersion = ""
+		}
 		if !s.snapshotChanged() {
 			return contexts
 		}
