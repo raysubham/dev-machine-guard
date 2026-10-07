@@ -1,0 +1,56 @@
+{
+  "packages": [
+    {
+      "name": "example/application-stack",
+      "version": "1.0.0",
+      "version_normalized": "1.0.0.0",
+      "dist": {
+        "type": "path",
+        "url": "/home/superping/composer-inventory-lab-20261004/packages/meta",
+        "reference": "773be2546023bd6f2243fa7bd019c8aa34315648"
+      },
+      "type": "metapackage",
+      "install-path": null
+    },
+    {
+      "name": "example/contracts",
+      "version": "1.0.0",
+      "version_normalized": "1.0.0.0",
+      "dist": {
+        "type": "path",
+        "url": "/home/superping/composer-inventory-lab-20261004/packages/contracts",
+        "reference": "8d909ab485deb38e427ab630d9be57325ca98369"
+      },
+      "type": "library",
+      "install-path": "../example/contracts"
+    },
+    {
+      "name": "example/dev-tool",
+      "version": "2.0.0",
+      "version_normalized": "2.0.0.0",
+      "dist": {
+        "type": "path",
+        "url": "/home/superping/composer-inventory-lab-20261004/packages/dev-tool",
+        "reference": "9c534b8244716dbfb6e5f878b4746bc1d28a8945"
+      },
+      "type": "library",
+      "install-path": "../example/dev-tool"
+    },
+    {
+      "name": "example/logger",
+      "version": "1.2.3",
+      "version_normalized": "1.2.3.0",
+      "dist": {
+        "type": "path",
+        "url": "/home/superping/composer-inventory-lab-20261004/packages/logger",
+        "reference": "de19aff65b0c3b6d33ccb5194653b72ee153a7f8"
+      },
+      "type": "library",
+      "install-path": "../example/logger"
+    }
+  ],
+  "dev": true,
+  "dev-package-names": [
+    "example/dev-tool"
+  ]
+}

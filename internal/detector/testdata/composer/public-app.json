@@ -1,0 +1,62 @@
+{
+  "packages": [
+    {
+      "name": "monolog/monolog",
+      "version": "3.9.0",
+      "version_normalized": "3.9.0.0",
+      "source": {
+        "type": "git",
+        "url": "https://github.com/Seldaek/monolog.git",
+        "reference": "10d85740180ecba7896c87e06a166e0c95a0e3b6"
+      },
+      "dist": {
+        "type": "zip",
+        "url": "https://api.github.com/repos/Seldaek/monolog/zipball/10d85740180ecba7896c87e06a166e0c95a0e3b6",
+        "reference": "10d85740180ecba7896c87e06a166e0c95a0e3b6",
+        "shasum": ""
+      },
+      "type": "library",
+      "install-path": "../monolog/monolog"
+    },
+    {
+      "name": "psr/container",
+      "version": "2.0.2",
+      "version_normalized": "2.0.2.0",
+      "source": {
+        "type": "git",
+        "url": "https://github.com/php-fig/container.git",
+        "reference": "c71ecc56dfe541dbd90c5360474fbc405f8d5963"
+      },
+      "dist": {
+        "type": "zip",
+        "url": "https://api.github.com/repos/php-fig/container/zipball/c71ecc56dfe541dbd90c5360474fbc405f8d5963",
+        "reference": "c71ecc56dfe541dbd90c5360474fbc405f8d5963",
+        "shasum": ""
+      },
+      "type": "library",
+      "install-path": "../psr/container"
+    },
+    {
+      "name": "psr/log",
+      "version": "3.0.2",
+      "version_normalized": "3.0.2.0",
+      "source": {
+        "type": "git",
+        "url": "https://github.com/php-fig/log.git",
+        "reference": "f16e1d5863e37f8d8c2a01719f5b34baa2b714d3"
+      },
+      "dist": {
+        "type": "zip",
+        "url": "https://api.github.com/repos/php-fig/log/zipball/f16e1d5863e37f8d8c2a01719f5b34baa2b714d3",
+        "reference": "f16e1d5863e37f8d8c2a01719f5b34baa2b714d3",
+        "shasum": ""
+      },
+      "type": "library",
+      "install-path": "../psr/log"
+    }
+  ],
+  "dev": true,
+  "dev-package-names": [
+    "psr/container"
+  ]
+}
