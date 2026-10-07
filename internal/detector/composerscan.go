@@ -329,8 +329,9 @@ func (c *composerScan) manifest(path, parent, scope, home string, targeted bool)
 	}
 }
 func (c *composerScan) inVendor(path string) bool {
+	path = c.key(path)
 	for vendor := range c.vendors {
-		if c.key(path) == vendor || goPathWithin(c.key(path), vendor) {
+		if path == vendor || goPathWithin(path, vendor) {
 			return true
 		}
 	}
@@ -343,8 +344,9 @@ func (c *composerScan) skip(path string) bool {
 	return c.inCache(path)
 }
 func (c *composerScan) inCache(path string) bool {
+	path = c.key(path)
 	for root := range c.caches {
-		if c.key(path) == root || goPathWithin(c.key(path), root) {
+		if path == root || goPathWithin(path, root) {
 			return true
 		}
 	}

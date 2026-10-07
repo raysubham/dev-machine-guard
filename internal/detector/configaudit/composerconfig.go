@@ -212,7 +212,12 @@ func (a *ComposerConfigSnapshot) resolveHomes() {
 	} else {
 		xdg := a.scope.ProcessVerified && a.exec.HasEnvPrefix("XDG_")
 		if !xdg {
-			exists, known := a.probeDir("/etc/xdg")
+			systemXDG := "/etc/xdg"
+			if a.exec.GOOS() == model.PlatformDarwin {
+				// /etc is a symlink on macOS; guard the physical missing-path probe.
+				systemXDG = "/private/etc/xdg"
+			}
+			exists, known := a.probeDir(systemXDG)
 			xdg = exists
 			if !known {
 				a.SelectionPartial = true

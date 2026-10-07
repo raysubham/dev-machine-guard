@@ -109,12 +109,17 @@ func TestComposerConfigHomeAndVendorSelection(t *testing.T) {
 		{"legacy default", model.PlatformDarwin, false, true, false, ".composer"},
 		{"XDG both", model.PlatformLinux, true, true, false, ".config/composer"},
 		{"Mac XDG both", model.PlatformDarwin, true, true, false, ".config/composer"},
+		{"Mac system XDG", model.PlatformDarwin, false, false, false, ".config/composer"},
 		{"explicit home", model.PlatformLinux, true, true, true, "custom"},
 		{"Windows developer", model.PlatformWindows, false, false, false, "AppData/Roaming/Composer"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m, scope := composerConfigTest(t)
 			m.SetGOOS(tc.goos)
+			if tc.name == "Mac system XDG" {
+				m.SetDir("/private/etc/xdg")
+				m.SetDir(filepath.Join(scope.Home, ".config", "composer"))
+			}
 			if tc.xdg {
 				m.SetEnv("XDG_SESSION_TYPE", "")
 				m.SetDir(filepath.Join(scope.Home, ".config", "composer"))
