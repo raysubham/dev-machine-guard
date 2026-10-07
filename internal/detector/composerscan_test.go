@@ -308,13 +308,16 @@ func TestComposerScanUnknownProcessAndDeveloper(t *testing.T) {
 	composerWriteProject(t, root)
 	scanner, x := composerTestScanner(t, home)
 	x.current = &user.User{Uid: "0", Username: "root", HomeDir: "/root"}
+	if runtime.GOOS == "windows" {
+		x.current.Uid = "S-1-5-18"
+	}
 	x.env["COMPOSER_HOME"] = "/not-the-developer"
 	inv, audit := scanner.Scan(context.Background(), goTestTarget(home), []string{root}, nil)
 	if len(inv.Packages) != 7 || audit.Status != "partial" || inv.Projects[0].SelectionStatus != "partial" {
 		t.Fatal("unverified process handling")
 	}
 	x.reads = map[string]int{}
-	for _, target := range []*user.User{nil, {Username: "root", Uid: "0", HomeDir: home}, {Username: "unknown", Uid: "9"}} {
+	for _, target := range []*user.User{nil, {Username: x.current.Username, Uid: x.current.Uid, HomeDir: home}, {Username: "unknown", Uid: "9"}} {
 		inv, audit = scanner.Scan(context.Background(), target, []string{root}, nil)
 		if inv.Status != "partial" || audit.Status != "partial" || len(inv.Sources) > 0 || len(x.reads) > 0 {
 			t.Fatal("unresolved developer accessed files")
@@ -502,7 +505,11 @@ func TestComposerScanPrunesConfiguredCacheBeforeAnyProject(t *testing.T) {
 	cache := filepath.Join(home, "a-cache")
 	composerWriteProject(t, filepath.Join(cache, "composer", "cached-repository"))
 	scanner, x := composerTestScanner(t, home)
-	x.env["XDG_CACHE_HOME"] = cache
+	if runtime.GOOS == "windows" {
+		x.env["LOCALAPPDATA"] = cache
+	} else {
+		x.env["XDG_CACHE_HOME"] = cache
+	}
 	inv, _ := scanner.Scan(context.Background(), goTestTarget(home), []string{home}, nil)
 	if len(inv.Packages) != 0 || len(inv.Projects) != 0 {
 		t.Fatal("cache metadata became project inventory")
