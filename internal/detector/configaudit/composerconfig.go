@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"maps"
 	"net/netip"
 	"net/url"
 	"path/filepath"
@@ -690,12 +691,7 @@ func (a *ComposerConfigSnapshot) parse(f *model.ComposerConfigFile, data []byte)
 				a.fileReason(f, "invalid", "parse_error")
 				continue
 			}
-			keys := make([]string, 0, len(entries))
-			for k := range entries {
-				keys = append(keys, k)
-			}
-			slices.Sort(keys)
-			for i, k := range keys {
+			for i, k := range slices.Sorted(maps.Keys(entries)) {
 				if i >= composerPatternLimit {
 					a.fileReason(f, "unsupported", "record_limit")
 					break

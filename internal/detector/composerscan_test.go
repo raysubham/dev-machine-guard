@@ -22,14 +22,15 @@ import (
 
 type composerTrap struct {
 	*goTrap
-	env       map[string]string
-	denied    map[string]error
-	reads     map[string]int
-	afterRead func(string)
+	env        map[string]string
+	denied     map[string]error
+	readErrors map[string]error
+	reads      map[string]int
+	afterRead  func(string)
 }
 
 func (x *composerTrap) GuardedFiles(roots []string, guard func(string) string, max int64) executor.Executor {
-	return &composerTrap{goTrap: &goTrap{Executor: x.Executor.GuardedFiles(roots, guard, max), t: x.t, current: x.current, guarded: true}, env: x.env, denied: x.denied, reads: x.reads, afterRead: x.afterRead}
+	return &composerTrap{goTrap: &goTrap{Executor: x.Executor.GuardedFiles(roots, guard, max), t: x.t, current: x.current, guarded: true}, env: x.env, denied: x.denied, reads: x.reads, readErrors: x.readErrors, afterRead: x.afterRead}
 }
 func (x *composerTrap) Getenv(key string) string {
 	if x.current.Uid != "1000" {
@@ -66,6 +67,9 @@ func (x *composerTrap) ReadFile(path string) ([]byte, error) {
 	if err := x.denied[filepath.Clean(path)]; err != nil {
 		return nil, err
 	}
+	if err := x.readErrors[filepath.Clean(path)]; err != nil {
+		return nil, err
+	}
 	data, err := x.goTrap.ReadFile(path)
 	if x.afterRead != nil {
 		x.afterRead(path)
@@ -74,7 +78,7 @@ func (x *composerTrap) ReadFile(path string) ([]byte, error) {
 }
 func composerTestScanner(t *testing.T, home string) (*ComposerScanner, *composerTrap) {
 	t.Helper()
-	x := &composerTrap{goTrap: &goTrap{Executor: executor.NewReal(), t: t, current: goTestTarget(home)}, env: map[string]string{}, denied: map[string]error{}, reads: map[string]int{}}
+	x := &composerTrap{goTrap: &goTrap{Executor: executor.NewReal(), t: t, current: goTestTarget(home)}, env: map[string]string{}, denied: map[string]error{}, reads: map[string]int{}, readErrors: map[string]error{}}
 	s := NewComposerScanner(x, progress.NewNoop())
 	s.protection = func(string, *bool) (func(string) string, func(string) bool) {
 		return func(string) string { return "" }, func(string) bool { return false }
@@ -468,29 +472,14 @@ func TestComposerScanChangedDuringRead(t *testing.T) {
 	root := filepath.Join(home, "code")
 	composerWriteProject(t, root)
 	scanner, x := composerTestScanner(t, home)
-	// A wrapper supplies an ENOENT specifically at ReadFile after successful Stat.
-	changed := &composerChangedRead{composerTrap: x, path: filepath.Join(root, "composer.lock")}
-	scanner.exec = changed
+	// Stat succeeds; the file disappears before ReadFile.
+	path := filepath.Join(root, "composer.lock")
+	x.readErrors[path] = os.ErrNotExist
 	inv, _ := scanner.Scan(context.Background(), goTestTarget(home), []string{root}, nil)
-	src := composerSource(t, inv, changed.path)
+	src := composerSource(t, inv, path)
 	if src.Presence != "unknown" || !slices.Contains(src.Reasons, "changed_during_scan") {
 		t.Fatalf("changed source %+v", src)
 	}
-}
-
-type composerChangedRead struct {
-	*composerTrap
-	path string
-}
-
-func (x *composerChangedRead) GuardedFiles(roots []string, g func(string) string, max int64) executor.Executor {
-	return &composerChangedRead{composerTrap: x.composerTrap.GuardedFiles(roots, g, max).(*composerTrap), path: x.path}
-}
-func (x *composerChangedRead) ReadFile(p string) ([]byte, error) {
-	if p == x.path {
-		return nil, os.ErrNotExist
-	}
-	return x.composerTrap.ReadFile(p)
 }
 
 func TestComposerScanOutputLimit(t *testing.T) {

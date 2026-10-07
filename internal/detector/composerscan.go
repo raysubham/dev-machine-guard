@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"maps"
 	"os/user"
 	"path/filepath"
 	"slices"
@@ -46,7 +47,6 @@ type composerProjectState struct {
 	project  model.ComposerProject
 	vendor   string
 }
-type composerReceipt struct{ path, parent string }
 type composerScan struct {
 	ctx                  context.Context
 	exec                 executor.Executor
@@ -60,7 +60,7 @@ type composerScan struct {
 	sources              []*model.ComposerSource
 	byID                 map[string]*model.ComposerSource
 	manifests            map[string]*composerProjectState
-	receipts             map[string]composerReceipt
+	receipts             map[string]string
 	vendors              map[string]bool
 	caches               map[string]bool
 	remaining            int
@@ -81,7 +81,7 @@ func (s *ComposerScanner) Scan(ctx context.Context, target *user.User, searchDir
 	}
 	guard, volume := s.protection(target.HomeDir, includeNetworkVolumes)
 	c := &composerScan{ctx: ctx, exec: s.exec, home: filepath.Clean(target.HomeDir), identity: target.Username, goos: s.exec.GOOS(), guard: guard, volume: volume, inv: inv,
-		byID: map[string]*model.ComposerSource{}, manifests: map[string]*composerProjectState{}, receipts: map[string]composerReceipt{}, vendors: map[string]bool{}, caches: map[string]bool{}, remaining: maxComposerRecords}
+		byID: map[string]*model.ComposerSource{}, manifests: map[string]*composerProjectState{}, receipts: map[string]string{}, vendors: map[string]bool{}, caches: map[string]bool{}, remaining: maxComposerRecords}
 	c.roots = []string{c.home}
 	dirs := []string{}
 	for _, dir := range searchDirs {
@@ -268,7 +268,7 @@ func (c *composerScan) receipt(path, parent string) {
 	if c.source("installed_metadata", path, parent) == nil {
 		return
 	}
-	c.receipts[key] = composerReceipt{path, parent}
+	c.receipts[key] = path
 	c.vendors[c.key(filepath.Dir(filepath.Dir(path)))] = true
 }
 func (c *composerScan) manifest(path, parent, scope, home string, targeted bool) {
@@ -504,26 +504,21 @@ func (c *composerScan) emit() {
 			c.packages(lock, false, m.project.ProjectPath, m.project.Scope)
 		}
 	}
-	paths := make([]string, 0, len(c.receipts))
-	for key := range c.receipts {
-		paths = append(paths, key)
-	}
-	slices.Sort(paths)
-	for _, key := range paths {
-		r := c.receipts[key]
-		vendorPath := filepath.Dir(filepath.Dir(r.path))
+	for _, key := range slices.Sorted(maps.Keys(c.receipts)) {
+		path := c.receipts[key]
+		vendorPath := filepath.Dir(filepath.Dir(path))
 		// A later project can identify an earlier candidate as a dependency
 		// tree or cache. Its nested receipts are not another installation.
 		if c.inVendor(filepath.Dir(vendorPath)) || c.inCache(vendorPath) {
-			delete(c.byID, configaudit.GoSourceID(c.identity, "installed_metadata", r.path))
+			delete(c.byID, configaudit.GoSourceID(c.identity, "installed_metadata", path))
 			continue
 		}
-		src := c.byID[configaudit.GoSourceID(c.identity, "installed_metadata", r.path)]
+		src := c.byID[configaudit.GoSourceID(c.identity, "installed_metadata", path)]
 		if src == nil {
 			continue
 		}
 		project, scope := "", "unknown"
-		vendor := c.key(filepath.Dir(filepath.Dir(r.path)))
+		vendor := c.key(vendorPath)
 		for _, m := range manifests {
 			if m.manifest != nil && !c.inVendor(m.project.ProjectPath) && c.key(m.vendor) == vendor {
 				if project != "" && project != m.project.ProjectPath {

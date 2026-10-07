@@ -192,20 +192,14 @@ func TestComposerConfigUnresolvedAndFailedSources(t *testing.T) {
 		}
 	}
 }
-func TestComposerConfigBoundedAuditAndTypedValues(t *testing.T) {
+func TestComposerConfigBoundedAudit(t *testing.T) {
 	m, scope := composerConfigTest(t)
-	a := NewComposerConfigDetector(m).Detect(context.Background(), scope)
-	a.Project(filepath.Join(scope.Home, "app", "composer.json"), []byte(`{"config":{"secure-http":"false","allow-plugins":[],"policy":{"ignore-unreachable":["CANARY_BAD"]}}}`), "present", nil, "")
-	audit := a.Finish()
-	if audit.Status != "partial" || len(audit.Findings) > 0 {
-		t.Fatal("invalid typed settings became a verdict")
-	}
 	old := maxComposerAuditBytes
 	maxComposerAuditBytes = 256
 	t.Cleanup(func() { maxComposerAuditBytes = old })
-	a = NewComposerConfigDetector(m).Detect(context.Background(), scope)
+	a := NewComposerConfigDetector(m).Detect(context.Background(), scope)
 	a.Project(filepath.Join(scope.Home, "app", "composer.json"), []byte(`{}`), "present", nil, "")
-	audit = a.Finish()
+	audit := a.Finish()
 	if audit.Status != "partial" || !slices.Contains(audit.Reasons, "output_size_limit") {
 		t.Fatal("audit overflow complete")
 	}
@@ -229,17 +223,20 @@ func TestComposerURLSanitizer(t *testing.T) {
 }
 
 func TestComposerConfigFailedSourcesDoNotPublishCurrentSettings(t *testing.T) {
-	for _, body := range []string{
-		`{"config":{"secure-http":false,"allow-plugins":{"CANARY_BAD@key":true}}}`,
-		`{"config":{"secure-http":false,"lock":"false"}}`,
+	for _, tc := range []struct{ name, body string }{
+		{"invalid types", `{"config":{"secure-http":"false","allow-plugins":[],"policy":{"ignore-unreachable":["CANARY_BAD"]}}}`},
+		{"invalid pattern", `{"config":{"secure-http":false,"allow-plugins":{"CANARY_BAD@key":true}}}`},
+		{"invalid lock", `{"config":{"secure-http":false,"lock":"false"}}`},
 	} {
-		m, scope := composerConfigTest(t)
-		a := NewComposerConfigDetector(m).Detect(context.Background(), scope)
-		a.Project(filepath.Join(scope.Home, "app", "composer.json"), []byte(body), "present", nil, "")
-		audit := a.Finish()
-		if audit.Status != "partial" || len(composerSettings(audit, "project")) != 0 || len(audit.Findings) != 0 {
-			t.Fatal("invalid source published current settings")
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			m, scope := composerConfigTest(t)
+			a := NewComposerConfigDetector(m).Detect(context.Background(), scope)
+			a.Project(filepath.Join(scope.Home, "app", "composer.json"), []byte(tc.body), "present", nil, "")
+			audit := a.Finish()
+			if audit.Status != "partial" || len(composerSettings(audit, "project")) != 0 || len(audit.Findings) != 0 {
+				t.Fatal("invalid source published current settings or findings")
+			}
+		})
 	}
 	m, scope := composerConfigTest(t)
 	m.SetEnv("COMPOSER", "relative.json")

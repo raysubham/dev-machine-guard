@@ -7,13 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See [VERSIONING.md](VERSIONING.md) for why the version starts at 1.8.1.
 
-## [1.18.0] - 2026-10-04
-
-### Added
-
-- Static PHP/Composer inventory in enterprise telemetry: independent root requirements, locked packages and installed receipts, with guarded directory-presence checks. Supports Composer global homes, custom vendor paths and Composer 1/2 receipt formats without executing PHP, Composer, plugins or scripts.
-- Composer configuration audit with a typed allowlist, credential redaction, source-specific TLS/HTTP/plugin findings and explicit partial coverage. Authentication files are checked for presence only.
-
 ## [1.17.0] - 2026-09-24
 
 ### Added

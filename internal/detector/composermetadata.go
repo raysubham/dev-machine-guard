@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/url"
 	"path/filepath"
 	"regexp"
@@ -114,12 +115,7 @@ func parseComposerManifest(data []byte) (*composerManifest, error) {
 			m.partial = true
 			continue
 		}
-		names := make([]string, 0, len(deps))
-		for name := range deps {
-			names = append(names, name)
-		}
-		slices.Sort(names)
-		for _, name := range names {
+		for _, name := range slices.Sorted(maps.Keys(deps)) {
 			// Platform requirements are not Composer package identities.
 			if composerPlatformRequirement(name) {
 				continue
@@ -144,18 +140,16 @@ func parseComposerPackages(data []byte, installed bool) ([]composerEntry, bool, 
 	if !utf8.Valid(data) || int64(len(data)) > maxComposerMetadataBytes {
 		return nil, false, errors.New("invalid metadata")
 	}
-	var groups []struct {
+	type group struct {
 		raw  json.RawMessage
 		kind string
 	}
+	var groups []group
 	var devNames map[string]bool
 	partial := false
 	trimmed := bytes.TrimSpace(data)
 	if installed && len(trimmed) > 0 && trimmed[0] == '[' {
-		groups = append(groups, struct {
-			raw  json.RawMessage
-			kind string
-		}{trimmed, "unknown"})
+		groups = append(groups, group{trimmed, "unknown"})
 	} else {
 		obj, err := composerObject(data)
 		if err != nil {
@@ -189,15 +183,9 @@ func parseComposerPackages(data []byte, installed bool) ([]composerEntry, bool, 
 				}
 			}
 		}
-		groups = append(groups, struct {
-			raw  json.RawMessage
-			kind string
-		}{obj["packages"], kind})
+		groups = append(groups, group{obj["packages"], kind})
 		if !installed && obj["packages-dev"] != nil {
-			groups = append(groups, struct {
-				raw  json.RawMessage
-				kind string
-			}{obj["packages-dev"], "require_dev"})
+			groups = append(groups, group{obj["packages-dev"], "require_dev"})
 		}
 	}
 	var out []composerEntry

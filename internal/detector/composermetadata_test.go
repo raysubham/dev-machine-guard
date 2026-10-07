@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 )
@@ -18,24 +17,28 @@ func TestComposerMetadataEvidence(t *testing.T) {
 		t.Fatalf("declaration: %+v", p)
 	}
 	for _, tc := range []struct {
-		name, body string
-		installed  bool
-		count      int
-		kind       string
+		name, body  string
+		installed   bool
+		kinds       []string
+		installPath string
 	}{
-		{"lock", `{"packages":[{"name":"example/lib","version":"dev-main"},{"name":"example/transitive","version":"1.2.3"}],"packages-dev":[{"name":"example/tool","version":"2.1.0"}],"aliases":[{"package":"example/lib","alias":"1.0.x-dev"}]}`, false, 3, "require"},
-		{"legacy", `[{"name":"example/lib","version":"v1.0.0"}]`, true, 1, "unknown"},
-		{"current", `{"packages":[{"name":"example/lib","version":"1.2.3","require-dev":{"vendor/dev":"*"}}],"dev":false,"dev-package-names":[]}`, true, 1, "require"},
-		{"dev", `{"packages":[{"name":"example/tool","version":"2.1.0"}],"dev-package-names":["example/tool"]}`, true, 1, "require_dev"},
-		{"empty legacy", `[]`, true, 0, ""}, {"empty current", `{"packages":[]}`, true, 0, ""},
+		{"lock", `{"packages":[{"name":"example/lib","version":"dev-main"},{"name":"example/transitive","version":"1.2.3"}],"packages-dev":[{"name":"example/tool","version":"2.1.0"}],"aliases":[{"package":"example/lib","alias":"1.0.x-dev"}]}`, false, []string{"require", "require", "require_dev"}, ""},
+		{"current", `{"packages":[{"name":"example/lib","version":"1.2.3","require-dev":{"vendor/dev":"*"}}],"dev":false,"dev-package-names":[]}`, true, []string{"require"}, ""},
+		{"mixed dev", `{"packages":[{"name":"example/lib","version":"1"},{"name":"example/tool","version":"2"}],"dev-package-names":["example/tool"]}`, true, []string{"require", "require_dev"}, ""},
+		{"no-dev", `{"packages":[{"name":"example/lib","version":"1"}],"dev":false,"dev-package-names":["example/tool"]}`, true, []string{"require"}, ""},
+		{"custom installer", `{"packages":[{"name":"example/wp-plugin","version":"1","type":"wordpress-plugin","install-path":"../../wp-content/plugins/wp-plugin"}]}`, true, []string{"unknown"}, "../../wp-content/plugins/wp-plugin"},
+		{"empty legacy", `[]`, true, []string{}, ""},
+		{"empty current", `{"packages":[]}`, true, []string{}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			entries, partial, err := parseComposerPackages([]byte(tc.body), tc.installed)
-			if err != nil || partial || len(entries) != tc.count {
+			if err != nil || partial || len(entries) != len(tc.kinds) {
 				t.Fatalf("entries=%+v partial=%v err=%v", entries, partial, err)
 			}
-			if tc.count > 0 && entries[0].pkg.DependencyKind != tc.kind {
-				t.Fatalf("kind=%s", entries[0].pkg.DependencyKind)
+			for i, e := range entries {
+				if e.pkg.DependencyKind != tc.kinds[i] || e.installPath != tc.installPath {
+					t.Fatalf("entry %d: %+v", i, e)
+				}
 			}
 		})
 	}
@@ -62,7 +65,7 @@ func TestComposerMetadataChecksumAndURLs(t *testing.T) {
 		hash, status string
 		count        int
 	}{{"", "absent", 0}, {strings.Repeat("AB", 20), "recorded", 1}, {"SECRET_CANARY", "partial", 0}, {strings.Repeat("f", 39), "partial", 0}} {
-		body := `{"packages":[{"name":"example/lib","version":"1.0.0","source":{"type":"git","url":"https://alice:SECRET_CANARY@code.example.invalid/lib?secret=SECRET_CANARY#SECRET_CANARY","reference":"branch/release"},"dist":{"type":"zip","url":"https://dist.example.invalid/lib.zip?token=SECRET_CANARY","shasum":"` + tc.hash + `"}}]}`
+		body := `{"packages":[{"name":"example/lib","version":"1.0.0","source":{"type":"git","url":"https://alice:SECRET_CANARY@code.example.invalid/lib?secret=SECRET_CANARY#SECRET_CANARY","reference":"branch/release"},"dist":{"type":"zip","url":"https://dist.example.invalid/lib.zip?token=SECRET_CANARY","reference":"branch/release","shasum":"` + tc.hash + `"}}]}`
 		entries, partial, err := parseComposerPackages([]byte(body), false)
 		if err != nil || partial || len(entries) != 1 {
 			t.Fatalf("parse %+v %v %v", entries, partial, err)
@@ -75,8 +78,8 @@ func TestComposerMetadataChecksumAndURLs(t *testing.T) {
 		if strings.Contains(string(encoded), "SECRET_CANARY") {
 			t.Fatal("secret survived")
 		}
-		if p.Source.URL != "https://code.example.invalid/lib" || p.Source.Reference != "branch/release" {
-			t.Fatalf("descriptor %+v", p.Source)
+		if p.Source.Type != "git" || p.Source.URL != "https://code.example.invalid/lib" || p.Source.Reference != "branch/release" || p.Dist.Type != "zip" || p.Dist.URL != "https://dist.example.invalid/lib.zip" || p.Dist.Reference != "branch/release" {
+			t.Fatalf("descriptors %+v %+v", p.Source, p.Dist)
 		}
 		if tc.count > 0 && (p.RecordedChecksums[0].Value != strings.Repeat("ab", 20) || p.RecordedChecksums[0].Verification != "not_verified") {
 			t.Fatal("checksum normalization")
@@ -88,27 +91,22 @@ func TestComposerMetadataChecksumAndURLs(t *testing.T) {
 // Composer 1.10.28 and 2.2.30. Only parser-allowlisted package fields remain.
 // These format tests do not substitute for the product VM acceptance run.
 func TestComposerNativeMetadataFixtures(t *testing.T) {
-	for _, name := range []string{"composer1", "composer22", "baseline", "no-dev", "custom-installer", "public-app"} {
-		t.Run(name, func(t *testing.T) {
-			data, err := os.ReadFile(filepath.Join("testdata", "composer", name+".json"))
+	for _, tc := range []struct{ name, kind, installPath string }{
+		{"composer1", "unknown", ""},
+		{"composer22", "require", "../example/contracts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("testdata", "composer", tc.name+".json"))
 			if err != nil {
 				t.Fatal(err)
 			}
 			entries, partial, err := parseComposerPackages(data, true)
-			if err != nil || partial || len(entries) == 0 {
+			if err != nil || partial || len(entries) != 1 {
 				t.Fatalf("native metadata %d %v %v", len(entries), partial, err)
 			}
-			if name == "baseline" && len(entries) != 4 {
-				t.Fatalf("baseline count %d", len(entries))
-			}
-			if name == "no-dev" && len(entries) != 3 {
-				t.Fatalf("no-dev count %d", len(entries))
-			}
-			if name == "custom-installer" && !slices.ContainsFunc(entries, func(e composerEntry) bool { return strings.Contains(e.installPath, "wp-content/plugins") }) {
-				t.Fatal("missing custom path")
-			}
-			if name == "composer1" && slices.ContainsFunc(entries, func(e composerEntry) bool { return e.pathProvided || e.pkg.DependencyKind != "unknown" }) {
-				t.Fatal("legacy attribution")
+			e := entries[0]
+			if e.pkg.PackageName != "example/contracts" || e.pkg.Version != "1.0.0" || e.pkg.VersionNormalized != "1.0.0.0" || e.pkg.DependencyKind != tc.kind || e.installPath != tc.installPath || e.pathProvided != (tc.installPath != "") {
+				t.Fatalf("native entry %+v", e)
 			}
 		})
 	}
