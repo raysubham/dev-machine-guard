@@ -834,8 +834,10 @@ func (a *ComposerConfigSnapshot) repositories(f *model.ComposerConfigFile, raw j
 			a.fileReason(f, "invalid", "parse_error")
 			return
 		}
-		if (name == "packagist.org" || name == "packagist") && string(entry) == "false" {
-			a.setting(f, "repositories.packagist.org", "false", false)
+		if name != "" && string(entry) == "false" {
+			if name == "packagist.org" || name == "packagist" {
+				a.setting(f, "repositories.packagist.org", "false", false)
+			}
 			continue
 		}
 		var obj map[string]json.RawMessage

@@ -63,10 +63,13 @@ func TestComposerConfigAllowlistRedactionAndFindings(t *testing.T) {
 	body := `{
  "minimum-stability":"RC","prefer-stable":true,
  "config":{"disable-tls":true,"secure-http":false,"lock":false,"source-fallback":false,"store-auths":"prompt","platform-check":"php-only","vendor-dir":"deps/php","bin-dir":"{$vendor-dir}/bin","cafile":"/cert/path","allow-plugins":true,"preferred-install":{"example/*":"dist","*":"source"},"http-basic":{"CANARY_HOST":{"username":"CANARY_USER","password":"CANARY_PASS"}},"audit":{"abandoned":"report","block-insecure":true,"block-abandoned":false,"ignore-unreachable":true,"ignore":{"CANARY_IGNORE":"CANARY_REASON"}},"policy":{"advisories":{"block":true,"audit":"fail","ignore-id":["CANARY_ID"]},"malware":{"block":false,"audit":"report","block-scope":"update"},"abandoned":false,"ignore-unreachable":["audit","install"],"custom-CANARY_POLICY":{"key":"CANARY_VALUE"}}},
- "repositories":{"CANARY_REPO_NAME":{"type":"composer","url":"http://alice:CANARY_URL@repo.example.invalid/index?token=CANARY_TOKEN#CANARY_FRAGMENT","canonical":false,"only":["example/*"],"exclude":["example/dev"],"options":{"http":{"header":["Authorization: CANARY_HEADER"]}}},"packagist.org":false,"another":{"type":"path","url":"../local/*"}},"scripts":{"post-install-cmd":"CANARY_SCRIPT"}}
+ "repositories":{"CANARY_REPO_NAME":{"type":"composer","url":"http://alice:CANARY_URL@repo.example.invalid/index?token=CANARY_TOKEN#CANARY_FRAGMENT","canonical":false,"only":["example/*"],"exclude":["example/dev"],"options":{"http":{"header":["Authorization: CANARY_HEADER"]}}},"packagist.org":false,"another":{"type":"path","url":"../local/*"},"CANARY_DISABLED_REPO":false},"scripts":{"post-install-cmd":"CANARY_SCRIPT"}}
  `
 	paths := a.Project(manifest, []byte(body), "present", nil, "")
 	audit := a.Finish()
+	if audit.Status != "complete" {
+		t.Fatalf("valid repository settings made audit %s: %v", audit.Status, audit.Reasons)
+	}
 	data, _ := json.Marshal(audit)
 	if strings.Contains(string(data), "CANARY_") {
 		t.Fatalf("canary survived: %s", data)
