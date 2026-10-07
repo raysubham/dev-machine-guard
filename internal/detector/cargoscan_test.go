@@ -194,6 +194,15 @@ func TestCargoScan_UnreadableBinIsUnreadable(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(bin, 0o755) })
 
 	inv, _ := cargoTestScan(t, home, filepath.Join(home, "code"))
+	if inv.Status != model.CargoStatusPartial || !slices.Contains(inv.Reasons, model.CargoReasonPermissionDenied) {
+		t.Errorf("inventory = %s %v, want partial with permission_denied", inv.Status, inv.Reasons)
+	}
+	for _, src := range inv.Sources {
+		if src.Kind == model.CargoSourceInstallRoot && src.Path == cargoHome &&
+			(src.Status != model.CargoStatusPartial || !slices.Contains(src.Reasons, model.CargoReasonPermissionDenied)) {
+			t.Errorf("install source = %s %v, want partial with permission_denied", src.Status, src.Reasons)
+		}
+	}
 	for _, p := range inv.Packages {
 		if p.Evidence != model.CargoEvidenceInstalledTool {
 			continue

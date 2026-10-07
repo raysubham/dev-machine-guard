@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -811,8 +812,9 @@ func cargoConfigSettings(doc map[string]any, file string) ([]cargoSetting, []car
 			b.provider("registry.global-credential-providers", p)
 		}
 	}
-	for name, raw := range cargoTableOf(doc["registries"]) {
-		r := cargoTableOf(raw)
+	registries := cargoTableOf(doc["registries"])
+	for _, name := range slices.Sorted(maps.Keys(registries)) {
+		r := cargoTableOf(registries[name])
 		part, redacted, ok := cargoKeyPart(name)
 		if !ok || r == nil {
 			continue
@@ -828,8 +830,9 @@ func cargoConfigSettings(doc map[string]any, file string) ([]cargoSetting, []car
 			b.redactFrom(start)
 		}
 	}
-	for name, raw := range cargoTableOf(doc["source"]) {
-		src := cargoTableOf(raw)
+	sources := cargoTableOf(doc["source"])
+	for _, name := range slices.Sorted(maps.Keys(sources)) {
+		src := cargoTableOf(sources[name])
 		part, redacted, ok := cargoKeyPart(name)
 		if !ok || src == nil {
 			continue
@@ -868,10 +871,12 @@ func cargoConfigSettings(doc map[string]any, file string) ([]cargoSetting, []car
 			b.path("paths", p)
 		}
 	}
-	for src, raw := range cargoTableOf(doc["patch"]) {
+	patches := cargoTableOf(doc["patch"])
+	for _, src := range slices.Sorted(maps.Keys(patches)) {
 		srcPart, srcRedacted, srcOK := cargoKeyPart(src)
-		for name, entry := range cargoTableOf(raw) {
-			e := cargoTableOf(entry)
+		entries := cargoTableOf(patches[src])
+		for _, name := range slices.Sorted(maps.Keys(entries)) {
+			e := cargoTableOf(entries[name])
 			part, redacted, ok := cargoKeyPart(name)
 			if !srcOK || !ok || e == nil {
 				continue

@@ -1763,6 +1763,7 @@ func (g *cargoScan) installation(src *model.CargoSource, files executor.Executor
 			absent++
 		default:
 			b.Presence = model.CargoBinUnreadable
+			cargoDegrade(src, g.reason(err, b.Path))
 		}
 		inst.Bins = append(inst.Bins, b)
 	}

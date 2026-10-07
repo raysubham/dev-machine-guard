@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -77,5 +78,50 @@ lockfile-path = "`+filepath.ToSlash(filepath.Join(home, "locks", "Cargo.lock"))+
 	}
 	if _, unresolved := snap.LockfilePath(""); unresolved {
 		t.Error("LockfilePath(home) unresolved, want resolved")
+	}
+}
+
+func TestCargoConfigSettings_DeterministicOrder(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "work")
+	file := filepath.Join(root, ".cargo", "config.toml")
+	doc := map[string]any{}
+	if err := toml.Unmarshal([]byte(`
+paths = ["vendor/second", "vendor/first"]
+include = ["b.toml", "a.toml"]
+[registry]
+global-credential-providers = ["cargo:wincred", "cargo:token"]
+[patch."https://git.example/repo.git?token=one"]
+widgets = { path = "vendor/one" }
+[patch."https://git.example/repo.git?token=two"]
+widgets = { path = "vendor/two" }
+`), &doc); err != nil {
+		t.Fatal(err)
+	}
+	var first string
+	for i := range 64 {
+		settings, _ := cargoConfigSettings(doc, file)
+		raw, err := json.Marshal(settings)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			first = string(raw)
+			got := map[string][]string{}
+			for _, s := range settings {
+				got[s.Key] = append(got[s.Key], s.Display)
+			}
+			for key, want := range map[string][]string{
+				"patch.https://git.example/repo.git.widgets.path": {filepath.Join(root, "vendor", "one"), filepath.Join(root, "vendor", "two")},
+				"paths":                                {filepath.Join(root, "vendor", "second"), filepath.Join(root, "vendor", "first")},
+				"include":                              {filepath.Join(root, ".cargo", "b.toml"), filepath.Join(root, ".cargo", "a.toml")},
+				"registry.global-credential-providers": {"cargo:wincred", "cargo:token"},
+			} {
+				if !reflect.DeepEqual(got[key], want) {
+					t.Errorf("%s order = %v, want %v", key, got[key], want)
+				}
+			}
+		} else if string(raw) != first {
+			t.Fatal("identical config produced different settings order")
+		}
 	}
 }
