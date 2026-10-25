@@ -164,7 +164,18 @@ func FuzzCondaMetadata(f *testing.F) {
 		f.Add([]byte(s))
 	}
 	leak := func(s string) bool {
-		return strings.ContainsAny(s, "@?#") || strings.Contains(s, "/t/") || strings.Contains(s, "%2F") || strings.Contains(s, "%2f")
+		// A token lives in a URL path; a host named "t" or a local
+		// directory named "t" is not one.
+		path := ""
+		if i := strings.Index(s, "://"); i >= 0 {
+			path = strings.TrimLeft(s[i+3:], "/")
+			if j := strings.IndexByte(path, '/'); j >= 0 {
+				path = path[j:]
+			} else {
+				path = ""
+			}
+		}
+		return strings.ContainsAny(s, "@?#") || strings.Contains(path, "/t/") || strings.Contains(s, "%2F") || strings.Contains(s, "%2f")
 	}
 	check := func(t *testing.T, pkgs []model.CondaPackage) {
 		t.Helper()

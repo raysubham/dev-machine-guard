@@ -205,7 +205,7 @@ func condaSanitizeSpec(spec string) string {
 	}
 	if channel, rest, ok := strings.Cut(spec, "::"); ok {
 		display, _ := configaudit.CondaChannelDisplay(channel)
-		if strings.ContainsAny(rest, "@:") || strings.Contains(rest, "/t/") {
+		if strings.ContainsAny(rest, "@:?#") || strings.Contains(rest, "/t/") {
 			return condaRedacted
 		}
 		return display + "::" + rest
@@ -217,7 +217,8 @@ func condaSanitizeSpec(spec string) string {
 		}
 		display, _ := configaudit.CondaSanitizeURL(spec)
 		return display
-	case strings.ContainsAny(spec, "@") || strings.Contains(spec, "/t/"):
+	case strings.ContainsAny(spec, "@?#") || strings.Contains(spec, "/t/"):
+		// A query or fragment marks a URL-like request, not a match spec.
 		return condaRedacted
 	}
 	return spec

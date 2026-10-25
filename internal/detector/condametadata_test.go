@@ -199,13 +199,13 @@ func TestCondaRecord(t *testing.T) {
 
 	modern := `{"name":"NumPy","version":"1.26.4","build":"py312h8813227_0","build_number":0,"subdir":"osx-arm64","channel":"conda-forge",
 		"url":"https://conda.anaconda.org/conda-forge/osx-arm64/numpy-1.26.4-py312h8813227_0.conda","md5":"` + condaMD5A + `","sha256":"` + strings.ToUpper(condaSHA_A) + `",
-		"requested_specs":["numpy>=1.26","https://CANARY:x@repo.example.invalid/t/CANARY/ch::numpy","numpy>=1.26"],"requested_spec":"ignored","package_type":"noarch_python"}`
+		"requested_specs":["numpy>=1.26","https://CANARY:x@repo.example.invalid/t/CANARY/ch::numpy","numpy>=1.26","./numpy.conda#CANARY_FRAGMENT","ch::numpy?CANARY_QUERY"],"requested_spec":"ignored","package_type":"noarch_python"}`
 	r, err = parseCondaRecord([]byte(modern))
 	if err != nil {
 		t.Fatal(err)
 	}
 	p = condaFact(r)
-	if p.PackageName != "numpy" || p.DependencyRelation != "direct" || !slices.Equal(p.RequestedSpecs, []string{"numpy>=1.26", "https://repo.example.invalid/ch::numpy"}) || p.BuildNumber == nil || *p.BuildNumber != 0 ||
+	if p.PackageName != "numpy" || p.DependencyRelation != "direct" || !slices.Equal(p.RequestedSpecs, []string{"numpy>=1.26", "https://repo.example.invalid/ch::numpy", "[redacted]"}) || p.BuildNumber == nil || *p.BuildNumber != 0 ||
 		p.Origin != (model.CondaOrigin{Kind: "channel", URL: "https://conda.anaconda.org/conda-forge"}) || len(p.RecordedChecksums) != 2 || p.RecordedChecksums[0].Algorithm != "sha256" || p.RecordedChecksums[0].Value != condaSHA_A {
 		t.Errorf("modern fact %+v", p)
 	}
