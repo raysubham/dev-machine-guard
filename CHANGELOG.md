@@ -11,7 +11,7 @@ See [VERSIONING.md](VERSIONING.md) for why the version starts at 1.8.1.
 
 ### Fixed
 
-- **Windows self-update now accepts real releases.** Trusted Signing embeds the signing certificate twice in every signature, and the 1.18.0 updater counted the copy as a second, ambiguous signer. Every release failed verification (`update_verify_failed`, "signer certificate is ambiguous"), and the MSI's own seed was never adopted. Identical copies now count once; two different certificates matching the signer are still rejected (#FIXPR).
+- **Windows self-update now accepts real releases.** Trusted Signing embeds the signing certificate twice in every signature, and the 1.18.0 updater counted the copy as a second, ambiguous signer. Every release failed verification (`update_verify_failed`, "signer certificate is ambiguous"), and the MSI's own seed was never adopted. Identical copies now count once; two different certificates matching the signer are still rejected (#265).
 
 ### Changed
 
