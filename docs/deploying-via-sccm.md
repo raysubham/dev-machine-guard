@@ -210,7 +210,7 @@ msiexec /i "stepsecurity-dev-machine-guard-<version>-x64.msi" REINSTALL=ALL REIN
 Don't use `msiexec /f...`: it ignores every command-line property,
 including `/norestart` and `AUTOUPDATE`. MSIs up to 1.17.0 could restart
 the machine without a prompt when a `/f` repair ran during a scan; from
-1.18.1 the MSI suppresses restarts itself and stops Dev Machine Guard
+1.18.0 the MSI suppresses restarts itself and stops Dev Machine Guard
 before replacing files. A repair re-creates the scheduled tasks and never
 moves a self-updated device back to the MSI's version.
 

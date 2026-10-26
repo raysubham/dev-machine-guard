@@ -205,7 +205,7 @@ msiexec /i "stepsecurity-dev-machine-guard-<version>-x64.msi" REINSTALL=ALL REIN
 
 Don't use `msiexec /f...` for repairs. A `/f` repair ignores every
 command-line property, including `/norestart` and `AUTOUPDATE`. From
-1.18.1 the MSI itself suppresses restarts and stops Dev Machine Guard
+1.18.0 the MSI itself suppresses restarts and stops Dev Machine Guard
 before it replaces files, so even a `/f` repair no longer reboots. But
 MSIs up to 1.17.0 could restart the machine without a prompt when a `/f`
 repair ran during a scan, and `/f` can't change the auto-update setting.
@@ -440,7 +440,7 @@ appears on hover.
 | Updater failing (`update_updater_failed`) | The updater in the current version failed three times in a row, and the MSI's copy took over. | Contact StepSecurity support with the device's `update.log`. |
 
 **No update events at all** from a device usually means it still runs an
-MSI older than 1.18.1 (it needs the final MSI push), the Update task is
+MSI older than 1.18.0 (it needs the final MSI push), the Update task is
 missing (check with `schtasks /query`, then repair the MSI), or the
 device can't reach `<api-host>`.
 
