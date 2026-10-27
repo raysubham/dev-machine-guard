@@ -208,7 +208,11 @@ func (d *CondaConfigDetector) Detect(ctx context.Context, scope CondaConfigScope
 		}
 	}
 	systemDirs := []string{"/etc/conda", "/var/lib/conda"}
-	if goos == model.PlatformWindows {
+	switch goos {
+	case model.PlatformDarwin:
+		// Missing directories cannot establish roots through /etc and /var symlinks.
+		systemDirs = []string{"/private/etc/conda", "/private/var/lib/conda"}
+	case model.PlatformWindows:
 		// The loader hardcodes this directory; %PROGRAMDATA% is not consulted.
 		systemDirs = []string{filepath.Join(`C:\ProgramData`, "conda")}
 	}
