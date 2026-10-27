@@ -262,11 +262,11 @@ func (c *condaScan) read(src *model.CondaSource, path string, targeted bool) ([]
 
 // list enumerates one directory for its owner. A missing directory has no
 // children; any other failure or truncation leaves the owner partial.
-func (c *condaScan) list(owner *model.CondaSource, dir string) ([]fs.DirEntry, bool) {
+func (c *condaScan) list(owner *model.CondaSource, dir string, limit int) ([]fs.DirEntry, bool) {
 	if c.stopped(owner) {
 		return nil, false
 	}
-	entries, more, err := c.fs(dir, 0).ReadDirLimit(dir, maxCondaListEntries)
+	entries, more, err := c.fs(dir, 0).ReadDirLimit(dir, limit)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, false
 	}
@@ -338,6 +338,7 @@ func (c *condaScan) environmentRoot(path, scope, parent, project string) bool {
 	}
 	path = filepath.Clean(path)
 	if c.envRoots[c.key(path)] {
+		c.adopt(path, owner)
 		return true
 	}
 	if c.stopped(owner) {
@@ -363,7 +364,7 @@ func (c *condaScan) environmentRoot(path, scope, parent, project string) bool {
 	// An activated or registered prefix with only conda-meta is an
 	// environment, not an installation whose .condarc the loader consults.
 	meta, envs, pkgs := has("conda-meta"), has("envs"), has("pkgs")
-	if !envs && !pkgs {
+	if !envs && !pkgs && !more {
 		return false
 	}
 	phys := path
@@ -374,6 +375,7 @@ func (c *condaScan) environmentRoot(path, scope, parent, project string) bool {
 	c.envRoots[c.key(path)], c.envRoots[c.key(phys)] = true, true
 	c.pruned[c.key(path)], c.pruned[c.key(phys)] = true, true
 	if duplicate {
+		c.adopt(phys, owner)
 		return true
 	}
 	src := c.source("environment_root", path, parent)
@@ -399,7 +401,8 @@ func (c *condaScan) environmentRoot(path, scope, parent, project string) bool {
 // envsDir enumerates one environments directory; each child is a candidate
 // prefix. It is a discovery step, not a source of its own.
 func (c *condaScan) envsDir(dir, scope string, owner *model.CondaSource) {
-	if !filepath.IsAbs(dir) || c.envsDirs[c.key(dir)] {
+	// A newly supplied owner needs the listing's coverage as well as its children.
+	if !filepath.IsAbs(dir) || c.envsDirs[c.key(dir)] && owner == nil {
 		return
 	}
 	c.envsDirs[c.key(dir)] = true
@@ -407,7 +410,7 @@ func (c *condaScan) envsDir(dir, scope string, owner *model.CondaSource) {
 	if owner != nil {
 		parent = owner.SourceID
 	}
-	entries, ok := c.list(owner, dir)
+	entries, ok := c.list(owner, dir, maxCondaListEntries)
 	if !ok {
 		return
 	}
@@ -430,6 +433,7 @@ func (c *condaScan) environment(prefix, scope, parent, project string) bool {
 	}
 	prefix = filepath.Clean(prefix)
 	if c.envs[c.key(prefix)] {
+		c.adopt(prefix, owner)
 		return true
 	}
 	if c.stopped(owner) {
@@ -449,6 +453,7 @@ func (c *condaScan) environment(prefix, scope, parent, project string) bool {
 	c.envs[c.key(prefix)], c.envs[c.key(phys)] = true, true
 	c.pruned[c.key(prefix)], c.pruned[c.key(phys)] = true, true
 	if duplicate {
+		c.adopt(phys, owner)
 		return true
 	}
 	src := c.source("environment", prefix, parent)
@@ -462,7 +467,7 @@ func (c *condaScan) environment(prefix, scope, parent, project string) bool {
 	case !info.IsDir():
 		c.degrade(src, "unsupported_entry")
 	default:
-		entries, ok := c.list(src, meta)
+		entries, ok := c.list(src, meta, maxCondaListEntries)
 		finished := false
 		for _, e := range entries {
 			name := e.Name()
@@ -568,7 +573,11 @@ func (c *condaScan) registry() {
 // unsupported coverage, and no identity is guessed from its name.
 func (c *condaScan) cacheRoot(path, scope, parent, project string) {
 	owner := c.byID[parent]
-	if path == "" || c.caches[c.key(path)] || c.stopped(owner) {
+	if path == "" || c.stopped(owner) {
+		return
+	}
+	if c.caches[c.key(path)] {
+		c.adopt(path, owner)
 		return
 	}
 	info, err := c.fs(path, 0).Stat(path)
@@ -595,13 +604,19 @@ func (c *condaScan) cacheRoot(path, scope, parent, project string) {
 	}
 	queue := []dir{{path, 0}}
 	stems, extracted := map[string]bool{}, map[string]bool{}
+	budget := maxCondaWalkEntries
 	for len(queue) > 0 {
+		if budget <= 0 {
+			c.degrade(src, "entry_limit")
+			return
+		}
 		if c.stopped(src) {
 			return
 		}
 		d := queue[0]
 		queue = queue[1:]
-		entries, ok := c.list(src, d.path)
+		entries, ok := c.list(src, d.path, min(budget, maxCondaListEntries))
+		budget -= len(entries)
 		if !ok {
 			continue
 		}
@@ -851,7 +866,7 @@ func (c *condaScan) independentLocks() {
 		}
 		dir := filepath.Dir(l.path)
 		if c.stopped(c.byID[l.parent]) {
-			return
+			continue
 		}
 		if src := c.lock(l.path, l.parent, dir); src != nil && src.Presence != "absent" {
 			for _, st := range c.projects {
@@ -952,6 +967,9 @@ func (c *condaScan) walk(root string, src *model.CondaSource) {
 			continue
 		}
 		budget -= len(entries)
+		if more {
+			c.degrade(src, "entry_limit")
+		}
 		has := func(name string, isDir bool) bool {
 			return slices.ContainsFunc(entries, func(e fs.DirEntry) bool { return e.Name() == name && e.IsDir() == isDir })
 		}
@@ -1026,6 +1044,9 @@ func (c *condaScan) walk(root string, src *model.CondaSource) {
 // of that root can prove its removal. Existing parents are kept; adopted
 // reasons propagate like any other child's.
 func (c *condaScan) adopt(path string, owner *model.CondaSource) {
+	if owner == nil {
+		return
+	}
 	for _, kind := range []string{"environment_root", "cache_root", "environment"} {
 		child := c.byID[configaudit.GoSourceID(c.identity, kind, filepath.Clean(path))]
 		if child == nil || child.ParentSourceID != "" || child == owner {

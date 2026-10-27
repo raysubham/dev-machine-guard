@@ -303,6 +303,8 @@ prefix: /home/CANARY/envs/app
 		unsupported, invalid bool
 		err                  bool
 	}{
+		{"root merge", "<<: {dependencies: [numpy]}\n", true, false, false},
+		{"tagged key", "!custom dependencies: [numpy]\n", true, false, false},
 		{"sel form", "dependencies:\n  - sel(win): m2-base\n", true, false, false},
 		{"duplicate dependencies key", "dependencies:\n  - a\ndependencies:\n  - b\n", true, false, false},
 		{"anchor", "channels: &c\n  - conda-forge\ndependencies: *c\n", true, false, false},
@@ -542,7 +544,7 @@ packages:
 	if p := got[key{"minimal-project", "second", "win-64"}]; p.Build != "first" {
 		t.Errorf("v6 source variant by build %+v", p)
 	}
-	for _, in := range []string{"version: 2\npackage: []\n", "version: 6\n", "version: 6\npackages: []\nenvironments: []\n", "version: 1\npackage: {}\n", "", "\xff", "version: 6\npackages: &p []\nenvironments: *p\n"} {
+	for _, in := range []string{"version: 1\n<<: {package: [{manager: conda, name: numpy, version: '1.0'}]}\n", "version: 2\npackage: []\n", "version: 6\n", "version: 6\npackages: []\nenvironments: []\n", "version: 1\npackage: {}\n", "", "\xff", "version: 6\npackages: &p []\nenvironments: *p\n"} {
 		if _, _, err := parseCondaLockYAML([]byte(in)); err == nil {
 			t.Errorf("accepted %q", in)
 		}

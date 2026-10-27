@@ -479,11 +479,15 @@ func condaScalar(n *yaml.Node) (string, bool) {
 }
 
 // condaYAMLField returns a mapping value, or nil with found when the key
-// repeats, since YAML loaders disagree on which duplicate wins.
+// repeats or uses unsupported YAML key syntax.
 func condaYAMLField(m *yaml.Node, field string) (*yaml.Node, bool) {
 	var out *yaml.Node
 	for i := 0; i+1 < len(m.Content); i += 2 {
-		if k := m.Content[i]; k.Kind == yaml.ScalarNode && k.Value == field {
+		k := m.Content[i]
+		if k.Kind != yaml.ScalarNode || !condaYAMLPlain(k) || k.Value == "<<" {
+			return nil, true
+		}
+		if k.Value == field {
 			if out != nil {
 				return nil, true
 			}

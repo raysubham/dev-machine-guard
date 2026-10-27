@@ -1106,7 +1106,9 @@ func (a *CondaConfigSnapshot) chain(own []*model.CondaConfigFile, state *model.C
 	}
 	add(own...)
 	add(a.user...)
-	add(a.roots...)
+	if a.env["CONDA_ROOT"] == "" {
+		add(a.roots...)
+	}
 	add(a.system...)
 	return ids, partial || a.rootsPresent > 1 && a.env["CONDA_ROOT"] == ""
 }
@@ -1157,8 +1159,14 @@ func (a *CondaConfigSnapshot) context(c model.CondaConfigContext) {
 	if a.limited {
 		return
 	}
+	size := len(c.EnvironmentPath) + len(c.ProjectPath) + len(c.ConfigSourceIDs)*70 + 128
+	if a.bytes+size > maxCondaAuditBytes {
+		a.limited, a.partial = true, true
+		a.degrade("output_size_limit")
+		return
+	}
 	a.audit.Contexts = append(a.audit.Contexts, c)
-	a.bytes += len(c.EnvironmentPath) + len(c.ProjectPath) + len(c.ConfigSourceIDs)*70 + 128
+	a.bytes += size
 }
 
 func (a *CondaConfigSnapshot) credential(path string) {

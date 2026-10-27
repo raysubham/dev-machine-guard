@@ -1011,3 +1011,78 @@ func TestCondaScanRootsAndLeads(t *testing.T) {
 		t.Fatalf("aliased root duplicated facts: %d", n)
 	}
 }
+
+func TestCondaScanDiscoveryCoverage(t *testing.T) {
+	t.Run("truncated installation", func(t *testing.T) {
+		home := goTestHome(t)
+		base := filepath.Join(home, "miniforge3")
+		goMkdir(t, filepath.Join(base, "aaa"))
+		goMkdir(t, filepath.Join(base, "envs"))
+		goMkdir(t, filepath.Join(base, "pkgs"))
+		goWrite(t, filepath.Join(base, "conda-meta", "history"), "history", 0o600)
+		goWrite(t, filepath.Join(base, "conda-meta", "tzdata-2024b-hc8b5060_0.json"), condaTzdata, 0o600)
+		old := maxCondaListEntries
+		maxCondaListEntries = 2
+		t.Cleanup(func() { maxCondaListEntries = old })
+		s, _ := condaTestScanner(t, home)
+		inv, _ := s.Scan(t.Context(), goTestTarget(home), nil, nil)
+		if !slices.Contains(inv.Reasons, "entry_limit") {
+			t.Fatalf("truncated root reported %s, %v", inv.Status, inv.Reasons)
+		}
+	})
+	t.Run("custom root ownership", func(t *testing.T) {
+		home := goTestHome(t)
+		base := filepath.Join(home, "custom-forge")
+		env := filepath.Join(base, "envs", "app")
+		cache := filepath.Join(base, "pkgs")
+		goWrite(t, filepath.Join(env, "conda-meta", "history"), "history", 0o600)
+		goMkdir(t, cache)
+		s, x := condaTestScanner(t, home)
+		x.env["CONDA_ROOT"] = base
+		x.env["CONDA_ENVS_PATH"] = filepath.Join(base, "envs")
+		x.env["CONDA_PKGS_DIRS"] = cache
+		inv, _ := s.Scan(t.Context(), goTestTarget(home), nil, nil)
+		owner := condaSource(t, inv, "environment_root", base)
+		for _, kindPath := range [][2]string{{"environment", env}, {"cache_root", cache}} {
+			child := condaSource(t, inv, kindPath[0], kindPath[1])
+			if child.ParentSourceID != owner.SourceID {
+				t.Errorf("%s remains parentless: %q", kindPath[0], child.ParentSourceID)
+			}
+		}
+	})
+	t.Run("deferred lock owners", func(t *testing.T) {
+		home := goTestHome(t)
+		roots := []string{}
+		for _, name := range []string{"a", "b", "c"} {
+			p := filepath.Join(home, name)
+			roots = append(roots, p)
+			goWrite(t, filepath.Join(p, "explicit.txt"), "@EXPLICIT\nhttps://example.invalid/ch/noarch/tzdata-2024b-hc8b5060_0.conda\n", 0o600)
+		}
+		old := maxCondaRecords
+		maxCondaRecords = 5
+		t.Cleanup(func() { maxCondaRecords = old })
+		s, _ := condaTestScanner(t, home)
+		inv, _ := s.Scan(t.Context(), goTestTarget(home), roots, nil)
+		if src := condaSource(t, inv, "project_search_root", roots[2]); src.Status == "complete" {
+			t.Fatal("third root complete despite uncollected lock")
+		}
+	})
+	t.Run("cache breadth", func(t *testing.T) {
+		home := goTestHome(t)
+		cache := filepath.Join(home, "cache-probe")
+		for i := range 3 {
+			for j := range 5 {
+				goWrite(t, filepath.Join(cache, strconv.Itoa(i), strconv.Itoa(j)), "incomplete extraction", 0o600)
+			}
+		}
+		old := maxCondaWalkEntries
+		maxCondaWalkEntries = 10
+		t.Cleanup(func() { maxCondaWalkEntries = old })
+		s, x := condaTestScanner(t, home)
+		x.env["CONDA_PKGS_DIRS"] = cache
+		inv, _ := s.Scan(t.Context(), goTestTarget(home), nil, nil)
+		if src := condaSource(t, inv, "cache_root", cache); !slices.Contains(src.Reasons, "entry_limit") {
+			t.Fatalf("cache exceeded total entry budget: %s %v", src.Status, src.Reasons)
+		}
+	})
+}

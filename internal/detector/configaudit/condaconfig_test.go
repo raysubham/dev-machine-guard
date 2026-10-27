@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -341,6 +342,9 @@ func TestCondaConfigSearchPathRootsAndEnvironments(t *testing.T) {
 	if audit.Contexts[0].SelectionStatus != "observed" {
 		t.Errorf("CONDA_ROOT did not settle ambient %+v", audit.Contexts[0])
 	}
+	if id := condaFile(t, audit, "system", filepath.Join(root, ".condarc")).SourceID; slices.Contains(audit.Contexts[0].ConfigSourceIDs, id) {
+		t.Error("selected root context includes an unrelated installation")
+	}
 	if !slices.Contains(a.Prefixes, other) {
 		t.Errorf("prefix leads %v", a.Prefixes)
 	}
@@ -543,4 +547,20 @@ func TestCondaConfigBudget(t *testing.T) {
 	if audit.Status != "partial" || !slices.Equal(audit.Reasons, []string{"deadline_exceeded"}) || len(audit.Files) != 0 {
 		t.Errorf("cancelled audit %s %v", audit.Status, audit.Reasons)
 	}
+	t.Run("context budget preserves audit", func(t *testing.T) {
+		m, scope := condaConfigTest(t)
+		m.SetFile(filepath.Join(scope.Home, ".condarc"), []byte("ssl_verify: false\n"))
+		a := NewCondaConfigDetector(m).Detect(t.Context(), scope)
+		for i := range 180 {
+			a.Environment(filepath.Join(scope.Home, "envs", strings.Repeat("x", 40)+strconv.Itoa(i)), false)
+		}
+		audit := a.Finish()
+		data, _ := json.Marshal(audit)
+		if len(audit.Files) == 0 || len(audit.Findings) == 0 {
+			t.Fatalf("context overflow erased audit: files=%d findings=%d bytes=%d reasons=%v", len(audit.Files), len(audit.Findings), len(data), audit.Reasons)
+		}
+		if len(data) > maxCondaAuditBytes {
+			t.Fatalf("audit exceeds cap: %d", len(data))
+		}
+	})
 }
