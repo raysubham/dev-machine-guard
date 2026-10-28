@@ -905,8 +905,9 @@ func (d *SkillsDetector) resolveProjectRoots(project string, info *model.AgentSk
 // directory name(s) whose presence marks the dot-dir's parent as a project root.
 // Keep in lockstep with resolveProjectRoots: that function is the authority on
 // which per-project skill dirs are probed once a project is known, and this
-// table is how walkForProjectRoots recognizes a project it was never told about.
-// A change to one MUST change the other.
+// table lets walkForProjectRoots recognize unregistered skill projects. Pi also
+// has package configuration and resource markers checked by hasPiProjectMarker.
+// A change to the skill roots in one MUST change the other.
 var projectMarkerDirs = map[string][]string{
 	".claude":    {"skills"},
 	".agents":    {"skills"},
@@ -1042,7 +1043,7 @@ func (d *SkillsDetector) walkForProjectRoots(ctx context.Context, searchDirs []s
 
 			if markerChildren, ok := projectMarkerDirs[name]; ok {
 				// A marker dot-dir (e.g. .claude): its parent `dir` is a project root
-				// iff the marker dir itself holds the expected skills child. Probe by
+				// when it holds a skills child or Pi configuration/resource marker. Probe by
 				// listing the marker dir (charged to the budget); never descend past
 				// it — enumerating the skills inside is enumerateRoot's job, reached
 				// via the normal project pipeline once discoverProjects admits `dir`.
@@ -1054,7 +1055,7 @@ func (d *SkillsDetector) walkForProjectRoots(ctx context.Context, searchDirs []s
 					d.addError(info, fmt.Sprintf("home walk read marker %s: %v", childDir, err))
 					continue
 				}
-				if hasMarkerChild(mEntries, markerChildren) {
+				if hasMarkerChild(mEntries, markerChildren) || name == ".pi" && hasPiProjectMarker(mEntries) {
 					emit(dir)
 				}
 				continue
@@ -1190,6 +1191,26 @@ func hasMarkerChild(entries []os.DirEntry, want []string) bool {
 		}
 		if slices.Contains(want, e.Name()) {
 			return true
+		}
+	}
+	return false
+}
+
+// Pi projects need no language manifest or skills directory to hold packages.
+func hasPiProjectMarker(entries []os.DirEntry) bool {
+	for _, e := range entries {
+		if e.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		switch e.Name() {
+		case "extensions", "prompts", "themes":
+			if e.IsDir() {
+				return true
+			}
+		case "settings.json", "mcp.json":
+			if e.Type().IsRegular() {
+				return true
+			}
 		}
 	}
 	return false

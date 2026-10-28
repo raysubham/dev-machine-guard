@@ -2990,6 +2990,53 @@ func TestPiSettingsFailuresKeepCoverage(t *testing.T) {
 	}
 }
 
+func TestPiProjectDiscovery(t *testing.T) {
+	t.Run("installed package without language manifest", func(t *testing.T) {
+		m, fs := newPluginMock()
+		project := filepath.Join(testHome, "repos", "pi-only")
+		root := filepath.Join(project, ".pi")
+		fs.addFile(filepath.Join(root, "settings.json"), `{"packages":["npm:widgets"]}`)
+		pkg := filepath.Join(root, "npm", "node_modules", "widgets")
+		fs.addFile(filepath.Join(pkg, "package.json"), `{"name":"widgets","version":"1.0.0","pi":{"extensions":["index.ts"]}}`)
+		fs.addFile(filepath.Join(pkg, "index.ts"), "")
+		fs.commit()
+
+		result := NewSkillsDetector(m).DetectAll(t.Context(), nil, []string{filepath.Join(testHome, "repos")})
+		plugin := piPlugin(t, piContext(t, result), "npm:widgets")
+		if plugin.Scope != model.PluginScopeProject || plugin.ProjectPath != project || len(plugin.Components) != 1 {
+			t.Fatalf("project installation = %+v", plugin)
+		}
+	})
+	for _, name := range []string{"skills", "extensions", "prompts", "themes", "settings.json", "mcp.json", "npm", "git", "other.json"} {
+		for _, kind := range []string{"directory", "file", "symlink", "irregular"} {
+			t.Run(name+"/"+kind, func(t *testing.T) {
+				m, fs := newSkillsMock()
+				project := filepath.Join(testHome, "repos", "pi-only")
+				root := filepath.Join(project, ".pi")
+				fs.mkdir(root)
+				switch kind {
+				case "directory":
+					fs.mkdir(filepath.Join(root, name))
+				case "file":
+					fs.addFile(filepath.Join(root, name), "{}")
+				case "symlink":
+					fs.addSymlink(filepath.Join(root, name), filepath.Join(testHome, "Documents", name))
+				case "irregular":
+					fs.children[root][name] = executor.MockIrregularDirEntry(name)
+				}
+				fs.commit()
+				info := &model.AgentSkillScanInfo{}
+				got := NewSkillsDetector(m).walkForProjectRoots(t.Context(), []string{filepath.Join(testHome, "repos")}, info)
+				want := kind == "directory" && slices.Contains([]string{"skills", "extensions", "prompts", "themes"}, name) ||
+					kind == "file" && (name == "settings.json" || name == "mcp.json")
+				if len(got) != 0 && (len(got) != 1 || got[0] != project) || (len(got) == 1) != want {
+					t.Errorf("projects = %v, want discovered = %v", got, want)
+				}
+			})
+		}
+	}
+}
+
 func TestPiProjectLayers(t *testing.T) {
 	m, fs := newPluginMock()
 	root := filepath.Join(testHome, ".pi", "agent")
