@@ -707,6 +707,7 @@ func (d *SkillsDetector) resolveGlobalRoots(info *model.AgentSkillScanInfo) []sk
 	home := getHomeDir(d.exec)
 	win := d.exec.GOOS() == model.PlatformWindows
 	var roots []skillsRoot
+	scanned := len(info.RootsScanned)
 
 	addRoot := func(root skillsRoot) {
 		// WithinProtected before DirExists: DirExists stats, and a stat inside a
@@ -756,8 +757,24 @@ func (d *SkillsDetector) resolveGlobalRoots(info *model.AgentSkillScanInfo) []sk
 	// alias tier is already covered by agents_user above).
 	add(filepath.Join(home, ".gemini", "skills"), "gemini_user", "gemini-cli", "global", "")
 
-	// pi_user: ~/.pi/agent/skills (note the "agent" path segment).
-	add(filepath.Join(home, ".pi", "agent", "skills"), "pi_user", "pi", "global", "")
+	// pi_user: <agent dir>/skills, ~/.pi/agent/skills by default (note the
+	// "agent" path segment). An unresolvable override keeps the default.
+	piRoot, _ := piAgentRoot(d.exec, home)
+	piSkills := filepath.Join(piRoot, "skills")
+	if piRoot != filepath.Join(home, ".pi", "agent") {
+		// A relocated root may link into a protected folder, which the lexical
+		// check in addRoot cannot see; resolve it link by link first.
+		guarded := d.exec.GuardedFiles([]string{home, piSkills}, func(p string) string {
+			if d.skipper.WithinProtected(p) {
+				return "tcc_protected"
+			}
+			return ""
+		}, maxSkillMDReadBytes)
+		if _, err := guarded.Stat(piSkills); err != nil {
+			piSkills = ""
+		}
+	}
+	add(piSkills, "pi_user", "pi", "global", "")
 
 	// factory_user: ~/.factory/skills.
 	add(filepath.Join(home, ".factory", "skills"), "factory_user", "factory", "global", "")
@@ -832,6 +849,15 @@ func (d *SkillsDetector) resolveGlobalRoots(info *model.AgentSkillScanInfo) []sk
 	add(filepath.Join(home, ".omp", "agent", "skills"), "omp_user", "oh-my-pi", "global", "")
 	add(filepath.Join(home, ".omp", "agent", "managed-skills"), "omp_managed_user", "oh-my-pi", "global", "")
 
+	// A custom Pi agent directory can be another agent's root; that root keeps
+	// its own label instead of shadowing itself.
+	for i, root := range roots {
+		if root.source == "pi_user" && slices.ContainsFunc(roots, func(o skillsRoot) bool { return o.source != "pi_user" && o.path == root.path }) {
+			roots = slices.Delete(roots, i, i+1)
+			info.RootsScanned = slices.Delete(info.RootsScanned, scanned+i, scanned+i+1)
+			break
+		}
+	}
 	return roots
 }
 
