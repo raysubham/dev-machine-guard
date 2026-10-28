@@ -1285,9 +1285,10 @@ func (k *piCollector) list(dir string) []os.DirEntry {
 	return entries
 }
 
-// kind classifies a directory entry, following a symlink through the guard.
+// kind follows links through the guard; Windows junctions report ModeIrregular.
 func (k *piCollector) kind(full string, e os.DirEntry) (isDir, isFile, ok bool) {
-	if e.Type()&os.ModeSymlink == 0 {
+	isJunction := e.Type()&os.ModeIrregular != 0 && k.gd.exec.GOOS() == model.PlatformWindows
+	if e.Type()&os.ModeSymlink == 0 && !isJunction {
 		return e.IsDir(), e.Type().IsRegular(), true
 	}
 	st, _, err := k.a.s.stat(k.gd, full)
